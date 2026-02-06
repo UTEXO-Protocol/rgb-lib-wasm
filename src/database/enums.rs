@@ -304,7 +304,7 @@ pub enum Assignment {
 }
 
 impl Assignment {
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
     pub(crate) fn from_opout_and_state(opout: Opout, state: &AllocatedState) -> Self {
         match state {
             AllocatedState::Amount(amt) if opout.ty == OS_ASSET => Self::Fungible(amt.as_u64()),
@@ -317,7 +317,7 @@ impl Assignment {
         }
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
     pub(crate) fn add_to_assignments(&self, assignments: &mut AssignmentsCollection) {
         match self {
             Self::Fungible(amt) => assignments.fungible += amt,
@@ -338,7 +338,7 @@ impl Assignment {
         }
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
     pub(crate) fn inflation_amount(&self) -> u64 {
         if let Self::InflationRight(amt) = self {
             *amt

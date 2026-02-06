@@ -1,0 +1,17 @@
+[package]
+name = "socket2"
+version = "0.4.10"
+edition = "2021"
+description = "WASM-compatible no-op replacement for socket2 crate"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "socket2"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]  # So Socket::new returns std::io::Error and async-io type-checks
+all = ["std"]      # async-io uses socket2 with "all"; enable std for Domain::for_address, SockAddr::unix, etc.
+std = []           # Feature for std::io::Error and std::net types
+
+[dependencies]

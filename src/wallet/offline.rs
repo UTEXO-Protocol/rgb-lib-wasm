@@ -3,6 +3,57 @@
 //! This module defines the offline methods of the [`Wallet`] structure and all its related data.
 
 use super::*;
+use bdk_wallet::WalletPersister;
+#[cfg(not(target_arch = "wasm32"))]
+use slog_async::AsyncGuard;
+use rgbstd::rgbcore::commit_verify::Conceal;
+
+/// Persister for BDK: file store (native) or in-memory store (WASM when data_dir == ":memory:").
+#[derive(Debug)]
+pub(crate) enum BdkPersister {
+    File(Store<ChangeSet>),
+    #[cfg(target_arch = "wasm32")]
+    Memory(memory_store::MemoryStore<ChangeSet>),
+}
+
+#[derive(Debug)]
+pub(crate) enum BdkPersisterError {
+    File(bdk_wallet::FileStoreError),
+    #[cfg(target_arch = "wasm32")]
+    Memory(std::convert::Infallible),
+}
+
+impl std::fmt::Display for BdkPersisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BdkPersisterError::File(e) => std::fmt::Display::fmt(e, f),
+            #[cfg(target_arch = "wasm32")]
+            BdkPersisterError::Memory(i) => match *i {},
+        }
+    }
+}
+
+impl std::error::Error for BdkPersisterError {}
+
+impl WalletPersister for BdkPersister {
+    type Error = BdkPersisterError;
+
+    fn initialize(persister: &mut Self) -> Result<ChangeSet, Self::Error> {
+        match persister {
+            BdkPersister::File(s) => WalletPersister::initialize(s).map_err(|e| BdkPersisterError::File(e)),
+            #[cfg(target_arch = "wasm32")]
+            BdkPersister::Memory(m) => WalletPersister::initialize(m).map_err(|i| match i {}),
+        }
+    }
+
+    fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error> {
+        match persister {
+            BdkPersister::File(s) => WalletPersister::persist(s, changeset).map_err(|e| BdkPersisterError::File(e)),
+            #[cfg(target_arch = "wasm32")]
+            BdkPersister::Memory(m) => WalletPersister::persist(m, changeset).map_err(|i| match i {}),
+        }
+    }
+}
 
 pub(crate) const RGB_LIB_DB_NAME: &str = "rgb_lib_db";
 const BDK_DB_NAME: &str = "bdk_db";
@@ -28,12 +79,20 @@ pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
 
 const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
+/// Logger guard: async on native (flushes slog), no-op on WASM (slog_async is not supported there).
+pub(crate) enum LoggerGuard {
+    #[cfg(not(target_arch = "wasm32"))]
+    Async(AsyncGuard),
+    #[cfg(target_arch = "wasm32")]
+    WasmNoOp,
+}
+
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
 pub(crate) const RGB_STATE_REPLACE_RIGHT: &str = "replaceRight";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
 
 pub(crate) const SCHEMA_ID_NIA: &str =
@@ -922,13 +981,13 @@ impl From<Outpoint> for OutPoint {
 
 impl From<DbTxo> for RgbOutpoint {
     fn from(x: DbTxo) -> RgbOutpoint {
-        RgbOutpoint::new(RgbTxid::from_str(&x.txid).unwrap(), x.vout)
+        RgbOutpoint::new(bp::Txid::from_str(&x.txid).unwrap(), x.vout)
     }
 }
 
 impl From<Outpoint> for RgbOutpoint {
     fn from(x: Outpoint) -> RgbOutpoint {
-        RgbOutpoint::new(RgbTxid::from_str(&x.txid).unwrap(), x.vout)
+        RgbOutpoint::new(bp::Txid::from_str(&x.txid).unwrap(), x.vout)
     }
 }
 
@@ -1240,16 +1299,16 @@ pub struct WalletData {
 pub struct Wallet {
     pub(crate) wallet_data: WalletData,
     pub(crate) logger: Logger,
-    pub(crate) _logger_guard: AsyncGuard,
+    pub(crate) _logger_guard: LoggerGuard,
     #[cfg_attr(not(any(feature = "electrum", feature = "esplora")), allow(dead_code))]
     pub(crate) watch_only: bool,
-    pub(crate) database: Arc<RgbLibDatabase>,
+    pub(crate) database: Arc<crate::database::RgbLibDatabaseBackend>,
     pub(crate) wallet_dir: PathBuf,
-    pub(crate) bdk_wallet: PersistedWallet<Store<ChangeSet>>,
-    pub(crate) bdk_database: Store<ChangeSet>,
+    pub(crate) bdk_wallet: PersistedWallet<BdkPersister>,
+    pub(crate) bdk_database: BdkPersister,
     #[cfg(any(feature = "electrum", feature = "esplora"))]
     pub(crate) rest_client: RestClient,
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
     pub(crate) online_data: Option<OnlineData>,
 }
 
@@ -1264,11 +1323,28 @@ impl Wallet {
         let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
 
         // wallet directory and file logging setup
-        let data_dir_path = Path::new(&wdata.data_dir);
-        if !data_dir_path.exists() {
-            return Err(Error::InexistentDataDir);
-        }
-        let data_dir_path = fs::canonicalize(data_dir_path)?;
+        // Check for in-memory mode (for WASM)
+        let is_in_memory = wdata.data_dir == ":memory:";
+        
+        let (wallet_dir, data_dir_path) = if is_in_memory {
+            // In-memory mode: use a dummy path that won't be used for file operations
+            let dummy_path = PathBuf::from(":memory:");
+            (dummy_path.clone(), dummy_path)
+        } else {
+            let data_dir_path = Path::new(&wdata.data_dir);
+            if !data_dir_path.exists() {
+                return Err(Error::InexistentDataDir);
+            }
+            let data_dir_path = fs::canonicalize(data_dir_path)?;
+            let wallet_dir = data_dir_path.join(&wdata.master_fingerprint);
+            if !wallet_dir.exists() {
+                fs::create_dir(&wallet_dir)?;
+                fs::create_dir(wallet_dir.join(ASSETS_DIR))?;
+                fs::create_dir(wallet_dir.join(MEDIA_DIR))?;
+            }
+            (wallet_dir, data_dir_path)
+        };
+        
         if let Some(mnemonic) = &wdata.mnemonic {
             // check master fingerprint derived from mnemonic matches provided one
             let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)?;
@@ -1283,13 +1359,32 @@ impl Wallet {
                 return Err(Error::FingerprintMismatch);
             }
         }
-        let wallet_dir = data_dir_path.join(&wdata.master_fingerprint);
-        if !wallet_dir.exists() {
-            fs::create_dir(&wallet_dir)?;
-            fs::create_dir(wallet_dir.join(ASSETS_DIR))?;
-            fs::create_dir(wallet_dir.join(MEDIA_DIR))?;
-        }
-        let (logger, _logger_guard) = setup_logger(&wallet_dir, None)?;
+        
+        // Logger setup. On WASM, slog_async is not supported ("operation not supported on this platform"),
+        // so use a sync discard logger and a no-op guard.
+        let (logger, _logger_guard) = if is_in_memory && cfg!(target_arch = "wasm32") {
+            let logger = slog::Logger::root(slog::Discard.fuse(), slog::o!());
+            (logger, LoggerGuard::WasmNoOp)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if is_in_memory {
+                    let (drain, async_guard) =
+                        slog_async::Async::new(slog::Discard.fuse()).build_with_guard();
+                    let logger = slog::Logger::root(drain.fuse(), slog::o!());
+                    (logger, LoggerGuard::Async(async_guard))
+                } else {
+                    let (l, g) = setup_logger(&wallet_dir, None)?;
+                    (l, LoggerGuard::Async(g))
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // WASM without in_memory should not happen (WASM wallet always uses :memory:).
+                let logger = slog::Logger::root(slog::Discard.fuse(), slog::o!());
+                (logger, LoggerGuard::WasmNoOp)
+            }
+        };
         info!(logger.clone(), "New wallet in '{:?}'", wallet_dir);
         let panic_logger = logger.clone();
         let prev_hook = panic::take_hook();
@@ -1330,9 +1425,22 @@ impl Wallet {
             wallet_params = wallet_params.extract_keys();
             BDK_DB_NAME.to_string()
         };
-        let bdk_db_path = wallet_dir.join(bdk_db_name);
-        let (mut bdk_database, _) =
-            Store::<ChangeSet>::load_or_create(BDK_DB_NAME.as_bytes(), bdk_db_path)?;
+        
+        // BDK database setup: file store (native) or in-memory store (WASM when :memory:)
+        let mut bdk_database = if is_in_memory && cfg!(target_arch = "wasm32") {
+            BdkPersister::Memory(memory_store::MemoryStore::new())
+        } else {
+            let bdk_db_path = if is_in_memory {
+                PathBuf::from(":memory:bdk")
+            } else {
+                wallet_dir.join(bdk_db_name)
+            };
+            let (store, _) = Store::<ChangeSet>::load_or_create(
+                BDK_DB_NAME.as_bytes(),
+                bdk_db_path,
+            )?;
+            BdkPersister::File(store)
+        };
         let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database)? {
             Some(wallet) => wallet,
             None => BdkWallet::create(desc_colored, desc_vanilla)
@@ -1362,18 +1470,28 @@ impl Wallet {
         }
 
         // RGB-LIB setup
-        let db_path = wallet_dir.join(RGB_LIB_DB_NAME);
-        let display_db_path = adjust_canonicalization(db_path);
-        let connection_string = format!("sqlite:{display_db_path}?mode=rwc");
+        // Use in-memory SQLite for WASM, file-based for regular mode
+        let connection_string = if is_in_memory {
+            "sqlite::memory:".to_string()
+        } else {
+            let db_path = wallet_dir.join(RGB_LIB_DB_NAME);
+            let display_db_path = adjust_canonicalization(db_path);
+            format!("sqlite:{display_db_path}?mode=rwc")
+        };
         let mut opt = ConnectOptions::new(connection_string);
-        opt.max_connections(1)
-            .min_connections(0)
-            .connect_timeout(Duration::from_secs(8))
-            .idle_timeout(Duration::from_secs(8))
-            .max_lifetime(Duration::from_secs(8));
+        opt.max_connections(1).min_connections(0);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            opt.connect_timeout(Duration::from_secs(8))
+                .idle_timeout(Duration::from_secs(8))
+                .max_lifetime(Duration::from_secs(8));
+        }
+        // WASM: std::time::Instant not implemented; avoid timeout options that use it
         let db_cnn = block_on(Database::connect(opt));
         let connection = db_cnn.map_err(InternalError::from)?;
+        #[cfg(not(target_arch = "wasm32"))]
         block_on(Migrator::up(&connection, None)).map_err(InternalError::from)?;
+        // WASM: migration runtime (async-std/rustls) not built; use pre-migrated DB or run migrations from host
         let database = RgbLibDatabase::new(connection);
         #[cfg(any(feature = "electrum", feature = "esplora"))]
         let rest_client = get_rest_client()?;
@@ -1384,19 +1502,249 @@ impl Wallet {
             logger,
             _logger_guard,
             watch_only,
-            database: Arc::new(database),
+            database: Arc::new(crate::database::RgbLibDatabaseBackend::Native(database)),
             wallet_dir,
             bdk_wallet,
             bdk_database,
             #[cfg(any(feature = "electrum", feature = "esplora"))]
             rest_client,
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
+            online_data: None,
+        })
+    }
+
+    /// Create a new RGB wallet (async). Use on WASM to avoid `std::time::Instant` in block_on.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_async(wallet_data: WalletData) -> Result<Self, Error> {
+        let wdata = wallet_data.clone();
+        let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
+        let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
+        let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
+        let is_in_memory = wdata.data_dir == ":memory:";
+        let (wallet_dir, _) = if is_in_memory {
+            (PathBuf::from(":memory:"), PathBuf::from(":memory:"))
+        } else {
+            let data_dir_path = Path::new(&wdata.data_dir);
+            if !data_dir_path.exists() {
+                return Err(Error::InexistentDataDir);
+            }
+            let data_dir_path = fs::canonicalize(data_dir_path)?;
+            let wallet_dir = data_dir_path.join(&wdata.master_fingerprint);
+            if !wallet_dir.exists() {
+                fs::create_dir(&wallet_dir)?;
+                fs::create_dir(wallet_dir.join(ASSETS_DIR))?;
+                fs::create_dir(wallet_dir.join(MEDIA_DIR))?;
+            }
+            (wallet_dir, data_dir_path)
+        };
+        if let Some(mnemonic) = &wdata.mnemonic {
+            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)?;
+            let master_xprv =
+                Xpriv::new_master(wdata.bitcoin_network, &mnemonic.to_seed("")).unwrap();
+            let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
+            let master_fingerprint = master_xpub.fingerprint();
+            if master_fingerprint
+                != Fingerprint::from_str(&wdata.master_fingerprint)
+                    .map_err(|_| Error::InvalidFingerprint)?
+            {
+                return Err(Error::FingerprintMismatch);
+            }
+        }
+        let (logger, _logger_guard) = if is_in_memory {
+            let logger = slog::Logger::root(slog::Discard.fuse(), slog::o!());
+            (logger, LoggerGuard::WasmNoOp)
+        } else {
+            let logger = slog::Logger::root(slog::Discard.fuse(), slog::o!());
+            (logger, LoggerGuard::WasmNoOp)
+        };
+        info!(logger.clone(), "New wallet in '{:?}'", wallet_dir);
+        let (desc_colored, desc_vanilla, watch_only) = if let Some(mnemonic) = wdata.mnemonic {
+            let (desc_colored, desc_vanilla) = get_descriptors(
+                wdata.bitcoin_network,
+                &mnemonic,
+                wdata.vanilla_keychain,
+                xpub_btc,
+                xpub_rgb,
+            )?;
+            (desc_colored, desc_vanilla, false)
+        } else {
+            let (desc_colored, desc_vanilla) = get_descriptors_from_xpubs(
+                wdata.bitcoin_network,
+                &wdata.master_fingerprint,
+                xpub_rgb,
+                xpub_btc,
+                wdata.vanilla_keychain,
+            )?;
+            (desc_colored, desc_vanilla, true)
+        };
+        let mut wallet_params = BdkWallet::load()
+            .descriptor(KeychainKind::External, Some(desc_colored.clone()))
+            .descriptor(KeychainKind::Internal, Some(desc_vanilla.clone()))
+            .check_genesis_hash(
+                BlockHash::from_str(get_genesis_hash(&wdata.bitcoin_network)).unwrap(),
+            );
+        let bdk_db_name = if watch_only {
+            format!("{BDK_DB_NAME}_watch_only")
+        } else {
+            wallet_params = wallet_params.extract_keys();
+            BDK_DB_NAME.to_string()
+        };
+        let mut bdk_database = if is_in_memory {
+            BdkPersister::Memory(memory_store::MemoryStore::new())
+        } else {
+            let bdk_db_path = wallet_dir.join(bdk_db_name);
+            let (store, _) = Store::<ChangeSet>::load_or_create(
+                BDK_DB_NAME.as_bytes(),
+                bdk_db_path,
+            )?;
+            BdkPersister::File(store)
+        };
+        let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database)? {
+            Some(wallet) => wallet,
+            None => BdkWallet::create(desc_colored, desc_vanilla)
+                .network(bdk_network)
+                .create_wallet(&mut bdk_database)?,
+        };
+        let supported_schemas = wdata.supported_schemas;
+        if supported_schemas.is_empty() {
+            return Err(Error::NoSupportedSchemas);
+        }
+        if wdata.bitcoin_network == BitcoinNetwork::Mainnet
+            && supported_schemas.contains(&AssetSchema::Ifa)
+        {
+            return Err(Error::CannotUseIfaOnMainnet);
+        }
+        let mut runtime = load_rgb_runtime(wallet_dir.clone())?;
+        let known_schemas = runtime.schemata()?;
+        if known_schemas.len() < NUM_KNOWN_SCHEMAS {
+            let known: HashSet<_> = known_schemas.iter().map(|s| s.id).collect();
+            for schema in supported_schemas {
+                if !known.contains(&SchemaId::from(schema)) {
+                    schema.import_kit(&mut runtime)?;
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let database = {
+            // In browser use in-memory collections (no SQLite); SeaORM/sqlx not supported on wasm32
+            Arc::new(crate::database::RgbLibDatabaseBackend::InMemory(
+                crate::database::memory_db::InMemoryDb::new(),
+            ))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let database = {
+            let connection_string =
+                if is_in_memory { "sqlite::memory:".to_string() } else {
+                    let db_path = wallet_dir.join(RGB_LIB_DB_NAME);
+                    let display_db_path = adjust_canonicalization(db_path);
+                    format!("sqlite:{display_db_path}?mode=rwc")
+                };
+            let mut opt = ConnectOptions::new(connection_string);
+            opt.max_connections(1).min_connections(0);
+            let connection = Database::connect(opt).await.map_err(InternalError::from)?;
+            Arc::new(crate::database::RgbLibDatabaseBackend::Native(
+                RgbLibDatabase::new(connection),
+            ))
+        };
+        info!(logger, "New wallet completed");
+        Ok(Wallet {
+            wallet_data,
+            logger,
+            _logger_guard,
+            watch_only,
+            database,
+            wallet_dir,
+            bdk_wallet,
+            bdk_database,
+            #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
             online_data: None,
         })
     }
 
     pub(crate) fn bitcoin_network(&self) -> BitcoinNetwork {
         self.wallet_data.bitcoin_network
+    }
+
+    /// Check if the wallet is in in-memory mode (for WASM)
+    pub(crate) fn is_in_memory(&self) -> bool {
+        self.wallet_data.data_dir == ":memory:"
+    }
+
+    /// Export wallet state for persistence (for in-memory wallets).
+    ///
+    /// This method exports the current wallet state including:
+    /// - Wallet data (configuration)
+    /// - Database state (SQLite dump)
+    /// - RGB runtime state
+    /// - BDK wallet state
+    ///
+    /// The exported state can be saved in JavaScript (IndexedDB, LocalStorage)
+    /// and restored later using `from_state()`.
+    ///
+    /// Note: This is a placeholder implementation. Full implementation should
+    /// export all components of the wallet state.
+    pub fn export_state(&self) -> Result<String, Error> {
+        if !self.is_in_memory() {
+            return Err(Error::Internal {
+                details: s!("export_state is only available for in-memory wallets"),
+            });
+        }
+
+        // For now, export just the wallet data
+        // TODO: Add export of:
+        // - SQLite database dump
+        // - RGB runtime state (Stock)
+        // - BDK wallet state (changeset)
+        let state = serde_json::json!({
+            "wallet_data": self.wallet_data,
+            "version": "0.1.0",
+            "note": "Partial export - SQLite, RGB runtime, and BDK state export not yet implemented",
+        });
+
+        serde_json::to_string(&state).map_err(|e| Error::Internal {
+            details: format!("Failed to serialize wallet state: {}", e),
+        })
+    }
+
+    /// Restore wallet from exported state (for in-memory wallets).
+    ///
+    /// This method restores a wallet from previously exported state.
+    /// The state should have been exported using `export_state()`.
+    ///
+    /// Note: This is a placeholder implementation. Full implementation should
+    /// restore all components of the wallet state.
+    pub fn from_state(state_json: String) -> Result<Self, Error> {
+        let state: serde_json::Value = serde_json::from_str(&state_json)
+            .map_err(|e| Error::Internal {
+                details: format!("Failed to parse state JSON: {}", e),
+            })?;
+
+        // Extract wallet_data from state
+        let wallet_data: WalletData = serde_json::from_value(
+            state.get("wallet_data")
+                .ok_or_else(|| Error::Internal {
+                    details: s!("State JSON missing wallet_data field"),
+                })?
+                .clone()
+        ).map_err(|e| Error::Internal {
+            details: format!("Failed to deserialize wallet_data: {}", e),
+        })?;
+
+        // Ensure we're creating an in-memory wallet
+        if wallet_data.data_dir != ":memory:" {
+            return Err(Error::Internal {
+                details: s!("from_state can only restore in-memory wallets"),
+            });
+        }
+
+        // Create wallet from wallet_data
+        // TODO: Restore:
+        // - SQLite database from dump
+        // - RGB runtime state (Stock)
+        // - BDK wallet state (changeset)
+        let wallet = Self::new(wallet_data)?;
+
+        Ok(wallet)
     }
 
     pub(crate) fn chain_net(&self) -> ChainNet {
@@ -1758,8 +2106,9 @@ impl Wallet {
     }
 
     pub(crate) fn get_blind_seal(&self, outpoint: impl Into<RgbOutpoint>) -> BlindSeal<RgbTxid> {
-        let outpoint = outpoint.into();
-        BlindSeal::new_random(outpoint.txid, outpoint.vout)
+        let op = outpoint.into();
+        let txid = RgbTxid::from_str(&op.txid.to_string()).unwrap();
+        BlindSeal::new_random(txid, op.vout.into_u32())
     }
 
     pub(crate) fn get_builder_seal(
@@ -3369,16 +3718,16 @@ impl Wallet {
     pub(crate) fn sync_if_requested(
         &mut self,
         #[cfg_attr(
-            not(any(feature = "electrum", feature = "esplora")),
+            not(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm")),
             allow(unused_variables)
         )]
         online: Option<Online>,
         skip_sync: bool,
     ) -> Result<(), Error> {
         if !skip_sync {
-            #[cfg(not(any(feature = "electrum", feature = "esplora")))]
+            #[cfg(not(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm")))]
             return Err(Error::Offline);
-            #[cfg(any(feature = "electrum", feature = "esplora"))]
+            #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
             {
                 if let Some(online) = online {
                     self.check_online(online)?;

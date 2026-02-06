@@ -1,0 +1,23 @@
+[package]
+name = "rustls-pki-types"
+version = "1.13.0"
+edition = "2021"
+description = "WASM-compatible replacement for rustls-pki-types"
+license = "Apache-2.0 OR ISC OR MIT"
+
+[lib]
+name = "rustls_pki_types"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "alloc"]
+std = []
+alloc = []
+web = []
+
+[dependencies]
+# For WASM, use js-sys for time
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[workspace]

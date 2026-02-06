@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>RGB Lib WASM - Simple Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        #output {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+        .success {
+            color: green;
+        }
+        .error {
+            color: red;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            margin-right: 8px;
+            margin-bottom: 8px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        button.secondary {
+            background: #28a745;
+        }
+        button.secondary:hover {
+            background: #1e7e34;
+        }
+        input[type="text"] {
+            padding: 8px;
+            width: 100%;
+            max-width: 400px;
+            margin: 8px 0;
+        }
+        label { display: block; margin-top: 12px; }
+    </style>
+</head>
+<body>
+    <h1>RGB Lib WASM - Simple Test</h1>
+    <p>Basic tests and full online test: connect to Esplora and get BTC balance.</p>
+    
+    <button id="testBtn" onclick="runTest()">Basic test (keys)</button>
+    <button id="onlineBtn" class="secondary" onclick="runOnlineTest()">Full online test (go_online + getBtcBalance)</button>
+    
+    <div id="onlineOptions" style="margin-top:12px;">
+        <label>Esplora API URL (e.g. esplora-api.utexo.com — Signet):</label>
+        <input type="text" id="esploraUrl" value="https://esplora-api.utexo.com/" placeholder="https://esplora-api.utexo.com/" />
+    </div>
+    
+    <div id="output"></div>
+
+    <script type="module">
+        let wasmModule = null;
+        
+        async function initWasm() {
+            if (wasmModule) return wasmModule;
+            const wasm = await import('../pkg/rgb_lib_wasm.js');
+            await wasm.default();
+            wasmModule = wasm;
+            return wasm;
+        }
+        
+        function log(msg, isError = false) {
+            const output = document.getElementById('output');
+            output.textContent += msg + '\n';
+            if (isError) output.className = 'error'; else output.className = 'success';
+        }
+        
+        async function runTest() {
+            const output = document.getElementById('output');
+            const btn = document.getElementById('testBtn');
+            output.textContent = '';
+            btn.disabled = true;
+            try {
+                const wasm = await initWasm();
+                log('✅ WASM module loaded');
+                log('Test 1: Generate keys...');
+                const keys = wasm.generate_keys(wasm.Network.Regtest);
+                log('✅ Keys: ' + keys.master_fingerprint + ' / ' + (keys.mnemonic ? 'mnemonic ok' : 'no mnemonic'));
+                if (typeof keys.free === 'function') keys.free();
+                const fns = Object.keys(wasm).filter(k => typeof wasm[k] === 'function');
+                log('Available functions: ' + fns.slice(0, 15).join(', ') + '...');
+                log('✅ Basic test completed.');
+            } catch (e) {
+                const errMsg = (typeof e === 'string' ? e : (e && e.message != null ? e.message : (e && typeof e.toString === 'function' ? e.toString() : null))) || 'Unknown error';
+                log('❌ Error: ' + errMsg, true);
+            } finally {
+                btn.disabled = false;
+            }
+        }
+        
+        async function runOnlineTest() {
+            const output = document.getElementById('output');
+            const btn = document.getElementById('onlineBtn');
+            const urlInput = document.getElementById('esploraUrl');
+            const esploraUrl = (urlInput && urlInput.value.trim()) || 'https://esplora-api.utexo.com/';
+            output.textContent = '';
+            btn.disabled = true;
+            try {
+                const wasm = await initWasm();
+                // Signet by default (esplora-api.utexo.com — Signet)
+                const network = wasm.Network.Signet;
+                log('✅ WASM loaded');
+                log('Creating wallet (signet)...');
+                const keys = wasm.generate_keys(network);
+                const walletDataJson = wasm.create_wallet_data(
+                    network,
+                    keys.account_xpub_vanilla,
+                    keys.account_xpub_colored,
+                    keys.mnemonic || null,
+                    keys.master_fingerprint,
+                    5,
+                    ['NIA']
+                );
+                if (typeof keys.free === 'function') keys.free();
+                const wallet = await wasm.Wallet.createWallet(walletDataJson);
+                log('Wallet created. (wallet_id=' + (wallet.getWalletId ? wallet.getWalletId() : wallet.walletId) + ')');
+                log('go_online → ' + esploraUrl + ' (signet) ...');
+                const online = await wallet.goOnline(true, esploraUrl);
+                const wid = wallet.getWalletId ? wallet.getWalletId() : wallet.walletId;
+                log('✅ go_online OK. Online id=' + online.id + ', indexerUrl=' + online.indexerUrl + ', wallet_id=' + wid);
+                // refresh(..., false) syncs RGB transfers. getBtcBalance(online, false) triggers
+                // sync_db_txos → indexer().sync() which uses std::time in the chain (panics in browser).
+                // So we use getBtcBalance(online, true) after refresh.
+                log('Refresh (sync RGB)...');
+                try {
+                    wallet.refresh(online, null, '[]', false);
+                    log('✅ refresh OK');
+                } catch (e) {
+                    log('⚠️ refresh: ' + (e && e.message ? e.message : e), false);
+                }
+                // Sync (fetch UTXOs) is skipped in browser: wallet.sync() panics with "time not implemented"
+                // and can leave the registry in a bad state, breaking getBtcBalance. Until the indexer chain
+                // uses a time polyfill for wasm32, balance will be from cache only (e.g. 0 until you use a desktop build).
+                log('Sync skipped in browser (would panic). getBtcBalance from cache...');
+                const balance = wallet.getBtcBalance(online, true);
+                const v = balance.vanilla;
+                const c = balance.colored;
+                log('✅ BTC balance: vanilla settled=' + v.settled + ' future=' + v.future + ' spendable=' + v.spendable);
+                log('   colored settled=' + c.settled + ' future=' + c.future + ' spendable=' + c.spendable);
+                log('Bitcoin address: ' + wallet.getAddress());
+                const assetId = 'rgb:tpk3SgP4-mRdSCNI-Pu~EDie-eBjfn5P-4HQdIKi-SUtqbe8';
+                log('Invoice for asset ' + assetId + '...');
+                try {
+                    const receiveData = wallet.blindReceive(assetId, 'Any', null, ['rpc://127.0.0.1'], 1);
+                    log('✅ Invoice: recipient_id=' + receiveData.recipientId);
+                    log('Invoice: ' + receiveData.invoice);
+                } catch (e) {
+                    log('⚠️ blind_receive: ' + (e && e.message ? e.message : e));
+                }
+                log('Full online test passed.');
+            } catch (e) {
+                const errMsg = (typeof e === 'string' ? e : (e && e.message != null ? e.message : (e && typeof e.toString === 'function' ? e.toString() : null))) || 'Unknown error';
+                log('❌ Error: ' + errMsg, true);
+                if (e && e.stack) {
+                    console.error('WASM stack:', e.stack);
+                }
+                if (errMsg === 'unreachable') {
+                    log('Hint: "unreachable" usually means a Rust panic (e.g. BDK file system in browser). Check the console.', true);
+                }
+                if (errMsg && (errMsg.includes('CORS') || errMsg.includes('Failed to fetch'))) {
+                    log('Hint: Esplora request blocked by CORS. Enable CORS on the Esplora server or use a local proxy.', true);
+                }
+                if (errMsg && errMsg.includes('indexer is for a network different')) {
+                    log('Hint: Esplora API returns a different network (e.g. signet) than the wallet (e.g. testnet). Use the same network or the matching Esplora.', true);
+                }
+                if (errMsg && errMsg.includes('time not implemented')) {
+                    log('Hint: full sync (getBtcBalance(online, false)) uses std::time and panics in browser. Use getBtcBalance(online, true).', true);
+                }
+            } finally {
+                btn.disabled = false;
+            }
+        }
+        
+        window.runTest = runTest;
+        window.runOnlineTest = runOnlineTest;
+        
+        window.addEventListener('load', () => {
+            const output = document.getElementById('output');
+            output.textContent = 'Click "Basic test" or "Full online test".\n';
+            output.textContent += 'Build: wasm-pack build --target web --out-dir pkg\n';
+        });
+    </script>
+</body>
+</html>

@@ -3,6 +3,7 @@
 //! This module defines the online methods of the [`Wallet`] structure and all its related data.
 
 use super::*;
+use psrgbt::{RgbOutExt, RgbPsbtExt};
 
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
@@ -190,32 +191,32 @@ struct InfoAssetTransfer {
 
 #[non_exhaustive]
 pub(crate) enum Indexer {
-    #[cfg(feature = "electrum")]
+    #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
     Electrum(Box<BdkElectrumClient<ElectrumClient>>),
-    #[cfg(feature = "esplora")]
+    #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
     Esplora(Box<EsploraClient>),
 }
 
 impl Indexer {
     pub(crate) fn block_hash(&self, height: usize) -> Result<String, IndexerError> {
         Ok(match self {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => {
                 client.inner.block_header(height)?.block_hash().to_string()
             }
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(client) => client.get_block_hash(height as u32)?.to_string(),
         })
     }
 
     pub(crate) fn broadcast(&self, tx: &BdkTransaction) -> Result<(), IndexerError> {
         match self {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => {
                 client.transaction_broadcast(tx)?;
                 Ok(())
             }
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(client) => {
                 client.broadcast(tx)?;
                 Ok(())
@@ -225,7 +226,7 @@ impl Indexer {
 
     pub(crate) fn fee_estimation(&self, blocks: u16) -> Result<f64, Error> {
         Ok(match self {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => {
                 let estimate = client
                     .inner
@@ -236,14 +237,14 @@ impl Indexer {
                 }
                 (estimate * 100_000_000.0) / 1_000.0
             }
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(client) => {
                 let estimate_map = client.get_fee_estimates().map_err(IndexerError::from)?; // in sat/vB
                 if estimate_map.is_empty() {
                     return Err(Error::CannotEstimateFees);
                 }
                 // map needs to be sorted for interpolation to work
-                let estimate_map = BTreeMap::from_iter(estimate_map);
+                let estimate_map: BTreeMap<u16, f64> = BTreeMap::from_iter(estimate_map);
                 match estimate_map.get(&blocks) {
                     Some(estimate) => *estimate,
                     None => {
@@ -287,11 +288,11 @@ impl Indexer {
         request: R,
     ) -> Result<FullScanResponse<K>, IndexerError> {
         match self {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => {
                 Ok(client.full_scan(request, INDEXER_STOP_GAP, INDEXER_BATCH_SIZE, true)?)
             }
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(client) => client
                 .full_scan(request, INDEXER_STOP_GAP, INDEXER_PARALLEL_REQUESTS)
                 .map_err(|e| IndexerError::from(*e)),
@@ -300,7 +301,7 @@ impl Indexer {
 
     pub(crate) fn get_tx_confirmations(&self, txid: &str) -> Result<Option<u64>, Error> {
         Ok(match self {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => {
                 let tx_details = match client.inner.raw_call(
                     "blockchain.transaction.get",
@@ -331,7 +332,7 @@ impl Indexer {
                     Some(0)
                 }
             }
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(client) => {
                 let txid = Txid::from_str(txid).unwrap();
                 let tx_status = client.get_tx_status(&txid).map_err(IndexerError::from)?;
@@ -350,15 +351,15 @@ impl Indexer {
     pub(crate) fn populate_tx_cache(
         &self,
         #[cfg_attr(feature = "esplora", allow(unused))] bdk_wallet: &PersistedWallet<
-            Store<ChangeSet>,
+            crate::wallet::offline::BdkPersister,
         >,
     ) {
         match self {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => {
                 client.populate_tx_cache(bdk_wallet.tx_graph().full_txs().map(|tx_node| tx_node.tx))
             }
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(_) => {}
         }
     }
@@ -368,9 +369,9 @@ impl Indexer {
         request: impl Into<SyncRequest<I>>,
     ) -> Result<SyncResponse, IndexerError> {
         match self {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => Ok(client.sync(request, INDEXER_BATCH_SIZE, true)?),
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(client) => client
                 .sync(request, INDEXER_PARALLEL_REQUESTS)
                 .map_err(|e| IndexerError::from(*e)),
@@ -546,7 +547,7 @@ impl Wallet {
             }
             Err(e) => {
                 match e {
-                    #[cfg(feature = "electrum")]
+                    #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
                     IndexerError::Electrum(ref e) => {
                         let err_str = e.to_string();
                         if err_str.contains("min relay fee not met")
@@ -557,7 +558,7 @@ impl Wallet {
                             return Err(Error::MaxFeeExceeded { txid: txid.clone() });
                         }
                     }
-                    #[cfg(feature = "esplora")]
+                    #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
                     IndexerError::Esplora(ref e) => {
                         if let EsploraError::HttpResponse { message, .. } = e {
                             if message.contains("min relay fee not met") {
@@ -1166,6 +1167,7 @@ impl Wallet {
         Ok(estimation)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn _go_online(&self, indexer_url: String) -> Result<(Online, OnlineData), Error> {
         let online_id = now().unix_timestamp_nanos() as u64;
         let online = Online {
@@ -1177,7 +1179,7 @@ impl Wallet {
         indexer.populate_tx_cache(&self.bdk_wallet);
 
         let resolver = match indexer {
-            #[cfg(feature = "electrum")]
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(_) => {
                 let electrum_config = BpElectrumConfig::builder()
                     .timeout(Some(INDEXER_TIMEOUT))
@@ -1189,18 +1191,63 @@ impl Wallet {
                     },
                 )?
             }
-            #[cfg(feature = "esplora")]
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
             Indexer::Esplora(_) => {
-                let esplora_config = BpEsploraConfig {
-                    proxy: None,
-                    timeout: Some(INDEXER_TIMEOUT.into()),
-                    max_retries: INDEXER_RETRIES as usize,
-                    headers: HashMap::new(),
-                };
-                AnyResolver::esplora_blocking(&indexer_url, Some(esplora_config)).map_err(|e| {
-                    Error::InvalidIndexer {
+                // On wasm32 avoid .timeout() — reqwest/esplora client may use std::time::Instant for it (panics in browser).
+                let builder = EsploraBuilder::new(&indexer_url)
+                    .max_retries(INDEXER_RETRIES.into());
+                #[cfg(not(target_arch = "wasm32"))]
+                let builder = builder.timeout(INDEXER_TIMEOUT.into());
+                AnyResolver::esplora_blocking(builder).map_err(|e| Error::InvalidIndexer {
+                    details: e.to_string(),
+                })?
+            }
+        };
+
+        let online_data = OnlineData {
+            id: online.id,
+            indexer_url,
+            indexer,
+            resolver,
+        };
+
+        Ok((online, online_data))
+    }
+
+    /// WASM: use gloo_net (fetch) for indexer validation instead of minreq. Resolver (esplora_blocking) still uses minreq and may fail until rgb-ops has async path.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+    async fn _go_online_async(&self, indexer_url: String) -> Result<(Online, OnlineData), Error> {
+        let online_id = now().unix_timestamp_nanos() as u64;
+        let online = Online {
+            id: online_id,
+            indexer_url: indexer_url.clone(),
+        };
+
+        let indexer = crate::utils::get_indexer_async(&indexer_url, self.bitcoin_network()).await?;
+        indexer.populate_tx_cache(&self.bdk_wallet);
+
+        let resolver = match indexer {
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
+            Indexer::Electrum(_) => {
+                let electrum_config = BpElectrumConfig::builder()
+                    .timeout(Some(INDEXER_TIMEOUT))
+                    .retry(INDEXER_RETRIES)
+                    .build();
+                AnyResolver::electrum_blocking(&indexer_url, Some(electrum_config)).map_err(
+                    |e| Error::InvalidIndexer {
                         details: e.to_string(),
-                    }
+                    },
+                )?
+            }
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
+            Indexer::Esplora(_) => {
+                // On wasm32 avoid .timeout() — reqwest/esplora client may use std::time::Instant for it (panics in browser).
+                let builder = EsploraBuilder::new(&indexer_url)
+                    .max_retries(INDEXER_RETRIES.into());
+                #[cfg(not(target_arch = "wasm32"))]
+                let builder = builder.timeout(INDEXER_TIMEOUT.into());
+                AnyResolver::esplora_blocking(builder).map_err(|e| Error::InvalidIndexer {
+                    details: e.to_string(),
                 })?
             }
         };
@@ -1224,6 +1271,7 @@ impl Wallet {
     ///
     /// <div class="warning">Warning: setting `skip_consistency_check` to true is dangerous, only
     /// do this if you know what you're doing!</div>
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn go_online(
         &mut self,
         skip_consistency_check: bool,
@@ -1247,6 +1295,44 @@ impl Wallet {
             }
         } else {
             let (online, online_data) = self._go_online(indexer_url)?;
+            self.online_data = Some(online_data);
+            online
+        };
+
+        if !skip_consistency_check {
+            let runtime = self.rgb_runtime()?;
+            self._check_consistency(&runtime)?;
+        }
+
+        info!(self.logger, "Go online completed");
+        Ok(online)
+    }
+
+    /// Async go_online for wasm32: uses gloo_net (fetch) for indexer validation. Returns a Future; from WASM bindings expose as Promise.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+    pub async fn go_online_async(
+        &mut self,
+        skip_consistency_check: bool,
+        indexer_url: String,
+    ) -> Result<Online, Error> {
+        info!(self.logger, "Going online (async)...");
+
+        let online = if let Some(online_data) = &self.online_data {
+            let online = Online {
+                id: online_data.id,
+                indexer_url: indexer_url.clone(),
+            };
+            if online_data.indexer_url != online.indexer_url {
+                let (online, online_data) = self._go_online_async(online.indexer_url).await?;
+                self.online_data = Some(online_data);
+                info!(self.logger, "Went online with new indexer URL");
+                online
+            } else {
+                self.check_online(online.clone())?;
+                online
+            }
+        } else {
+            let (online, online_data) = self._go_online_async(indexer_url).await?;
             self.online_data = Some(online_data);
             online
         };
@@ -1304,6 +1390,12 @@ impl Wallet {
         recipient_id: String,
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Err(Error::Internal {
+            details: s!("Proxy/consignment not supported in WASM"),
+        });
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         debug!(
             self.logger,
             "Refusing invalid consignment for {recipient_id}"
@@ -1329,6 +1421,7 @@ impl Wallet {
             self.database
                 .update_batch_transfer(updated_batch_transfer)?,
         ))
+        }
     }
 
     pub(crate) fn get_consignment(
@@ -1336,6 +1429,12 @@ impl Wallet {
         proxy_url: &str,
         recipient_id: String,
     ) -> Result<GetConsignmentResponse, Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Err(Error::Internal {
+            details: s!("Proxy/consignment not supported in WASM"),
+        });
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         let consignment_res = self
             .rest_client
             .clone()
@@ -1357,6 +1456,7 @@ impl Wallet {
         );
 
         Ok(consignment_res)
+        }
     }
 
     pub(crate) fn extract_received_assignments(
@@ -1451,6 +1551,12 @@ impl Wallet {
         &self,
         reject_list_url: &str,
     ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Err(Error::Internal {
+            details: s!("Reject list/proxy not supported in WASM"),
+        });
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         let list = self.rest_client.clone().get_reject_list(reject_list_url)?;
         let reject_list = list.trim();
         let mut opout_map = HashMap::with_capacity(reject_list.lines().count());
@@ -1478,6 +1584,7 @@ impl Wallet {
         );
 
         Ok((reject_opouts, allow_opouts))
+        }
     }
 
     fn _wait_consignment(
@@ -1485,6 +1592,12 @@ impl Wallet {
         batch_transfer: &DbBatchTransfer,
         db_data: &DbData,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Err(Error::Internal {
+            details: s!("Consignment/proxy not supported in WASM"),
+        });
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         debug!(self.logger, "Waiting consignment...");
 
         let batch_transfer_data =
@@ -1648,14 +1761,16 @@ impl Wallet {
             if let Some(RecipientTypeFull::Witness { .. }) = transfer.recipient_type {
                 if let Some(vout) = vout {
                     if let PubWitness::Tx(tx) = &anchored_bundle.pub_witness {
-                        if let Some(output) = tx.outputs().nth(vout as usize) {
+                        if let Some(output) = tx.output.get(vout as usize) {
                             let script_pubkey = ScriptPubkey::try_from(
                                 script_buf_from_recipient_id(recipient_id.clone())?
                                     .unwrap()
                                     .into_bytes(),
                             )
                             .unwrap();
-                            if output.script_pubkey != script_pubkey {
+                            let output_sp = ScriptPubkey::try_from(output.script_pubkey.to_bytes())
+                                .map_err(|_| Error::Internal { details: s!("invalid script") })?;
+                            if output_sp != script_pubkey {
                                 error!(
                                     self.logger,
                                     "The provided vout pays an incorrect script pubkey"
@@ -1944,6 +2059,7 @@ impl Wallet {
             self.database
                 .update_batch_transfer(&mut updated_batch_transfer)?,
         ))
+        }
     }
 
     fn _wait_ack(
@@ -1952,6 +2068,12 @@ impl Wallet {
         db_data: &mut DbData,
         skip_sync: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Err(Error::Internal {
+            details: s!("Proxy/ACK not supported in WASM"),
+        });
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         debug!(self.logger, "Waiting ACK...");
 
         let mut batch_transfer_data =
@@ -2022,6 +2144,7 @@ impl Wallet {
             self.database
                 .update_batch_transfer(&mut updated_batch_transfer)?,
         ))
+        }
     }
 
     fn _wait_confirmations(
@@ -2164,6 +2287,10 @@ impl Wallet {
         filter: &[RefreshFilter],
         skip_sync: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Ok(None);
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         debug!(self.logger, "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?;
         if !filter.is_empty() {
@@ -2183,6 +2310,7 @@ impl Wallet {
                 self._wait_confirmations(transfer, db_data, incoming, skip_sync)
             }
             _ => Ok(None),
+        }
         }
     }
 
@@ -2558,8 +2686,11 @@ impl Wallet {
         let mut rgb_psbt = RgbPsbt::from_str(&psbt.to_string()).unwrap();
 
         let prev_outputs = rgb_psbt
-            .inputs()
-            .map(|txin| txin.previous_outpoint)
+            .unsigned_tx()
+            .input
+            .iter()
+            .zip(rgb_psbt.inputs.iter())
+            .map(|(txin, _)| RgbOutpoint::from(Outpoint::from(txin.previous_output)))
             .collect::<HashSet<RgbOutpoint>>();
 
         let input_outpoints: Vec<Outpoint> = psbt
@@ -2641,7 +2772,7 @@ impl Wallet {
             let mut beneficiaries = vec![];
             for recipient in &transfer_info.recipients {
                 let seal: BuilderSeal<GraphSeal> = match &recipient.local_recipient_data {
-                    LocalRecipientData::Blind(secret_seal) => BuilderSeal::Concealed(*secret_seal),
+                    LocalRecipientData::Blind(secret_seal) => BuilderSeal::Concealed((*secret_seal).into()),
                     LocalRecipientData::Witness(witness_data) => {
                         let graph_seal = if let Some(blinding) = witness_data.blinding {
                             GraphSeal::with_blinded_vout(witness_data.vout, blinding)
@@ -2803,19 +2934,23 @@ impl Wallet {
         }
 
         let opreturn_index = rgb_psbt
-            .to_unsigned_tx()
-            .outputs
+            .unsigned_tx()
+            .output
             .iter()
             .enumerate()
             .find(|(_, o)| o.script_pubkey.is_op_return())
             .expect("psbt should have an op_return output")
             .0;
-        rgb_psbt
-            .outputs_mut()
+        if !rgb_psbt
+            .outputs_iter_mut()
             .nth(opreturn_index)
             .unwrap()
             .set_opret_host()
-            .map_err(InternalError::from)?;
+        {
+            return Err(Error::Internal {
+                details: s!("failed to set opret host on PSBT output"),
+            });
+        }
 
         for (cid, transitions) in &all_transitions {
             for transition in transitions {
@@ -2828,12 +2963,11 @@ impl Wallet {
         }
 
         rgb_psbt.set_rgb_close_method(CloseMethod::OpretFirst);
-        rgb_psbt.complete_construction();
         let fascia = rgb_psbt.rgb_commit().map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
 
-        let witness_txid = rgb_psbt.txid();
+        let witness_txid = rgb_psbt.get_txid();
 
         runtime.consume_fascia(fascia, witness_txid, None)?;
 
@@ -2947,6 +3081,12 @@ impl Wallet {
         txid: String,
         medias: Vec<Media>,
     ) -> Result<(), Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Err(Error::Internal {
+            details: s!("Post transfer/proxy not supported in WASM"),
+        });
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         let consignment_path = self._get_send_consignment_path(&asset_transfer_dir);
         for recipient in recipients {
             let recipient_id = &recipient.recipient_id;
@@ -3006,6 +3146,7 @@ impl Wallet {
         }
 
         Ok(())
+        }
     }
 
     fn _save_transfers(
@@ -3461,6 +3602,12 @@ impl Wallet {
         fee_rate: u64,
         min_confirmations: u8,
     ) -> Result<String, Error> {
+        #[cfg(feature = "esplora-wasm")]
+        return Err(Error::Internal {
+            details: s!("Send/transfer/proxy not supported in WASM"),
+        });
+        #[cfg(any(feature = "electrum", feature = "esplora"))]
+        {
         info!(self.logger, "Sending (begin) to: {:?}...", recipient_map);
 
         let (fee_rate_checked, unspents, input_unspents, mut runtime) =
@@ -3543,7 +3690,7 @@ impl Wallet {
                     Beneficiary::WitnessVout(pay_2_vout, _) => {
                         if let Some(ref witness_data) = recipient.witness_data {
                             let script_buf =
-                                ScriptBuf::from_hex(&pay_2_vout.script_pubkey().to_hex()).unwrap();
+                                ScriptBuf::from_bytes(pay_2_vout.to_script().as_bytes().to_vec());
                             witness_recipients.push((script_buf.clone(), witness_data.amount_sat));
                             let local_witness_data = LocalWitnessData {
                                 amount_sat: witness_data.amount_sat,
@@ -3647,6 +3794,7 @@ impl Wallet {
 
         info!(self.logger, "Send (begin) completed");
         Ok(psbt_string)
+        }
     }
 
     /// Complete the send operation by saving the PSBT to disk, POSTing consignments to the RGB

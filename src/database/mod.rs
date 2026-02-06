@@ -1,6 +1,11 @@
 pub(crate) mod entities;
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod memory_db;
+
 use super::*;
+
+use rgb_lib_migration::OnConflict;
 
 use crate::database::entities::{
     asset, coloring, media, pending_witness_script, prelude::*, transfer_transport_endpoint,
@@ -199,7 +204,7 @@ impl LocalRecipientData {
     }
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct LocalRecipient {
     pub recipient_id: String,
@@ -251,6 +256,13 @@ pub(crate) struct TransferData {
 
 pub struct RgbLibDatabase {
     connection: DatabaseConnection,
+}
+
+/// Backend for wallet DB: SeaORM on native, in-memory collections on wasm32.
+pub enum RgbLibDatabaseBackend {
+    Native(RgbLibDatabase),
+    #[cfg(target_arch = "wasm32")]
+    InMemory(memory_db::InMemoryDb),
 }
 
 impl RgbLibDatabase {
@@ -354,7 +366,7 @@ impl RgbLibDatabase {
     #[cfg_attr(not(any(feature = "electrum", feature = "esplora")), allow(dead_code))]
     pub(crate) fn set_txo(&self, txo: DbTxoActMod) -> Result<i32, InternalError> {
         let mut on_conflict =
-            sea_query::OnConflict::columns([txo::Column::Txid, txo::Column::Vout]);
+            OnConflict::columns([txo::Column::Txid, txo::Column::Vout]);
         let mut update = false;
         if txo.exists.clone().unwrap() {
             update = true;
@@ -930,6 +942,752 @@ impl RgbLibDatabase {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl RgbLibDatabaseBackend {
+    pub(crate) fn set_asset(&self, asset: DbAssetActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_asset(asset),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_asset(asset),
+        }
+    }
+    pub(crate) fn set_asset_transfer(
+        &self,
+        asset_transfer: DbAssetTransferActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_asset_transfer(asset_transfer),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_asset_transfer(asset_transfer),
+        }
+    }
+    pub(crate) fn set_backup_info(
+        &self,
+        backup_info: DbBackupInfoActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_backup_info(backup_info),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_backup_info(backup_info),
+        }
+    }
+    pub(crate) fn set_batch_transfer(
+        &self,
+        batch_transfer: DbBatchTransferActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_batch_transfer(batch_transfer),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_batch_transfer(batch_transfer),
+        }
+    }
+    pub(crate) fn set_coloring(&self, coloring: DbColoringActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_coloring(coloring),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_coloring(coloring),
+        }
+    }
+    pub(crate) fn set_media(&self, media: DbMediaActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_media(media),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_media(media),
+        }
+    }
+    pub(crate) fn set_pending_witness_script(
+        &self,
+        pending_witness_script: DbPendingWitnessScriptActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_pending_witness_script(pending_witness_script),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_pending_witness_script(pending_witness_script),
+        }
+    }
+    pub(crate) fn set_token(&self, token: DbTokenActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_token(token),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_token(token),
+        }
+    }
+    pub(crate) fn set_token_media(
+        &self,
+        token_media: DbTokenMediaActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_token_media(token_media),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_token_media(token_media),
+        }
+    }
+    pub(crate) fn set_transport_endpoint(
+        &self,
+        transport_endpoint: DbTransportEndpointActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_transport_endpoint(transport_endpoint),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_transport_endpoint(transport_endpoint),
+        }
+    }
+    pub(crate) fn set_transfer(&self, transfer: DbTransferActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_transfer(transfer),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_transfer(transfer),
+        }
+    }
+    pub(crate) fn set_transfer_transport_endpoint(
+        &self,
+        transfer_transport_endpoint: DbTransferTransportEndpointActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_transfer_transport_endpoint(transfer_transport_endpoint),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_transfer_transport_endpoint(transfer_transport_endpoint),
+        }
+    }
+    pub(crate) fn set_txo(&self, txo: DbTxoActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_txo(txo),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_txo(txo),
+        }
+    }
+    pub(crate) fn set_wallet_transaction(
+        &self,
+        wallet_transaction: DbWalletTransactionActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_wallet_transaction(wallet_transaction),
+            RgbLibDatabaseBackend::InMemory(db) => db.set_wallet_transaction(wallet_transaction),
+        }
+    }
+    pub(crate) fn update_transfer(
+        &self,
+        transfer: &mut DbTransferActMod,
+    ) -> Result<DbTransfer, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_transfer(transfer),
+            RgbLibDatabaseBackend::InMemory(db) => db.update_transfer(transfer),
+        }
+    }
+    pub(crate) fn update_asset(&self, asset: &mut DbAssetActMod) -> Result<DbAsset, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_asset(asset),
+            RgbLibDatabaseBackend::InMemory(db) => db.update_asset(asset),
+        }
+    }
+    pub(crate) fn update_asset_transfer(
+        &self,
+        asset_transfer: &mut DbAssetTransferActMod,
+    ) -> Result<DbAssetTransfer, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_asset_transfer(asset_transfer),
+            RgbLibDatabaseBackend::InMemory(db) => db.update_asset_transfer(asset_transfer),
+        }
+    }
+    pub(crate) fn update_backup_info(
+        &self,
+        backup_info: &mut DbBackupInfoActMod,
+    ) -> Result<DbBackupInfo, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_backup_info(backup_info),
+            RgbLibDatabaseBackend::InMemory(db) => db.update_backup_info(backup_info),
+        }
+    }
+    pub(crate) fn update_batch_transfer(
+        &self,
+        batch_transfer: &mut DbBatchTransferActMod,
+    ) -> Result<DbBatchTransfer, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_batch_transfer(batch_transfer),
+            RgbLibDatabaseBackend::InMemory(db) => db.update_batch_transfer(batch_transfer),
+        }
+    }
+    pub(crate) fn update_transfer_transport_endpoint(
+        &self,
+        transfer_transport_endpoint: &mut DbTransferTransportEndpointActMod,
+    ) -> Result<DbTransferTransportEndpoint, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_transfer_transport_endpoint(transfer_transport_endpoint),
+            RgbLibDatabaseBackend::InMemory(db) => db.update_transfer_transport_endpoint(transfer_transport_endpoint),
+        }
+    }
+    pub(crate) fn update_txo(&self, txo: DbTxoActMod) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_txo(txo),
+            RgbLibDatabaseBackend::InMemory(db) => db.update_txo(txo),
+        }
+    }
+    pub(crate) fn del_backup_info(&self) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_backup_info(),
+            RgbLibDatabaseBackend::InMemory(db) => db.del_backup_info(),
+        }
+    }
+    pub(crate) fn del_batch_transfer(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_batch_transfer(batch_transfer),
+            RgbLibDatabaseBackend::InMemory(db) => db.del_batch_transfer(batch_transfer),
+        }
+    }
+    pub(crate) fn del_coloring(&self, asset_transfer_idx: i32) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_coloring(asset_transfer_idx),
+            RgbLibDatabaseBackend::InMemory(db) => db.del_coloring(asset_transfer_idx),
+        }
+    }
+    pub(crate) fn del_pending_witness_script(&self, script: String) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_pending_witness_script(script),
+            RgbLibDatabaseBackend::InMemory(db) => db.del_pending_witness_script(script),
+        }
+    }
+    pub(crate) fn del_txo(&self, idx: i32) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_txo(idx),
+            RgbLibDatabaseBackend::InMemory(db) => db.del_txo(idx),
+        }
+    }
+    pub(crate) fn get_asset(&self, asset_id: String) -> Result<Option<DbAsset>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_asset(asset_id),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_asset(asset_id),
+        }
+    }
+    pub(crate) fn get_backup_info(&self) -> Result<Option<DbBackupInfo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_backup_info(),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_backup_info(),
+        }
+    }
+    pub(crate) fn get_media(&self, media_idx: i32) -> Result<Option<DbMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_media(media_idx),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_media(media_idx),
+        }
+    }
+    pub(crate) fn get_media_by_digest(
+        &self,
+        digest: String,
+    ) -> Result<Option<DbMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_media_by_digest(digest),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_media_by_digest(digest),
+        }
+    }
+    pub(crate) fn get_transport_endpoint(
+        &self,
+        endpoint: String,
+    ) -> Result<Option<DbTransportEndpoint>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_transport_endpoint(endpoint),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_transport_endpoint(endpoint),
+        }
+    }
+    pub(crate) fn get_txo(&self, outpoint: &Outpoint) -> Result<Option<DbTxo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_txo(outpoint),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_txo(outpoint),
+        }
+    }
+    pub(crate) fn iter_assets(&self) -> Result<Vec<DbAsset>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_assets(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_assets(),
+        }
+    }
+    pub(crate) fn iter_asset_transfers(&self) -> Result<Vec<DbAssetTransfer>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_asset_transfers(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_asset_transfers(),
+        }
+    }
+    pub(crate) fn iter_batch_transfers(&self) -> Result<Vec<DbBatchTransfer>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_batch_transfers(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_batch_transfers(),
+        }
+    }
+    pub(crate) fn iter_colorings(&self) -> Result<Vec<DbColoring>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_colorings(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_colorings(),
+        }
+    }
+    pub(crate) fn iter_media(&self) -> Result<Vec<DbMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_media(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_media(),
+        }
+    }
+    pub(crate) fn iter_pending_witness_scripts(
+        &self,
+    ) -> Result<Vec<DbPendingWitnessScript>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_pending_witness_scripts(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_pending_witness_scripts(),
+        }
+    }
+    pub(crate) fn iter_token_medias(&self) -> Result<Vec<DbTokenMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_token_medias(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_token_medias(),
+        }
+    }
+    pub(crate) fn iter_tokens(&self) -> Result<Vec<DbToken>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_tokens(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_tokens(),
+        }
+    }
+    pub(crate) fn iter_transfers(&self) -> Result<Vec<DbTransfer>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_transfers(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_transfers(),
+        }
+    }
+    pub(crate) fn iter_txos(&self) -> Result<Vec<DbTxo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_txos(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_txos(),
+        }
+    }
+    pub(crate) fn iter_wallet_transactions(
+        &self,
+    ) -> Result<Vec<DbWalletTransaction>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_wallet_transactions(),
+            RgbLibDatabaseBackend::InMemory(db) => db.iter_wallet_transactions(),
+        }
+    }
+    pub(crate) fn get_transfer_transport_endpoints_data(
+        &self,
+        transfer_idx: i32,
+    ) -> Result<Vec<(DbTransferTransportEndpoint, DbTransportEndpoint)>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_transfer_transport_endpoints_data(transfer_idx),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_transfer_transport_endpoints_data(transfer_idx),
+        }
+    }
+    pub(crate) fn get_db_data(&self, empty_transfers: bool) -> Result<DbData, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_db_data(empty_transfers),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_db_data(empty_transfers),
+        }
+    }
+    pub(crate) fn get_unspent_txos(&self, txos: Vec<DbTxo>) -> Result<Vec<DbTxo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_unspent_txos(txos),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_unspent_txos(txos),
+        }
+    }
+    pub(crate) fn get_asset_balance(
+        &self,
+        asset_id: String,
+        transfers: Option<Vec<DbTransfer>>,
+        asset_transfers: Option<Vec<DbAssetTransfer>>,
+        batch_transfers: Option<Vec<DbBatchTransfer>>,
+        colorings: Option<Vec<DbColoring>>,
+        txos: Option<Vec<DbTxo>>,
+    ) -> Result<Balance, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_asset_balance(
+                asset_id, transfers, asset_transfers, batch_transfers, colorings, txos,
+            ),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_asset_balance(
+                asset_id, transfers, asset_transfers, batch_transfers, colorings, txos,
+            ),
+        }
+    }
+    pub(crate) fn get_asset_ids(&self) -> Result<Vec<String>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_asset_ids(),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_asset_ids(),
+        }
+    }
+    pub(crate) fn check_asset_exists(&self, asset_id: String) -> Result<DbAsset, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.check_asset_exists(asset_id),
+            RgbLibDatabaseBackend::InMemory(db) => db.check_asset_exists(asset_id),
+        }
+    }
+    pub(crate) fn get_batch_transfer_or_fail(
+        &self,
+        idx: i32,
+        batch_transfers: &[DbBatchTransfer],
+    ) -> Result<DbBatchTransfer, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_batch_transfer_or_fail(idx, batch_transfers),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_batch_transfer_or_fail(idx, batch_transfers),
+        }
+    }
+    pub(crate) fn get_incoming_transfer(
+        &self,
+        batch_transfer_data: &DbBatchTransferData,
+    ) -> Result<(DbAssetTransfer, DbTransfer), Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_incoming_transfer(batch_transfer_data),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_incoming_transfer(batch_transfer_data),
+        }
+    }
+    pub(crate) fn get_rgb_allocations(
+        &self,
+        utxos: Vec<DbTxo>,
+        colorings: Option<Vec<DbColoring>>,
+        batch_transfers: Option<Vec<DbBatchTransfer>>,
+        asset_transfers: Option<Vec<DbAssetTransfer>>,
+        transfers: Option<Vec<DbTransfer>>,
+    ) -> Result<Vec<LocalUnspent>, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_rgb_allocations(
+                utxos, colorings, batch_transfers, asset_transfers, transfers,
+            ),
+            RgbLibDatabaseBackend::InMemory(db) => db.get_rgb_allocations(
+                utxos, colorings, batch_transfers, asset_transfers, transfers,
+            ),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RgbLibDatabaseBackend {
+    pub(crate) fn set_asset(&self, asset: DbAssetActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_asset(asset),
+        }
+    }
+    pub(crate) fn set_asset_transfer(
+        &self,
+        asset_transfer: DbAssetTransferActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_asset_transfer(asset_transfer),
+        }
+    }
+    pub(crate) fn set_backup_info(
+        &self,
+        backup_info: DbBackupInfoActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_backup_info(backup_info),
+        }
+    }
+    pub(crate) fn set_batch_transfer(
+        &self,
+        batch_transfer: DbBatchTransferActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_batch_transfer(batch_transfer),
+        }
+    }
+    pub(crate) fn set_coloring(&self, coloring: DbColoringActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_coloring(coloring),
+        }
+    }
+    pub(crate) fn set_media(&self, media: DbMediaActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_media(media),
+        }
+    }
+    pub(crate) fn set_pending_witness_script(
+        &self,
+        pending_witness_script: DbPendingWitnessScriptActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_pending_witness_script(pending_witness_script),
+        }
+    }
+    pub(crate) fn set_token(&self, token: DbTokenActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_token(token),
+        }
+    }
+    pub(crate) fn set_token_media(
+        &self,
+        token_media: DbTokenMediaActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_token_media(token_media),
+        }
+    }
+    pub(crate) fn set_transport_endpoint(
+        &self,
+        transport_endpoint: DbTransportEndpointActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_transport_endpoint(transport_endpoint),
+        }
+    }
+    pub(crate) fn set_transfer(&self, transfer: DbTransferActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_transfer(transfer),
+        }
+    }
+    pub(crate) fn set_transfer_transport_endpoint(
+        &self,
+        transfer_transport_endpoint: DbTransferTransportEndpointActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_transfer_transport_endpoint(transfer_transport_endpoint),
+        }
+    }
+    pub(crate) fn set_txo(&self, txo: DbTxoActMod) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_txo(txo),
+        }
+    }
+    pub(crate) fn set_wallet_transaction(
+        &self,
+        wallet_transaction: DbWalletTransactionActMod,
+    ) -> Result<i32, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.set_wallet_transaction(wallet_transaction),
+        }
+    }
+    pub(crate) fn update_transfer(
+        &self,
+        transfer: &mut DbTransferActMod,
+    ) -> Result<DbTransfer, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_transfer(transfer),
+        }
+    }
+    pub(crate) fn update_asset(&self, asset: &mut DbAssetActMod) -> Result<DbAsset, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_asset(asset),
+        }
+    }
+    pub(crate) fn update_asset_transfer(
+        &self,
+        asset_transfer: &mut DbAssetTransferActMod,
+    ) -> Result<DbAssetTransfer, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_asset_transfer(asset_transfer),
+        }
+    }
+    pub(crate) fn update_backup_info(
+        &self,
+        backup_info: &mut DbBackupInfoActMod,
+    ) -> Result<DbBackupInfo, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_backup_info(backup_info),
+        }
+    }
+    pub(crate) fn update_batch_transfer(
+        &self,
+        batch_transfer: &mut DbBatchTransferActMod,
+    ) -> Result<DbBatchTransfer, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_batch_transfer(batch_transfer),
+        }
+    }
+    pub(crate) fn update_transfer_transport_endpoint(
+        &self,
+        transfer_transport_endpoint: &mut DbTransferTransportEndpointActMod,
+    ) -> Result<DbTransferTransportEndpoint, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_transfer_transport_endpoint(transfer_transport_endpoint),
+        }
+    }
+    pub(crate) fn update_txo(&self, txo: DbTxoActMod) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.update_txo(txo),
+        }
+    }
+    pub(crate) fn del_backup_info(&self) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_backup_info(),
+        }
+    }
+    pub(crate) fn del_batch_transfer(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_batch_transfer(batch_transfer),
+        }
+    }
+    pub(crate) fn del_coloring(&self, asset_transfer_idx: i32) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_coloring(asset_transfer_idx),
+        }
+    }
+    pub(crate) fn del_pending_witness_script(&self, script: String) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_pending_witness_script(script),
+        }
+    }
+    pub(crate) fn del_txo(&self, idx: i32) -> Result<(), InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.del_txo(idx),
+        }
+    }
+    pub(crate) fn get_asset(&self, asset_id: String) -> Result<Option<DbAsset>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_asset(asset_id),
+        }
+    }
+    pub(crate) fn get_backup_info(&self) -> Result<Option<DbBackupInfo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_backup_info(),
+        }
+    }
+    pub(crate) fn get_media(&self, media_idx: i32) -> Result<Option<DbMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_media(media_idx),
+        }
+    }
+    pub(crate) fn get_media_by_digest(
+        &self,
+        digest: String,
+    ) -> Result<Option<DbMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_media_by_digest(digest),
+        }
+    }
+    pub(crate) fn get_transport_endpoint(
+        &self,
+        endpoint: String,
+    ) -> Result<Option<DbTransportEndpoint>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_transport_endpoint(endpoint),
+        }
+    }
+    pub(crate) fn get_txo(&self, outpoint: &Outpoint) -> Result<Option<DbTxo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_txo(outpoint),
+        }
+    }
+    pub(crate) fn iter_assets(&self) -> Result<Vec<DbAsset>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_assets(),
+        }
+    }
+    pub(crate) fn iter_asset_transfers(&self) -> Result<Vec<DbAssetTransfer>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_asset_transfers(),
+        }
+    }
+    pub(crate) fn iter_batch_transfers(&self) -> Result<Vec<DbBatchTransfer>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_batch_transfers(),
+        }
+    }
+    pub(crate) fn iter_colorings(&self) -> Result<Vec<DbColoring>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_colorings(),
+        }
+    }
+    pub(crate) fn iter_media(&self) -> Result<Vec<DbMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_media(),
+        }
+    }
+    pub(crate) fn iter_pending_witness_scripts(
+        &self,
+    ) -> Result<Vec<DbPendingWitnessScript>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_pending_witness_scripts(),
+        }
+    }
+    pub(crate) fn iter_token_medias(&self) -> Result<Vec<DbTokenMedia>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_token_medias(),
+        }
+    }
+    pub(crate) fn iter_tokens(&self) -> Result<Vec<DbToken>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_tokens(),
+        }
+    }
+    pub(crate) fn iter_transfers(&self) -> Result<Vec<DbTransfer>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_transfers(),
+        }
+    }
+    pub(crate) fn iter_txos(&self) -> Result<Vec<DbTxo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_txos(),
+        }
+    }
+    pub(crate) fn iter_wallet_transactions(
+        &self,
+    ) -> Result<Vec<DbWalletTransaction>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.iter_wallet_transactions(),
+        }
+    }
+    pub(crate) fn get_transfer_transport_endpoints_data(
+        &self,
+        transfer_idx: i32,
+    ) -> Result<Vec<(DbTransferTransportEndpoint, DbTransportEndpoint)>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_transfer_transport_endpoints_data(transfer_idx),
+        }
+    }
+    pub(crate) fn get_db_data(&self, empty_transfers: bool) -> Result<DbData, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_db_data(empty_transfers),
+        }
+    }
+    pub(crate) fn get_unspent_txos(&self, txos: Vec<DbTxo>) -> Result<Vec<DbTxo>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_unspent_txos(txos),
+        }
+    }
+    pub(crate) fn get_asset_balance(
+        &self,
+        asset_id: String,
+        transfers: Option<Vec<DbTransfer>>,
+        asset_transfers: Option<Vec<DbAssetTransfer>>,
+        batch_transfers: Option<Vec<DbBatchTransfer>>,
+        colorings: Option<Vec<DbColoring>>,
+        txos: Option<Vec<DbTxo>>,
+    ) -> Result<Balance, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_asset_balance(
+                asset_id, transfers, asset_transfers, batch_transfers, colorings, txos,
+            ),
+        }
+    }
+    pub(crate) fn get_asset_ids(&self) -> Result<Vec<String>, InternalError> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_asset_ids(),
+        }
+    }
+    pub(crate) fn check_asset_exists(&self, asset_id: String) -> Result<DbAsset, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.check_asset_exists(asset_id),
+        }
+    }
+    pub(crate) fn get_batch_transfer_or_fail(
+        &self,
+        idx: i32,
+        batch_transfers: &[DbBatchTransfer],
+    ) -> Result<DbBatchTransfer, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_batch_transfer_or_fail(idx, batch_transfers),
+        }
+    }
+    pub(crate) fn get_incoming_transfer(
+        &self,
+        batch_transfer_data: &DbBatchTransferData,
+    ) -> Result<(DbAssetTransfer, DbTransfer), Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_incoming_transfer(batch_transfer_data),
+        }
+    }
+    pub(crate) fn get_rgb_allocations(
+        &self,
+        utxos: Vec<DbTxo>,
+        colorings: Option<Vec<DbColoring>>,
+        batch_transfers: Option<Vec<DbBatchTransfer>>,
+        asset_transfers: Option<Vec<DbAssetTransfer>>,
+        transfers: Option<Vec<DbTransfer>>,
+    ) -> Result<Vec<LocalUnspent>, Error> {
+        match self {
+            RgbLibDatabaseBackend::Native(db) => db.get_rgb_allocations(
+                utxos, colorings, batch_transfers, asset_transfers, transfers,
+            ),
+        }
     }
 }
 

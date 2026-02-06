@@ -1,0 +1,16 @@
+[package]
+name = "polling"
+version = "2.8.0"
+edition = "2021"
+description = "No-op replacement for polling crate in WASM"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "polling"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[workspace]

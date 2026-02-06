@@ -20,15 +20,15 @@ pub(crate) const ACCOUNT: u8 = 0;
 pub(crate) const KEYCHAIN_RGB: u8 = 0;
 pub(crate) const KEYCHAIN_BTC: u8 = 0;
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 pub(crate) const INDEXER_STOP_GAP: usize = 20;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 pub(crate) const INDEXER_TIMEOUT: u8 = 10;
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 pub(crate) const INDEXER_RETRIES: u8 = 3;
-#[cfg(feature = "electrum")]
+#[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
 pub(crate) const INDEXER_BATCH_SIZE: usize = 5;
-#[cfg(feature = "esplora")]
+#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
 pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]
@@ -239,7 +239,7 @@ where
     deserialize_str_or_number(deserializer)
 }
 
-pub(crate) fn get_genesis_hash(bitcoin_network: &BitcoinNetwork) -> &str {
+pub(crate) fn get_genesis_hash(bitcoin_network: &BitcoinNetwork) -> &'static str {
     match bitcoin_network {
         BitcoinNetwork::Mainnet => {
             "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
@@ -259,7 +259,29 @@ pub(crate) fn get_genesis_hash(bitcoin_network: &BitcoinNetwork) -> &str {
     }
 }
 
-#[cfg(feature = "electrum")]
+/// Returns network name for a known genesis hash; "unknown" otherwise. Uses get_genesis_hash as single source of truth.
+fn genesis_hash_to_network_name(block_hash: &str) -> &'static str {
+    for network in [
+        BitcoinNetwork::Mainnet,
+        BitcoinNetwork::Testnet,
+        BitcoinNetwork::Testnet4,
+        BitcoinNetwork::Signet,
+        BitcoinNetwork::Regtest,
+    ] {
+        if get_genesis_hash(&network) == block_hash {
+            return match network {
+                BitcoinNetwork::Mainnet => "mainnet",
+                BitcoinNetwork::Testnet => "testnet",
+                BitcoinNetwork::Testnet4 => "testnet4",
+                BitcoinNetwork::Signet => "signet",
+                BitcoinNetwork::Regtest => "regtest",
+            };
+        }
+    }
+    "unknown"
+}
+
+#[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
 fn get_valid_txid_for_network(bitcoin_network: &BitcoinNetwork) -> String {
     match bitcoin_network {
         BitcoinNetwork::Mainnet => {
@@ -428,10 +450,8 @@ pub fn script_buf_from_recipient_id(recipient_id: String) -> Result<Option<Scrip
         XChainNet::<Beneficiary>::from_str(&recipient_id).map_err(|_| Error::InvalidRecipientID)?;
     match xchainnet_beneficiary.into_inner() {
         Beneficiary::WitnessVout(pay_2_vout, _) => {
-            let script_pubkey = pay_2_vout.script_pubkey();
-            let script_bytes = script_pubkey.as_script_bytes();
-            let script_bytes_vec = script_bytes.clone().into_vec();
-            let script_buf = ScriptBuf::from_bytes(script_bytes_vec);
+            let script = pay_2_vout.to_script();
+            let script_buf = ScriptBuf::from_bytes(script.into_bytes().to_vec());
             Ok(Some(script_buf))
         }
         Beneficiary::BlindedSeal(_) => Ok(None),
@@ -439,9 +459,7 @@ pub fn script_buf_from_recipient_id(recipient_id: String) -> Result<Option<Scrip
 }
 
 pub(crate) fn beneficiary_from_script_buf(script_buf: ScriptBuf) -> Beneficiary {
-    let address_payload =
-        AddressPayload::from_script(&ScriptPubkey::try_from(script_buf.into_bytes()).unwrap())
-            .unwrap();
+    let address_payload = AddressPayload::from_script(&script_buf).unwrap();
     Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None)
 }
 
@@ -520,7 +538,7 @@ pub(crate) fn calculate_descriptor_from_xpub(
     Ok(format!("tr({key})"))
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 fn check_genesis_hash(bitcoin_network: &BitcoinNetwork, indexer: &Indexer) -> Result<(), Error> {
     let expected = get_genesis_hash(bitcoin_network);
     let block_hash = indexer.block_hash(0)?;
@@ -570,28 +588,39 @@ pub(crate) fn check_proxy(proxy_url: &str, rest_client: Option<&RestClient>) -> 
     })
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 pub(crate) fn get_indexer(
     indexer_url: &str,
     bitcoin_network: BitcoinNetwork,
 ) -> Result<Indexer, Error> {
     // detect indexer type
     let indexer = build_indexer(indexer_url);
-    let mut invalid_indexer = true;
+    let mut validation_err: Option<String> = None;
     if let Some(ref indexer) = indexer {
-        invalid_indexer = indexer.block_hash(0).is_err();
+        if let Err(e) = indexer.block_hash(0) {
+            validation_err = Some(e.to_string());
+        }
     }
-    if invalid_indexer {
-        return Err(Error::InvalidIndexer {
-            details: s!("not a valid electrum nor esplora server"),
-        });
+    if validation_err.is_some() || indexer.is_none() {
+        let mut details = validation_err
+            .unwrap_or_else(|| s!("not a valid electrum nor esplora server"));
+        // On WASM, Esplora uses blocking HTTP (minreq) which is unsupported in the browser.
+        // Show friendly message but keep original in parentheses for debugging.
+        #[cfg(target_arch = "wasm32")]
+        if details.contains("Minreq") || details.contains("operation not supported") {
+            details = format!(
+                "Esplora in the browser requires async HTTP; this build uses blocking minreq which is unsupported on WASM. Use reqwest (async) for wasm32 or a desktop build. (Original: {})",
+                details
+            );
+        }
+        return Err(Error::InvalidIndexer { details });
     }
     let indexer = indexer.unwrap();
 
     // check the indexer server is for the correct network
     check_genesis_hash(&bitcoin_network, &indexer)?;
 
-    #[cfg(feature = "electrum")]
+    #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
     if matches!(indexer, Indexer::Electrum(_)) {
         // check the electrum server has the required functionality (verbose transactions)
         indexer
@@ -604,9 +633,9 @@ pub(crate) fn get_indexer(
     Ok(indexer)
 }
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
-    #[cfg(feature = "electrum")]
+        #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
     {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let opts = ConfigBuilder::new()
@@ -619,18 +648,77 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
             return Some(indexer);
         }
     }
-    if cfg!(feature = "esplora") {
-        #[cfg(feature = "esplora")]
+    if cfg!(any(feature = "esplora", feature = "esplora-wasm")) {
+        #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
         {
-            let opts = EsploraBuilder::new(indexer_url)
-                .max_retries(INDEXER_RETRIES.into())
-                .timeout(INDEXER_TIMEOUT.into());
+            // On wasm32 avoid .timeout() — reqwest/esplora uses std::time::Instant (panics in browser).
+            let opts = EsploraBuilder::new(indexer_url).max_retries(INDEXER_RETRIES.into());
+            #[cfg(not(target_arch = "wasm32"))]
+            let opts = opts.timeout(INDEXER_TIMEOUT.into());
             let client = EsploraClient::from_builder(opts);
             let indexer = Indexer::Esplora(Box::new(client));
             return Some(indexer);
         }
     }
     None
+}
+
+/// On WASM, validate Esplora URL and fetch block hash using [gloo-net](https://docs.rs/gloo-net/latest/gloo_net/) (fetch API) instead of minreq.
+#[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+pub(crate) async fn fetch_esplora_block_hash_async(
+    base_url: &str,
+    height: u32,
+) -> Result<String, Error> {
+    use gloo_net::http::Request;
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{}/block-height/{}", base, height);
+    let resp = Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| Error::InvalidIndexer {
+            details: e.to_string(),
+        })?;
+    if !resp.ok() {
+        return Err(Error::InvalidIndexer {
+            details: format!(
+                "Esplora block-height/{} returned {}",
+                height,
+                resp.status()
+            ),
+        });
+    }
+    let text = resp.text().await.map_err(|e| Error::InvalidIndexer {
+        details: e.to_string(),
+    })?;
+    Ok(text.trim().to_string())
+}
+
+/// Async get_indexer for wasm32: validates Esplora URL via gloo_net (fetch) instead of minreq, then builds the same Indexer.
+/// Use this from async go_online on wasm32. Resolver creation (esplora_blocking) still uses minreq and will need a separate fix.
+#[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+pub(crate) async fn get_indexer_async(
+    indexer_url: &str,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<Indexer, Error> {
+    let indexer = build_indexer(indexer_url).ok_or_else(|| Error::InvalidIndexer {
+        details: s!("not a valid esplora server"),
+    })?;
+    // Validate using gloo_net (fetch) instead of indexer.block_hash(0) (minreq).
+    let block_hash = fetch_esplora_block_hash_async(indexer_url, 0).await?;
+    let expected = get_genesis_hash(&bitcoin_network);
+    if expected != block_hash {
+        let indexer_network = genesis_hash_to_network_name(&block_hash);
+        return Err(Error::InvalidIndexer {
+            details: format!(
+                "indexer is for a network different from the wallet's one: wallet is {:?}, indexer at {} is {} (genesis {})",
+                bitcoin_network,
+                indexer_url,
+                indexer_network,
+                block_hash
+            ),
+        });
+    }
+    Ok(indexer)
 }
 
 fn convert_time_fmt_error(cause: time::error::Format) -> io::Error {
@@ -668,6 +756,15 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
     Ok((logger, async_guard))
 }
 
+/// Current UTC time. On wasm32 uses JS Date.now() because std::time panics.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn now() -> OffsetDateTime {
+    let ms = js_sys::Date::now();
+    let secs = (ms / 1000.0).floor() as i64;
+    OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
@@ -755,9 +852,13 @@ impl RgbRuntime {
         &self,
         outputs: impl IntoIterator<Item = impl Into<RgbOutpoint>>,
     ) -> Result<BTreeSet<ContractId>, InternalError> {
+        let outpoints: Vec<rgbstd::Outpoint> = outputs
+            .into_iter()
+            .map(|o| rgbstd::Outpoint::from(crate::wallet::offline::Outpoint::from(o.into())))
+            .collect();
         Ok(FromIterator::from_iter(
             self.stock
-                .contracts_assigning(outputs)
+                .contracts_assigning(outpoints)
                 .map_err(InternalError::from)?,
         ))
     }
@@ -791,8 +892,12 @@ impl RgbRuntime {
         contract_id: ContractId,
         outpoints: impl IntoIterator<Item = impl Into<RgbOutpoint>>,
     ) -> Result<HashMap<OutputSeal, HashMap<Opout, AllocatedState>>, InternalError> {
+        let ops: Vec<rgbstd::Outpoint> = outpoints
+            .into_iter()
+            .map(|o| rgbstd::Outpoint::from(crate::wallet::offline::Outpoint::from(o.into())))
+            .collect();
         self.stock
-            .contract_assignments_for(contract_id, outpoints)
+            .contract_assignments_for(contract_id, ops)
             .map_err(InternalError::from)
     }
 
@@ -834,7 +939,7 @@ impl RgbRuntime {
             .map_err(InternalError::from)
     }
 
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
     pub(crate) fn transfer_with_dag(
         &self,
         contract_id: ContractId,
@@ -853,8 +958,11 @@ impl RgbRuntime {
         contract_id: ContractId,
         transition_name: impl Into<FieldName>,
     ) -> Result<TransitionBuilder, InternalError> {
+        let tn = transition_name.into();
+        let s = tn.to_string();
+        let name = strict_types::FieldName::from(&*Box::leak(s.into_boxed_str()));
         self.stock
-            .transition_builder(contract_id, transition_name)
+            .transition_builder(contract_id, name)
             .map_err(InternalError::from)
     }
 
@@ -895,14 +1003,15 @@ impl RgbRuntime {
 impl Drop for RgbRuntime {
     fn drop(&mut self) {
         self.stock.store().expect("unable to save stock");
+        #[cfg(not(target_arch = "wasm32"))]
         fs::remove_file(self.wallet_dir.join(RGB_RUNTIME_LOCK_FILE))
-            .expect("should be able to drop lockfile")
+            .expect("should be able to drop lockfile");
     }
 }
 
 fn _write_rgb_runtime_lockfile(wallet_dir: &Path) -> Result<(), Error> {
     let lock_file_path = wallet_dir.join(RGB_RUNTIME_LOCK_FILE);
-    let t_0 = OffsetDateTime::now_utc();
+    let t_0 = now();
     loop {
         match fs::OpenOptions::new()
             .write(true)
@@ -911,12 +1020,13 @@ fn _write_rgb_runtime_lockfile(wallet_dir: &Path) -> Result<(), Error> {
         {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 3600.0 {
+                if (now() - t_0).as_seconds_f32() > 3600.0 {
                     return Err(Error::Internal {
                         details: s!("unreleased lock file"),
                     });
                 } else {
-                    std::thread::sleep(std::time::Duration::from_millis(400))
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::thread::sleep(std::time::Duration::from_millis(400));
                 }
             }
             Err(e) => {
@@ -929,28 +1039,39 @@ fn _write_rgb_runtime_lockfile(wallet_dir: &Path) -> Result<(), Error> {
 }
 
 pub(crate) fn load_rgb_runtime(wallet_dir: PathBuf) -> Result<RgbRuntime, Error> {
-    _write_rgb_runtime_lockfile(&wallet_dir)?;
+    // Check for in-memory mode (wallet_dir is ":memory:" for WASM)
+    let is_in_memory = wallet_dir.to_str() == Some(":memory:");
+    
+    if is_in_memory {
+        // In-memory mode: use Stock::in_memory() directly
+        // No file system operations needed
+        let stock = Stock::in_memory();
+        Ok(RgbRuntime { stock, wallet_dir })
+    } else {
+        // Regular file-based mode
+        _write_rgb_runtime_lockfile(&wallet_dir)?;
 
-    let rgb_dir = wallet_dir.join(RGB_RUNTIME_DIR);
-    if !rgb_dir.exists() {
-        fs::create_dir_all(&rgb_dir)?;
-    }
-    let provider = FsBinStore::new(rgb_dir.clone())?;
-    let stock = Stock::load(provider.clone(), true).or_else(|err| {
-        if err
-            .0
-            .downcast_ref::<DeserializeError>()
-            .map(|e| matches!(e, DeserializeError::Decode(DecodeError::Io(e)) if e.kind() == ErrorKind::NotFound))
-            .unwrap_or_default()
-        {
-            let mut stock = Stock::in_memory();
-            stock.make_persistent(provider, true).expect("unable to save stock");
-            return Ok(stock)
+        let rgb_dir = wallet_dir.join(RGB_RUNTIME_DIR);
+        if !rgb_dir.exists() {
+            fs::create_dir_all(&rgb_dir)?;
         }
-        Err(Error::IO { details: err.to_string() })
-    })?;
+        let provider = FsBinStore::new(rgb_dir.clone())?;
+        let stock = Stock::load(provider.clone(), true).or_else(|err| {
+            if err
+                .0
+                .downcast_ref::<DeserializeError>()
+                .map(|e| matches!(e, DeserializeError::Decode(DecodeError::Io(e)) if e.kind() == ErrorKind::NotFound))
+                .unwrap_or_default()
+            {
+                let mut stock = Stock::in_memory();
+                stock.make_persistent(provider, true).expect("unable to save stock");
+                return Ok(stock)
+            }
+            Err(Error::IO { details: err.to_string() })
+        })?;
 
-    Ok(RgbRuntime { stock, wallet_dir })
+        Ok(RgbRuntime { stock, wallet_dir })
+    }
 }
 
 #[cfg(any(feature = "electrum", feature = "esplora"))]

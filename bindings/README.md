@@ -12,6 +12,7 @@ These are the officially supported languages:
 | -------- | ------ | --------------------- | ---------------- |
 | C        | c-ffi  | Linux, macOS, Windows | [c-ffi]          |
 | C++      | c-ffi  | Linux, macOS, Windows | [c-ffi]          |
+| JavaScript/TypeScript | wasm-bindgen | Browser, Node.js | [wasm] |
 | Kotlin   | uniffi | android               | [rgb-lib-kotlin] |
 | Node.js  | c-ffi  | Linux, macOS, Windows | [rgb-lib-nodejs] |
 | Python   | uniffi | Linux, macOS, Windows | [rgb-lib-python] |
@@ -34,3 +35,4 @@ These are the unofficially supported languages:
 [rgb-lib-swift]: https://github.com/RGB-Tools/rgb-lib-swift
 [c-ffi]: c-ffi/
 [uniffi]: uniffi/
+[wasm]: wasm/

@@ -3,6 +3,7 @@
 //! This module defines additional utility methods that are not exposed via FFI
 
 use super::*;
+use psrgbt::{RgbOutExt, RgbPsbtExt};
 
 /// RGB asset-specific information to color a transaction
 #[derive(Clone, Debug)]
@@ -120,13 +121,16 @@ impl Wallet {
         let mut rgb_psbt = RgbPsbt::from_str(&psbt.to_string()).unwrap();
 
         let prev_outputs = rgb_psbt
-            .inputs()
-            .map(|txin| txin.previous_outpoint)
+            .unsigned_tx()
+            .input
+            .iter()
+            .zip(rgb_psbt.inputs.iter())
+            .map(|(txin, _)| RgbOutpoint::from(Outpoint::from(txin.previous_output)))
             .collect::<HashSet<RgbOutpoint>>();
 
         let mut all_transitions: HashMap<ContractId, Transition> = HashMap::new();
         let mut asset_beneficiaries: AssetBeneficiariesMap = bmap![];
-        let assignment_name = FieldName::from(RGB_STATE_ASSET_OWNER);
+        let assignment_name_ident = strict_types::FieldName::from(RGB_STATE_ASSET_OWNER);
 
         for (contract_id, asset_coloring_info) in coloring_info.asset_info_map.clone() {
             let schema = AssetSchema::get_from_contract_id(contract_id, &runtime)?;
@@ -161,7 +165,7 @@ impl Wallet {
                     vout += 1;
                 }
                 sending_amt += amount;
-                if vout as usize > rgb_psbt.outputs().count() {
+                if vout as usize > rgb_psbt.outputs.len() {
                     return Err(Error::InvalidColoringInfo {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
                     });
@@ -177,7 +181,7 @@ impl Wallet {
                 match schema {
                     AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => {
                         asset_transition_builder = asset_transition_builder.add_fungible_state(
-                            assignment_name.clone(),
+                            assignment_name_ident.clone(),
                             seal,
                             amount,
                         )?;
@@ -185,7 +189,7 @@ impl Wallet {
                     AssetSchema::Uda => {
                         if let AllocatedState::Data(state) = uda_state.clone().unwrap() {
                             asset_transition_builder = asset_transition_builder
-                                .add_data(assignment_name.clone(), seal, Allocation::from(state))
+                                .add_data(assignment_name_ident.clone(), seal, Allocation::from(state))
                                 .map_err(Error::from)?;
                         }
                     }
@@ -209,20 +213,22 @@ impl Wallet {
         }
 
         let (opreturn_index, _) = rgb_psbt
-            .to_unsigned_tx()
-            .outputs
+            .unsigned_tx()
+            .output
             .iter()
             .enumerate()
             .find(|(_, o)| o.script_pubkey.is_op_return())
             .expect("psbt should have an op_return output");
         let (_, opreturn_output) = rgb_psbt
-            .outputs_mut()
+            .outputs_iter_mut()
             .enumerate()
             .find(|(i, _)| i == &opreturn_index)
             .unwrap();
-        opreturn_output
-            .set_opret_host()
-            .map_err(InternalError::from)?;
+        if !opreturn_output.set_opret_host() {
+            return Err(Error::Internal {
+                details: s!("failed to set opret host on PSBT output"),
+            });
+        }
         if let Some(blinding) = coloring_info.static_blinding {
             opreturn_output
                 .set_mpc_entropy(blinding)
@@ -241,7 +247,6 @@ impl Wallet {
         }
 
         rgb_psbt.set_rgb_close_method(CloseMethod::OpretFirst);
-        rgb_psbt.complete_construction();
         let fascia = rgb_psbt.rgb_commit().map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
@@ -266,7 +271,7 @@ impl Wallet {
             self.color_psbt(psbt_to_color, coloring_info.clone())?;
 
         let rgb_psbt = RgbPsbt::from_str(&psbt_to_color.to_string()).unwrap();
-        let witness_txid = rgb_psbt.txid();
+        let witness_txid = rgb_psbt.get_txid();
 
         let mut runtime = self.rgb_runtime()?;
         runtime.consume_fascia(fascia, witness_txid, None)?;
@@ -403,7 +408,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
     pub fn get_tx_height(&self, txid: String) -> Result<Option<u32>, Error> {
         info!(self.logger, "Getting TX height...");
         let txid = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;

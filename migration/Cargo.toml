@@ -16,14 +16,18 @@ description = "RGB wallet library migrations"
 name = "rgb_lib_migration"
 path = "src/lib.rs"
 
+[features]
+default = ["runtime"]
+# Enable async runtime + TLS for running migrations (native only; wasm uses default-features = false)
+runtime = ["async-std", "sea-orm-migration/runtime-async-std-rustls"]
+
 [dependencies]
-async-std = { version = "1.13", default-features = false, features = [
+async-std = { version = "1.13", optional = true, default-features = false, features = [
     "attributes",
     "tokio1",
 ] }
 sea-orm-migration = { version = "1.1.12", default-features = false, features = [
     "cli",
-    "runtime-async-std-rustls",
     "sqlx-mysql",
     "sqlx-postgres",
     "sqlx-sqlite",

@@ -85,7 +85,7 @@ pub use crate::{
     wallet::{RecipientType, TransactionType, TransferKind, Wallet, backup::restore_backup},
 };
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 use std::{
     cmp::{Ordering, max, min},
     collections::hash_map::DefaultHasher,
@@ -104,27 +104,29 @@ use std::{
     time::Duration,
 };
 
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 use amplify::hex::ToHex;
 use amplify::{Wrapper, bmap, confinement::Confined, s};
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 use base64::{Engine as _, engine::general_purpose};
-use bc::{Outpoint as RgbOutpoint, ScriptPubkey};
-#[cfg(feature = "electrum")]
+pub(crate) use bp;
+use bp::{Outpoint as RgbOutpoint, ScriptPubkey};
+#[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
 use bdk_electrum::{
     BdkElectrumClient,
     electrum_client::{
-        Client as ElectrumClient, ConfigBuilder, ElectrumApi, Error as ElectrumError, Param,
+        Client as ElectrumClient, Config as BpElectrumConfig, ConfigBuilder, ElectrumApi,
+        Error as ElectrumError, Param,
     },
 };
-#[cfg(feature = "esplora")]
+#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
 use bdk_esplora::{
     EsploraExt,
     esplora_client::{
         BlockingClient as EsploraClient, Builder as EsploraBuilder, Error as EsploraError,
     },
 };
-#[cfg(feature = "esplora")]
+#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
 use bdk_wallet::bitcoin::Txid;
 use bdk_wallet::{
     ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions, Wallet as BdkWallet,
@@ -146,7 +148,7 @@ use bdk_wallet::{
         bip39::{Language, Mnemonic, WordCount},
     },
 };
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 use bdk_wallet::{
     Update,
     bitcoin::{Transaction as BdkTransaction, blockdata::fee_rate::FeeRate},
@@ -161,23 +163,22 @@ use chacha20poly1305::{
     aead::{generic_array::GenericArray, stream},
 };
 use commit_verify::Conceal;
-#[cfg(feature = "electrum")]
-use electrum::Config as BpElectrumConfig;
-#[cfg(feature = "esplora")]
+#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
 use esplora::Config as BpEsploraConfig;
 use file_format::FileFormat;
 use futures::executor::block_on;
-use invoice::{AddressPayload, Network as RgbNetwork};
-use psrgbt::{Psbt as RgbPsbt, RgbExt, RgbPsbt as RgbPsbtTrait};
+use invoice::Network as RgbNetwork;
+use psrgbt::RgbPsbtExt;
+use rgbstd::bitcoin::Psbt as RgbPsbt;
 use rand::{Rng, distr::Alphanumeric};
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use reqwest::{
     blocking::{Client as RestClient, multipart},
     header::CONTENT_TYPE,
 };
-use rgb_lib_migration::{
-    ArrayType, ColumnType, Migrator, MigratorTrait, Nullable, Value, ValueType, ValueTypeErr,
-};
+use rgb_lib_migration::{ArrayType, ColumnType, Nullable, Value, ValueType, ValueTypeErr};
+#[cfg(not(target_arch = "wasm32"))]
+use rgb_lib_migration::{Migrator, MigratorTrait};
 use rgbinvoice::{Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
     Allocation, Amount, ChainNet, Genesis, GraphSeal, Identity, Layer1, Operation, Opout,
@@ -186,8 +187,9 @@ use rgbstd::{
     containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
     contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder},
     info::{ContractInfo, SchemaInfo},
-    invoice::{InvoiceState, Pay2Vout},
+    invoice::{AddressPayload, InvoiceState, Pay2Vout},
     persistence::{MemContract, MemContractState, StashReadProvider, Stock, fs::FsBinStore},
+    txout::{BlindSeal, CloseMethod, ExplicitSeal, TxPtr},
     stl::{
         AssetSpec, Attachment, ContractTerms, Details, EmbeddedMedia as RgbEmbeddedMedia,
         MediaType, Name, ProofOfReserves as RgbProofOfReserves, RejectListUrl, RicardianContract,
@@ -197,7 +199,7 @@ use rgbstd::{
         ResolveWitness, Scripts, Status, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
     },
 };
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 use rgbstd::{
     Assign, KnownTransition,
     containers::Consignment,
@@ -206,7 +208,7 @@ use rgbstd::{
     indexers::AnyResolver,
     validation::{OpoutsDagData, ValidationConfig, ValidationError, Validity, Warning},
 };
-#[cfg(any(feature = "electrum", feature = "esplora"))]
+#[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
 use schemata::{
     CfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_REPLACE, UdaWrapper,
 };
@@ -222,9 +224,6 @@ use sea_orm::{
     DeriveActiveEnum, EntityTrait, EnumIter, IntoActiveValue, JsonValue, QueryFilter, QueryOrder,
     QueryResult, TryGetError, TryGetable, TryIntoModel,
 };
-#[cfg(any(feature = "electrum", feature = "esplora"))]
-use seals::txout::TxPtr;
-use seals::txout::{BlindSeal, CloseMethod, ExplicitSeal};
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use slog::{Drain, Logger, debug, error, info, o, warn};
@@ -237,9 +236,9 @@ use typenum::consts::U32;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
-#[cfg(feature = "electrum")]
+#[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
 use crate::utils::INDEXER_BATCH_SIZE;
-#[cfg(feature = "esplora")]
+#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(test)]
 use crate::wallet::test::{mock_asset_terms, mock_contract_details, mock_token_data};
@@ -258,6 +257,14 @@ use crate::{
         INDEXER_RETRIES, INDEXER_STOP_GAP, INDEXER_TIMEOUT, OffchainResolver, check_proxy,
         get_indexer, get_rest_client, script_buf_from_recipient_id,
     },
+    wallet::{AssignmentsCollection, Indexer},
+};
+#[cfg(feature = "esplora-wasm")]
+use crate::{
+    api::proxy::GetConsignmentResponse,
+    database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
+    error::IndexerError,
+    utils::{get_indexer, INDEXER_RETRIES, INDEXER_STOP_GAP, INDEXER_TIMEOUT},
     wallet::{AssignmentsCollection, Indexer},
 };
 use crate::{

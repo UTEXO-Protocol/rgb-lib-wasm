@@ -1,0 +1,21 @@
+[package]
+name = "rustix"
+version = "1.1.2"
+edition = "2021"
+description = "No-op replacement for rustix crate in WASM"
+license = "Apache-2.0 OR MIT"
+
+[lib]
+name = "rustix"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "fs"]
+std = []
+use-libc = []
+fs = []
+time = []
+process = []
+thread = []
+
+[workspace]

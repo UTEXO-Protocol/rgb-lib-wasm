@@ -1,0 +1,55 @@
+[package]
+name = "rgb-lib-wasm"
+version = "0.3.0-beta.4"
+authors = [
+    "Zoe Faltibà <zoefaltiba@gmail.com>",
+    "Nicola Busanello <nicola.busanello@gmail.com>",
+]
+edition = "2024"
+rust-version = "1.85.0"
+repository = "https://github.com/RGB-Tools/rgb-lib"
+homepage = "https://github.com/RGB-Tools/rgb-lib"
+license = "MIT"
+description = "RGB wallet library for WebAssembly (Browsers and Node.js)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "rgb_lib_wasm"
+
+[dependencies]
+# WASM: esplora-wasm for online (async-https + reqwest wasm, no rustls/ring)
+# Or electrum-wasm: use features = ["electrum-wasm"] and build with --features electrum-wasm
+rgb-lib = { version = "0.3.0-beta.4", path = "../../", default-features = false, features = [
+    "esplora-wasm",
+] }
+# Enable ring's wasm32 RNG so rustls (via minreq -> esplora-client) can use SystemRandom in browser
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+# Note: For WASM, we may need sqlx-sqlite with bundled feature
+# This compiles SQLite into the WASM module instead of using system library
+# sea-orm = { version = "1.1.12", default-features = false, features = [
+#     "macros",
+#     "sqlx-sqlite/bundled",  # ← Bundled SQLite for WASM
+#     "runtime-async-std-rustls",
+#     "with-json",
+# ] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde = { version = "1.0", default-features = false, features = [
+    "derive",
+] }
+serde-wasm-bindgen = "0.6"
+serde_json = { version = "1.0", default-features = false, features = [
+    "preserve_order",
+] }
+thiserror = { version = "2.0", default-features = false }
+js-sys = "0.3"
+# console_error_panic_hook = "0.1"  # Disabled: pulls "env" (strcmp etc.) that browsers don't resolve
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[features]
+default = []
+# Use Electrum for WASM (TCP/SSL for now; WebSocket connection via proxy or future wss transport)
+electrum-wasm = ["rgb-lib/electrum-wasm"]
+# esplora = ["rgb-lib/esplora"]  # Disabled: pulls rustls/ring, reqwest; not WASM-ready

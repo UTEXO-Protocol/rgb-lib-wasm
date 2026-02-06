@@ -1,0 +1,10 @@
+[package]
+name = "home"
+version = "0.5.11"
+edition = "2021"
+description = "WASM-compatible no-op replacement for home crate"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "home"
+path = "src/lib.rs"

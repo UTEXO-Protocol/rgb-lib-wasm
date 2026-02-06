@@ -1,0 +1,16 @@
+[package]
+name = "errno"
+version = "0.3.14"
+edition = "2021"
+description = "No-op replacement for errno crate in WASM"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "errno"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[workspace]

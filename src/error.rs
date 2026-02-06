@@ -124,7 +124,7 @@ pub enum Error {
     InsufficientAllocationSlots,
 
     /// There are not enough assignments of the requested asset to fulfill the request
-    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    #[cfg(any(feature = "electrum", feature = "esplora", feature = "esplora-wasm"))]
     #[error("Insufficient total assignments for asset: {asset_id}")]
     InsufficientAssignments {
         /// Asset ID
@@ -502,11 +502,11 @@ pub enum Error {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
-    #[cfg(feature = "electrum")]
+    #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
     #[error("Electrum error: {0}")]
     Electrum(#[from] ElectrumError),
 
-    #[cfg(feature = "esplora")]
+    #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
     #[error("Esplora error: {0}")]
     Esplora(#[from] EsploraError),
 }
@@ -566,7 +566,7 @@ pub(crate) enum InternalError {
     RgbPsbtError(String),
 
     #[error("Seal parse error: {0}")]
-    SealParse(#[from] seals::txout::explicit::ParseError),
+    SealParse(#[from] rgbstd::txout::explicit::ParseError),
 
     #[error("Serde JSON error: {0}")]
     SerdeJSON(#[from] serde_json::Error),
@@ -743,6 +743,41 @@ impl From<bdk_wallet::LoadWithPersistError<bdk_wallet::FileStoreError>> for Erro
             _ => Error::IO {
                 details: e.to_string(),
             },
+        }
+    }
+}
+
+impl From<crate::wallet::offline::BdkPersisterError> for Error {
+    fn from(e: crate::wallet::offline::BdkPersisterError) -> Self {
+        match e {
+            crate::wallet::offline::BdkPersisterError::File(store_err) => store_err.into(),
+            #[cfg(target_arch = "wasm32")]
+            crate::wallet::offline::BdkPersisterError::Memory(i) => match i {},
+        }
+    }
+}
+
+impl From<bdk_wallet::LoadWithPersistError<crate::wallet::offline::BdkPersisterError>> for Error {
+    fn from(
+        e: bdk_wallet::LoadWithPersistError<crate::wallet::offline::BdkPersisterError>,
+    ) -> Self {
+        match e {
+            bdk_wallet::LoadWithPersistError::InvalidChangeSet(
+                bdk_wallet::LoadError::Mismatch(bdk_wallet::LoadMismatch::Genesis { .. }),
+            ) => Error::BitcoinNetworkMismatch,
+            _ => Error::IO {
+                details: e.to_string(),
+            },
+        }
+    }
+}
+
+impl From<bdk_wallet::CreateWithPersistError<crate::wallet::offline::BdkPersisterError>> for Error {
+    fn from(
+        e: bdk_wallet::CreateWithPersistError<crate::wallet::offline::BdkPersisterError>,
+    ) -> Self {
+        Error::IO {
+            details: e.to_string(),
         }
     }
 }

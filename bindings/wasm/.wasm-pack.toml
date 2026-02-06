@@ -1,0 +1,6 @@
+# Configuration for wasm-pack
+# This file helps configure wasm-pack build settings
+
+[package]
+name = "rgb-lib-wasm"
+version = "0.3.0-beta.4"
