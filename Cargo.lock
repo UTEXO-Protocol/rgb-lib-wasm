@@ -494,8 +494,6 @@ dependencies = [
 [[package]]
 name = "bdk_core"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dbbe4aad0c898bfeb5253c222be3ea3dccfb380a07e72c87e3e4ed6664a6753"
 dependencies = [
  "bitcoin",
  "hashbrown 0.14.5",
@@ -3202,6 +3200,7 @@ dependencies = [
  "commit_verify",
  "copy_dir",
  "dircmp",
+ "esplora-client",
  "file-format",
  "futures",
  "generic-array",
@@ -3253,6 +3252,7 @@ dependencies = [
 name = "rgb-lib-wasm"
 version = "0.3.0-beta.4"
 dependencies = [
+ "instant",
  "js-sys",
  "rgb-lib",
  "ring",
@@ -3759,7 +3759,7 @@ version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
- "bitcoin_hashes 0.14.0",
+ "bitcoin_hashes 0.13.0",
  "rand 0.8.5",
  "secp256k1-sys",
  "serde",

@@ -283,6 +283,8 @@ const __wbg_star0 = {
     sed 's/\(wasm = instance.exports;\)/\1\
     __env_memory = instance.exports.memory;/' "$PKG_JS" > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
   fi
+  # Cache-bust .wasm URL чтобы браузер не подставлял старый .wasm (иначе "Import function requires a callable")
+  sed "s|new URL('rgb_lib_wasm_bg.wasm'|new URL('rgb_lib_wasm_bg.wasm?v=2'|g" "$PKG_JS" > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
   echo "✅ Патч применён к pkg/rgb_lib_wasm.js"
 elif ! grep -q "strncmp(ptr1, ptr2, n)" "$PKG_JS"; then
   echo "⚠️  Патч применён, но в __wbg_star0 нет полного набора полифиллов. Пересоберите: wasm-pack build --target web --out-dir pkg && ./patch-pkg-env.sh"

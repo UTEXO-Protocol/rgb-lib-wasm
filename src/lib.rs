@@ -123,7 +123,8 @@ use bdk_electrum::{
 use bdk_esplora::{
     EsploraExt,
     esplora_client::{
-        BlockingClient as EsploraClient, Builder as EsploraBuilder, Error as EsploraError,
+        AsyncClient as EsploraAsyncClient, BlockingClient as EsploraClient,
+        Builder as EsploraBuilder, Error as EsploraError,
     },
 };
 #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]

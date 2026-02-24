@@ -189,12 +189,44 @@ struct InfoAssetTransfer {
     main_transition: TypeOfTransition,
 }
 
+/// On wasm32 we hold both blocking and async Esplora clients; sync_async uses the async one to avoid std::time in block_on.
+#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
+pub(crate) enum EsploraIndexerInner {
+    #[cfg(not(target_arch = "wasm32"))]
+    Blocking(EsploraClient),
+    #[cfg(target_arch = "wasm32")]
+    Wasm {
+        blocking: EsploraClient,
+        async_client: esplora_client::AsyncClient<crate::utils::WasmSleeper>,
+    },
+}
+
+#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
+impl EsploraIndexerInner {
+    fn blocking(&self) -> &EsploraClient {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            EsploraIndexerInner::Blocking(c) => c,
+            #[cfg(target_arch = "wasm32")]
+            EsploraIndexerInner::Wasm { blocking, .. } => blocking,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn async_client(&self) -> &esplora_client::AsyncClient<crate::utils::WasmSleeper> {
+        match self {
+            EsploraIndexerInner::Wasm { async_client, .. } => async_client,
+            _ => unreachable!("sync_async only used with Wasm variant on wasm32"),
+        }
+    }
+}
+
 #[non_exhaustive]
 pub(crate) enum Indexer {
     #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
     Electrum(Box<BdkElectrumClient<ElectrumClient>>),
     #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
-    Esplora(Box<EsploraClient>),
+    Esplora(Box<EsploraIndexerInner>),
 }
 
 impl Indexer {
@@ -205,7 +237,7 @@ impl Indexer {
                 client.inner.block_header(height)?.block_hash().to_string()
             }
             #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
-            Indexer::Esplora(client) => client.get_block_hash(height as u32)?.to_string(),
+            Indexer::Esplora(inner) => inner.blocking().get_block_hash(height as u32)?.to_string(),
         })
     }
 
@@ -217,8 +249,8 @@ impl Indexer {
                 Ok(())
             }
             #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
-            Indexer::Esplora(client) => {
-                client.broadcast(tx)?;
+            Indexer::Esplora(inner) => {
+                inner.blocking().broadcast(tx)?;
                 Ok(())
             }
         }
@@ -238,8 +270,8 @@ impl Indexer {
                 (estimate * 100_000_000.0) / 1_000.0
             }
             #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
-            Indexer::Esplora(client) => {
-                let estimate_map = client.get_fee_estimates().map_err(IndexerError::from)?; // in sat/vB
+            Indexer::Esplora(inner) => {
+                let estimate_map = inner.blocking().get_fee_estimates().map_err(IndexerError::from)?; // in sat/vB
                 if estimate_map.is_empty() {
                     return Err(Error::CannotEstimateFees);
                 }
@@ -293,7 +325,8 @@ impl Indexer {
                 Ok(client.full_scan(request, INDEXER_STOP_GAP, INDEXER_BATCH_SIZE, true)?)
             }
             #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
-            Indexer::Esplora(client) => client
+            Indexer::Esplora(inner) => inner
+                .blocking()
                 .full_scan(request, INDEXER_STOP_GAP, INDEXER_PARALLEL_REQUESTS)
                 .map_err(|e| IndexerError::from(*e)),
         }
@@ -333,13 +366,14 @@ impl Indexer {
                 }
             }
             #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
-            Indexer::Esplora(client) => {
+            Indexer::Esplora(inner) => {
+                let b = inner.blocking();
                 let txid = Txid::from_str(txid).unwrap();
-                let tx_status = client.get_tx_status(&txid).map_err(IndexerError::from)?;
+                let tx_status = b.get_tx_status(&txid).map_err(IndexerError::from)?;
                 if let Some(tx_height) = tx_status.block_height {
-                    let height = client.get_height().map_err(IndexerError::from)?;
+                    let height = b.get_height().map_err(IndexerError::from)?;
                     Some((height - tx_height + 1) as u64)
-                } else if client.get_tx(&txid).map_err(IndexerError::from)?.is_none() {
+                } else if b.get_tx(&txid).map_err(IndexerError::from)?.is_none() {
                     None
                 } else {
                     Some(0)
@@ -372,9 +406,31 @@ impl Indexer {
             #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
             Indexer::Electrum(client) => Ok(client.sync(request, INDEXER_BATCH_SIZE, true)?),
             #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
-            Indexer::Esplora(client) => client
+            Indexer::Esplora(inner) => inner
+                .blocking()
                 .sync(request, INDEXER_PARALLEL_REQUESTS)
                 .map_err(|e| IndexerError::from(*e)),
+        }
+    }
+
+    /// Async sync for wasm32: avoids block_on and std::time::Instant in the sync path.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+    pub(crate) async fn sync_async<I: 'static + Send>(
+        &self,
+        request: impl Into<SyncRequest<I>> + Send,
+    ) -> Result<SyncResponse, IndexerError> {
+        match self {
+            #[cfg(any(feature = "electrum", feature = "electrum-wasm"))]
+            Indexer::Electrum(_) => unreachable!("sync_async only used with Esplora on wasm32"),
+            #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
+            Indexer::Esplora(inner) => {
+                use bdk_esplora::EsploraAsyncExt;
+                inner
+                    .async_client()
+                    .sync(request, INDEXER_PARALLEL_REQUESTS)
+                    .await
+                    .map_err(|e| IndexerError::EsploraAsync(e.to_string()))
+            }
         }
     }
 }
@@ -467,16 +523,8 @@ impl Wallet {
         Ok(fee_rate)
     }
 
-    pub(crate) fn sync_db_txos(&mut self, full_scan: bool) -> Result<(), Error> {
-        debug!(self.logger, "Syncing TXOs...");
-
-        let update: Update = if full_scan {
-            let request = self.bdk_wallet.start_full_scan();
-            self.indexer().full_scan(request)?.into()
-        } else {
-            let request = self.bdk_wallet.start_sync_with_revealed_spks();
-            self.indexer().sync(request)?.into()
-        };
+    /// Applies an indexer update (from sync or full_scan), persists BDK and writes new UTXOs to DB.
+    fn apply_sync_update(&mut self, update: Update) -> Result<(), Error> {
         self.bdk_wallet
             .apply_update(update)
             .map_err(|e| Error::FailedBdkSync {
@@ -523,8 +571,38 @@ impl Wallet {
             self.database.set_txo(new_db_utxo.clone())?;
         }
 
-        debug!(self.logger, "Synced TXOs");
+        Ok(())
+    }
 
+    pub(crate) fn sync_db_txos(&mut self, full_scan: bool) -> Result<(), Error> {
+        debug!(self.logger, "Syncing TXOs...");
+
+        let update: Update = if full_scan {
+            let request = self.bdk_wallet.start_full_scan();
+            self.indexer().full_scan(request)?.into()
+        } else {
+            let request = self.bdk_wallet.start_sync_with_revealed_spks();
+            self.indexer().sync(request)?.into()
+        };
+        self.apply_sync_update(update)?;
+        debug!(self.logger, "Synced TXOs");
+        Ok(())
+    }
+
+    /// Async sync for wasm32: avoids block_on and std::time in the indexer path.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+    pub(crate) async fn sync_db_txos_async(&mut self, full_scan: bool) -> Result<(), Error> {
+        debug!(self.logger, "Syncing TXOs (async)...");
+        let update: Update = if full_scan {
+            // full_scan_async not implemented; use blocking path for full_scan on wasm (rare)
+            let request = self.bdk_wallet.start_full_scan();
+            self.indexer().full_scan(request)?.into()
+        } else {
+            let request = self.bdk_wallet.start_sync_with_revealed_spks();
+            self.indexer().sync_async(request).await?.into()
+        };
+        self.apply_sync_update(update)?;
+        debug!(self.logger, "Synced TXOs");
         Ok(())
     }
 
@@ -533,6 +611,16 @@ impl Wallet {
         info!(self.logger, "Syncing...");
         self.check_online(online)?;
         self.sync_db_txos(false)?;
+        info!(self.logger, "Sync completed");
+        Ok(())
+    }
+
+    /// Async sync for wasm32: use from browser to avoid std::time::Instant panic in block_on path.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+    pub async fn sync_async(&mut self, online: Online) -> Result<(), Error> {
+        info!(self.logger, "Syncing (async)...");
+        self.check_online(online)?;
+        self.sync_db_txos_async(false).await?;
         info!(self.logger, "Sync completed");
         Ok(())
     }
@@ -566,6 +654,14 @@ impl Wallet {
                             } else if message.contains("Fee exceeds maximum configured") {
                                 return Err(Error::MaxFeeExceeded { txid: txid.clone() });
                             }
+                        }
+                    }
+                    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+                    IndexerError::EsploraAsync(ref msg) => {
+                        if msg.contains("min relay fee not met") {
+                            return Err(Error::MinFeeNotMet { txid: txid.clone() });
+                        } else if msg.contains("Fee exceeds maximum configured") {
+                            return Err(Error::MaxFeeExceeded { txid: txid.clone() });
                         }
                     }
                 }
@@ -689,6 +785,78 @@ impl Wallet {
         let psbt = self.sign_psbt(unsigned_psbt, None)?;
 
         self.create_utxos_end(online, psbt, skip_sync)
+    }
+
+    /// Async create_utxos for wasm32: broadcasts via fetch (gloo_net) instead of blocking Minreq.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+    pub async fn create_utxos_async(
+        &mut self,
+        online: Online,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<u8, Error> {
+        info!(self.logger, "Creating UTXOs (async)...");
+        self._check_xprv()?;
+
+        // Always pass skip_sync=true to begin: blocking sync_db_txos in begin uses Minreq (fails in browser).
+        // We sync at the end via sync_db_txos_async when !skip_sync.
+        let unsigned_psbt =
+            self.create_utxos_begin(online.clone(), up_to, num, size, fee_rate, true)?;
+        let signed_psbt = self.sign_psbt(unsigned_psbt, None)?;
+        let psbt = Psbt::from_str(&signed_psbt)?;
+        let tx = psbt.extract_tx().map_err(InternalError::from)?;
+
+        let tx_bytes = bitcoin::consensus::encode::serialize(&tx);
+        let tx_hex = hex::encode(&tx_bytes);
+
+        crate::utils::fetch_esplora_broadcast_async(&online.indexer_url, &tx_hex).await?;
+        debug!(self.logger, "Broadcasted create_utxos TX via fetch");
+
+        let internal_unspents_outpoints: Vec<(String, u32)> = self
+            .internal_unspents()
+            .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout))
+            .collect();
+        for input in tx.clone().input {
+            let txid = input.previous_output.txid.to_string();
+            let vout = input.previous_output.vout;
+            if internal_unspents_outpoints.contains(&(txid.clone(), vout)) {
+                continue;
+            }
+            let mut db_txo: DbTxoActMod = self
+                .database
+                .get_txo(&Outpoint { txid, vout })?
+                .expect("outpoint should be in the DB")
+                .into();
+            db_txo.spent = ActiveValue::Set(true);
+            self.database.update_txo(db_txo)?;
+        }
+        if !skip_sync {
+            self.sync_db_txos_async(false).await?;
+        }
+
+        self.database
+            .set_wallet_transaction(DbWalletTransactionActMod {
+                txid: ActiveValue::Set(tx.compute_txid().to_string()),
+                r#type: ActiveValue::Set(WalletTransactionType::CreateUtxos),
+                ..Default::default()
+            })?;
+
+        let mut num_utxos_created = 0u8;
+        if !skip_sync {
+            let bdk_utxos: Vec<LocalOutput> = self.bdk_wallet.list_unspent().collect();
+            let txid = tx.compute_txid();
+            for utxo in bdk_utxos.into_iter() {
+                if utxo.outpoint.txid == txid && utxo.keychain == KeychainKind::External {
+                    num_utxos_created = num_utxos_created.saturating_add(1);
+                }
+            }
+        }
+        self.update_backup_info(false)?;
+        info!(self.logger, "Create UTXOs (async) completed");
+        Ok(num_utxos_created)
     }
 
     /// Prepare the PSBT to create new UTXOs to hold RGB allocations with the provided `fee_rate`
@@ -1169,6 +1337,8 @@ impl Wallet {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn _go_online(&self, indexer_url: String) -> Result<(Online, OnlineData), Error> {
+        // Esplora client joins base + "/path"; trailing slash would produce "//path" (404).
+        let indexer_url = indexer_url.trim_end_matches('/').to_string();
         let online_id = now().unix_timestamp_nanos() as u64;
         let online = Online {
             id: online_id,
@@ -1217,6 +1387,8 @@ impl Wallet {
     /// WASM: use gloo_net (fetch) for indexer validation instead of minreq. Resolver (esplora_blocking) still uses minreq and may fail until rgb-ops has async path.
     #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
     async fn _go_online_async(&self, indexer_url: String) -> Result<(Online, OnlineData), Error> {
+        // Esplora client joins base + "/path"; trailing slash would produce "//path" (404).
+        let indexer_url = indexer_url.trim_end_matches('/').to_string();
         let online_id = now().unix_timestamp_nanos() as u64;
         let online = Online {
             id: online_id,

@@ -114,6 +114,8 @@ bdk_core = { version = "0.6" }
 instant = { version = "0.1", features = ["wasm-bindgen"] }
 # Esplora for WASM (async-https + reqwest wasm, no rustls/ring)
 bdk_esplora = { version = "0.22.0", optional = true, default-features = false, features = ["async-https"] }
+# Direct dep so build_async_with_sleeper exists; we use WasmSleeper (DefaultSleeper uses std::time on wasm).
+esplora-client = { version = "0.12", optional = true, default-features = false, features = ["async-https"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
 bp-esplora = { version = "=0.11.1-alpha.2", optional = true, default-features = false }
 # Wall-clock time on WASM (OffsetDateTime::now_utc() uses std::time and panics)
@@ -151,6 +153,7 @@ esplora = [
 esplora-wasm = [
     "bdk_esplora",
     "bp-esplora",
+    "esplora-client",
     "reqwest",
     "rgb-ops/esplora_blocking",
 ]
@@ -203,3 +206,6 @@ async-std = { path = "bindings/wasm/noop-deps/async-std", version = "1.13.0" }
 # Patched reqwest: add instant::Instant polyfill for wasm32 (std::time::Instant panics in browser).
 # Run once: bindings/wasm/noop-deps/prepare-reqwest-patch.sh
 reqwest = { path = "bindings/wasm/noop-deps/reqwest", version = "0.12.24" }
+# Patched bdk_core: SyncRequest::builder / FullScanRequest::builder use builder_at(0) on wasm32 to avoid std::time panic.
+# Version 0.6.2 must match bdk_wallet's dependency so the patch is used (not "0.6" only).
+bdk_core = { path = "bindings/wasm/noop-deps/bdk_core", version = "0.6.2" }

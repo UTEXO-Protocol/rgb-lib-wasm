@@ -19,6 +19,7 @@
 //! in a WASM environment out of the box.
 
 use std::panic;
+use std::backtrace::Backtrace;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(js_namespace = console)]
@@ -28,12 +29,27 @@ extern "C" {
 }
 
 /// Initialize WASM module. Call once after loading (e.g. after default()).
-/// Sets a panic hook so Rust panics are printed to the browser console (instead of just "unreachable").
+/// Sets a panic hook so Rust panics are printed to the browser console with backtrace.
+/// Calls instant::Instant::now() so the Instant polyfill is linked (avoids "time not implemented" from deps that use it).
 #[wasm_bindgen(start)]
 pub fn init() {
+    let _ = instant::Instant::now();
     panic::set_hook(Box::new(move |info| {
         let msg = format!("[rgb-lib WASM panic] {}", info);
         console_error(&msg);
+        let bt = Backtrace::force_capture();
+        let bt_str = bt.to_string();
+        if !bt_str.is_empty() && bt_str != "disabled backtrace\n" {
+            console_error("Backtrace:");
+            for line in bt_str.lines() {
+                console_error(line);
+            }
+        } else {
+            console_error("(Backtrace requires build with debug info: ./build-and-serve.sh debug)");
+        }
+        if msg.contains("time not implemented") {
+            console_error("Hint: one of the deps uses std::time::Instant (not available on wasm32). Patch that crate to use instant::Instant.");
+        }
     }));
 }
 

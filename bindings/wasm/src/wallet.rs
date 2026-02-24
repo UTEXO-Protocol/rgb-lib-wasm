@@ -66,6 +66,26 @@ fn next_wallet_id() -> u32 {
     })
 }
 
+/// Sync wallet UTXOs from Esplora (async). Call from JS as syncWalletAsync(walletId, online).
+/// Always exported so the test can use it; on non-WASM builds returns an error.
+#[wasm_bindgen(js_name = syncWalletAsync)]
+pub async fn sync_wallet_async(wallet_id: u32, online: &Online) -> Result<(), RgbLibError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut wallet = WALLET_REGISTRY
+            .with(|reg| reg.borrow_mut().remove(&wallet_id))
+            .ok_or_else(|| RgbLibError::new("Wallet not found".to_string()))?;
+        wallet.sync_async(online.inner.clone()).await.map_err(RgbLibError::from)?;
+        WALLET_REGISTRY.with(|reg| reg.borrow_mut().insert(wallet_id, wallet));
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (wallet_id, online);
+        Err(RgbLibError::new("syncWalletAsync only available in WASM build".to_string()))
+    }
+}
+
 // WASM Wallet bindings: direct rgb-lib dependency, in-memory mode via data_dir = ":memory:",
 // persist via export_state() / from_state() and JS storage (IndexedDB, LocalStorage).
 
@@ -327,6 +347,14 @@ impl Wallet {
         wallet_ref.sync(online.inner.clone()).map_err(RgbLibError::from)
     }
 
+    /// Async sync for WASM: syncs UTXOs from Esplora without blocking; use this in the browser
+    /// so balance updates after receiving BTC. Returns a Promise.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = syncAsync)]
+    pub async fn sync_async(&mut self, online: &Online) -> Result<(), RgbLibError> {
+        sync_wallet_async(self.id, online).await
+    }
+
     /// Refresh transfers. asset_id: optional asset ID; filter_json: "[]" for all.
     #[wasm_bindgen]
     pub fn refresh(
@@ -347,6 +375,57 @@ impl Wallet {
             let result = wallet.refresh(online.inner.clone(), asset_id, filter, skip_sync).map_err(RgbLibError::from)?;
             serde_json::to_string(&result).map_err(|e| RgbLibError::new(format!("Serialize: {}", e)))
         })
+    }
+
+    /// Create UTXOs for RGB allocations (sync path; uses blocking HTTP — fails in browser with "operation not supported").
+    #[wasm_bindgen(js_name = createUtxos)]
+    pub fn create_utxos(
+        &mut self,
+        online: &Online,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<u8, RgbLibError> {
+        WALLET_REGISTRY.with(|reg| {
+            let mut reg = reg.borrow_mut();
+            let wallet = reg.get_mut(&self.id).ok_or_else(|| RgbLibError::new("Wallet not found".to_string()))?;
+            wallet
+                .create_utxos(online.inner.clone(), up_to, num, size, fee_rate, skip_sync)
+                .map_err(RgbLibError::from)
+        })
+    }
+
+    /// Create UTXOs for RGB allocations (async; use in browser — broadcasts via fetch instead of Minreq).
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = createUtxosAsync)]
+    pub async fn create_utxos_async(
+        &mut self,
+        online: &Online,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<u8, RgbLibError> {
+        let id = self.id;
+        let mut wallet = WALLET_REGISTRY
+            .with(|reg| reg.borrow_mut().remove(&id))
+            .ok_or_else(|| RgbLibError::new("Wallet not found".to_string()))?;
+        let result = wallet
+            .create_utxos_async(
+                online.inner.clone(),
+                up_to,
+                num,
+                size,
+                fee_rate,
+                skip_sync,
+            )
+            .await;
+        // Always re-insert wallet so later calls (e.g. blind_receive) don't get "Wallet not found".
+        WALLET_REGISTRY.with(|reg| reg.borrow_mut().insert(id, wallet));
+        result.map_err(RgbLibError::from)
     }
 
     /// Blind receive: create an RGB invoice (any asset/amount). Requires at least one UTXO in the wallet.

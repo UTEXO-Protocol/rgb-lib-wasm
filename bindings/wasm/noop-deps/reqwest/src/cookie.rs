@@ -5,6 +5,7 @@ use bytes::Bytes;
 use std::convert::TryInto;
 use std::fmt;
 use std::sync::RwLock;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
 
 /// Actions for a persistent cookie store providing session support.
@@ -90,11 +91,18 @@ impl<'a> Cookie<'a> {
     }
 
     /// The cookie expiration time.
+    /// On wasm32 returns None to avoid std::time::SystemTime (not implemented on that platform).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn expires(&self) -> Option<SystemTime> {
         match self.0.expires() {
             Some(cookie_crate::Expiration::DateTime(offset)) => Some(SystemTime::from(offset)),
             None | Some(cookie_crate::Expiration::Session) => None,
         }
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn expires(&self) -> Option<std::time::SystemTime> {
+        let _ = self;
+        None
     }
 }
 

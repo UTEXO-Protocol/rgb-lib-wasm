@@ -651,16 +651,72 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
     if cfg!(any(feature = "esplora", feature = "esplora-wasm")) {
         #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
         {
-            // On wasm32 avoid .timeout() — reqwest/esplora uses std::time::Instant (panics in browser).
+            use crate::wallet::online::EsploraIndexerInner;
+            // On wasm32 avoid .timeout() and build both blocking + async client for sync_async.
             let opts = EsploraBuilder::new(indexer_url).max_retries(INDEXER_RETRIES.into());
             #[cfg(not(target_arch = "wasm32"))]
             let opts = opts.timeout(INDEXER_TIMEOUT.into());
-            let client = EsploraClient::from_builder(opts);
-            let indexer = Indexer::Esplora(Box::new(client));
+            #[cfg(not(target_arch = "wasm32"))]
+            let inner = EsploraIndexerInner::Blocking(EsploraClient::from_builder(opts));
+            #[cfg(target_arch = "wasm32")]
+            let inner = {
+                let blocking = EsploraClient::from_builder(opts.clone());
+                let async_client = opts
+                    .build_async_with_sleeper::<WasmSleeper>()
+                    .ok()?;
+                EsploraIndexerInner::Wasm {
+                    blocking,
+                    async_client,
+                }
+            };
+            let indexer = Indexer::Esplora(Box::new(inner));
             return Some(indexer);
         }
     }
     None
+}
+
+/// Sleeper for wasm32: DefaultSleeper uses std::time and panics in browser; we use no-op sleep (retries run without backoff).
+#[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+#[derive(Clone)]
+pub(crate) struct WasmSleeper;
+
+#[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+impl esplora_client::Sleeper for WasmSleeper {
+    type Sleep = futures::future::Ready<()>;
+
+    fn sleep(_duration: std::time::Duration) -> Self::Sleep {
+        futures::future::ready(())
+    }
+}
+
+/// On WASM, broadcast a raw tx (hex) to Esplora via fetch (POST /tx). Avoids blocking Minreq.
+#[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+pub(crate) async fn fetch_esplora_broadcast_async(
+    indexer_url: &str,
+    tx_hex: &str,
+) -> Result<(), Error> {
+    use gloo_net::http::Request;
+    let base = indexer_url.trim_end_matches('/');
+    let url = format!("{}/tx", base);
+    let resp = Request::post(&url)
+        .body(tx_hex)
+        .map_err(|e| Error::FailedBroadcast {
+            details: e.to_string(),
+        })?
+        .send()
+        .await
+        .map_err(|e| Error::FailedBroadcast {
+            details: e.to_string(),
+        })?;
+    if !resp.ok() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(Error::FailedBroadcast {
+            details: format!("Esplora POST /tx returned {}: {}", status, text),
+        });
+    }
+    Ok(())
 }
 
 /// On WASM, validate Esplora URL and fetch block hash using [gloo-net](https://docs.rs/gloo-net/latest/gloo_net/) (fetch API) instead of minreq.

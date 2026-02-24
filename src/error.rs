@@ -509,6 +509,11 @@ pub(crate) enum IndexerError {
     #[cfg(any(feature = "esplora", feature = "esplora-wasm"))]
     #[error("Esplora error: {0}")]
     Esplora(#[from] EsploraError),
+
+    /// Async Esplora sync on wasm32 returns Box<dyn Error>; we capture it as string.
+    #[cfg(all(target_arch = "wasm32", feature = "esplora-wasm"))]
+    #[error("Esplora async error: {0}")]
+    EsploraAsync(String),
 }
 
 #[derive(Debug, thiserror::Error)]

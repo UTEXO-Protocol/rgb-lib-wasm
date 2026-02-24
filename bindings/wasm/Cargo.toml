@@ -43,6 +43,8 @@ serde_json = { version = "1.0", default-features = false, features = [
 ] }
 thiserror = { version = "2.0", default-features = false }
 js-sys = "0.3"
+# Polyfill for std::time::Instant on WASM; ensure it is linked so patched deps (reqwest, async-io, sqlx) use it
+instant = { version = "0.1", features = ["wasm-bindgen"] }
 # console_error_panic_hook = "0.1"  # Disabled: pulls "env" (strcmp etc.) that browsers don't resolve
 
 [dev-dependencies]
