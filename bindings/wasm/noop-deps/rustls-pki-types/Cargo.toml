@@ -1,6 +1,6 @@
 [package]
 name = "rustls-pki-types"
-version = "1.13.0"
+version = "1.14.0"
 edition = "2021"
 description = "WASM-compatible replacement for rustls-pki-types"
 license = "Apache-2.0 OR ISC OR MIT"

@@ -157,9 +157,9 @@ esplora-wasm = [
     "reqwest",
     "rgb-ops/esplora_blocking",
 ]
-# Electrum for WASM: целевой транспорт — WebSocket (wss://), не TCP.
-# Сейчас те же зависимости, что electrum; для чистого wss:// нужен транспорт поверх
-# electrum_streaming_client или прокси (браузер → wss → прокси → TCP Electrum).
+# Electrum for WASM: target transport is WebSocket (wss://), not TCP.
+# Currently same deps as electrum; for pure wss:// need transport over
+# electrum_streaming_client or proxy (browser → wss → proxy → TCP Electrum).
 electrum-wasm = [
     "bdk_electrum",
     "reqwest",

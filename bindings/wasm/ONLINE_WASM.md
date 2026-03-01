@@ -1,97 +1,97 @@
-# Полностью онлайн в тесте WASM — что нужно
+# Fully online in WASM test — what is needed
 
-Чтобы в браузерном тесте выйти «полностью в онлайн» (синк с блокчейном, балансы, refresh), нужно следующее.
+To go "fully online" in the browser test (sync with blockchain, balances, refresh), the following is required.
 
-## Включено (шаг 1)
+## Enabled (step 1)
 
-- **rgb-lib**: добавлена фича **esplora-wasm** (без rustls): `bdk_esplora`, `bp-esplora`, `reqwest`, `rgb-ops/esplora_blocking`.
-- **Целевые зависимости для wasm32**: в `[target.'cfg(target_arch = "wasm32")'.dependencies]` добавлены `bdk_esplora` (async-https), `reqwest` (json, wasm), `bp-esplora` — для wasm32 используются они вместо блокирующих/rustls.
-- **Код**: все `#[cfg(feature = "esplora")]` заменены на `#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]` в `lib.rs`, `utils.rs`, `wallet/online.rs`, `error.rs`.
-- **bindings/wasm**: в `Cargo.toml` rgb-lib подключается с `features = ["esplora-wasm"]`.
+- **rgb-lib**: added **esplora-wasm** feature (no rustls): `bdk_esplora`, `bp-esplora`, `reqwest`, `rgb-ops/esplora_blocking`.
+- **Target deps for wasm32**: in `[target.'cfg(target_arch = "wasm32")'.dependencies]` added `bdk_esplora` (async-https), `reqwest` (json, wasm), `bp-esplora` — for wasm32 these are used instead of blocking/rustls.
+- **Code**: all `#[cfg(feature = "esplora")]` replaced with `#[cfg(any(feature = "esplora", feature = "esplora-wasm"))]` in `lib.rs`, `utils.rs`, `wallet/online.rs`, `error.rs`.
+- **bindings/wasm**: in `Cargo.toml` rgb-lib is used with `features = ["esplora-wasm"]`.
 
-**Проверка:** из `bindings/wasm` выполнить:
+**Check:** from `bindings/wasm` run:
 ```bash
 cargo check --target wasm32-unknown-unknown --no-default-features --features esplora-wasm
 ```
-или полная сборка:
+or full build:
 ```bash
 ./test-now.sh
 ```
-Если появятся ошибки (например, блокирующий Esplora API в wasm32), потребуется добавить async-путь или `#[cfg(not(target_arch = "wasm32"))]` для блокирующего кода (шаг 2–3 из чеклиста ниже).
+If errors appear (e.g. blocking Esplora API on wasm32), add an async path or `#[cfg(not(target_arch = "wasm32"))]` for blocking code (steps 2–3 in the checklist below).
 
 ---
 
-## Что значит «полностью онлайн»
+## What "fully online" means
 
-- **go_online** — подключить кошелёк к индексатору (Esplora URL), синхронизировать UTXO и граф транзакций.
-- **refresh** — обновить статусы переводов (pending → settled и т.д.).
-- **get_btc_balance** — получить BTC-баланс (после sync).
-- **list_assets / get_asset_balance** — активы и их балансы.
+- **go_online** — connect wallet to indexer (Esplora URL), sync UTXO and tx graph.
+- **refresh** — update transfer statuses (pending → settled etc.).
+- **get_btc_balance** — get BTC balance (after sync).
+- **list_assets / get_asset_balance** — assets and their balances.
 
-Сейчас в WASM доступны только **офлайн**-вещи: генерация ключей, создание кошелька (in-memory), экспорт/импорт состояния. Методов `go_online`, `refresh`, `get_btc_balance` в bindings нет, а в rgb-lib они завязаны на фичу **esplora** (или electrum), которую мы для WASM не включаем.
-
----
-
-## Что нужно по шагам
-
-### 1. Включить Esplora для wasm32 в rgb-lib
-
-- **Сейчас:** в корневом `Cargo.toml` фича `esplora` тянет `bdk_esplora` с `blocking-https-rustls`, `reqwest`, `rustls`. В WASM-сборке rgb-lib подключается **без** `esplora` (`default-features = false`, `features = []` в `bindings/wasm`), чтобы не тащить rustls/ring и блокирующий HTTP.
-- **Нужно:** отдельная конфигурация для `target_arch = "wasm32"`:
-  - Подключить `bdk_esplora` с фичей **async-https** (и при необходимости TLS, совместимый с WASM).
-  - Подключить `bp-esplora` с асинхронным API для WASM (если есть такая опция).
-  - Использовать HTTP-клиент, работающий в браузере: например `reqwest` с фичей `wasm` или аналог (gloo-net и т.п.).
-  - Рантайм: `wasm-bindgen-futures` + возможно `gloo-timers` (как в bdk-wasm).
-
-Итог: в `Cargo.toml` rgb-lib нужны условные зависимости вида `[target.'cfg(target_arch = "wasm32")'.dependencies]` для esplora/reqwest с wasm-фичами, без блокирующего rustls в том виде, в каком он сейчас используется на десктопе.
-
-### 2. Асинхронный путь в rgb-lib для WASM
-
-- **Сейчас:** `go_online`, `refresh`, `get_btc_balance` в rgb-lib используют **блокирующий** Esplora client (`BlockingClient`, `esplora_blocking`).
-- **Нужно:** для `#[cfg(target_arch = "wasm32")]` вызывать **асинхронный** API (например `EsploraAsyncExt` у bdk_esplora) и пробрасывать async через верхний API. То есть либо:
-  - ввести async-версии методов (`go_online_async`, `refresh_async`, `get_btc_balance_async`), либо
-  - сделать существующие методы асинхронными там, где они обращаются к индексатору (тогда сигнатуры в rgb-lib поменяются для WASM).
-
-Плюс в WASM не должно быть блокирующего runtime (blocking thread pool), только `wasm-bindgen-futures` и event loop браузера.
-
-### 3. Экспорт в WASM bindings (bindings/wasm)
-
-- **Сейчас:** из кошелька в WASM экспортируются только создание из JSON, `get_wallet_data`, `export_state`, `from_state`.
-- **Нужно:**
-  - Экспортировать тип **Online** (или его JS-аналог: например id + URL индексатора).
-  - Экспортировать **go_online**(wallet, indexer_url, skip_consistency_check) — лучше асинхронно, т.к. в браузере sync по сети должен быть async.
-  - Экспортировать **refresh**(wallet, online, asset_id, filter, skip_sync).
-  - Экспортировать **get_btc_balance**(wallet, online, skip_sync).
-  - При необходимости **list_assets** / **get_asset_balance** и т.д., если нужны в тесте.
-
-Все эти методы в rgb-lib уже есть, но они за `#[cfg(feature = "esplora")]` и блокирующие; в bindings их нужно вызывать из async-обёрток и только при включённой esplora для wasm32.
-
-### 4. Тестовая страница (полностью онлайн)
-
-- Создать кошелёк (как сейчас: ключи + `create_wallet_data` + `Wallet::new`).
-- Вызвать **go_online** с публичным URL Esplora (например `https://blockstream.info/api` для mainnet или testnet).
-- Дождаться окончания (async).
-- Вызвать **refresh** (и при необходимости **get_btc_balance**).
-- Показать в интерфейсе: «online», баланс, список активов (если экспортировали).
-
-Плюс: учёт CORS — публичный Esplora может не пускать запросы из браузера с другого origin; тогда нужен свой прокси или Esplora с CORS.
+Currently in WASM only **offline** flows are available: key generation, wallet creation (in-memory), export/import state. Methods `go_online`, `refresh`, `get_btc_balance` are not in bindings, and in rgb-lib they depend on **esplora** (or electrum), which we do not enable for WASM.
 
 ---
 
-## Краткий чеклист
+## Step-by-step requirements
 
-| Шаг | Что сделать | Где |
-|-----|-------------|-----|
-| 1 | Включить esplora для wasm32 (async-https, reqwest wasm, без blocking rustls) | rgb-lib `Cargo.toml` |
-| 2 | Реализовать async-путь для go_online/refresh/get_btc_balance под wasm32 | rgb-lib `src/wallet/online.rs` и др. |
-| 3 | Экспортировать Online, go_online, refresh, get_btc_balance в WASM | `bindings/wasm/src/wallet.rs` |
-| 4 | Добавить тест «полностью онлайн» (go_online → refresh → баланс) | `examples/simple-test.html` или новый пример |
+### 1. Enable Esplora for wasm32 in rgb-lib
+
+- **Current:** in root `Cargo.toml` feature `esplora` pulls `bdk_esplora` with `blocking-https-rustls`, `reqwest`, `rustls`. In WASM build rgb-lib is used **without** `esplora` (`default-features = false`, `features = []` in `bindings/wasm`) to avoid rustls/ring and blocking HTTP.
+- **Needed:** separate config for `target_arch = "wasm32"`:
+  - Use `bdk_esplora` with **async-https** feature (and WASM-compatible TLS if needed).
+  - Use `bp-esplora` with async API for WASM (if such option exists).
+  - Use an HTTP client that works in the browser: e.g. `reqwest` with `wasm` feature or similar (gloo-net etc.).
+  - Runtime: `wasm-bindgen-futures` and possibly `gloo-timers` (as in bdk-wasm).
+
+Result: rgb-lib `Cargo.toml` needs conditional deps like `[target.'cfg(target_arch = "wasm32")'.dependencies]` for esplora/reqwest with wasm features, without the current blocking rustls used on desktop.
+
+### 2. Async path in rgb-lib for WASM
+
+- **Current:** `go_online`, `refresh`, `get_btc_balance` in rgb-lib use **blocking** Esplora client (`BlockingClient`, `esplora_blocking`).
+- **Needed:** for `#[cfg(target_arch = "wasm32")]` call **async** API (e.g. `EsploraAsyncExt` in bdk_esplora) and expose async through the public API. So either:
+  - add async variants (`go_online_async`, `refresh_async`, `get_btc_balance_async`), or
+  - make the existing methods async where they hit the indexer (then rgb-lib signatures change for WASM).
+
+Also, WASM must not use a blocking runtime (blocking thread pool), only `wasm-bindgen-futures` and the browser event loop.
+
+### 3. Export in WASM bindings (bindings/wasm)
+
+- **Current:** from the wallet in WASM only creation from JSON, `get_wallet_data`, `export_state`, `from_state` are exported.
+- **Needed:**
+  - Export **Online** type (or its JS equivalent: e.g. id + indexer URL).
+  - Export **go_online**(wallet, indexer_url, skip_consistency_check) — preferably async, since browser network sync should be async.
+  - Export **refresh**(wallet, online, asset_id, filter, skip_sync).
+  - Export **get_btc_balance**(wallet, online, skip_sync).
+  - Optionally **list_assets** / **get_asset_balance** etc. if needed in the test.
+
+These methods exist in rgb-lib but are behind `#[cfg(feature = "esplora")]` and are blocking; in bindings they must be called from async wrappers and only when esplora is enabled for wasm32.
+
+### 4. Test page (fully online)
+
+- Create wallet (as now: keys + `create_wallet_data` + `Wallet::new`).
+- Call **go_online** with a public Esplora URL (e.g. `https://blockstream.info/api` for mainnet or testnet).
+- Wait for completion (async).
+- Call **refresh** (and **get_btc_balance** if needed).
+- Show in UI: "online", balance, asset list (if exported).
+
+Note: CORS — a public Esplora may reject requests from another origin; then you need your own proxy or an Esplora with CORS.
 
 ---
 
-## Почему сейчас нельзя «просто включить» онлайн
+## Short checklist
 
-- В rgb-lib Esplora включён через фичу **esplora** с **blocking** HTTP и **rustls**. В WASM блокирующие вызовы и текущий rustls/ring не подходят.
-- Нужен отдельный путь для wasm32: **async** Esplora + HTTP-клиент для браузера + экспорт async-методов в JS (например через `#[wasm_bindgen]` и `Promise`).
+| Step | Action | Where |
+|------|--------|-------|
+| 1 | Enable esplora for wasm32 (async-https, reqwest wasm, no blocking rustls) | rgb-lib `Cargo.toml` |
+| 2 | Implement async path for go_online/refresh/get_btc_balance on wasm32 | rgb-lib `src/wallet/online.rs` etc. |
+| 3 | Export Online, go_online, refresh, get_btc_balance to WASM | `bindings/wasm/src/wallet.rs` |
+| 4 | Add "fully online" test (go_online → refresh → balance) | `examples/simple-test.html` or new example |
 
-После выполнения шагов 1–4 тест в браузере сможет «полностью выйти в онлайн»: go_online → refresh → показ баланса и активов.
+---
+
+## Why you can't "just enable" online today
+
+- In rgb-lib Esplora is enabled via **esplora** feature with **blocking** HTTP and **rustls**. In WASM blocking calls and current rustls/ring are not suitable.
+- A separate path for wasm32 is needed: **async** Esplora + browser HTTP client + export of async methods to JS (e.g. via `#[wasm_bindgen]` and `Promise`).
+
+After steps 1–4, the browser test can go "fully online": go_online → refresh → show balance and assets.

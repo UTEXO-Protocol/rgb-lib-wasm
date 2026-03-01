@@ -19,19 +19,19 @@ This library offers RGB wallet functionality:
 
 ## ✅ In-Memory Support
 
-**Поддержка in-memory режима добавлена в rgb-lib!**
+**In-memory mode support added to rgb-lib!**
 
-WASM биндинги теперь используют in-memory режим:
+WASM bindings now use in-memory mode:
 - ✅ SQLite in-memory (`sqlite::memory:`)
 - ✅ RGB runtime in-memory (`Stock::in_memory()`)
-- ✅ Не требует файловую систему
+- ✅ No file system required
 
-**Использование**: Просто установите `data_dir = ":memory:"` в `WalletData`.
+**Usage**: Set `data_dir = ":memory:"` in `WalletData`.
 
-См.:
-- [ARCHITECTURE.md](ARCHITECTURE.md) - детали о коммуникации
-- [SQLITE_IN_MEMORY.md](SQLITE_IN_MEMORY.md) - как работает SQLite in-memory
-- [COMMUNICATION.md](COMMUNICATION.md) - схемы коммуникации
+See:
+- [ARCHITECTURE.md](ARCHITECTURE.md) — communication details
+- [SQLITE_IN_MEMORY.md](SQLITE_IN_MEMORY.md) — how SQLite in-memory works
+- [COMMUNICATION.md](COMMUNICATION.md) — communication diagrams
 
 ## WASM Considerations
 

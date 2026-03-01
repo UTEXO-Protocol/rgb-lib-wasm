@@ -1,18 +1,18 @@
 #!/bin/bash
-# Патч pkg/rgb_lib_wasm.js: заменяем импорт 'env' на inline объект для браузера.
-# Запускать после wasm-pack build (или вручную, если кнопка "Запустить тест" не работает).
+# Patch pkg/rgb_lib_wasm.js: replace 'env' import with inline object for browser.
+# Run after wasm-pack build (or manually if "Run test" button does not work).
 
 cd "$(dirname "$0")"
 PKG_JS="pkg/rgb_lib_wasm.js"
 
 if [ ! -f "$PKG_JS" ]; then
-  echo "❌ Не найден: $PKG_JS (сначала выполните wasm-pack build)"
+  echo "❌ Not found: $PKG_JS (run wasm-pack build first)"
   exit 1
 fi
 
 if grep -q "import \* as __wbg_star0 from 'env'" "$PKG_JS"; then
-  # Полный блок env: __wbindgen_throw + полифиллы libc (C-зависимости WASM тянут эти символы).
-  INLINE='// Патч для браузера: импорт '\''env'\'' не резолвится + полифиллы libc.
+  # Full env block: __wbindgen_throw + libc polyfills (WASM C deps pull these symbols).
+  INLINE='// Browser patch: '\''env'\'' import does not resolve + libc polyfills.
 let __env_memory = null;
 function __env_get_mem() {
   return __env_memory ? new Uint8Array(__env_memory.buffer) : (wasm && wasm.memory ? new Uint8Array(wasm.memory.buffer) : null);
@@ -274,31 +274,31 @@ const __wbg_star0 = {
   futimes(_fd, _times) { return 0; }
 };
 '
-  # Замена первой строки импорта на inline-код (переносимо для macOS/Linux)
+  # Replace first import line with inline code (portable for macOS/Linux)
   (echo "$INLINE"; tail -n +2 "$PKG_JS") > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
-  # Убираем лишние бэкслэши перед кавычками в qsort (в single-quoted INLINE \" попадает в файл буквально)
+  # Remove extra backslashes before quotes in qsort (in single-quoted INLINE \" goes literal)
   sed 's/!== \\"function\\"/!== "function"/g' "$PKG_JS" > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
-  # Добавляем __env_memory в __wbg_finalize_init (если ещё нет)
+  # Add __env_memory to __wbg_finalize_init if not present
   if ! grep -q "__env_memory = instance.exports.memory" "$PKG_JS"; then
     sed 's/\(wasm = instance.exports;\)/\1\
     __env_memory = instance.exports.memory;/' "$PKG_JS" > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
   fi
-  # Cache-bust .wasm URL чтобы браузер не подставлял старый .wasm (иначе "Import function requires a callable")
+  # Cache-bust .wasm URL so browser does not use stale .wasm (else "Import function requires a callable")
   sed "s|new URL('rgb_lib_wasm_bg.wasm'|new URL('rgb_lib_wasm_bg.wasm?v=2'|g" "$PKG_JS" > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
-  echo "✅ Патч применён к pkg/rgb_lib_wasm.js"
+  echo "✅ Patch applied to pkg/rgb_lib_wasm.js"
 elif ! grep -q "strncmp(ptr1, ptr2, n)" "$PKG_JS"; then
-  echo "⚠️  Патч применён, но в __wbg_star0 нет полного набора полифиллов. Пересоберите: wasm-pack build --target web --out-dir pkg && ./patch-pkg-env.sh"
+  echo "⚠️  Patch applied but __wbg_star0 lacks full polyfills. Rebuild: wasm-pack build --target web --out-dir pkg && ./patch-pkg-env.sh"
 else
-  echo "ℹ️  Патч уже применён или импорт 'env' отсутствует"
+  echo "ℹ️  Patch already applied or 'env' import absent"
 fi
 
-# Добавить sqlite3_load_extension в env, если его ещё нет (для bundled SQLite в WASM).
+# Add sqlite3_load_extension to env if missing (for bundled SQLite in WASM).
 if [ -f "$PKG_JS" ] && grep -q "getenv(_name_ptr)" "$PKG_JS" && ! grep -q "sqlite3_load_extension" "$PKG_JS"; then
   sed 's/  getenv(_name_ptr) { return 0; },/  getenv(_name_ptr) { return 0; },\n  sqlite3_load_extension(_db, _zFile, _zProc, _pzErrMsg) { return 1; },/' "$PKG_JS" > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
-  echo "✅ Добавлена заглушка sqlite3_load_extension в env"
+  echo "✅ Added sqlite3_load_extension stub to env"
 fi
 
-# Добавить qsort в env, если его ещё нет (libc-символ для WASM).
+# Add qsort to env if missing (libc symbol for WASM).
 if [ -f "$PKG_JS" ] && grep -q "sqlite3_load_extension" "$PKG_JS" && ! grep -q '"env".*qsort\|qsort(base,' "$PKG_JS"; then
   QSORT='  qsort(base, nmemb, size, compar) {
     const n = nmemb >>> 0, sz = size >>> 0;
@@ -331,5 +331,5 @@ if [ -f "$PKG_JS" ] && grep -q "sqlite3_load_extension" "$PKG_JS" && ! grep -q '
     sort(0, n - 1);
   },'
   sed "s/  sqlite3_load_extension(_db, _zFile, _zProc, _pzErrMsg) { return 1; },/  sqlite3_load_extension(_db, _zFile, _zProc, _pzErrMsg) { return 1; },\n$QSORT/" "$PKG_JS" > "$PKG_JS.tmp" && mv "$PKG_JS.tmp" "$PKG_JS"
-  echo "✅ Добавлен qsort в env"
+  echo "✅ Added qsort to env"
 fi
