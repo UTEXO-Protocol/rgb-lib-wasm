@@ -67,6 +67,10 @@
     <div id="onlineOptions" style="margin-top:12px;">
         <label>Esplora API URL (e.g. esplora-api.utexo.com — Signet):</label>
         <input type="text" id="esploraUrl" value="https://esplora-api.utexo.com/" placeholder="https://esplora-api.utexo.com/" />
+        <label style="margin-top:8px;">
+            <input type="checkbox" id="useSavedWallet" checked /> Use saved wallet (same wallet across runs)
+        </label>
+        <label style="margin-top:4px; font-size:12px; color:#666;">Clear saved wallet: <button type="button" onclick="clearSavedWallet()">Clear</button></label>
     </div>
     
     <div id="output"></div>
@@ -74,9 +78,11 @@
     <script type="module">
         let wasmModule = null;
         
+        // Cache-bust so browser loads fresh WASM after rebuild (bump v when you rebuild)
+        const WASM_MODULE_URL = '../pkg/rgb_lib_wasm.js?v=2';
         async function initWasm() {
             if (wasmModule) return wasmModule;
-            const wasm = await import('../pkg/rgb_lib_wasm.js');
+            const wasm = await import(/* @vite-ignore */ WASM_MODULE_URL);
             await wasm.default();
             wasmModule = wasm;
             return wasm;
@@ -111,36 +117,84 @@
             }
         }
         
+        const SAVED_WALLET_KEY = 'rgb_test_wallet_data';
+
+        function clearSavedWallet() {
+            try {
+                localStorage.removeItem(SAVED_WALLET_KEY);
+                log('Saved wallet cleared. Next run will create a new wallet.');
+            } catch (e) {
+                log('Clear failed: ' + (e && e.message ? e.message : e));
+            }
+        }
+
         async function runOnlineTest() {
             const output = document.getElementById('output');
             const btn = document.getElementById('onlineBtn');
             const urlInput = document.getElementById('esploraUrl');
+            const useSavedCheck = document.getElementById('useSavedWallet');
             const esploraUrl = (urlInput && urlInput.value.trim()) || 'https://esplora-api.utexo.com/';
+            const useSaved = useSavedCheck ? useSavedCheck.checked : true;
             output.textContent = '';
             btn.disabled = true;
             try {
                 const wasm = await initWasm();
-                // Signet by default (esplora-api.utexo.com — Signet)
                 const network = wasm.Network.Signet;
                 log('✅ WASM loaded');
-                log('Creating wallet (signet)...');
-                const keys = wasm.generate_keys(network);
-                const walletDataJson = wasm.create_wallet_data(
-                    network,
-                    keys.account_xpub_vanilla,
-                    keys.account_xpub_colored,
-                    keys.mnemonic || null,
-                    keys.master_fingerprint,
-                    5,
-                    ['NIA']
-                );
-                if (typeof keys.free === 'function') keys.free();
-                const wallet = await wasm.Wallet.createWallet(walletDataJson);
-                log('Wallet created. (wallet_id=' + (wallet.getWalletId ? wallet.getWalletId() : wallet.walletId) + ')');
+
+                let wallet;
+                let walletDataJson = null;
+                if (useSaved) {
+                    try {
+                        walletDataJson = localStorage.getItem(SAVED_WALLET_KEY);
+                    } catch (_) {}
+                }
+                if (walletDataJson) {
+                    log('Loading saved wallet...');
+                    wallet = await wasm.Wallet.createWallet(walletDataJson);
+                    log('Wallet loaded from storage. (wallet_id=' + (wallet.getWalletId ? wallet.getWalletId() : wallet.walletId) + ')');
+                } else {
+                    log('Creating new wallet (signet)...');
+                    const keys = wasm.generate_keys(network);
+                    walletDataJson = wasm.create_wallet_data(
+                        network,
+                        keys.account_xpub_vanilla,
+                        keys.account_xpub_colored,
+                        keys.mnemonic || null,
+                        keys.master_fingerprint,
+                        5,
+                        ['NIA']
+                    );
+                    if (typeof keys.free === 'function') keys.free();
+                    wallet = await wasm.Wallet.createWallet(walletDataJson);
+                    log('Wallet created. (wallet_id=' + (wallet.getWalletId ? wallet.getWalletId() : wallet.walletId) + ')');
+                    // Print keys for reuse and save to storage
+                    try {
+                        const wd = wallet.get_wallet_data();
+                        const data = JSON.parse(wd);
+                        log('--- Keys (save for next tests) ---');
+                        if (data.mnemonic) log('Mnemonic: ' + data.mnemonic);
+                        log('Master fingerprint: ' + (data.master_fingerprint || ''));
+                        log('Account xpub vanilla: ' + (data.account_xpub_vanilla || ''));
+                        log('Account xpub colored: ' + (data.account_xpub_colored || ''));
+                        log('--------------------------------');
+                        try {
+                            localStorage.setItem(SAVED_WALLET_KEY, wd);
+                            log('Wallet data saved to localStorage for next run.');
+                        } catch (e2) {
+                            log('Could not save to localStorage: ' + (e2 && e2.message ? e2.message : e2));
+                        }
+                    } catch (e1) {
+                        log('Could not get wallet data: ' + (e1 && e1.message ? e1.message : e1));
+                    }
+                }
                 log('go_online → ' + esploraUrl + ' (signet) ...');
                 const online = await wallet.goOnline(true, esploraUrl);
                 const wid = wallet.getWalletId ? wallet.getWalletId() : wallet.walletId;
                 log('✅ go_online OK. Online id=' + online.id + ', indexerUrl=' + online.indexerUrl + ', wallet_id=' + wid);
+                // BDK sync only fetches UTXOs for "revealed" addresses. Reveal the first address before sync
+                // so that start_sync_with_revealed_spks() includes it (otherwise sync returns empty → balance 0).
+                try { wallet.getAddress(); } catch (_) {}
                 // refresh(..., false) syncs RGB transfers. getBtcBalance(online, false) triggers
                 // sync_db_txos → indexer().sync() which uses std::time in the chain (panics in browser).
                 // So we use getBtcBalance(online, true) after refresh.
@@ -151,16 +205,42 @@
                 } catch (e) {
                     log('⚠️ refresh: ' + (e && e.message ? e.message : e), false);
                 }
-                // Sync (fetch UTXOs) is skipped in browser: wallet.sync() panics with "time not implemented"
-                // and can leave the registry in a bad state, breaking getBtcBalance. Until the indexer chain
-                // uses a time polyfill for wasm32, balance will be from cache only (e.g. 0 until you use a desktop build).
-                log('Sync skipped in browser (would panic). getBtcBalance from cache...');
+                // Sync UTXOs from Esplora (required for balance to update after receiving BTC)
+                log('Sync (syncWalletAsync)...');
+                const walletId = wallet.getWalletId ? wallet.getWalletId() : wallet.walletId;
+                const syncFn = wasm.syncWalletAsync || wasm.sync_wallet_async;
+                try {
+                    if (typeof syncFn === 'function') {
+                        await syncFn(walletId, online);
+                        log('✅ syncWalletAsync OK');
+                    } else if (typeof wallet.syncAsync === 'function') {
+                        await wallet.syncAsync(online);
+                        log('✅ wallet.syncAsync OK');
+                    } else {
+                        const syncExports = Object.keys(wasm).filter(function(k) { return /sync/i.test(k); });
+                        const allExports = Object.keys(wasm).filter(function(k) { return typeof wasm[k] === 'function' || (typeof wasm[k] === 'object' && wasm[k] !== null); });
+                        log('⚠️ syncWalletAsync not in wasm module. Exports with "sync": ' + (syncExports.length ? syncExports.join(', ') : 'none'));
+                        log('   Sample exports: ' + allExports.slice(0, 20).join(', '));
+                        log('   → Rebuild: cd bindings/wasm && rm -rf pkg && ./build-and-serve.sh , then hard refresh (Ctrl+Shift+R)');
+                    }
+                } catch (e) {
+                    log('⚠️ syncWalletAsync: ' + (e && e.message ? e.message : e));
+                }
+                log('getBtcBalance...');
                 const balance = wallet.getBtcBalance(online, true);
                 const v = balance.vanilla;
                 const c = balance.colored;
                 log('✅ BTC balance: vanilla settled=' + v.settled + ' future=' + v.future + ' spendable=' + v.spendable);
                 log('   colored settled=' + c.settled + ' future=' + c.future + ' spendable=' + c.spendable);
                 log('Bitcoin address: ' + wallet.getAddress());
+                // Create UTXOs for RGB allocations (skip_sync=false so we sync after broadcast and new UTXOs count as allocations).
+                log('Create UTXOs (for RGB allocations)...');
+                try {
+                    const created = await wallet.createUtxosAsync(online, false, undefined, undefined, BigInt(1000), false);
+                    log('✅ createUtxos: ' + created + ' UTXO(s) created');
+                } catch (e) {
+                    log('⚠️ createUtxos: ' + (e && e.message ? e.message : e));
+                }
                 const assetId = 'rgb:tpk3SgP4-mRdSCNI-Pu~EDie-eBjfn5P-4HQdIKi-SUtqbe8';
                 log('Invoice for asset ' + assetId + '...');
                 try {
@@ -196,6 +276,7 @@
         
         window.runTest = runTest;
         window.runOnlineTest = runOnlineTest;
+        window.clearSavedWallet = clearSavedWallet;
         
         window.addEventListener('load', () => {
             const output = document.getElementById('output');

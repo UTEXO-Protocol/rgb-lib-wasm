@@ -172,40 +172,19 @@ camel_case = ["default"]
 inherits = "release"
 debug = 1
 
-# Patch dependencies for WASM compatibility
-# Replace problematic dependencies with WASM-compatible no-op versions
-# WARNING: These patches apply to ALL targets. For production, consider using
-# conditional compilation or workspace-level patches only for WASM builds
+# Patch dependencies for WASM (target web / wasm32-unknown-unknown).
+# No-op/patched crates for errno, socket2, rustix, rustls, async-io, bdk_core, etc.
 [patch.crates-io]
-# Use no-op versions - these will be used for all targets
-# TODO: Make this conditional or move to workspace-level configuration
-# Version must match the version used by dependencies
 errno = { path = "bindings/wasm/noop-deps/errno", version = "0.3.14" }
 polling = { path = "bindings/wasm/noop-deps/polling", version = "2.8.0" }
-# Try to patch rustix 0.37.28 (older version, may be more compatible)
-# If dependencies require 1.1.2, we may need to update them
 rustix = { path = "bindings/wasm/noop-deps/rustix-0.37", version = "0.37.28" }
-# Patch rustls-pki-types to add WASM support for UnixTime::now()
-rustls-pki-types = { path = "bindings/wasm/noop-deps/rustls-pki-types", version = "1.13.0" }
-# Patch home crate for WASM (no home directory in WASM)
+rustls-pki-types = { path = "bindings/wasm/noop-deps/rustls-pki-types", version = "1.14.0" }
 home = { path = "bindings/wasm/noop-deps/home", version = "0.5.11" }
-# Patch socket2 for WASM (no sockets in WASM)
 socket2 = { path = "bindings/wasm/noop-deps/socket2", version = "0.4.10" }
-# Fix rustls-webpki Ipv4Addr/Ipv6Addr as_ref on Rust < 1.77: run bindings/wasm/noop-deps/prepare-rustls-webpki-patch.sh first
 rustls-webpki = { path = "bindings/wasm/noop-deps/rustls-webpki", version = "0.103.8" }
-# Patched rustls (use pki_types::{IntoOwned,ToOwned} + dns_name.as_bytes()) — код уже в репо
 rustls = { path = "bindings/wasm/noop-deps/rustls", version = "0.23" }
-# Patched async-io: use instant::Instant on wasm32 (std::time::Instant not implemented).
-# Run once: bindings/wasm/noop-deps/prepare-async-io-patch.sh
 async-io = { path = "bindings/wasm/noop-deps/async-io", version = "2.6.0" }
-# sqlx-core uses async-io 1.13.0; patch it to use our patched async-io-1.13 (Instant on wasm32).
-# Run once: prepare-async-io-1.13-patch.sh then prepare-sqlx-core-patch.sh
 sqlx-core = { path = "bindings/wasm/noop-deps/sqlx-core", version = "0.8.6" }
-# Patched async-std: use instant::Instant on wasm32 (std::time::Instant panics in browser).
 async-std = { path = "bindings/wasm/noop-deps/async-std", version = "1.13.0" }
-# Patched reqwest: add instant::Instant polyfill for wasm32 (std::time::Instant panics in browser).
-# Run once: bindings/wasm/noop-deps/prepare-reqwest-patch.sh
 reqwest = { path = "bindings/wasm/noop-deps/reqwest", version = "0.12.24" }
-# Patched bdk_core: SyncRequest::builder / FullScanRequest::builder use builder_at(0) on wasm32 to avoid std::time panic.
-# Version 0.6.2 must match bdk_wallet's dependency so the patch is used (not "0.6" only).
 bdk_core = { path = "bindings/wasm/noop-deps/bdk_core", version = "0.6.2" }

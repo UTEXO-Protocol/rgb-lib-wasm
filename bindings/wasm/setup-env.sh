@@ -15,24 +15,29 @@ if [ ! -f "$WASI_SDK_DIR/bin/clang" ]; then
     exit 1
 fi
 
-# Set compiler for wasm32-unknown-unknown target
-export CC_wasm32_unknown_unknown="$WASI_SDK_DIR/bin/clang"
+export WASI_SDK_DIR
+
+# cc-rs передаёт --target=wasm32-unknown-unknown, а WASI clang понимает только wasm32-wasi.
+# Wrapper подменяет triple и добавляет sysroot.
+WRAPPER="$SCRIPT_DIR/clang-wasm32-wrapper.sh"
+[ -f "$WRAPPER" ] && chmod +x "$WRAPPER" 2>/dev/null || true
+if [ -x "$WRAPPER" ]; then
+    export CC_wasm32_unknown_unknown="$WRAPPER"
+    export TARGET_CC="$WRAPPER"
+    export CC="$WRAPPER"
+else
+    export CC_wasm32_unknown_unknown="$WASI_SDK_DIR/bin/clang"
+    export TARGET_CC="$WASI_SDK_DIR/bin/clang"
+    export CC="$WASI_SDK_DIR/bin/clang"
+fi
 export AR_wasm32_unknown_unknown="$WASI_SDK_DIR/bin/llvm-ar"
-export CFLAGS_wasm32_unknown_unknown="--target=wasm32-wasi --sysroot=$WASI_SDK_DIR/share/wasi-sysroot"
-
-# cc-rs also checks these variables
-export TARGET_CC="$WASI_SDK_DIR/bin/clang"
 export TARGET_AR="$WASI_SDK_DIR/bin/llvm-ar"
-
-# For cc-rs to find the right compiler, we need to set it when building for wasm32-unknown-unknown
-# The CC_wasm32_unknown_unknown should be enough, but if not, we can also set:
-export CC="$WASI_SDK_DIR/bin/clang"
 export AR="$WASI_SDK_DIR/bin/llvm-ar"
+export CFLAGS_wasm32_unknown_unknown="-isysroot $WASI_SDK_DIR/share/wasi-sysroot"
 
-echo "✅ Переменные окружения установлены:"
+echo "✅ Переменные окружения установлены (WASI SDK + clang wrapper для wasm32):"
 echo "   CC_wasm32_unknown_unknown=$CC_wasm32_unknown_unknown"
 echo "   AR_wasm32_unknown_unknown=$AR_wasm32_unknown_unknown"
-echo "   CFLAGS_wasm32_unknown_unknown=$CFLAGS_wasm32_unknown_unknown"
 echo ""
 echo "📝 Для постоянной настройки добавьте в ~/.zshrc:"
 echo "   source $SCRIPT_DIR/setup-env.sh"
