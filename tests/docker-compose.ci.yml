@@ -1,0 +1,73 @@
+services:
+  bitcoind:
+    image: registry.gitlab.com/hashbeam/docker/bitcoind:30.2
+    command: "-fallbackfee=0.0002"
+
+  esplora:
+    build:
+      context: ./esplora
+      dockerfile: ./Dockerfile.notor
+    command: /srv/explorer/run.sh bitcoin-regtest explorer
+    environment:
+      DEBUG: verbose
+      NO_PRECACHE: 1
+      NO_ADDRESS_SEARCH: 1
+      NO_REGTEST_MINING: 1
+    ports:
+      - "50004:50001"
+      - "8094:80"
+    depends_on:
+      - bitcoind
+
+  proxy:
+    image: ghcr.io/rgb-tools/rgb-proxy-server:0.3.0
+    ports:
+      - "3000:3000"
+
+  regtest-helper:
+    build:
+      context: ./regtest-helper
+    ports:
+      - "8080:8080"
+    environment:
+      BITCOIND_RPC_URL: http://bitcoind:18443
+      BITCOIND_RPC_USER: user
+      BITCOIND_RPC_PASS: default_password
+    depends_on:
+      - bitcoind
+
+  vss-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  vss-server:
+    build:
+      context: ./vss-server
+      dockerfile: Dockerfile
+    environment:
+      VSS_BIND_ADDRESS: "0.0.0.0:8080"
+      VSS_PSQL_USERNAME: postgres
+      VSS_PSQL_PASSWORD: postgres
+      VSS_PSQL_ADDRESS: "vss-postgres:5432"
+      VSS_PSQL_DEFAULT_DB: postgres
+      VSS_PSQL_VSS_DB: vss
+    depends_on:
+      vss-postgres:
+        condition: service_healthy
+
+  vss-cors-proxy:
+    image: nginx:alpine
+    ports:
+      - "8082:80"
+    volumes:
+      - ./vss-server/nginx-cors.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - vss-server

@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Keys &amp; Wallet &mdash; rgb-lib-wasm Examples</title>
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 960px; margin: 0 auto; }
+h1 { color: #58a6ff; margin-bottom: 0.5rem; }
+.subtitle { color: #8b949e; margin-bottom: 1rem; font-size: 0.9rem; }
+nav { margin-bottom: 2rem; }
+nav a { color: #58a6ff; margin-right: 1.5rem; font-size: 0.9rem; text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+nav a.active { font-weight: 700; border-bottom: 2px solid #58a6ff; padding-bottom: 2px; }
+.status { padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 2rem; font-size: 0.85rem; }
+.status.loading { background: #1c1f26; color: #d29922; }
+.status.ready { background: #0d2818; color: #3fb950; }
+.status.error { background: #2d1117; color: #f85149; }
+.section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.section h2 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 1rem; }
+.section h3 { color: #8b949e; font-size: 0.95rem; margin-bottom: 0.75rem; margin-top: 0.75rem; }
+.hint { color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; }
+label { display: block; color: #8b949e; font-size: 0.85rem; margin-bottom: 0.3rem; }
+select, input, textarea {
+  width: 100%; padding: 0.5rem 0.75rem; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 6px; color: #c9d1d9; font-family: monospace; font-size: 0.9rem; margin-bottom: 1rem;
+}
+input[type="checkbox"] { width: auto; margin-bottom: 0; }
+input[type="file"] { padding: 0.3rem; }
+.checkbox-label {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; cursor: pointer;
+}
+textarea { resize: vertical; min-height: 60px; }
+select:focus, input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+button {
+  padding: 0.5rem 1.25rem; background: #238636; color: #fff; border: none;
+  border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 600;
+}
+button:hover { background: #2ea043; }
+button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+button.danger { background: #da3633; }
+button.danger:hover { background: #f85149; }
+button.danger:disabled { background: #21262d; color: #484f58; }
+button.secondary { background: #30363d; }
+button.secondary:hover { background: #484f58; }
+button.secondary:disabled { background: #21262d; color: #484f58; }
+button.accent { background: #1f6feb; }
+button.accent:hover { background: #388bfd; }
+button.accent:disabled { background: #21262d; color: #484f58; }
+button.auto-btn { background: #8957e5; }
+button.auto-btn:hover { background: #a371f7; }
+button.auto-btn:disabled { background: #21262d; color: #484f58; }
+.output { margin-top: 1rem; }
+.output-label { color: #8b949e; font-size: 0.8rem; margin-bottom: 0.3rem; }
+pre {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.5;
+  max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+}
+.field-row { display: flex; gap: 1rem; align-items: flex-end; }
+.field-row > * { flex: 1; }
+.field-row > button { flex: 0 0 auto; margin-bottom: 1rem; }
+.btn-group { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.copy-btn { background: #30363d; font-size: 0.75rem; padding: 0.3rem 0.6rem; margin-left: 0.5rem; }
+.copy-btn:hover { background: #484f58; }
+hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
+#log {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; font-size: 0.8rem; line-height: 1.6; max-height: 400px;
+  overflow-y: auto; white-space: pre-wrap; word-break: break-all; min-height: 60px;
+}
+.log-ok { color: #3fb950; }
+.log-err { color: #f85149; }
+.log-warn { color: #d29922; }
+.log-info { color: #8b949e; }
+.round-trip-result { margin-top: 0.5rem; font-size: 0.85rem; padding: 0.4rem 0.75rem; border-radius: 4px; }
+.round-trip-result.pass { background: #0d2818; color: #3fb950; }
+.round-trip-result.fail { background: #2d1117; color: #f85149; }
+  </style>
+</head>
+<body>
+  <h1>Keys &amp; Wallet</h1>
+  <p class="subtitle">Key generation, wallet creation, funding, UTXOs, and wallet state queries</p>
+
+  <!-- Nav bar -->
+  <nav>
+    <a href="index.html">Quick Start</a>
+    <a href="wallet.html" class="active">Keys &amp; Wallet</a>
+    <a href="bitcoin.html">Bitcoin</a>
+    <a href="rgb.html">RGB Assets</a>
+    <a href="backup.html">Backup &amp; Utilities</a>
+  </nav>
+
+  <!-- WASM status -->
+  <div id="status" class="status loading">Initializing WASM module...</div>
+
+  <!-- 1. Key Management -->
+  <div class="section">
+    <h2>1. Key Management</h2>
+    <div class="field-row">
+      <div>
+        <label for="gen-network">Network</label>
+        <select id="gen-network">
+          <option value="regtest" selected>Regtest</option>
+          <option value="testnet">Testnet</option>
+          <option value="signet">Signet</option>
+          <option value="mainnet">Mainnet</option>
+        </select>
+      </div>
+      <button id="btn-generate" disabled>Generate Keys</button>
+    </div>
+
+    <h3>Restore Keys</h3>
+    <div>
+      <label for="restore-mnemonic">Mnemonic (BIP39) &mdash; auto-filled from Generate</label>
+      <textarea id="restore-mnemonic" rows="2" placeholder="Enter 12-word mnemonic or click Generate Keys first"></textarea>
+    </div>
+    <div class="btn-group">
+      <button id="btn-restore" disabled>Restore Keys</button>
+      <button id="btn-roundtrip" class="secondary" disabled>Round-Trip Verification</button>
+    </div>
+
+    <div class="output" id="keys-output" style="display:none;">
+      <div id="rt-status"></div>
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('keys-result')">Copy</button></div>
+      <pre id="keys-result"></pre>
+    </div>
+  </div>
+
+  <!-- 2. Create Wallet -->
+  <div class="section">
+    <h2>2. Create Wallet</h2>
+    <p class="hint">
+      Creates a Wallet from WalletData JSON. Uses <code>WasmWallet.create()</code> for IndexedDB state restoration.
+    </p>
+    <div>
+      <label for="wallet-data">WalletData JSON (auto-filled from generated keys)</label>
+      <textarea id="wallet-data" rows="8" placeholder='{"data_dir": ":memory:", "bitcoin_network": "Regtest", ...}'></textarea>
+    </div>
+    <div class="btn-group">
+      <button id="btn-create-wallet" disabled>Create Wallet</button>
+      <button id="btn-clear-storage" class="danger" disabled>Clear IndexedDB Storage</button>
+    </div>
+    <div class="output" id="wallet-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('wallet-result')">Copy</button></div>
+      <pre id="wallet-result"></pre>
+    </div>
+  </div>
+
+  <!-- 3. Go Online + Sync -->
+  <div class="section">
+    <h2>3. Go Online + Sync</h2>
+    <p class="hint">
+      Connect the wallet to an indexer. The Online object is stored for use by all subsequent operations.
+    </p>
+    <div>
+      <label for="indexer-url">Indexer URL</label>
+      <input id="indexer-url" type="text" value="http://127.0.0.1:8094/regtest/api" />
+    </div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="skip-consistency" checked> Skip consistency check
+    </label>
+    <div class="btn-group">
+      <button id="btn-go-online" disabled>Go Online</button>
+      <button id="btn-sync" disabled>Sync</button>
+    </div>
+    <div class="output" id="online-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('online-result')">Copy</button></div>
+      <pre id="online-result"></pre>
+    </div>
+  </div>
+
+  <!-- 4. Fund + Create UTXOs (regtest) -->
+  <div class="section">
+    <h2>4. Fund + Create UTXOs (regtest)</h2>
+
+    <h3>Fund Wallet</h3>
+    <p class="hint">
+      Calls regtest-helper to send BTC to wallet address, mines 1 block, waits for esplora to index, then syncs.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="fund-amount">Amount (BTC)</label>
+        <input id="fund-amount" type="number" value="1.0" min="0.001" step="0.1" />
+      </div>
+      <button id="btn-fund" disabled>Fund Wallet</button>
+    </div>
+
+    <h3>Mine Blocks</h3>
+    <div class="field-row">
+      <div>
+        <label for="mine-blocks">Number of blocks</label>
+        <input id="mine-blocks" type="number" value="1" min="1" />
+      </div>
+      <button id="btn-mine" disabled>Mine</button>
+    </div>
+
+    <hr class="divider" />
+
+    <h3>Create UTXOs</h3>
+    <p class="hint">
+      Three-step PSBT workflow: Begin &rarr; Sign &rarr; End. Or use Quick (auto) for all 3 in one click.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="utxo-num">Number of UTXOs</label>
+        <input id="utxo-num" type="number" value="5" min="1" />
+      </div>
+      <div>
+        <label for="utxo-size">UTXO size (sats)</label>
+        <input id="utxo-size" type="number" value="1000" min="546" />
+      </div>
+      <div>
+        <label for="utxo-fee-rate">Fee rate (sat/vB)</label>
+        <input id="utxo-fee-rate" type="number" value="1" min="1" />
+      </div>
+    </div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="utxo-up-to" checked> Up to (create only if needed)
+    </label>
+    <br />
+    <label class="checkbox-label">
+      <input type="checkbox" id="utxo-skip-sync"> Skip sync
+    </label>
+    <div class="btn-group">
+      <button id="btn-create-utxos-begin" disabled>1. Begin</button>
+      <button id="btn-utxo-sign" disabled>2. Sign</button>
+      <button id="btn-create-utxos-end" disabled>3. End</button>
+      <button id="btn-create-utxos-auto" class="auto-btn" disabled>Quick: Create UTXOs (auto)</button>
+    </div>
+    <div>
+      <label for="utxo-unsigned-psbt">Unsigned PSBT</label>
+      <textarea id="utxo-unsigned-psbt" rows="2" placeholder="Filled automatically by Begin step"></textarea>
+    </div>
+    <div>
+      <label for="utxo-signed-psbt">Signed PSBT</label>
+      <textarea id="utxo-signed-psbt" rows="2" placeholder="Filled automatically by Sign step"></textarea>
+    </div>
+    <div class="output" id="utxo-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('utxo-result')">Copy</button></div>
+      <pre id="utxo-result"></pre>
+    </div>
+  </div>
+
+  <!-- 5. Wallet State -->
+  <div class="section">
+    <h2>5. Wallet State</h2>
+    <p class="hint">Read-only wallet queries. Each button displays its result below.</p>
+    <div class="btn-group">
+      <button id="btn-btc-balance" disabled>Get BTC Balance</button>
+      <button id="btn-get-address" disabled>Get Address</button>
+      <button id="btn-list-assets" disabled>List Assets</button>
+      <button id="btn-list-unspents" disabled>List Unspents</button>
+      <button id="btn-list-transactions" disabled>List Transactions</button>
+      <button id="btn-list-transfers" disabled>List Transfers</button>
+      <button id="btn-list-unspents-vanilla" disabled>List Unspents Vanilla</button>
+    </div>
+    <div class="field-row">
+      <div>
+        <label for="state-asset-id">Asset ID (for balance lookup)</label>
+        <input id="state-asset-id" type="text" placeholder="Enter asset ID" />
+      </div>
+      <button id="btn-get-asset-balance" disabled>Get Asset Balance</button>
+    </div>
+    <div class="output" id="state-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('state-result')">Copy</button></div>
+      <pre id="state-result"></pre>
+    </div>
+  </div>
+
+  <!-- 6. Fee Estimation -->
+  <div class="section">
+    <h2>6. Fee Estimation</h2>
+    <p class="hint">
+      Estimate the fee rate (sat/vB) for a target number of confirmation blocks.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="fee-blocks">Target blocks</label>
+        <input id="fee-blocks" type="number" value="6" min="1" max="25" />
+      </div>
+      <button id="btn-fee-estimate" disabled>Estimate Fee</button>
+    </div>
+    <div class="output" id="fee-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('fee-result')">Copy</button></div>
+      <pre id="fee-result"></pre>
+    </div>
+  </div>
+
+  <!-- Activity Log -->
+  <div class="section">
+    <h2>Activity Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+  <script type="module">
+    import {
+      generate_keys,
+      restore_keys,
+      WasmWallet,
+      state,
+      ESPLORA_API,
+      json,
+      showResult,
+      showJson,
+      showError,
+      requireWallet,
+      requireOnline,
+      optionalInt,
+      log,
+      copyOutput,
+      fundAddress,
+      mineAndWait,
+      mineBlocks,
+      initWasm,
+      enableBtns,
+      fillWalletData,
+    } from './lib/shared.js';
+
+    // -----------------------------------------------------------------
+    // Button groups for gating
+    // -----------------------------------------------------------------
+    const keyBtns = [
+      'btn-generate', 'btn-restore', 'btn-roundtrip',
+      'btn-create-wallet', 'btn-clear-storage',
+    ];
+
+    const walletCreatedBtns = [
+      'btn-go-online',
+      'btn-btc-balance', 'btn-get-address', 'btn-list-assets',
+      'btn-list-unspents', 'btn-list-transactions', 'btn-list-transfers',
+      'btn-get-asset-balance',
+    ];
+
+    const onlineBtns = [
+      'btn-sync', 'btn-fund', 'btn-mine',
+      'btn-create-utxos-begin', 'btn-utxo-sign', 'btn-create-utxos-end',
+      'btn-create-utxos-auto',
+      'btn-fee-estimate',
+      'btn-list-unspents-vanilla',
+    ];
+
+    // -----------------------------------------------------------------
+    // WASM Initialization
+    // -----------------------------------------------------------------
+    const ok = await initWasm();
+    if (ok) {
+      enableBtns(keyBtns);
+    }
+
+    // =================================================================
+    // 1. Key Management
+    // =================================================================
+
+    document.getElementById('btn-generate').addEventListener('click', () => {
+      const network = document.getElementById('gen-network').value;
+      try {
+        const keys = generate_keys(network);
+        showJson('keys-output', 'keys-result', keys);
+        document.getElementById('rt-status').innerHTML = '';
+        if (keys.mnemonic) {
+          document.getElementById('restore-mnemonic').value = keys.mnemonic;
+          fillWalletData(keys, network);
+        }
+        log('generate_keys(' + network + ') OK', 'log-ok');
+      } catch (e) {
+        showError('keys-output', 'keys-result', 'Error: ', e);
+        document.getElementById('rt-status').innerHTML = '';
+        log('generate_keys failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-restore').addEventListener('click', () => {
+      const network = document.getElementById('gen-network').value;
+      const mnemonic = document.getElementById('restore-mnemonic').value.trim();
+      if (!mnemonic) {
+        showResult('keys-output', 'keys-result', 'Error: Please enter a mnemonic');
+        document.getElementById('rt-status').innerHTML = '';
+        return;
+      }
+      try {
+        const keys = restore_keys(network, mnemonic);
+        showJson('keys-output', 'keys-result', keys);
+        document.getElementById('rt-status').innerHTML = '';
+        log('restore_keys(' + network + ') OK', 'log-ok');
+      } catch (e) {
+        showError('keys-output', 'keys-result', 'Error: ', e);
+        document.getElementById('rt-status').innerHTML = '';
+        log('restore_keys failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-roundtrip').addEventListener('click', () => {
+      const network = document.getElementById('gen-network').value;
+      const statusDiv = document.getElementById('rt-status');
+      try {
+        const generated = generate_keys(network);
+        const restored = restore_keys(network, generated.mnemonic);
+        const fields = Object.keys(generated);
+        let allMatch = true;
+        const lines = [];
+        for (const field of fields) {
+          const genVal = json(generated[field]);
+          const resVal = json(restored[field]);
+          const match = genVal === resVal;
+          if (!match) allMatch = false;
+          const icon = match ? 'PASS' : 'FAIL';
+          const val = typeof generated[field] === 'string'
+            ? generated[field].substring(0, 60) + (generated[field].length > 60 ? '...' : '')
+            : json(generated[field]);
+          lines.push('[' + icon + '] ' + field + ': ' + val);
+        }
+        statusDiv.innerHTML = allMatch
+          ? '<div class="round-trip-result pass">All fields match -- round-trip OK</div>'
+          : '<div class="round-trip-result fail">Mismatch detected -- see details below</div>';
+        showResult('keys-output', 'keys-result', lines.join('\n'));
+        log('Round-trip verification: ' + (allMatch ? 'PASS' : 'FAIL'), allMatch ? 'log-ok' : 'log-err');
+      } catch (e) {
+        statusDiv.innerHTML = '<div class="round-trip-result fail">Error: ' + e + '</div>';
+        showResult('keys-output', 'keys-result', '');
+        log('Round-trip error: ' + e, 'log-err');
+      }
+    });
+
+    // =================================================================
+    // 2. Create Wallet
+    // =================================================================
+
+    document.getElementById('btn-create-wallet').addEventListener('click', async () => {
+      const walletDataJson = document.getElementById('wallet-data').value.trim();
+      if (!walletDataJson) {
+        showResult('wallet-output', 'wallet-result', 'Error: Please enter WalletData JSON or generate keys first');
+        return;
+      }
+      try {
+        log('Creating wallet...', 'log-warn');
+        state.wallet = await WasmWallet.create(walletDataJson);
+        const wd = state.wallet.get_wallet_data();
+        showResult('wallet-output', 'wallet-result',
+          'Wallet created successfully (with IndexedDB restore)!\n\n' + json(wd));
+        enableBtns(walletCreatedBtns);
+        log('Wallet created', 'log-ok');
+      } catch (e) {
+        showError('wallet-output', 'wallet-result', 'Error creating wallet: ', e);
+        state.wallet = null;
+        log('Wallet creation failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-clear-storage').addEventListener('click', () => {
+      const req = indexedDB.deleteDatabase('rgb_lib_wallet');
+      req.onsuccess = () => {
+        showResult('wallet-output', 'wallet-result', 'IndexedDB storage cleared.');
+        log('IndexedDB cleared', 'log-ok');
+      };
+      req.onerror = () => {
+        showError('wallet-output', 'wallet-result', 'Failed to clear storage: ', req.error);
+        log('IndexedDB clear failed: ' + req.error, 'log-err');
+      };
+    });
+
+    // =================================================================
+    // 3. Go Online + Sync
+    // =================================================================
+
+    document.getElementById('btn-go-online').addEventListener('click', async () => {
+      if (!requireWallet('online-output', 'online-result')) return;
+      const skip = document.getElementById('skip-consistency').checked;
+      const url = document.getElementById('indexer-url').value.trim();
+      try {
+        log('Going online: ' + url + '...', 'log-warn');
+        state.online = await state.wallet.go_online(skip, url);
+        showResult('online-output', 'online-result',
+          'Online! Stored for subsequent operations.\n\n' + json(state.online));
+        enableBtns(onlineBtns);
+        log('Online: ' + url, 'log-ok');
+      } catch (e) {
+        showError('online-output', 'online-result', 'Error going online: ', e);
+        log('go_online failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-sync').addEventListener('click', async () => {
+      if (!requireOnline('online-output', 'online-result')) return;
+      try {
+        log('Syncing...', 'log-warn');
+        await state.wallet.sync(state.online);
+        showResult('online-output', 'online-result', 'Sync completed successfully.');
+        log('Sync complete', 'log-ok');
+      } catch (e) {
+        showError('online-output', 'online-result', 'Error syncing: ', e);
+        log('Sync failed: ' + e, 'log-err');
+      }
+    });
+
+    // =================================================================
+    // 4. Fund + Create UTXOs
+    // =================================================================
+
+    document.getElementById('btn-fund').addEventListener('click', async () => {
+      if (!requireOnline('utxo-output', 'utxo-result')) return;
+      try {
+        log('Getting wallet address...', 'log-warn');
+        const address = state.wallet.get_address();
+        const amount = parseFloat(document.getElementById('fund-amount').value) || 1.0;
+
+        log('Funding ' + address + ' with ' + amount + ' BTC...', 'log-warn');
+        const fundResult = await fundAddress(address, amount);
+        log('Fund txid: ' + (fundResult.txid || json(fundResult)), 'log-info');
+
+        log('Mining 1 block...', 'log-warn');
+        const mineResult = await mineAndWait(1);
+        log('Mined to height ' + mineResult.height, 'log-info');
+
+        log('Syncing wallet...', 'log-warn');
+        await state.wallet.sync(state.online);
+
+        const balance = state.wallet.get_btc_balance();
+        showResult('utxo-output', 'utxo-result',
+          'Funded ' + address + ' with ' + amount + ' BTC\n' +
+          'Mine height: ' + mineResult.height + '\n\n' +
+          'BTC Balance:\n' + json(balance));
+        log('Wallet funded. Balance: ' + json(balance), 'log-ok');
+      } catch (e) {
+        showError('utxo-output', 'utxo-result', 'Error funding wallet: ', e);
+        log('Fund failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-mine').addEventListener('click', async () => {
+      const blocks = parseInt(document.getElementById('mine-blocks').value, 10) || 1;
+      try {
+        log('Mining ' + blocks + ' block(s)...', 'log-warn');
+        const result = await mineAndWait(blocks);
+        showResult('utxo-output', 'utxo-result', 'Mined ' + blocks + ' block(s). Height: ' + result.height);
+        log('Mined ' + blocks + ' block(s) to height ' + result.height, 'log-ok');
+      } catch (e) {
+        showError('utxo-output', 'utxo-result', 'Error mining: ', e);
+        log('Mine failed: ' + e, 'log-err');
+      }
+    });
+
+    // --- Create UTXOs: 3-step PSBT ---
+
+    document.getElementById('btn-create-utxos-begin').addEventListener('click', async () => {
+      if (!requireOnline('utxo-output', 'utxo-result')) return;
+      const upTo = document.getElementById('utxo-up-to').checked;
+      const num = optionalInt('utxo-num');
+      const size = optionalInt('utxo-size');
+      const feeRate = parseInt(document.getElementById('utxo-fee-rate').value, 10) || 1;
+      const skipSync = document.getElementById('utxo-skip-sync').checked;
+      try {
+        log('create_utxos_begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.create_utxos_begin(
+          state.online, upTo, num, size, BigInt(feeRate), skipSync
+        );
+        document.getElementById('utxo-unsigned-psbt').value = unsignedPsbt;
+        showResult('utxo-output', 'utxo-result', 'Unsigned PSBT created. Proceed to Sign.');
+        log('create_utxos_begin OK', 'log-ok');
+      } catch (e) {
+        showError('utxo-output', 'utxo-result', 'Error in create_utxos_begin: ', e);
+        log('create_utxos_begin failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-utxo-sign').addEventListener('click', () => {
+      if (!requireWallet('utxo-output', 'utxo-result')) return;
+      const unsigned = document.getElementById('utxo-unsigned-psbt').value.trim();
+      if (!unsigned) {
+        showResult('utxo-output', 'utxo-result', 'Error: No unsigned PSBT. Run Begin first.');
+        return;
+      }
+      try {
+        const signed = state.wallet.sign_psbt(unsigned);
+        document.getElementById('utxo-signed-psbt').value = signed;
+        showResult('utxo-output', 'utxo-result', 'PSBT signed. Proceed to End.');
+        log('UTXO PSBT signed', 'log-ok');
+      } catch (e) {
+        showError('utxo-output', 'utxo-result', 'Error signing PSBT: ', e);
+        log('UTXO PSBT sign failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-create-utxos-end').addEventListener('click', async () => {
+      if (!requireOnline('utxo-output', 'utxo-result')) return;
+      const signed = document.getElementById('utxo-signed-psbt').value.trim();
+      if (!signed) {
+        showResult('utxo-output', 'utxo-result', 'Error: No signed PSBT. Run Sign first.');
+        return;
+      }
+      const skipSync = document.getElementById('utxo-skip-sync').checked;
+      try {
+        log('create_utxos_end...', 'log-warn');
+        const count = await state.wallet.create_utxos_end(state.online, signed, skipSync);
+        showResult('utxo-output', 'utxo-result', 'UTXOs created: ' + count);
+        log('create_utxos_end OK: ' + count + ' UTXOs', 'log-ok');
+      } catch (e) {
+        showError('utxo-output', 'utxo-result', 'Error in create_utxos_end: ', e);
+        log('create_utxos_end failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-create-utxos-auto').addEventListener('click', async () => {
+      if (!requireOnline('utxo-output', 'utxo-result')) return;
+      const upTo = document.getElementById('utxo-up-to').checked;
+      const num = optionalInt('utxo-num');
+      const size = optionalInt('utxo-size');
+      const feeRate = parseInt(document.getElementById('utxo-fee-rate').value, 10) || 1;
+      const skipSync = document.getElementById('utxo-skip-sync').checked;
+      try {
+        log('create_utxos (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.create_utxos_begin(
+          state.online, upTo, num, size, BigInt(feeRate), skipSync
+        );
+        document.getElementById('utxo-unsigned-psbt').value = unsignedPsbt;
+
+        log('create_utxos (auto) sign...', 'log-warn');
+        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        document.getElementById('utxo-signed-psbt').value = signed;
+
+        log('create_utxos (auto) end...', 'log-warn');
+        const count = await state.wallet.create_utxos_end(state.online, signed, skipSync);
+        showResult('utxo-output', 'utxo-result', 'UTXOs created (auto): ' + count);
+        log('create_utxos (auto) complete: ' + count + ' UTXOs', 'log-ok');
+      } catch (e) {
+        showError('utxo-output', 'utxo-result', 'Error in create_utxos (auto): ', e);
+        log('create_utxos (auto) failed: ' + e, 'log-err');
+      }
+    });
+
+    // =================================================================
+    // 5. Wallet State
+    // =================================================================
+
+    document.getElementById('btn-btc-balance').addEventListener('click', () => {
+      if (!requireWallet('state-output', 'state-result')) return;
+      try {
+        const balance = state.wallet.get_btc_balance();
+        showJson('state-output', 'state-result', balance);
+        log('BTC balance: ' + json(balance), 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('get_btc_balance failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-get-address').addEventListener('click', () => {
+      if (!requireWallet('state-output', 'state-result')) return;
+      try {
+        const address = state.wallet.get_address();
+        showResult('state-output', 'state-result', 'Address: ' + address);
+        log('Address: ' + address, 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('get_address failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-list-assets').addEventListener('click', () => {
+      if (!requireWallet('state-output', 'state-result')) return;
+      try {
+        const assets = state.wallet.list_assets([]);
+        showJson('state-output', 'state-result', assets);
+        log('list_assets OK', 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('list_assets failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-list-unspents').addEventListener('click', () => {
+      if (!requireWallet('state-output', 'state-result')) return;
+      try {
+        const unspents = state.wallet.list_unspents(false);
+        showJson('state-output', 'state-result', unspents);
+        log('list_unspents OK', 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('list_unspents failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-list-transactions').addEventListener('click', () => {
+      if (!requireWallet('state-output', 'state-result')) return;
+      try {
+        const txs = state.wallet.list_transactions(false);
+        showJson('state-output', 'state-result', txs);
+        log('list_transactions OK', 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('list_transactions failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-list-transfers').addEventListener('click', () => {
+      if (!requireWallet('state-output', 'state-result')) return;
+      try {
+        const transfers = state.wallet.list_transfers(null);
+        showJson('state-output', 'state-result', transfers);
+        log('list_transfers OK', 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('list_transfers failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-list-unspents-vanilla').addEventListener('click', async () => {
+      if (!requireOnline('state-output', 'state-result')) return;
+      try {
+        log('list_unspents_vanilla...', 'log-warn');
+        const unspents = await state.wallet.list_unspents_vanilla(state.online, 0, null);
+        showJson('state-output', 'state-result', unspents);
+        log('list_unspents_vanilla OK', 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('list_unspents_vanilla failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-get-asset-balance').addEventListener('click', () => {
+      if (!requireWallet('state-output', 'state-result')) return;
+      const assetId = document.getElementById('state-asset-id').value.trim();
+      if (!assetId) {
+        showResult('state-output', 'state-result', 'Error: Please enter an Asset ID');
+        return;
+      }
+      try {
+        const balance = state.wallet.get_asset_balance(assetId);
+        showJson('state-output', 'state-result', balance);
+        log('Asset balance for ' + assetId.substring(0, 16) + '...', 'log-ok');
+      } catch (e) {
+        showError('state-output', 'state-result', 'Error: ', e);
+        log('get_asset_balance failed: ' + e, 'log-err');
+      }
+    });
+
+    // =================================================================
+    // 6. Fee Estimation
+    // =================================================================
+
+    document.getElementById('btn-fee-estimate').addEventListener('click', async () => {
+      if (!requireOnline('fee-output', 'fee-result')) return;
+      const blocks = parseInt(document.getElementById('fee-blocks').value, 10) || 6;
+      try {
+        log('Estimating fee for ' + blocks + ' blocks...', 'log-warn');
+        const feeRate = await state.wallet.get_fee_estimation(state.online, blocks);
+        showResult('fee-output', 'fee-result', 'Estimated fee rate: ' + feeRate + ' sat/vB (target: ' + blocks + ' blocks)');
+        log('Fee estimate: ' + feeRate + ' sat/vB', 'log-ok');
+      } catch (e) {
+        showError('fee-output', 'fee-result', 'Error estimating fee: ', e);
+        log('Fee estimation failed: ' + e, 'log-err');
+      }
+    });
+  </script>
+</body>
+</html>

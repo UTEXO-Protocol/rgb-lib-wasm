@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>rgb-lib WASM — Backup &amp; Utilities</title>
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 960px; margin: 0 auto; }
+h1 { color: #58a6ff; margin-bottom: 0.5rem; }
+.subtitle { color: #8b949e; margin-bottom: 1rem; font-size: 0.9rem; }
+nav { margin-bottom: 2rem; }
+nav a { color: #58a6ff; margin-right: 1.5rem; font-size: 0.9rem; text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+nav a.active { font-weight: 700; border-bottom: 2px solid #58a6ff; padding-bottom: 2px; }
+.status { padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 2rem; font-size: 0.85rem; }
+.status.loading { background: #1c1f26; color: #d29922; }
+.status.ready { background: #0d2818; color: #3fb950; }
+.status.error { background: #2d1117; color: #f85149; }
+.section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.section h2 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 1rem; }
+.section h3 { color: #8b949e; font-size: 0.95rem; margin-bottom: 0.75rem; margin-top: 0.75rem; }
+.hint { color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; }
+label { display: block; color: #8b949e; font-size: 0.85rem; margin-bottom: 0.3rem; }
+select, input, textarea {
+  width: 100%; padding: 0.5rem 0.75rem; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 6px; color: #c9d1d9; font-family: monospace; font-size: 0.9rem; margin-bottom: 1rem;
+}
+input[type="checkbox"] { width: auto; margin-bottom: 0; }
+input[type="file"] { padding: 0.3rem; }
+.checkbox-label {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; cursor: pointer;
+}
+textarea { resize: vertical; min-height: 60px; }
+select:focus, input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+button {
+  padding: 0.5rem 1.25rem; background: #238636; color: #fff; border: none;
+  border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 600;
+}
+button:hover { background: #2ea043; }
+button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+button.danger { background: #da3633; }
+button.danger:hover { background: #f85149; }
+button.danger:disabled { background: #21262d; color: #484f58; }
+button.secondary { background: #30363d; }
+button.secondary:hover { background: #484f58; }
+button.secondary:disabled { background: #21262d; color: #484f58; }
+button.accent { background: #1f6feb; }
+button.accent:hover { background: #388bfd; }
+button.accent:disabled { background: #21262d; color: #484f58; }
+button.auto-btn { background: #8957e5; }
+button.auto-btn:hover { background: #a371f7; }
+button.auto-btn:disabled { background: #21262d; color: #484f58; }
+.output { margin-top: 1rem; }
+.output-label { color: #8b949e; font-size: 0.8rem; margin-bottom: 0.3rem; }
+pre {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.5;
+  max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+}
+.field-row { display: flex; gap: 1rem; align-items: flex-end; }
+.field-row > * { flex: 1; }
+.field-row > button { flex: 0 0 auto; margin-bottom: 1rem; }
+.btn-group { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.copy-btn { background: #30363d; font-size: 0.75rem; padding: 0.3rem 0.6rem; margin-left: 0.5rem; }
+.copy-btn:hover { background: #484f58; }
+hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
+#log {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; font-size: 0.8rem; line-height: 1.6; max-height: 400px;
+  overflow-y: auto; white-space: pre-wrap; word-break: break-all; min-height: 60px;
+}
+.log-ok { color: #3fb950; }
+.log-err { color: #f85149; }
+.log-warn { color: #d29922; }
+.log-info { color: #8b949e; }
+.round-trip-result { margin-top: 0.5rem; font-size: 0.85rem; padding: 0.4rem 0.75rem; border-radius: 4px; }
+.round-trip-result.pass { background: #0d2818; color: #3fb950; }
+.round-trip-result.fail { background: #2d1117; color: #f85149; }
+  </style>
+</head>
+<body>
+  <h1>rgb-lib WASM &mdash; Backup &amp; Utilities</h1>
+  <p class="subtitle">Local backup, VSS cloud backup, proxy check, and error handling tests</p>
+
+  <!-- Nav bar -->
+  <nav>
+    <a href="index.html">Quick Start</a>
+    <a href="wallet.html">Keys &amp; Wallet</a>
+    <a href="bitcoin.html">Bitcoin</a>
+    <a href="rgb.html">RGB Assets</a>
+    <a href="backup.html" class="active">Backup &amp; Utilities</a>
+  </nav>
+
+  <!-- WASM status -->
+  <div id="status" class="status loading">Initializing WASM module...</div>
+
+  <!-- ================================================================== -->
+  <!-- Wallet Setup (quick) -->
+  <!-- ================================================================== -->
+  <div class="section">
+    <h2>Wallet Setup (quick)</h2>
+    <p class="hint">
+      Auto-setup generates keys and creates a wallet in one click. Or do it manually below.
+    </p>
+    <div class="btn-group">
+      <button id="btn-auto-setup" class="auto-btn" disabled>Auto-Setup Regtest Wallet</button>
+    </div>
+
+    <hr class="divider" />
+
+    <h3>Manual Setup</h3>
+    <div class="field-row">
+      <div>
+        <label for="gen-network">Network</label>
+        <select id="gen-network">
+          <option value="regtest" selected>Regtest</option>
+          <option value="testnet">Testnet</option>
+          <option value="signet">Signet</option>
+          <option value="mainnet">Mainnet</option>
+        </select>
+      </div>
+      <button id="btn-generate" disabled>Generate Keys</button>
+    </div>
+    <div>
+      <label for="wallet-data">WalletData JSON</label>
+      <textarea id="wallet-data" rows="6" placeholder='{"data_dir": ":memory:", "bitcoin_network": "Regtest", ...}'></textarea>
+    </div>
+    <div class="btn-group">
+      <button id="btn-create-wallet" disabled>Create Wallet</button>
+    </div>
+
+    <div class="output" id="setup-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('setup-result')">Copy</button></div>
+      <pre id="setup-result"></pre>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- Local Backup -->
+  <!-- ================================================================== -->
+  <div class="section">
+    <h2>Local Backup</h2>
+    <p class="hint">
+      Encrypt wallet state and download as a file, or restore from a previously downloaded backup.
+    </p>
+
+    <div>
+      <label for="backup-password">Backup Password</label>
+      <input id="backup-password" type="password" placeholder="Enter encryption password" />
+    </div>
+    <div class="btn-group">
+      <button id="btn-backup" disabled>Backup (Download)</button>
+      <button id="btn-backup-info" class="secondary" disabled>Check Backup Status</button>
+    </div>
+
+    <hr class="divider" />
+
+    <h3>Restore from File</h3>
+    <div>
+      <label for="restore-file">Backup File</label>
+      <input id="restore-file" type="file" accept=".rgbbackup,.bin,*/*" />
+    </div>
+    <div>
+      <label for="restore-password">Restore Password</label>
+      <input id="restore-password" type="password" placeholder="Password used when backup was created" />
+    </div>
+    <div class="btn-group">
+      <button id="btn-restore-backup" disabled>Restore Backup</button>
+    </div>
+
+    <div class="output" id="backup-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('backup-result')">Copy</button></div>
+      <pre id="backup-result"></pre>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- VSS Cloud Backup -->
+  <!-- ================================================================== -->
+  <div class="section">
+    <h2>VSS Cloud Backup</h2>
+    <p class="hint">
+      Configure a Versioned Secret Storage server for cloud-based encrypted backups.
+    </p>
+
+    <div>
+      <label for="vss-url">Server URL</label>
+      <input id="vss-url" type="text" value="http://127.0.0.1:8082/vss" />
+    </div>
+    <div>
+      <label for="vss-store-id">Store ID</label>
+      <input id="vss-store-id" type="text" placeholder="my-wallet-store" />
+    </div>
+    <div>
+      <label for="vss-signing-key">Signing Key (32-byte hex)</label>
+      <input id="vss-signing-key" type="text" placeholder="64 hex characters" />
+    </div>
+    <div class="btn-group">
+      <button id="btn-vss-configure" disabled>Configure VSS</button>
+      <button id="btn-vss-disable" class="danger" disabled>Disable VSS</button>
+    </div>
+
+    <hr class="divider" />
+
+    <div class="btn-group">
+      <button id="btn-vss-backup" class="accent" disabled>VSS Backup</button>
+      <button id="btn-vss-restore" class="accent" disabled>VSS Restore</button>
+      <button id="btn-vss-info" class="secondary" disabled>VSS Info</button>
+    </div>
+
+    <div class="output" id="vss-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('vss-result')">Copy</button></div>
+      <pre id="vss-result"></pre>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- Check Proxy URL -->
+  <!-- ================================================================== -->
+  <div class="section">
+    <h2>Check Proxy URL</h2>
+    <p class="hint">
+      Verify that a URL points to a valid RGB proxy server.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="proxy-url">Proxy URL</label>
+        <input id="proxy-url" type="text" value="http://127.0.0.1:3000/json-rpc" />
+      </div>
+      <button id="btn-check-proxy" disabled>Check Proxy</button>
+    </div>
+
+    <div class="output" id="proxy-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('proxy-result')">Copy</button></div>
+      <pre id="proxy-result"></pre>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- Error Handling Tests -->
+  <!-- ================================================================== -->
+  <div class="section">
+    <h2>Error Handling Tests</h2>
+    <p class="hint">
+      Runs a suite of tests to verify that invalid inputs are properly rejected and round-trip verification works across all networks.
+    </p>
+    <div class="btn-group">
+      <button id="btn-error-tests" disabled>Run Error Tests</button>
+    </div>
+
+    <div class="output" id="error-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('error-result')">Copy</button></div>
+      <pre id="error-result"></pre>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- Activity Log -->
+  <!-- ================================================================== -->
+  <div class="section">
+    <h2>Activity Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- Script -->
+  <!-- ================================================================== -->
+  <script type="module">
+    import {
+      initWasm, state, log, json,
+      showResult, showJson, showError,
+      requireWallet, enableBtns, copyOutput,
+      generate_keys, restore_keys, check_proxy_url, WasmWallet,
+      fillWalletData,
+      PROXY_URL, VSS_URL,
+    } from './lib/shared.js';
+
+    // -----------------------------------------------------------------
+    // WASM Init
+    // -----------------------------------------------------------------
+    const ok = await initWasm();
+    if (ok) {
+      enableBtns([
+        'btn-auto-setup', 'btn-generate', 'btn-create-wallet',
+        'btn-check-proxy', 'btn-error-tests',
+      ]);
+    }
+
+    // Buttons that require a wallet to be created
+    const walletBtns = [
+      'btn-backup', 'btn-backup-info', 'btn-restore-backup',
+      'btn-vss-configure', 'btn-vss-disable',
+      'btn-vss-backup', 'btn-vss-restore', 'btn-vss-info',
+    ];
+
+    // -----------------------------------------------------------------
+    // Wallet Setup — Auto
+    // -----------------------------------------------------------------
+    document.getElementById('btn-auto-setup').addEventListener('click', async () => {
+      try {
+        log('Auto-setup: generating keys...', 'log-info');
+        const keys = generate_keys('regtest');
+        const wd = fillWalletData(keys, 'regtest');
+        log('Auto-setup: creating wallet...', 'log-info');
+        state.wallet = await WasmWallet.create(JSON.stringify(wd));
+        const walletData = state.wallet.get_wallet_data();
+        showResult('setup-output', 'setup-result',
+          'Wallet created (auto-setup)\n\nMnemonic: ' + keys.mnemonic + '\n\n' + json(walletData));
+        enableBtns(walletBtns);
+        log('Auto-setup complete', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Auto-setup failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Wallet Setup — Manual: Generate Keys
+    // -----------------------------------------------------------------
+    document.getElementById('btn-generate').addEventListener('click', () => {
+      const network = document.getElementById('gen-network').value;
+      try {
+        const keys = generate_keys(network);
+        fillWalletData(keys, network);
+        showResult('setup-output', 'setup-result',
+          'Keys generated for ' + network + '\n\nMnemonic: ' + keys.mnemonic + '\n\nWalletData JSON filled below.');
+        log('generate_keys(' + network + ') OK', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Generate keys failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Wallet Setup — Manual: Create Wallet
+    // -----------------------------------------------------------------
+    document.getElementById('btn-create-wallet').addEventListener('click', async () => {
+      const walletDataJson = document.getElementById('wallet-data').value.trim();
+      if (!walletDataJson) {
+        showResult('setup-output', 'setup-result', 'Enter WalletData JSON or generate keys first');
+        return;
+      }
+      try {
+        log('Creating wallet...', 'log-info');
+        state.wallet = await WasmWallet.create(walletDataJson);
+        const wd = state.wallet.get_wallet_data();
+        showResult('setup-output', 'setup-result',
+          'Wallet created successfully\n\n' + json(wd));
+        enableBtns(walletBtns);
+        log('Wallet created', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Wallet creation failed', e);
+        state.wallet = null;
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Local Backup — Download
+    // -----------------------------------------------------------------
+    document.getElementById('btn-backup').addEventListener('click', () => {
+      if (!requireWallet('backup-output', 'backup-result')) return;
+      const password = document.getElementById('backup-password').value;
+      if (!password) {
+        showResult('backup-output', 'backup-result', 'Please enter a backup password');
+        log('Backup: no password provided', 'log-warn');
+        return;
+      }
+      try {
+        log('Creating backup...', 'log-info');
+        const bytes = state.wallet.backup(password);
+        const blob = new Blob([bytes], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'rgb-wallet-backup-' + Date.now() + '.rgbbackup';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showResult('backup-output', 'backup-result',
+          'Backup downloaded (' + bytes.length + ' bytes)');
+        log('Backup created and downloaded (' + bytes.length + ' bytes)', 'log-ok');
+      } catch (e) {
+        showError('backup-output', 'backup-result', 'Backup failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Local Backup — Check Status
+    // -----------------------------------------------------------------
+    document.getElementById('btn-backup-info').addEventListener('click', () => {
+      if (!requireWallet('backup-output', 'backup-result')) return;
+      try {
+        const needsBackup = state.wallet.backup_info();
+        const msg = needsBackup
+          ? 'Backup required: wallet has been modified since last backup'
+          : 'Backup up to date: no changes since last backup';
+        showResult('backup-output', 'backup-result', msg);
+        log('backup_info: needs_backup=' + needsBackup, 'log-ok');
+      } catch (e) {
+        showError('backup-output', 'backup-result', 'Backup info failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Local Backup — Restore from File
+    // -----------------------------------------------------------------
+    document.getElementById('btn-restore-backup').addEventListener('click', async () => {
+      if (!requireWallet('backup-output', 'backup-result')) return;
+      const fileInput = document.getElementById('restore-file');
+      const password = document.getElementById('restore-password').value;
+      if (!fileInput.files || fileInput.files.length === 0) {
+        showResult('backup-output', 'backup-result', 'Please select a backup file');
+        log('Restore: no file selected', 'log-warn');
+        return;
+      }
+      if (!password) {
+        showResult('backup-output', 'backup-result', 'Please enter the restore password');
+        log('Restore: no password provided', 'log-warn');
+        return;
+      }
+      try {
+        log('Reading backup file...', 'log-info');
+        const file = fileInput.files[0];
+        const arrayBuffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        log('Restoring backup (' + bytes.length + ' bytes)...', 'log-info');
+        state.wallet.restore_backup(bytes, password);
+        showResult('backup-output', 'backup-result',
+          'Backup restored successfully from "' + file.name + '" (' + bytes.length + ' bytes)');
+        log('Backup restored from "' + file.name + '"', 'log-ok');
+      } catch (e) {
+        showError('backup-output', 'backup-result', 'Restore failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // VSS — Configure
+    // -----------------------------------------------------------------
+    document.getElementById('btn-vss-configure').addEventListener('click', () => {
+      if (!requireWallet('vss-output', 'vss-result')) return;
+      const url = document.getElementById('vss-url').value.trim();
+      const storeId = document.getElementById('vss-store-id').value.trim();
+      const signingKey = document.getElementById('vss-signing-key').value.trim();
+      if (!url || !storeId || !signingKey) {
+        showResult('vss-output', 'vss-result', 'Please fill in all VSS fields (URL, Store ID, Signing Key)');
+        log('VSS configure: missing fields', 'log-warn');
+        return;
+      }
+      try {
+        state.wallet.configure_vss_backup(url, storeId, signingKey);
+        showResult('vss-output', 'vss-result',
+          'VSS backup configured\n  Server: ' + url + '\n  Store ID: ' + storeId);
+        log('VSS configured: ' + url + ' / ' + storeId, 'log-ok');
+      } catch (e) {
+        showError('vss-output', 'vss-result', 'VSS configure failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // VSS — Disable
+    // -----------------------------------------------------------------
+    document.getElementById('btn-vss-disable').addEventListener('click', () => {
+      if (!requireWallet('vss-output', 'vss-result')) return;
+      state.wallet.disable_vss_backup();
+      showResult('vss-output', 'vss-result', 'VSS backup disabled');
+      log('VSS backup disabled', 'log-ok');
+    });
+
+    // -----------------------------------------------------------------
+    // VSS — Backup
+    // -----------------------------------------------------------------
+    document.getElementById('btn-vss-backup').addEventListener('click', async () => {
+      if (!requireWallet('vss-output', 'vss-result')) return;
+      try {
+        log('VSS backup in progress...', 'log-info');
+        const version = await state.wallet.vss_backup();
+        showResult('vss-output', 'vss-result',
+          'VSS backup complete\n  Server version: ' + version);
+        log('VSS backup OK, version=' + version, 'log-ok');
+      } catch (e) {
+        showError('vss-output', 'vss-result', 'VSS backup failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // VSS — Restore
+    // -----------------------------------------------------------------
+    document.getElementById('btn-vss-restore').addEventListener('click', async () => {
+      if (!requireWallet('vss-output', 'vss-result')) return;
+      try {
+        log('VSS restore in progress...', 'log-info');
+        await state.wallet.vss_restore_backup();
+        showResult('vss-output', 'vss-result', 'VSS restore complete');
+        log('VSS restore OK', 'log-ok');
+      } catch (e) {
+        showError('vss-output', 'vss-result', 'VSS restore failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // VSS — Info
+    // -----------------------------------------------------------------
+    document.getElementById('btn-vss-info').addEventListener('click', async () => {
+      if (!requireWallet('vss-output', 'vss-result')) return;
+      try {
+        log('Querying VSS info...', 'log-info');
+        const info = await state.wallet.vss_backup_info();
+        showJson('vss-output', 'vss-result', info);
+        log('VSS info retrieved', 'log-ok');
+      } catch (e) {
+        showError('vss-output', 'vss-result', 'VSS info failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Check Proxy URL
+    // -----------------------------------------------------------------
+    document.getElementById('btn-check-proxy').addEventListener('click', async () => {
+      const url = document.getElementById('proxy-url').value.trim();
+      if (!url) {
+        showResult('proxy-output', 'proxy-result', 'Please enter a proxy URL');
+        return;
+      }
+      try {
+        log('Checking proxy: ' + url + '...', 'log-info');
+        await check_proxy_url(url);
+        showResult('proxy-output', 'proxy-result',
+          'Proxy URL is valid: ' + url);
+        log('check_proxy_url OK: ' + url, 'log-ok');
+      } catch (e) {
+        showError('proxy-output', 'proxy-result', 'Proxy check failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Error Handling Tests
+    // -----------------------------------------------------------------
+    document.getElementById('btn-error-tests').addEventListener('click', () => {
+      const lines = [];
+      let passCount = 0;
+      let failCount = 0;
+
+      function record(pass, label, detail) {
+        const tag = pass ? '[PASS]' : '[FAIL]';
+        lines.push(tag + ' ' + label + (detail ? ' -- ' + detail : ''));
+        if (pass) passCount++; else failCount++;
+      }
+
+      // Test 1: invalid network in generate_keys
+      try {
+        generate_keys('invalid_network');
+        record(false, 'generate_keys("invalid_network")', 'expected error but succeeded');
+      } catch (e) {
+        record(true, 'generate_keys("invalid_network")', 'rejected: ' + e);
+      }
+
+      // Test 2: bad mnemonic in restore_keys
+      try {
+        restore_keys('regtest', 'not a valid mnemonic phrase at all');
+        record(false, 'restore_keys(bad mnemonic)', 'expected error but succeeded');
+      } catch (e) {
+        record(true, 'restore_keys(bad mnemonic)', 'rejected: ' + e);
+      }
+
+      // Test 3: empty mnemonic in restore_keys
+      try {
+        restore_keys('regtest', '');
+        record(false, 'restore_keys(empty mnemonic)', 'expected error but succeeded');
+      } catch (e) {
+        record(true, 'restore_keys(empty mnemonic)', 'rejected: ' + e);
+      }
+
+      // Test 4: round-trip verification for all networks
+      const networks = ['regtest', 'testnet', 'signet', 'mainnet'];
+      for (const net of networks) {
+        try {
+          const generated = generate_keys(net);
+          const restored = restore_keys(net, generated.mnemonic);
+          const fields = Object.keys(generated);
+          let allMatch = true;
+          for (const field of fields) {
+            if (JSON.stringify(generated[field]) !== JSON.stringify(restored[field])) {
+              allMatch = false;
+              break;
+            }
+          }
+          record(allMatch, 'round-trip ' + net,
+            allMatch ? 'all fields match' : 'mismatch detected');
+        } catch (e) {
+          record(false, 'round-trip ' + net, 'error: ' + e);
+        }
+      }
+
+      // Summary
+      lines.push('');
+      lines.push('Summary: ' + passCount + ' passed, ' + failCount + ' failed, ' + (passCount + failCount) + ' total');
+
+      showResult('error-output', 'error-result', lines.join('\n'));
+      const allPassed = failCount === 0;
+      log('Error tests: ' + passCount + '/' + (passCount + failCount) + ' passed',
+        allPassed ? 'log-ok' : 'log-err');
+    });
+  </script>
+</body>
+</html>

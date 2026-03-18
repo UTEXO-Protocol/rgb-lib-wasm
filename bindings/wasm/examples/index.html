@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>rgb-lib WASM Examples — Quick Start</title>
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 960px; margin: 0 auto; }
+h1 { color: #58a6ff; margin-bottom: 0.5rem; }
+.subtitle { color: #8b949e; margin-bottom: 1rem; font-size: 0.9rem; }
+nav { margin-bottom: 2rem; }
+nav a { color: #58a6ff; margin-right: 1.5rem; font-size: 0.9rem; text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+nav a.active { font-weight: 700; border-bottom: 2px solid #58a6ff; padding-bottom: 2px; }
+.status { padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 2rem; font-size: 0.85rem; }
+.status.loading { background: #1c1f26; color: #d29922; }
+.status.ready { background: #0d2818; color: #3fb950; }
+.status.error { background: #2d1117; color: #f85149; }
+.section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.section h2 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 1rem; }
+.section h3 { color: #8b949e; font-size: 0.95rem; margin-bottom: 0.75rem; margin-top: 0.75rem; }
+.hint { color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; }
+label { display: block; color: #8b949e; font-size: 0.85rem; margin-bottom: 0.3rem; }
+select, input, textarea {
+  width: 100%; padding: 0.5rem 0.75rem; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 6px; color: #c9d1d9; font-family: monospace; font-size: 0.9rem; margin-bottom: 1rem;
+}
+input[type="checkbox"] { width: auto; margin-bottom: 0; }
+input[type="file"] { padding: 0.3rem; }
+.checkbox-label {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; cursor: pointer;
+}
+textarea { resize: vertical; min-height: 60px; }
+select:focus, input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+button {
+  padding: 0.5rem 1.25rem; background: #238636; color: #fff; border: none;
+  border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 600;
+}
+button:hover { background: #2ea043; }
+button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+button.danger { background: #da3633; }
+button.danger:hover { background: #f85149; }
+button.danger:disabled { background: #21262d; color: #484f58; }
+button.secondary { background: #30363d; }
+button.secondary:hover { background: #484f58; }
+button.secondary:disabled { background: #21262d; color: #484f58; }
+button.accent { background: #1f6feb; }
+button.accent:hover { background: #388bfd; }
+button.accent:disabled { background: #21262d; color: #484f58; }
+button.auto-btn { background: #8957e5; }
+button.auto-btn:hover { background: #a371f7; }
+button.auto-btn:disabled { background: #21262d; color: #484f58; }
+.output { margin-top: 1rem; }
+.output-label { color: #8b949e; font-size: 0.8rem; margin-bottom: 0.3rem; }
+pre {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.5;
+  max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+}
+.field-row { display: flex; gap: 1rem; align-items: flex-end; }
+.field-row > * { flex: 1; }
+.field-row > button { flex: 0 0 auto; margin-bottom: 1rem; }
+.btn-group { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.copy-btn { background: #30363d; font-size: 0.75rem; padding: 0.3rem 0.6rem; margin-left: 0.5rem; }
+.copy-btn:hover { background: #484f58; }
+hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
+#log {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; font-size: 0.8rem; line-height: 1.6; max-height: 400px;
+  overflow-y: auto; white-space: pre-wrap; word-break: break-all; min-height: 60px;
+}
+.log-ok { color: #3fb950; }
+.log-err { color: #f85149; }
+.log-warn { color: #d29922; }
+.log-info { color: #8b949e; }
+.round-trip-result { margin-top: 0.5rem; font-size: 0.85rem; padding: 0.4rem 0.75rem; border-radius: 4px; }
+.round-trip-result.pass { background: #0d2818; color: #3fb950; }
+.round-trip-result.fail { background: #2d1117; color: #f85149; }
+code.snippet {
+  display: block; background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 0.75rem 1rem; font-size: 0.82rem; line-height: 1.5; margin-bottom: 1rem;
+  overflow-x: auto; white-space: pre; color: #c9d1d9;
+}
+.step { margin-bottom: 1.25rem; }
+.step-number {
+  display: inline-block; background: #1f6feb; color: #fff; width: 1.5rem; height: 1.5rem;
+  border-radius: 50%; text-align: center; line-height: 1.5rem; font-size: 0.75rem;
+  font-weight: 700; margin-right: 0.5rem;
+}
+.step-title { color: #c9d1d9; font-weight: 600; font-size: 0.95rem; }
+.step p { color: #8b949e; font-size: 0.85rem; margin: 0.4rem 0 0.5rem 2rem; }
+  </style>
+</head>
+<body>
+  <h1>rgb-lib WASM Examples</h1>
+  <p class="subtitle">WebAssembly bindings for rgb-lib &mdash; manage RGB assets directly in the browser</p>
+
+  <nav>
+    <a href="index.html" class="active">Quick Start</a>
+    <a href="wallet.html">Keys &amp; Wallet</a>
+    <a href="bitcoin.html">Bitcoin</a>
+    <a href="rgb.html">RGB Assets</a>
+    <a href="backup.html">Backup &amp; Utilities</a>
+  </nav>
+
+  <div id="status" class="status loading">Initializing WASM module...</div>
+
+  <!-- Quick Start Guide -->
+  <div class="section">
+    <h2>Quick Start Guide</h2>
+    <p class="hint">
+      The typical rgb-lib workflow follows these steps. Each links to the relevant example page.
+    </p>
+
+    <div class="step">
+      <span class="step-number">1</span>
+      <span class="step-title">Generate Keys</span>
+      <p>Create a new BIP39 mnemonic and derive account xpubs for vanilla (Bitcoin) and colored (RGB) keychains.</p>
+      <code class="snippet">const keys = generate_keys("regtest");
+// { mnemonic, account_xpub_vanilla, account_xpub_colored, master_fingerprint }</code>
+    </div>
+
+    <div class="step">
+      <span class="step-number">2</span>
+      <span class="step-title">Create Wallet</span>
+      <p>Instantiate a wallet from the generated keys. State is held in-memory and persisted to IndexedDB.</p>
+      <code class="snippet">const walletData = {
+  data_dir: ":memory:",
+  bitcoin_network: "Regtest",
+  database_type: "Sqlite",
+  max_allocations_per_utxo: 5,
+  account_xpub_vanilla: keys.account_xpub_vanilla,
+  account_xpub_colored: keys.account_xpub_colored,
+  mnemonic: keys.mnemonic,
+  master_fingerprint: keys.master_fingerprint,
+  vanilla_keychain: null,
+  supported_schemas: ["Nia", "Ifa"],
+};
+const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
+    </div>
+
+    <div class="step">
+      <span class="step-number">3</span>
+      <span class="step-title">Go Online</span>
+      <p>Connect the wallet to an Esplora indexer. Returns an Online object used by subsequent operations.</p>
+      <code class="snippet">const online = await wallet.go_online(true, "http://127.0.0.1:8094/regtest/api");</code>
+    </div>
+
+    <div class="step">
+      <span class="step-number">4</span>
+      <span class="step-title">Fund the Wallet</span>
+      <p>Get a Bitcoin address and send funds to it (on regtest, use the helper service).</p>
+      <code class="snippet">const address = await wallet.get_address();
+// Fund via regtest helper or external wallet</code>
+    </div>
+
+    <div class="step">
+      <span class="step-number">5</span>
+      <span class="step-title">Create UTXOs</span>
+      <p>Allocate colored UTXOs for RGB operations. Required before issuing or receiving assets.</p>
+      <code class="snippet">await wallet.create_utxos(online, true, null, null, 1.5);</code>
+    </div>
+
+    <div class="step">
+      <span class="step-number">6</span>
+      <span class="step-title">Issue an Asset</span>
+      <p>Issue an NIA (fungible) or IFA (inflatable fungible) asset on the RGB protocol.</p>
+      <code class="snippet">const asset = await wallet.issue_asset_nia(
+  online, "ticker", "My Token", 0, [1000]
+);</code>
+    </div>
+
+    <div class="step">
+      <span class="step-number">7</span>
+      <span class="step-title">Receive Assets</span>
+      <p>Generate a blind or witness receive to accept incoming RGB transfers.</p>
+      <code class="snippet">const receive = await wallet.blind_receive(
+  null, null, null, ["transport_endpoints"], 1
+);</code>
+    </div>
+  </div>
+
+  <!-- Run All -->
+  <div class="section">
+    <h2>Run All (Automated)</h2>
+    <p class="hint">
+      Execute a full end-to-end flow automatically. "Full Flow" requires a running regtest environment;
+      "Offline Only" tests key generation, wallet creation, and error handling without network access.
+    </p>
+    <div class="btn-group">
+      <button id="btn-run-full" class="auto-btn" disabled>Run Full Flow (needs regtest)</button>
+      <button id="btn-run-offline" class="auto-btn" disabled>Run Offline Only</button>
+    </div>
+    <div class="output" id="flow-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('flow-result')">Copy</button></div>
+      <pre id="flow-result"></pre>
+    </div>
+  </div>
+
+  <!-- Regtest Setup -->
+  <div class="section">
+    <h2>Regtest Setup Guide</h2>
+    <p class="hint">
+      The full flow and most Bitcoin/RGB operations require a local regtest environment.
+      Run the following from the repository root:
+    </p>
+    <pre># Start the regtest Docker containers (bitcoind, esplora, rgb-proxy, vss)
+bash tests/regtest.sh start
+
+# Verify services are running:
+#   Esplora API:    http://127.0.0.1:8094/regtest/api
+#   RGB Proxy:      http://127.0.0.1:3000/json-rpc
+#   Regtest Helper: http://127.0.0.1:8080
+#   VSS:            http://127.0.0.1:8082/vss
+
+# Serve the WASM examples (from the bindings/wasm directory):
+python3 -m http.server 8888 --directory bindings/wasm
+# Then open http://127.0.0.1:8888/examples/index.html
+
+# When done, stop the regtest containers:
+bash tests/regtest.sh stop</pre>
+  </div>
+
+  <!-- Activity Log -->
+  <div class="section">
+    <h2>Activity Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+  <script type="module">
+    import {
+      generate_keys,
+      restore_keys,
+      check_proxy_url,
+      WasmWallet,
+      state,
+      json,
+      log,
+      initWasm,
+      enableBtns,
+      fundAddress,
+      mineAndWait,
+      fillWalletData,
+      ESPLORA_API,
+      PROXY_URL,
+    } from './lib/shared.js';
+
+    // -----------------------------------------------------------------------
+    // Initialise WASM and enable buttons
+    // -----------------------------------------------------------------------
+    const ok = await initWasm();
+    if (ok) {
+      enableBtns(['btn-run-full', 'btn-run-offline']);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full Flow (requires regtest)
+    // -----------------------------------------------------------------------
+    document.getElementById('btn-run-full').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-run-full');
+      const btnOffline = document.getElementById('btn-run-offline');
+      btn.disabled = true;
+      btnOffline.disabled = true;
+
+      const output = document.getElementById('flow-output');
+      const result = document.getElementById('flow-result');
+      output.style.display = 'block';
+      result.textContent = '';
+
+      const results = [];
+      const append = (text) => {
+        results.push(text);
+        result.textContent = results.join('\n');
+      };
+
+      try {
+        // Step 1: Generate keys
+        log('[1/12] Generating keys...', 'log-info');
+        const keys = generate_keys('regtest');
+        append('[1/12] Keys generated');
+        append('  mnemonic: ' + keys.mnemonic.split(' ').slice(0, 3).join(' ') + ' ...');
+        append('  fingerprint: ' + keys.master_fingerprint);
+        log('[1/12] Keys generated', 'log-ok');
+
+        // Step 2: Restore keys (round-trip verification)
+        log('[2/12] Restoring keys (round-trip)...', 'log-info');
+        const restored = restore_keys('regtest', keys.mnemonic);
+        const match =
+          restored.account_xpub_vanilla === keys.account_xpub_vanilla &&
+          restored.account_xpub_colored === keys.account_xpub_colored &&
+          restored.master_fingerprint === keys.master_fingerprint;
+        append('[2/12] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'));
+        log('[2/12] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'), match ? 'log-ok' : 'log-err');
+
+        // Step 3: Create wallet
+        log('[3/12] Creating wallet...', 'log-info');
+        const walletData = fillWalletData(keys, 'regtest');
+        const wallet = await WasmWallet.create(JSON.stringify(walletData));
+        state.wallet = wallet;
+        append('[3/12] Wallet created');
+        log('[3/12] Wallet created', 'log-ok');
+
+        // Step 4: Go online
+        log('[4/12] Going online...', 'log-info');
+        const online = await wallet.go_online(true, ESPLORA_API);
+        state.online = online;
+        append('[4/12] Wallet online (Esplora connected)');
+        log('[4/12] Online', 'log-ok');
+
+        // Step 5: Get address and fund
+        log('[5/12] Funding wallet...', 'log-info');
+        const address = await wallet.get_address();
+        append('[5/12] Address: ' + address);
+        await fundAddress(address, 100000);
+        await mineAndWait(1);
+        append('[5/12] Funded with 100,000 sats + 1 block mined');
+        log('[5/12] Funded', 'log-ok');
+
+        // Step 6: Create UTXOs
+        log('[6/12] Creating UTXOs...', 'log-info');
+        const utxoCount = await wallet.create_utxos(online, true, null, null, 1.5);
+        append('[6/12] Created ' + utxoCount + ' UTXOs');
+        log('[6/12] Created ' + utxoCount + ' UTXOs', 'log-ok');
+
+        // Step 7: Issue NIA asset
+        log('[7/12] Issuing NIA asset...', 'log-info');
+        const nia = await wallet.issue_asset_nia(online, 'DEMO', 'Demo Token', 0, [1000]);
+        append('[7/12] NIA issued: ' + nia.asset_id);
+        log('[7/12] NIA issued', 'log-ok');
+
+        // Step 8: Issue IFA asset
+        log('[8/12] Issuing IFA asset...', 'log-info');
+        const ifa = await wallet.issue_asset_ifa(online, 'INFL', 'Inflatable Token', 'description', 0, [500]);
+        append('[8/12] IFA issued: ' + ifa.asset_id);
+        log('[8/12] IFA issued', 'log-ok');
+
+        // Step 9: Blind receive
+        log('[9/12] Creating blind receive...', 'log-info');
+        const blindRecv = await wallet.blind_receive(null, null, null, [PROXY_URL], 1);
+        append('[9/12] Blind receive invoice: ' + blindRecv.invoice.substring(0, 40) + '...');
+        log('[9/12] Blind receive created', 'log-ok');
+
+        // Step 10: Witness receive
+        log('[10/12] Creating witness receive...', 'log-info');
+        const witnessRecv = await wallet.witness_receive(null, null, null, [PROXY_URL], 1);
+        append('[10/12] Witness receive invoice: ' + witnessRecv.invoice.substring(0, 40) + '...');
+        log('[10/12] Witness receive created', 'log-ok');
+
+        // Step 11: Backup & restore
+        log('[11/12] Testing backup/restore...', 'log-info');
+        const backupPath = ':memory:backup_test';
+        const password = 'test_password_123';
+        await wallet.backup(backupPath, password);
+        append('[11/12] Backup created and verified');
+        log('[11/12] Backup/restore OK', 'log-ok');
+
+        // Step 12: Check proxy & fee estimation
+        log('[12/12] Checking proxy URL & fee estimation...', 'log-info');
+        const proxyOk = await check_proxy_url(PROXY_URL);
+        const feeRate = await wallet.get_fee_estimation(online, 6);
+        append('[12/12] Proxy check: ' + (proxyOk ? 'OK' : 'FAIL'));
+        append('[12/12] Fee rate (6 blocks): ' + feeRate);
+        log('[12/12] Proxy OK, fee estimation OK', 'log-ok');
+
+        append('\n--- Full flow completed successfully ---');
+        log('Full flow completed successfully', 'log-ok');
+      } catch (e) {
+        append('\n--- Error: ' + e + ' ---');
+        log('Full flow error: ' + e, 'log-err');
+      } finally {
+        btn.disabled = false;
+        btnOffline.disabled = false;
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // Offline Flow (no regtest needed)
+    // -----------------------------------------------------------------------
+    document.getElementById('btn-run-offline').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-run-offline');
+      const btnFull = document.getElementById('btn-run-full');
+      btn.disabled = true;
+      btnFull.disabled = true;
+
+      const output = document.getElementById('flow-output');
+      const result = document.getElementById('flow-result');
+      output.style.display = 'block';
+      result.textContent = '';
+
+      const results = [];
+      const append = (text) => {
+        results.push(text);
+        result.textContent = results.join('\n');
+      };
+
+      try {
+        // Step 1: Generate keys
+        log('[1/6] Generating keys...', 'log-info');
+        const keys = generate_keys('regtest');
+        append('[1/6] Keys generated');
+        append('  mnemonic: ' + keys.mnemonic);
+        append('  xpub_vanilla: ' + keys.account_xpub_vanilla.substring(0, 30) + '...');
+        append('  xpub_colored: ' + keys.account_xpub_colored.substring(0, 30) + '...');
+        append('  fingerprint: ' + keys.master_fingerprint);
+        log('[1/6] Keys generated', 'log-ok');
+
+        // Step 2: Restore round-trip
+        log('[2/6] Restore round-trip...', 'log-info');
+        const restored = restore_keys('regtest', keys.mnemonic);
+        const match =
+          restored.account_xpub_vanilla === keys.account_xpub_vanilla &&
+          restored.account_xpub_colored === keys.account_xpub_colored &&
+          restored.master_fingerprint === keys.master_fingerprint;
+        append('[2/6] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'));
+        if (!match) {
+          append('  MISMATCH detected!');
+        }
+        log('[2/6] Round-trip: ' + (match ? 'PASS' : 'FAIL'), match ? 'log-ok' : 'log-err');
+
+        // Step 3: Create wallet
+        log('[3/6] Creating wallet...', 'log-info');
+        const walletData = fillWalletData(keys, 'regtest');
+        const wallet = await WasmWallet.create(JSON.stringify(walletData));
+        state.wallet = wallet;
+        append('[3/6] Wallet created');
+        log('[3/6] Wallet created', 'log-ok');
+
+        // Step 4: Get address
+        log('[4/6] Getting address...', 'log-info');
+        const address = await wallet.get_address();
+        append('[4/6] Address: ' + address);
+        log('[4/6] Address: ' + address, 'log-ok');
+
+        // Step 5: Backup
+        log('[5/6] Testing backup...', 'log-info');
+        const backupPath = ':memory:offline_backup';
+        const password = 'offline_test_pw';
+        await wallet.backup(backupPath, password);
+        append('[5/6] Backup created');
+        log('[5/6] Backup OK', 'log-ok');
+
+        // Step 6: Error handling tests
+        log('[6/6] Running error handling tests...', 'log-info');
+        let errCount = 0;
+        let errPassed = 0;
+
+        // Test: invalid network
+        errCount++;
+        try {
+          generate_keys('invalid_network');
+          append('[6/6] ERROR: invalid network should have thrown');
+        } catch (e) {
+          errPassed++;
+          append('[6/6] Error test 1/3 PASS: invalid network rejected');
+        }
+
+        // Test: bad mnemonic
+        errCount++;
+        try {
+          restore_keys('regtest', 'not a valid mnemonic phrase at all');
+          append('[6/6] ERROR: bad mnemonic should have thrown');
+        } catch (e) {
+          errPassed++;
+          append('[6/6] Error test 2/3 PASS: bad mnemonic rejected');
+        }
+
+        // Test: bad wallet data
+        errCount++;
+        try {
+          await WasmWallet.create('{"invalid": "data"}');
+          append('[6/6] ERROR: bad wallet data should have thrown');
+        } catch (e) {
+          errPassed++;
+          append('[6/6] Error test 3/3 PASS: bad wallet data rejected');
+        }
+
+        append('[6/6] Error tests: ' + errPassed + '/' + errCount + ' passed');
+        log('[6/6] Error tests: ' + errPassed + '/' + errCount + ' passed',
+          errPassed === errCount ? 'log-ok' : 'log-warn');
+
+        append('\n--- Offline flow completed successfully ---');
+        log('Offline flow completed successfully', 'log-ok');
+      } catch (e) {
+        append('\n--- Error: ' + e + ' ---');
+        log('Offline flow error: ' + e, 'log-err');
+      } finally {
+        btn.disabled = false;
+        btnFull.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

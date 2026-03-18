@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Bitcoin Operations - rgb-lib-wasm Examples</title>
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 960px; margin: 0 auto; }
+h1 { color: #58a6ff; margin-bottom: 0.5rem; }
+.subtitle { color: #8b949e; margin-bottom: 1rem; font-size: 0.9rem; }
+nav { margin-bottom: 2rem; }
+nav a { color: #58a6ff; margin-right: 1.5rem; font-size: 0.9rem; text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+nav a.active { font-weight: 700; border-bottom: 2px solid #58a6ff; padding-bottom: 2px; }
+.status { padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 2rem; font-size: 0.85rem; }
+.status.loading { background: #1c1f26; color: #d29922; }
+.status.ready { background: #0d2818; color: #3fb950; }
+.status.error { background: #2d1117; color: #f85149; }
+.section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.section h2 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 1rem; }
+.section h3 { color: #8b949e; font-size: 0.95rem; margin-bottom: 0.75rem; margin-top: 0.75rem; }
+.hint { color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; }
+label { display: block; color: #8b949e; font-size: 0.85rem; margin-bottom: 0.3rem; }
+select, input, textarea {
+  width: 100%; padding: 0.5rem 0.75rem; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 6px; color: #c9d1d9; font-family: monospace; font-size: 0.9rem; margin-bottom: 1rem;
+}
+input[type="checkbox"] { width: auto; margin-bottom: 0; }
+input[type="file"] { padding: 0.3rem; }
+.checkbox-label {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; cursor: pointer;
+}
+textarea { resize: vertical; min-height: 60px; }
+select:focus, input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+button {
+  padding: 0.5rem 1.25rem; background: #238636; color: #fff; border: none;
+  border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 600;
+}
+button:hover { background: #2ea043; }
+button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+button.danger { background: #da3633; }
+button.danger:hover { background: #f85149; }
+button.danger:disabled { background: #21262d; color: #484f58; }
+button.secondary { background: #30363d; }
+button.secondary:hover { background: #484f58; }
+button.secondary:disabled { background: #21262d; color: #484f58; }
+button.accent { background: #1f6feb; }
+button.accent:hover { background: #388bfd; }
+button.accent:disabled { background: #21262d; color: #484f58; }
+button.auto-btn { background: #8957e5; }
+button.auto-btn:hover { background: #a371f7; }
+button.auto-btn:disabled { background: #21262d; color: #484f58; }
+.output { margin-top: 1rem; }
+.output-label { color: #8b949e; font-size: 0.8rem; margin-bottom: 0.3rem; }
+pre {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.5;
+  max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+}
+.field-row { display: flex; gap: 1rem; align-items: flex-end; }
+.field-row > * { flex: 1; }
+.field-row > button { flex: 0 0 auto; margin-bottom: 1rem; }
+.btn-group { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.copy-btn { background: #30363d; font-size: 0.75rem; padding: 0.3rem 0.6rem; margin-left: 0.5rem; }
+.copy-btn:hover { background: #484f58; }
+hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
+#log {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; font-size: 0.8rem; line-height: 1.6; max-height: 400px;
+  overflow-y: auto; white-space: pre-wrap; word-break: break-all; min-height: 60px;
+}
+.log-ok { color: #3fb950; }
+.log-err { color: #f85149; }
+.log-warn { color: #d29922; }
+.log-info { color: #8b949e; }
+.round-trip-result { margin-top: 0.5rem; font-size: 0.85rem; padding: 0.4rem 0.75rem; border-radius: 4px; }
+.round-trip-result.pass { background: #0d2818; color: #3fb950; }
+.round-trip-result.fail { background: #2d1117; color: #f85149; }
+  </style>
+</head>
+<body>
+  <h1>Bitcoin Operations</h1>
+  <p class="subtitle">Send BTC, drain wallets, and manage PSBTs with rgb-lib-wasm</p>
+
+  <!-- Nav bar -->
+  <nav>
+    <a href="index.html">Quick Start</a>
+    <a href="wallet.html">Keys &amp; Wallet</a>
+    <a href="bitcoin.html" class="active">Bitcoin</a>
+    <a href="rgb.html">RGB Assets</a>
+    <a href="backup.html">Backup &amp; Utilities</a>
+  </nav>
+
+  <!-- WASM Status -->
+  <div id="status" class="status loading">Initializing WASM module...</div>
+
+  <!-- 1. Wallet Setup (quick) -->
+  <div class="section">
+    <h2>Wallet Setup</h2>
+    <p class="hint">Quick wallet setup for this page. Use the auto button for one-click setup, or expand manual controls below.</p>
+
+    <div class="btn-group">
+      <button id="btn-auto-setup" class="auto-btn" disabled>Auto: Generate + Create + Go Online</button>
+    </div>
+
+    <hr class="divider" />
+
+    <h3>Manual Setup</h3>
+    <div class="field-row">
+      <div>
+        <label for="gen-network">Network</label>
+        <select id="gen-network">
+          <option value="regtest" selected>Regtest</option>
+          <option value="testnet">Testnet</option>
+          <option value="signet">Signet</option>
+          <option value="mainnet">Mainnet</option>
+        </select>
+      </div>
+      <button id="btn-generate" disabled>Generate Keys</button>
+    </div>
+    <div>
+      <label for="wallet-data">WalletData JSON (auto-filled from generated keys)</label>
+      <textarea id="wallet-data" rows="6" placeholder='{"data_dir": ":memory:", "bitcoin_network": "Regtest", ...}'></textarea>
+    </div>
+    <div class="btn-group">
+      <button id="btn-create-wallet" disabled>Create Wallet</button>
+    </div>
+
+    <h3>Go Online</h3>
+    <div class="field-row">
+      <div>
+        <label for="indexer-url">Indexer URL</label>
+        <input id="indexer-url" type="text" value="http://127.0.0.1:8094/regtest/api" />
+      </div>
+      <button id="btn-go-online" disabled>Go Online</button>
+      <button id="btn-sync" class="secondary" disabled>Sync</button>
+    </div>
+
+    <div class="output" id="setup-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('setup-result')">Copy</button></div>
+      <pre id="setup-result"></pre>
+    </div>
+  </div>
+
+  <!-- 2. Send BTC -->
+  <div class="section">
+    <h2>Send BTC</h2>
+    <p class="hint">
+      Three-step PSBT workflow: Begin &rarr; Sign &rarr; End. Or use Quick (auto) for all 3 in one click.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="send-btc-address">Destination address</label>
+        <input id="send-btc-address" type="text" placeholder="bcrt1... / tb1q..." />
+      </div>
+      <div>
+        <label for="send-btc-amount">Amount (sats)</label>
+        <input id="send-btc-amount" type="number" value="1000" min="1" />
+      </div>
+      <div>
+        <label for="send-btc-fee-rate">Fee rate (sat/vB)</label>
+        <input id="send-btc-fee-rate" type="number" value="1" min="1" />
+      </div>
+    </div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="send-btc-skip-sync"> Skip sync
+    </label>
+    <div class="btn-group">
+      <button id="btn-send-btc-begin" disabled>1. Begin</button>
+      <button id="btn-send-btc-sign" disabled>2. Sign</button>
+      <button id="btn-send-btc-end" disabled>3. End</button>
+      <button id="btn-send-btc-auto" class="auto-btn" disabled>Quick: Send BTC (auto)</button>
+    </div>
+    <div>
+      <label for="send-btc-unsigned-psbt">Unsigned PSBT</label>
+      <textarea id="send-btc-unsigned-psbt" rows="2" placeholder="Filled automatically by Begin step"></textarea>
+    </div>
+    <div>
+      <label for="send-btc-signed-psbt">Signed PSBT</label>
+      <textarea id="send-btc-signed-psbt" rows="2" placeholder="Filled automatically by Sign step"></textarea>
+    </div>
+    <div class="output" id="send-btc-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('send-btc-result')">Copy</button></div>
+      <pre id="send-btc-result"></pre>
+    </div>
+  </div>
+
+  <!-- 3. Drain Wallet -->
+  <div class="section">
+    <h2>Drain Wallet</h2>
+    <p class="hint">
+      Three-step PSBT workflow: drain all wallet funds to a destination address.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="drain-address">Destination address</label>
+        <input id="drain-address" type="text" placeholder="bcrt1... / tb1q..." />
+      </div>
+      <div>
+        <label for="drain-fee-rate">Fee rate (sat/vB)</label>
+        <input id="drain-fee-rate" type="number" value="1" min="1" />
+      </div>
+    </div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="drain-destroy-assets"> Destroy RGB assets (drain everything)
+    </label>
+    <div class="btn-group">
+      <button id="btn-drain-begin" disabled>1. Begin</button>
+      <button id="btn-drain-sign" disabled>2. Sign</button>
+      <button id="btn-drain-end" disabled>3. End</button>
+      <button id="btn-drain-auto" class="auto-btn" disabled>Quick: Drain (auto)</button>
+    </div>
+    <div>
+      <label for="drain-unsigned-psbt">Unsigned PSBT</label>
+      <textarea id="drain-unsigned-psbt" rows="2" placeholder="Filled automatically by Begin step"></textarea>
+    </div>
+    <div>
+      <label for="drain-signed-psbt">Signed PSBT</label>
+      <textarea id="drain-signed-psbt" rows="2" placeholder="Filled automatically by Sign step"></textarea>
+    </div>
+    <div class="output" id="drain-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('drain-result')">Copy</button></div>
+      <pre id="drain-result"></pre>
+    </div>
+  </div>
+
+  <!-- 4. PSBT Utilities -->
+  <div class="section">
+    <h2>PSBT Utilities</h2>
+    <p class="hint">
+      Standalone sign and finalize operations for manual PSBT handling.
+    </p>
+    <div>
+      <label for="psbt-input">PSBT (base64)</label>
+      <textarea id="psbt-input" rows="4" placeholder="Paste a base64-encoded PSBT here"></textarea>
+    </div>
+    <div class="btn-group">
+      <button id="btn-psbt-sign" disabled>Sign PSBT</button>
+      <button id="btn-psbt-finalize" disabled>Finalize PSBT</button>
+    </div>
+    <div class="output" id="psbt-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('psbt-result')">Copy</button></div>
+      <pre id="psbt-result"></pre>
+    </div>
+  </div>
+
+  <!-- Activity Log -->
+  <div class="section">
+    <h2>Activity Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+  <script type="module">
+    import {
+      initWasm,
+      generate_keys,
+      WasmWallet,
+      state,
+      ESPLORA_API,
+      json,
+      log,
+      showResult,
+      showJson,
+      showError,
+      requireWallet,
+      requireOnline,
+      enableBtns,
+      fillWalletData,
+      copyOutput,
+    } from './lib/shared.js';
+
+    // =======================================================================
+    // Button groups for gating
+    // =======================================================================
+
+    /** Enabled once WASM loads */
+    const wasmBtns = ['btn-auto-setup', 'btn-generate', 'btn-create-wallet'];
+
+    /** Enabled after wallet is created */
+    const walletBtns = [
+      'btn-go-online',
+      'btn-psbt-sign', 'btn-psbt-finalize',
+    ];
+
+    /** Enabled after going online */
+    const onlineBtns = [
+      'btn-sync',
+      'btn-send-btc-begin', 'btn-send-btc-sign', 'btn-send-btc-end', 'btn-send-btc-auto',
+      'btn-drain-begin', 'btn-drain-sign', 'btn-drain-end', 'btn-drain-auto',
+    ];
+
+    // =======================================================================
+    // WASM Init
+    // =======================================================================
+
+    const ok = await initWasm();
+    if (ok) {
+      enableBtns(wasmBtns);
+    }
+
+    // =======================================================================
+    // 1. Wallet Setup
+    // =======================================================================
+
+    // --- Auto setup: generate + create + go online in one click ---
+    document.getElementById('btn-auto-setup').addEventListener('click', async () => {
+      try {
+        log('Auto setup: generating keys...', 'log-warn');
+        const network = document.getElementById('gen-network').value;
+        const keys = generate_keys(network);
+        const wd = fillWalletData(keys, network);
+        log('Auto setup: keys generated', 'log-ok');
+
+        log('Auto setup: creating wallet...', 'log-warn');
+        state.wallet = await WasmWallet.create(json(wd));
+        enableBtns(walletBtns);
+        log('Auto setup: wallet created', 'log-ok');
+
+        log('Auto setup: going online...', 'log-warn');
+        const url = document.getElementById('indexer-url').value.trim();
+        state.online = await state.wallet.go_online(true, url);
+        enableBtns(onlineBtns);
+        log('Auto setup: online at ' + url, 'log-ok');
+
+        showResult('setup-output', 'setup-result',
+          'Auto setup complete!\n' +
+          'Network: ' + network + '\n' +
+          'Mnemonic: ' + keys.mnemonic + '\n' +
+          'Indexer: ' + url);
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Auto setup failed', e);
+      }
+    });
+
+    // --- Generate Keys ---
+    document.getElementById('btn-generate').addEventListener('click', () => {
+      const network = document.getElementById('gen-network').value;
+      try {
+        const keys = generate_keys(network);
+        fillWalletData(keys, network);
+        showResult('setup-output', 'setup-result',
+          'Keys generated for ' + network + '\nMnemonic: ' + keys.mnemonic);
+        log('generate_keys(' + network + ') OK', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Generate keys failed', e);
+      }
+    });
+
+    // --- Create Wallet ---
+    document.getElementById('btn-create-wallet').addEventListener('click', async () => {
+      const walletDataJson = document.getElementById('wallet-data').value.trim();
+      if (!walletDataJson) {
+        showResult('setup-output', 'setup-result', 'Enter WalletData JSON or generate keys first');
+        return;
+      }
+      try {
+        log('Creating wallet...', 'log-warn');
+        state.wallet = await WasmWallet.create(walletDataJson);
+        const wd = state.wallet.get_wallet_data();
+        showResult('setup-output', 'setup-result',
+          'Wallet created successfully!\n\n' + json(wd));
+        enableBtns(walletBtns);
+        log('Wallet created', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Create wallet failed', e);
+        state.wallet = null;
+      }
+    });
+
+    // --- Go Online ---
+    document.getElementById('btn-go-online').addEventListener('click', async () => {
+      if (!requireWallet('setup-output', 'setup-result')) return;
+      const url = document.getElementById('indexer-url').value.trim();
+      try {
+        log('Going online: ' + url + '...', 'log-warn');
+        state.online = await state.wallet.go_online(true, url);
+        showResult('setup-output', 'setup-result',
+          'Online! Connected to ' + url + '\n\n' + json(state.online));
+        enableBtns(onlineBtns);
+        log('Online: ' + url, 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Go online failed', e);
+      }
+    });
+
+    // --- Sync ---
+    document.getElementById('btn-sync').addEventListener('click', async () => {
+      if (!requireOnline('setup-output', 'setup-result')) return;
+      try {
+        log('Syncing...', 'log-warn');
+        await state.wallet.sync(state.online);
+        showResult('setup-output', 'setup-result', 'Sync completed successfully.');
+        log('Sync complete', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Sync failed', e);
+      }
+    });
+
+    // =======================================================================
+    // 2. Send BTC
+    // =======================================================================
+
+    // --- Begin ---
+    document.getElementById('btn-send-btc-begin').addEventListener('click', async () => {
+      if (!requireOnline('send-btc-output', 'send-btc-result')) return;
+      const address = document.getElementById('send-btc-address').value.trim();
+      if (!address) {
+        showResult('send-btc-output', 'send-btc-result', 'Enter a destination address');
+        return;
+      }
+      const amount = parseInt(document.getElementById('send-btc-amount').value, 10) || 0;
+      const feeRate = parseInt(document.getElementById('send-btc-fee-rate').value, 10) || 1;
+      const skipSync = document.getElementById('send-btc-skip-sync').checked;
+      try {
+        log('send_btc_begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.send_btc_begin(
+          state.online, address, BigInt(amount), BigInt(feeRate), skipSync
+        );
+        document.getElementById('send-btc-unsigned-psbt').value = unsignedPsbt;
+        showResult('send-btc-output', 'send-btc-result', 'Unsigned PSBT created. Proceed to Sign.');
+        log('send_btc_begin OK', 'log-ok');
+      } catch (e) {
+        showError('send-btc-output', 'send-btc-result', 'send_btc_begin failed', e);
+      }
+    });
+
+    // --- Sign ---
+    document.getElementById('btn-send-btc-sign').addEventListener('click', () => {
+      if (!requireWallet('send-btc-output', 'send-btc-result')) return;
+      const unsigned = document.getElementById('send-btc-unsigned-psbt').value.trim();
+      if (!unsigned) {
+        showResult('send-btc-output', 'send-btc-result', 'No unsigned PSBT. Run Begin first.');
+        return;
+      }
+      try {
+        const signed = state.wallet.sign_psbt(unsigned);
+        document.getElementById('send-btc-signed-psbt').value = signed;
+        showResult('send-btc-output', 'send-btc-result', 'PSBT signed. Proceed to End.');
+        log('Send BTC PSBT signed', 'log-ok');
+      } catch (e) {
+        showError('send-btc-output', 'send-btc-result', 'Sign PSBT failed', e);
+      }
+    });
+
+    // --- End ---
+    document.getElementById('btn-send-btc-end').addEventListener('click', async () => {
+      if (!requireOnline('send-btc-output', 'send-btc-result')) return;
+      const signed = document.getElementById('send-btc-signed-psbt').value.trim();
+      if (!signed) {
+        showResult('send-btc-output', 'send-btc-result', 'No signed PSBT. Run Sign first.');
+        return;
+      }
+      const skipSync = document.getElementById('send-btc-skip-sync').checked;
+      try {
+        log('send_btc_end...', 'log-warn');
+        const txid = await state.wallet.send_btc_end(state.online, signed, skipSync);
+        showResult('send-btc-output', 'send-btc-result', 'Transaction broadcast!\nTxid: ' + txid);
+        log('send_btc_end OK: ' + txid, 'log-ok');
+      } catch (e) {
+        showError('send-btc-output', 'send-btc-result', 'send_btc_end failed', e);
+      }
+    });
+
+    // --- Quick auto ---
+    document.getElementById('btn-send-btc-auto').addEventListener('click', async () => {
+      if (!requireOnline('send-btc-output', 'send-btc-result')) return;
+      const address = document.getElementById('send-btc-address').value.trim();
+      if (!address) {
+        showResult('send-btc-output', 'send-btc-result', 'Enter a destination address');
+        return;
+      }
+      const amount = parseInt(document.getElementById('send-btc-amount').value, 10) || 0;
+      const feeRate = parseInt(document.getElementById('send-btc-fee-rate').value, 10) || 1;
+      const skipSync = document.getElementById('send-btc-skip-sync').checked;
+      try {
+        log('send_btc (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.send_btc_begin(
+          state.online, address, BigInt(amount), BigInt(feeRate), skipSync
+        );
+        document.getElementById('send-btc-unsigned-psbt').value = unsignedPsbt;
+
+        log('send_btc (auto) sign...', 'log-warn');
+        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        document.getElementById('send-btc-signed-psbt').value = signed;
+
+        log('send_btc (auto) end...', 'log-warn');
+        const txid = await state.wallet.send_btc_end(state.online, signed, skipSync);
+        showResult('send-btc-output', 'send-btc-result', 'Transaction broadcast (auto)!\nTxid: ' + txid);
+        log('send_btc (auto) complete: ' + txid, 'log-ok');
+      } catch (e) {
+        showError('send-btc-output', 'send-btc-result', 'send_btc (auto) failed', e);
+      }
+    });
+
+    // =======================================================================
+    // 3. Drain Wallet
+    // =======================================================================
+
+    // --- Begin ---
+    document.getElementById('btn-drain-begin').addEventListener('click', async () => {
+      if (!requireOnline('drain-output', 'drain-result')) return;
+      const address = document.getElementById('drain-address').value.trim();
+      if (!address) {
+        showResult('drain-output', 'drain-result', 'Enter a destination address');
+        return;
+      }
+      const destroyAssets = document.getElementById('drain-destroy-assets').checked;
+      const feeRate = parseInt(document.getElementById('drain-fee-rate').value, 10) || 1;
+      try {
+        log('drain_to_begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.drain_to_begin(
+          state.online, address, destroyAssets, BigInt(feeRate)
+        );
+        document.getElementById('drain-unsigned-psbt').value = unsignedPsbt;
+        showResult('drain-output', 'drain-result', 'Unsigned PSBT created. Proceed to Sign.');
+        log('drain_to_begin OK', 'log-ok');
+      } catch (e) {
+        showError('drain-output', 'drain-result', 'drain_to_begin failed', e);
+      }
+    });
+
+    // --- Sign ---
+    document.getElementById('btn-drain-sign').addEventListener('click', () => {
+      if (!requireWallet('drain-output', 'drain-result')) return;
+      const unsigned = document.getElementById('drain-unsigned-psbt').value.trim();
+      if (!unsigned) {
+        showResult('drain-output', 'drain-result', 'No unsigned PSBT. Run Begin first.');
+        return;
+      }
+      try {
+        const signed = state.wallet.sign_psbt(unsigned);
+        document.getElementById('drain-signed-psbt').value = signed;
+        showResult('drain-output', 'drain-result', 'PSBT signed. Proceed to End.');
+        log('Drain PSBT signed', 'log-ok');
+      } catch (e) {
+        showError('drain-output', 'drain-result', 'Sign PSBT failed', e);
+      }
+    });
+
+    // --- End ---
+    document.getElementById('btn-drain-end').addEventListener('click', async () => {
+      if (!requireOnline('drain-output', 'drain-result')) return;
+      const signed = document.getElementById('drain-signed-psbt').value.trim();
+      if (!signed) {
+        showResult('drain-output', 'drain-result', 'No signed PSBT. Run Sign first.');
+        return;
+      }
+      try {
+        log('drain_to_end...', 'log-warn');
+        const txid = await state.wallet.drain_to_end(state.online, signed);
+        showResult('drain-output', 'drain-result', 'Wallet drained!\nTxid: ' + txid);
+        log('drain_to_end OK: ' + txid, 'log-ok');
+      } catch (e) {
+        showError('drain-output', 'drain-result', 'drain_to_end failed', e);
+      }
+    });
+
+    // --- Quick auto ---
+    document.getElementById('btn-drain-auto').addEventListener('click', async () => {
+      if (!requireOnline('drain-output', 'drain-result')) return;
+      const address = document.getElementById('drain-address').value.trim();
+      if (!address) {
+        showResult('drain-output', 'drain-result', 'Enter a destination address');
+        return;
+      }
+      const destroyAssets = document.getElementById('drain-destroy-assets').checked;
+      const feeRate = parseInt(document.getElementById('drain-fee-rate').value, 10) || 1;
+      try {
+        log('drain (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.drain_to_begin(
+          state.online, address, destroyAssets, BigInt(feeRate)
+        );
+        document.getElementById('drain-unsigned-psbt').value = unsignedPsbt;
+
+        log('drain (auto) sign...', 'log-warn');
+        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        document.getElementById('drain-signed-psbt').value = signed;
+
+        log('drain (auto) end...', 'log-warn');
+        const txid = await state.wallet.drain_to_end(state.online, signed);
+        showResult('drain-output', 'drain-result', 'Wallet drained (auto)!\nTxid: ' + txid);
+        log('drain (auto) complete: ' + txid, 'log-ok');
+      } catch (e) {
+        showError('drain-output', 'drain-result', 'drain (auto) failed', e);
+      }
+    });
+
+    // =======================================================================
+    // 4. PSBT Utilities
+    // =======================================================================
+
+    // --- Sign PSBT ---
+    document.getElementById('btn-psbt-sign').addEventListener('click', () => {
+      if (!requireWallet('psbt-output', 'psbt-result')) return;
+      const psbt = document.getElementById('psbt-input').value.trim();
+      if (!psbt) {
+        showResult('psbt-output', 'psbt-result', 'Paste a PSBT first');
+        return;
+      }
+      try {
+        const signed = state.wallet.sign_psbt(psbt);
+        document.getElementById('psbt-input').value = signed;
+        showResult('psbt-output', 'psbt-result', 'PSBT signed successfully.\n\n' + signed);
+        log('PSBT signed (utility)', 'log-ok');
+      } catch (e) {
+        showError('psbt-output', 'psbt-result', 'Sign PSBT failed', e);
+      }
+    });
+
+    // --- Finalize PSBT ---
+    document.getElementById('btn-psbt-finalize').addEventListener('click', () => {
+      if (!requireWallet('psbt-output', 'psbt-result')) return;
+      const psbt = document.getElementById('psbt-input').value.trim();
+      if (!psbt) {
+        showResult('psbt-output', 'psbt-result', 'Paste a PSBT first');
+        return;
+      }
+      try {
+        const finalized = state.wallet.finalize_psbt(psbt);
+        document.getElementById('psbt-input').value = finalized;
+        showResult('psbt-output', 'psbt-result', 'PSBT finalized successfully.\n\n' + finalized);
+        log('PSBT finalized (utility)', 'log-ok');
+      } catch (e) {
+        showError('psbt-output', 'psbt-result', 'Finalize PSBT failed', e);
+      }
+    });
+
+  </script>
+</body>
+</html>

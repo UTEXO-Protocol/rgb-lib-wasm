@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>RGB Assets &mdash; rgb-lib-wasm</title>
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 960px; margin: 0 auto; }
+h1 { color: #58a6ff; margin-bottom: 0.5rem; }
+.subtitle { color: #8b949e; margin-bottom: 1rem; font-size: 0.9rem; }
+nav { margin-bottom: 2rem; }
+nav a { color: #58a6ff; margin-right: 1.5rem; font-size: 0.9rem; text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+nav a.active { font-weight: 700; border-bottom: 2px solid #58a6ff; padding-bottom: 2px; }
+.status { padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 2rem; font-size: 0.85rem; }
+.status.loading { background: #1c1f26; color: #d29922; }
+.status.ready { background: #0d2818; color: #3fb950; }
+.status.error { background: #2d1117; color: #f85149; }
+.section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.section h2 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 1rem; }
+.section h3 { color: #8b949e; font-size: 0.95rem; margin-bottom: 0.75rem; margin-top: 0.75rem; }
+.hint { color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; }
+label { display: block; color: #8b949e; font-size: 0.85rem; margin-bottom: 0.3rem; }
+select, input, textarea {
+  width: 100%; padding: 0.5rem 0.75rem; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 6px; color: #c9d1d9; font-family: monospace; font-size: 0.9rem; margin-bottom: 1rem;
+}
+input[type="checkbox"] { width: auto; margin-bottom: 0; }
+input[type="file"] { padding: 0.3rem; }
+.checkbox-label {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; cursor: pointer;
+}
+textarea { resize: vertical; min-height: 60px; }
+select:focus, input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+button {
+  padding: 0.5rem 1.25rem; background: #238636; color: #fff; border: none;
+  border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 600;
+}
+button:hover { background: #2ea043; }
+button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+button.danger { background: #da3633; }
+button.danger:hover { background: #f85149; }
+button.danger:disabled { background: #21262d; color: #484f58; }
+button.secondary { background: #30363d; }
+button.secondary:hover { background: #484f58; }
+button.secondary:disabled { background: #21262d; color: #484f58; }
+button.accent { background: #1f6feb; }
+button.accent:hover { background: #388bfd; }
+button.accent:disabled { background: #21262d; color: #484f58; }
+button.auto-btn { background: #8957e5; }
+button.auto-btn:hover { background: #a371f7; }
+button.auto-btn:disabled { background: #21262d; color: #484f58; }
+.output { margin-top: 1rem; }
+.output-label { color: #8b949e; font-size: 0.8rem; margin-bottom: 0.3rem; }
+pre {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.5;
+  max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+}
+.field-row { display: flex; gap: 1rem; align-items: flex-end; }
+.field-row > * { flex: 1; }
+.field-row > button { flex: 0 0 auto; margin-bottom: 1rem; }
+.btn-group { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.copy-btn { background: #30363d; font-size: 0.75rem; padding: 0.3rem 0.6rem; margin-left: 0.5rem; }
+.copy-btn:hover { background: #484f58; }
+hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
+#log {
+  background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+  padding: 1rem; font-size: 0.8rem; line-height: 1.6; max-height: 400px;
+  overflow-y: auto; white-space: pre-wrap; word-break: break-all; min-height: 60px;
+}
+.log-ok { color: #3fb950; }
+.log-err { color: #f85149; }
+.log-warn { color: #d29922; }
+.log-info { color: #8b949e; }
+.round-trip-result { margin-top: 0.5rem; font-size: 0.85rem; padding: 0.4rem 0.75rem; border-radius: 4px; }
+.round-trip-result.pass { background: #0d2818; color: #3fb950; }
+.round-trip-result.fail { background: #2d1117; color: #f85149; }
+  </style>
+</head>
+<body>
+  <h1>RGB Assets</h1>
+  <p class="subtitle">Issue, send, receive, and manage RGB assets via rgb-lib WebAssembly bindings</p>
+
+  <!-- Nav bar -->
+  <nav>
+    <a href="index.html">Quick Start</a>
+    <a href="wallet.html">Keys &amp; Wallet</a>
+    <a href="bitcoin.html">Bitcoin</a>
+    <a href="rgb.html" class="active">RGB Assets</a>
+    <a href="backup.html">Backup &amp; Utilities</a>
+  </nav>
+
+  <!-- WASM status -->
+  <div id="status" class="status loading">Initializing WASM module...</div>
+
+  <!-- 1. Wallet Setup (quick) -->
+  <div class="section">
+    <h2>Wallet Setup</h2>
+    <p class="hint">
+      One-click auto-setup: generates keys, creates wallet, and goes online. Or use the manual controls below.
+    </p>
+    <div class="btn-group">
+      <button id="btn-auto-setup" class="auto-btn" disabled>Auto Setup (regtest)</button>
+    </div>
+
+    <hr class="divider" />
+
+    <h3>Manual Setup</h3>
+    <div class="field-row">
+      <div>
+        <label for="setup-network">Network</label>
+        <select id="setup-network">
+          <option value="regtest" selected>Regtest</option>
+          <option value="testnet">Testnet</option>
+          <option value="signet">Signet</option>
+          <option value="mainnet">Mainnet</option>
+        </select>
+      </div>
+      <div>
+        <label for="setup-indexer-url">Indexer URL</label>
+        <input id="setup-indexer-url" type="text" value="http://127.0.0.1:8094/regtest/api" />
+      </div>
+    </div>
+    <div>
+      <label for="wallet-data">WalletData JSON (auto-filled from Generate / Auto Setup)</label>
+      <textarea id="wallet-data" rows="6" placeholder='{"data_dir": ":memory:", "bitcoin_network": "Regtest", ...}'></textarea>
+    </div>
+    <div class="btn-group">
+      <button id="btn-generate" disabled>Generate Keys</button>
+      <button id="btn-create-wallet" class="secondary" disabled>Create Wallet</button>
+      <button id="btn-go-online" class="secondary" disabled>Go Online</button>
+    </div>
+
+    <hr class="divider" />
+
+    <h3>Fund &amp; Create UTXOs</h3>
+    <p class="hint">
+      RGB operations require colored UTXOs. Fund the wallet and create UTXOs before issuing or receiving assets.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="fund-amount">Fund amount (BTC)</label>
+        <input id="fund-amount" type="number" value="1.0" min="0.001" step="0.1" />
+      </div>
+      <button id="btn-fund" disabled>Fund</button>
+    </div>
+    <div class="field-row">
+      <div>
+        <label for="utxo-num">Number of UTXOs</label>
+        <input id="utxo-num" type="number" value="5" min="1" />
+      </div>
+      <div>
+        <label for="utxo-size">UTXO size (sats)</label>
+        <input id="utxo-size" type="number" value="1000" min="546" />
+      </div>
+      <div>
+        <label for="utxo-fee-rate">Fee rate</label>
+        <input id="utxo-fee-rate" type="number" value="1" min="1" />
+      </div>
+    </div>
+    <div class="btn-group">
+      <button id="btn-create-utxos" class="auto-btn" disabled>Create UTXOs (auto)</button>
+    </div>
+    <div class="output" id="setup-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('setup-result')">Copy</button></div>
+      <pre id="setup-result"></pre>
+    </div>
+  </div>
+
+  <!-- 2. Issue NIA -->
+  <div class="section">
+    <h2>Issue NIA (Non-Inflatable Asset)</h2>
+    <div class="field-row">
+      <div>
+        <label for="nia-ticker">Ticker</label>
+        <input id="nia-ticker" type="text" value="TEST" />
+      </div>
+      <div>
+        <label for="nia-name">Name</label>
+        <input id="nia-name" type="text" value="Test Token" />
+      </div>
+      <div>
+        <label for="nia-precision">Precision</label>
+        <input id="nia-precision" type="number" value="0" min="0" max="18" />
+      </div>
+    </div>
+    <div>
+      <label for="nia-amounts">Amounts (comma-separated)</label>
+      <input id="nia-amounts" type="text" value="1000" />
+    </div>
+    <div class="btn-group">
+      <button id="btn-issue-nia" disabled>Issue NIA</button>
+    </div>
+    <div class="output" id="nia-output" style="display:none;">
+      <div class="output-label">NIA Result <button class="copy-btn" onclick="copyOutput('nia-result')">Copy</button></div>
+      <pre id="nia-result"></pre>
+    </div>
+  </div>
+
+  <!-- 3. Issue IFA -->
+  <div class="section">
+    <h2>Issue IFA (Inflatable Fungible Asset)</h2>
+    <div class="field-row">
+      <div>
+        <label for="ifa-ticker">Ticker</label>
+        <input id="ifa-ticker" type="text" value="TIFA" />
+      </div>
+      <div>
+        <label for="ifa-name">Name</label>
+        <input id="ifa-name" type="text" value="Test IFA" />
+      </div>
+      <div>
+        <label for="ifa-precision">Precision</label>
+        <input id="ifa-precision" type="number" value="0" min="0" max="18" />
+      </div>
+    </div>
+    <div>
+      <label for="ifa-amounts">Amounts (comma-separated)</label>
+      <input id="ifa-amounts" type="text" value="1000" />
+    </div>
+    <div>
+      <label for="ifa-inflation-amounts">Inflation Amounts (comma-separated)</label>
+      <input id="ifa-inflation-amounts" type="text" value="500" />
+    </div>
+    <div class="field-row">
+      <div>
+        <label for="ifa-replace-rights-num">Replace Rights Num</label>
+        <input id="ifa-replace-rights-num" type="number" value="1" min="0" max="255" />
+      </div>
+      <div>
+        <label for="ifa-reject-list-url">Reject List URL (optional)</label>
+        <input id="ifa-reject-list-url" type="text" value="" placeholder="https://..." />
+      </div>
+    </div>
+    <div class="btn-group">
+      <button id="btn-issue-ifa" disabled>Issue IFA</button>
+    </div>
+    <div class="output" id="ifa-output" style="display:none;">
+      <div class="output-label">IFA Result <button class="copy-btn" onclick="copyOutput('ifa-result')">Copy</button></div>
+      <pre id="ifa-result"></pre>
+    </div>
+  </div>
+
+  <!-- 4. Receive -->
+  <div class="section">
+    <h2>Receive</h2>
+    <p class="hint">
+      Create a blind or witness receive invoice. Returns ReceiveData with the invoice string.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="recv-asset-id">Asset ID (optional)</label>
+        <input id="recv-asset-id" type="text" placeholder="Leave empty for any asset" />
+      </div>
+      <div>
+        <label for="recv-assignment">Assignment</label>
+        <select id="recv-assignment">
+          <option value="Any" selected>Any</option>
+          <option value="Fungible">Fungible</option>
+          <option value="NonFungible">NonFungible</option>
+        </select>
+      </div>
+    </div>
+    <div id="recv-fungible-row" style="display:none;">
+      <label for="recv-fungible-amount">Fungible amount</label>
+      <input id="recv-fungible-amount" type="number" value="100" min="1" />
+    </div>
+    <div class="field-row">
+      <div>
+        <label for="recv-duration">Duration (seconds, optional)</label>
+        <input id="recv-duration" type="number" placeholder="Leave empty for default" />
+      </div>
+      <div>
+        <label for="recv-min-conf">Min confirmations</label>
+        <input id="recv-min-conf" type="number" value="1" min="0" />
+      </div>
+    </div>
+    <div>
+      <label for="recv-endpoints">Transport endpoints (comma-separated)</label>
+      <input id="recv-endpoints" type="text" value="rpc://127.0.0.1:3000/json-rpc" />
+    </div>
+    <div class="btn-group">
+      <button id="btn-blind-receive" disabled>Blind Receive</button>
+      <button id="btn-witness-receive" disabled>Witness Receive</button>
+    </div>
+    <div class="output" id="recv-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('recv-result')">Copy</button></div>
+      <pre id="recv-result"></pre>
+    </div>
+  </div>
+
+  <!-- 5. Send RGB -->
+  <div class="section">
+    <h2>Send RGB</h2>
+    <p class="hint">
+      Three-step PSBT workflow for RGB asset transfers. Recipient map is a JSON object mapping asset IDs to arrays of recipients.
+    </p>
+    <div>
+      <label for="send-rgb-recipient-map">Recipient Map (JSON)</label>
+      <textarea id="send-rgb-recipient-map" rows="6" placeholder='{"asset_id": [{"recipient_id": "invoice...", "witness_data": {"amount_sat": 1000, "blinding": null}, "amount": 100, "transport_endpoints": ["rpc://127.0.0.1:3000/json-rpc"]}]}'></textarea>
+    </div>
+    <div class="field-row">
+      <div>
+        <label for="send-rgb-fee-rate">Fee rate (sat/vB)</label>
+        <input id="send-rgb-fee-rate" type="number" value="1" min="1" />
+      </div>
+      <div>
+        <label for="send-rgb-min-conf">Min confirmations</label>
+        <input id="send-rgb-min-conf" type="number" value="1" min="0" />
+      </div>
+    </div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="send-rgb-donation"> Donation
+    </label>
+    <br />
+    <label class="checkbox-label">
+      <input type="checkbox" id="send-rgb-skip-sync"> Skip sync
+    </label>
+    <div class="btn-group">
+      <button id="btn-send-rgb-begin" disabled>1. Begin</button>
+      <button id="btn-send-rgb-sign" disabled>2. Sign</button>
+      <button id="btn-send-rgb-end" disabled>3. End</button>
+      <button id="btn-send-rgb-auto" class="auto-btn" disabled>Quick: Send RGB (auto)</button>
+    </div>
+    <div>
+      <label for="send-rgb-unsigned-psbt">Unsigned PSBT</label>
+      <textarea id="send-rgb-unsigned-psbt" rows="2" placeholder="Filled automatically by Begin step"></textarea>
+    </div>
+    <div>
+      <label for="send-rgb-signed-psbt">Signed PSBT</label>
+      <textarea id="send-rgb-signed-psbt" rows="2" placeholder="Filled automatically by Sign step"></textarea>
+    </div>
+    <div class="output" id="send-rgb-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('send-rgb-result')">Copy</button></div>
+      <pre id="send-rgb-result"></pre>
+    </div>
+  </div>
+
+  <!-- 6. Inflate IFA -->
+  <div class="section">
+    <h2>Inflate IFA</h2>
+    <p class="hint">
+      Three-step PSBT workflow: inflate an existing IFA asset with additional supply.
+    </p>
+    <div>
+      <label for="inflate-asset-id">Asset ID</label>
+      <input id="inflate-asset-id" type="text" placeholder="Enter IFA asset ID" />
+    </div>
+    <div class="field-row">
+      <div>
+        <label for="inflate-amounts">Inflation amounts (comma-separated)</label>
+        <input id="inflate-amounts" type="text" value="100" />
+      </div>
+      <div>
+        <label for="inflate-fee-rate">Fee rate (sat/vB)</label>
+        <input id="inflate-fee-rate" type="number" value="1" min="1" />
+      </div>
+      <div>
+        <label for="inflate-min-conf">Min confirmations</label>
+        <input id="inflate-min-conf" type="number" value="1" min="0" />
+      </div>
+    </div>
+    <div class="btn-group">
+      <button id="btn-inflate-begin" disabled>1. Begin</button>
+      <button id="btn-inflate-sign" disabled>2. Sign</button>
+      <button id="btn-inflate-end" disabled>3. End</button>
+      <button id="btn-inflate-auto" class="auto-btn" disabled>Quick: Inflate (auto)</button>
+    </div>
+    <div>
+      <label for="inflate-unsigned-psbt">Unsigned PSBT</label>
+      <textarea id="inflate-unsigned-psbt" rows="2" placeholder="Filled automatically by Begin step"></textarea>
+    </div>
+    <div>
+      <label for="inflate-signed-psbt">Signed PSBT</label>
+      <textarea id="inflate-signed-psbt" rows="2" placeholder="Filled automatically by Sign step"></textarea>
+    </div>
+    <div class="output" id="inflate-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('inflate-result')">Copy</button></div>
+      <pre id="inflate-result"></pre>
+    </div>
+  </div>
+
+  <!-- 7. Refresh / Fail / Delete Transfers -->
+  <div class="section">
+    <h2>Refresh / Fail / Delete Transfers</h2>
+    <div class="field-row">
+      <div>
+        <label for="refresh-asset-id">Asset ID (optional)</label>
+        <input id="refresh-asset-id" type="text" placeholder="Leave empty for all assets" />
+      </div>
+      <div>
+        <label for="refresh-filter">Filter (JSON array)</label>
+        <input id="refresh-filter" type="text" value="[]" />
+      </div>
+    </div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="refresh-skip-sync"> Skip sync
+    </label>
+    <div class="btn-group">
+      <button id="btn-refresh" disabled>Refresh</button>
+    </div>
+
+    <hr class="divider" />
+
+    <div class="field-row">
+      <div>
+        <label for="fail-batch-idx">Batch transfer index (optional)</label>
+        <input id="fail-batch-idx" type="number" placeholder="Leave empty for all" />
+      </div>
+    </div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="fail-no-asset-only"> No asset only
+    </label>
+    <br />
+    <label class="checkbox-label">
+      <input type="checkbox" id="fail-skip-sync"> Skip sync
+    </label>
+    <div class="btn-group">
+      <button id="btn-fail-transfers" disabled>Fail Transfers</button>
+      <button id="btn-delete-transfers" disabled>Delete Transfers</button>
+    </div>
+    <div class="output" id="transfer-ops-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('transfer-ops-result')">Copy</button></div>
+      <pre id="transfer-ops-result"></pre>
+    </div>
+  </div>
+
+  <!-- Activity Log -->
+  <div class="section">
+    <h2>Activity Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+  <script type="module">
+    import {
+      initWasm,
+      generate_keys,
+      restore_keys,
+      WasmWallet,
+      state,
+      ESPLORA_API,
+      PROXY_URL,
+      json,
+      sleep,
+      showResult,
+      showJson,
+      showError,
+      requireWallet,
+      requireOnline,
+      optionalInt,
+      optionalString,
+      parseAmounts,
+      log,
+      copyOutput,
+      fundAddress,
+      mineAndWait,
+      fillWalletData,
+      enableBtns,
+    } from './lib/shared.js';
+
+    // =======================================================================
+    // Button groups
+    // =======================================================================
+    const wasmBtns = ['btn-auto-setup', 'btn-generate', 'btn-create-wallet'];
+    const walletBtns = [
+      'btn-go-online', 'btn-issue-nia', 'btn-issue-ifa',
+      'btn-blind-receive', 'btn-witness-receive', 'btn-delete-transfers',
+    ];
+    const onlineBtns = [
+      'btn-fund', 'btn-create-utxos',
+      'btn-send-rgb-begin', 'btn-send-rgb-sign', 'btn-send-rgb-end', 'btn-send-rgb-auto',
+      'btn-inflate-begin', 'btn-inflate-sign', 'btn-inflate-end', 'btn-inflate-auto',
+      'btn-refresh', 'btn-fail-transfers',
+    ];
+
+    // =======================================================================
+    // WASM init
+    // =======================================================================
+    const ok = await initWasm();
+    if (ok) enableBtns(wasmBtns);
+
+    // =======================================================================
+    // Assignment selector show/hide
+    // =======================================================================
+    document.getElementById('recv-assignment').addEventListener('change', () => {
+      const row = document.getElementById('recv-fungible-row');
+      row.style.display = document.getElementById('recv-assignment').value === 'Fungible' ? 'block' : 'none';
+    });
+
+    // =======================================================================
+    // Helpers
+    // =======================================================================
+    function buildAssignment() {
+      const type = document.getElementById('recv-assignment').value;
+      if (type === 'Fungible') {
+        const amount = parseInt(document.getElementById('recv-fungible-amount').value, 10) || 0;
+        return { Fungible: amount };
+      }
+      return type;
+    }
+
+    function parseEndpoints() {
+      return document.getElementById('recv-endpoints').value
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
+    }
+
+    // =======================================================================
+    // Auto Setup
+    // =======================================================================
+    document.getElementById('btn-auto-setup').addEventListener('click', async () => {
+      try {
+        log('Auto setup: generating keys...', 'log-warn');
+        const network = document.getElementById('setup-network').value;
+        const keys = generate_keys(network);
+        log('Keys generated', 'log-ok');
+
+        const wd = fillWalletData(keys, network);
+        log('Auto setup: creating wallet...', 'log-warn');
+        state.wallet = await WasmWallet.create(JSON.stringify(wd));
+        log('Wallet created', 'log-ok');
+
+        const url = document.getElementById('setup-indexer-url').value.trim();
+        log('Auto setup: going online (' + url + ')...', 'log-warn');
+        state.online = await state.wallet.go_online(true, url);
+        log('Online', 'log-ok');
+
+        enableBtns(walletBtns);
+        enableBtns(onlineBtns);
+        showResult('setup-output', 'setup-result',
+          'Auto setup complete!\n\n' +
+          'Mnemonic: ' + keys.mnemonic + '\n\n' +
+          'Wallet data:\n' + json(wd));
+        log('Auto setup complete', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Auto setup failed', e);
+        log('Auto setup failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Manual: Generate Keys
+    // =======================================================================
+    document.getElementById('btn-generate').addEventListener('click', () => {
+      const network = document.getElementById('setup-network').value;
+      try {
+        const keys = generate_keys(network);
+        fillWalletData(keys, network);
+        showResult('setup-output', 'setup-result', 'Keys generated.\n\n' + json(keys));
+        log('generate_keys(' + network + ') OK', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Generate keys failed', e);
+        log('generate_keys failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Manual: Create Wallet
+    // =======================================================================
+    document.getElementById('btn-create-wallet').addEventListener('click', async () => {
+      const walletDataJson = document.getElementById('wallet-data').value.trim();
+      if (!walletDataJson) {
+        showResult('setup-output', 'setup-result', 'Enter WalletData JSON or generate keys first');
+        return;
+      }
+      try {
+        log('Creating wallet...', 'log-warn');
+        state.wallet = await WasmWallet.create(walletDataJson);
+        showResult('setup-output', 'setup-result', 'Wallet created.\n\n' + json(state.wallet.get_wallet_data()));
+        enableBtns(walletBtns);
+        log('Wallet created', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Create wallet failed', e);
+        state.wallet = null;
+        log('Wallet creation failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Manual: Go Online
+    // =======================================================================
+    document.getElementById('btn-go-online').addEventListener('click', async () => {
+      if (!requireWallet('setup-output', 'setup-result')) return;
+      const url = document.getElementById('setup-indexer-url').value.trim();
+      try {
+        log('Going online: ' + url + '...', 'log-warn');
+        state.online = await state.wallet.go_online(true, url);
+        enableBtns(onlineBtns);
+        showResult('setup-output', 'setup-result', 'Online!\n\n' + json(state.online));
+        log('Online: ' + url, 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Go online failed', e);
+        log('go_online failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Fund Wallet
+    // =======================================================================
+    document.getElementById('btn-fund').addEventListener('click', async () => {
+      if (!requireOnline('setup-output', 'setup-result')) return;
+      try {
+        log('Getting wallet address...', 'log-warn');
+        const address = state.wallet.get_address();
+        const amount = parseFloat(document.getElementById('fund-amount').value) || 1.0;
+
+        log('Funding ' + address + ' with ' + amount + ' BTC...', 'log-warn');
+        const fundResult = await fundAddress(address, amount);
+        log('Fund txid: ' + (fundResult.txid || json(fundResult)), 'log-info');
+
+        log('Mining 1 block...', 'log-warn');
+        const mineResult = await mineAndWait(1);
+        log('Mined to height ' + mineResult.height, 'log-info');
+
+        log('Syncing wallet...', 'log-warn');
+        await state.wallet.sync(state.online);
+
+        const balance = state.wallet.get_btc_balance();
+        showResult('setup-output', 'setup-result',
+          'Funded ' + address + ' with ' + amount + ' BTC\n' +
+          'Mine height: ' + mineResult.height + '\n\n' +
+          'BTC Balance:\n' + json(balance));
+        log('Wallet funded. Balance: ' + json(balance), 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Fund failed', e);
+        log('Fund failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Create UTXOs (auto)
+    // =======================================================================
+    document.getElementById('btn-create-utxos').addEventListener('click', async () => {
+      if (!requireOnline('setup-output', 'setup-result')) return;
+      const num = optionalInt('utxo-num');
+      const size = optionalInt('utxo-size');
+      const feeRate = parseInt(document.getElementById('utxo-fee-rate').value, 10) || 1;
+      try {
+        log('create_utxos (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.create_utxos_begin(
+          state.online, true, num, size, BigInt(feeRate), false
+        );
+        log('create_utxos (auto) sign...', 'log-warn');
+        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        log('create_utxos (auto) end...', 'log-warn');
+        const count = await state.wallet.create_utxos_end(state.online, signed, false);
+        showResult('setup-output', 'setup-result', 'UTXOs created: ' + count);
+        log('create_utxos complete: ' + count + ' UTXOs', 'log-ok');
+      } catch (e) {
+        showError('setup-output', 'setup-result', 'Create UTXOs failed', e);
+        log('create_utxos failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Issue NIA
+    // =======================================================================
+    document.getElementById('btn-issue-nia').addEventListener('click', () => {
+      if (!requireWallet('nia-output', 'nia-result')) return;
+      const ticker = document.getElementById('nia-ticker').value.trim();
+      const name = document.getElementById('nia-name').value.trim();
+      const precision = parseInt(document.getElementById('nia-precision').value, 10);
+      const amounts = parseAmounts(document.getElementById('nia-amounts').value);
+      try {
+        log('Issuing NIA: ' + ticker + '...', 'log-warn');
+        const asset = state.wallet.issue_asset_nia(ticker, name, precision, amounts);
+        showJson('nia-output', 'nia-result', asset);
+        log('NIA issued: ' + (asset.asset_id || ticker), 'log-ok');
+      } catch (e) {
+        showError('nia-output', 'nia-result', 'Issue NIA failed', e);
+        log('Issue NIA failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Issue IFA
+    // =======================================================================
+    document.getElementById('btn-issue-ifa').addEventListener('click', () => {
+      if (!requireWallet('ifa-output', 'ifa-result')) return;
+      const ticker = document.getElementById('ifa-ticker').value.trim();
+      const name = document.getElementById('ifa-name').value.trim();
+      const precision = parseInt(document.getElementById('ifa-precision').value, 10);
+      const amounts = parseAmounts(document.getElementById('ifa-amounts').value);
+      const inflationStr = document.getElementById('ifa-inflation-amounts').value.trim();
+      const inflationAmounts = inflationStr ? parseAmounts(inflationStr) : [];
+      const replaceRightsNum = parseInt(document.getElementById('ifa-replace-rights-num').value, 10);
+      const rejectListUrl = document.getElementById('ifa-reject-list-url').value.trim() || undefined;
+      try {
+        log('Issuing IFA: ' + ticker + '...', 'log-warn');
+        const asset = state.wallet.issue_asset_ifa(
+          ticker, name, precision, amounts, inflationAmounts, replaceRightsNum, rejectListUrl
+        );
+        showJson('ifa-output', 'ifa-result', asset);
+        log('IFA issued: ' + (asset.asset_id || ticker), 'log-ok');
+      } catch (e) {
+        showError('ifa-output', 'ifa-result', 'Issue IFA failed', e);
+        log('Issue IFA failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Blind Receive
+    // =======================================================================
+    document.getElementById('btn-blind-receive').addEventListener('click', () => {
+      if (!requireWallet('recv-output', 'recv-result')) return;
+      const assetId = optionalString('recv-asset-id');
+      const assignment = buildAssignment();
+      const duration = optionalInt('recv-duration');
+      const endpoints = parseEndpoints();
+      const minConf = parseInt(document.getElementById('recv-min-conf').value, 10) || 1;
+      try {
+        log('blind_receive...', 'log-warn');
+        const data = state.wallet.blind_receive(assetId, assignment, duration, endpoints, minConf);
+        showJson('recv-output', 'recv-result', data);
+        log('blind_receive OK', 'log-ok');
+      } catch (e) {
+        showError('recv-output', 'recv-result', 'blind_receive failed', e);
+        log('blind_receive failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Witness Receive
+    // =======================================================================
+    document.getElementById('btn-witness-receive').addEventListener('click', () => {
+      if (!requireWallet('recv-output', 'recv-result')) return;
+      const assetId = optionalString('recv-asset-id');
+      const assignment = buildAssignment();
+      const duration = optionalInt('recv-duration');
+      const endpoints = parseEndpoints();
+      const minConf = parseInt(document.getElementById('recv-min-conf').value, 10) || 1;
+      try {
+        log('witness_receive...', 'log-warn');
+        const data = state.wallet.witness_receive(assetId, assignment, duration, endpoints, minConf);
+        showJson('recv-output', 'recv-result', data);
+        log('witness_receive OK', 'log-ok');
+      } catch (e) {
+        showError('recv-output', 'recv-result', 'witness_receive failed', e);
+        log('witness_receive failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Send RGB: 3-step
+    // =======================================================================
+    document.getElementById('btn-send-rgb-begin').addEventListener('click', async () => {
+      if (!requireOnline('send-rgb-output', 'send-rgb-result')) return;
+      const mapJson = document.getElementById('send-rgb-recipient-map').value.trim();
+      if (!mapJson) {
+        showResult('send-rgb-output', 'send-rgb-result', 'Enter a recipient map JSON');
+        return;
+      }
+      let recipientMap;
+      try { recipientMap = JSON.parse(mapJson); } catch (e) {
+        showResult('send-rgb-output', 'send-rgb-result', 'Invalid JSON: ' + e);
+        return;
+      }
+      const donation = document.getElementById('send-rgb-donation').checked;
+      const feeRate = parseInt(document.getElementById('send-rgb-fee-rate').value, 10) || 1;
+      const minConf = parseInt(document.getElementById('send-rgb-min-conf').value, 10) || 1;
+      try {
+        log('send_begin (RGB)...', 'log-warn');
+        const unsignedPsbt = await state.wallet.send_begin(
+          state.online, recipientMap, donation, BigInt(feeRate), minConf
+        );
+        document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
+        showResult('send-rgb-output', 'send-rgb-result', 'Unsigned PSBT created. Proceed to Sign.');
+        log('send_begin OK', 'log-ok');
+      } catch (e) {
+        showError('send-rgb-output', 'send-rgb-result', 'send_begin failed', e);
+        log('send_begin failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-send-rgb-sign').addEventListener('click', () => {
+      if (!requireWallet('send-rgb-output', 'send-rgb-result')) return;
+      const unsigned = document.getElementById('send-rgb-unsigned-psbt').value.trim();
+      if (!unsigned) {
+        showResult('send-rgb-output', 'send-rgb-result', 'No unsigned PSBT. Run Begin first.');
+        return;
+      }
+      try {
+        const signed = state.wallet.sign_psbt(unsigned);
+        document.getElementById('send-rgb-signed-psbt').value = signed;
+        showResult('send-rgb-output', 'send-rgb-result', 'PSBT signed. Proceed to End.');
+        log('Send RGB PSBT signed', 'log-ok');
+      } catch (e) {
+        showError('send-rgb-output', 'send-rgb-result', 'Sign PSBT failed', e);
+        log('Send RGB sign failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-send-rgb-end').addEventListener('click', async () => {
+      if (!requireOnline('send-rgb-output', 'send-rgb-result')) return;
+      const signed = document.getElementById('send-rgb-signed-psbt').value.trim();
+      if (!signed) {
+        showResult('send-rgb-output', 'send-rgb-result', 'No signed PSBT. Run Sign first.');
+        return;
+      }
+      const skipSync = document.getElementById('send-rgb-skip-sync').checked;
+      try {
+        log('send_end (RGB)...', 'log-warn');
+        const result = await state.wallet.send_end(state.online, signed, skipSync);
+        showJson('send-rgb-output', 'send-rgb-result', result);
+        log('send_end OK', 'log-ok');
+      } catch (e) {
+        showError('send-rgb-output', 'send-rgb-result', 'send_end failed', e);
+        log('send_end failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-send-rgb-auto').addEventListener('click', async () => {
+      if (!requireOnline('send-rgb-output', 'send-rgb-result')) return;
+      const mapJson = document.getElementById('send-rgb-recipient-map').value.trim();
+      if (!mapJson) {
+        showResult('send-rgb-output', 'send-rgb-result', 'Enter a recipient map JSON');
+        return;
+      }
+      let recipientMap;
+      try { recipientMap = JSON.parse(mapJson); } catch (e) {
+        showResult('send-rgb-output', 'send-rgb-result', 'Invalid JSON: ' + e);
+        return;
+      }
+      const donation = document.getElementById('send-rgb-donation').checked;
+      const feeRate = parseInt(document.getElementById('send-rgb-fee-rate').value, 10) || 1;
+      const minConf = parseInt(document.getElementById('send-rgb-min-conf').value, 10) || 1;
+      const skipSync = document.getElementById('send-rgb-skip-sync').checked;
+      try {
+        log('send RGB (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.send_begin(
+          state.online, recipientMap, donation, BigInt(feeRate), minConf
+        );
+        document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
+
+        log('send RGB (auto) sign...', 'log-warn');
+        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        document.getElementById('send-rgb-signed-psbt').value = signed;
+
+        log('send RGB (auto) end...', 'log-warn');
+        const result = await state.wallet.send_end(state.online, signed, skipSync);
+        showJson('send-rgb-output', 'send-rgb-result', result);
+        log('send RGB (auto) complete', 'log-ok');
+      } catch (e) {
+        showError('send-rgb-output', 'send-rgb-result', 'send RGB (auto) failed', e);
+        log('send RGB (auto) failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Inflate IFA: 3-step
+    // =======================================================================
+    document.getElementById('btn-inflate-begin').addEventListener('click', async () => {
+      if (!requireOnline('inflate-output', 'inflate-result')) return;
+      const assetId = document.getElementById('inflate-asset-id').value.trim();
+      if (!assetId) {
+        showResult('inflate-output', 'inflate-result', 'Enter an asset ID');
+        return;
+      }
+      const amounts = parseAmounts(document.getElementById('inflate-amounts').value);
+      const feeRate = parseInt(document.getElementById('inflate-fee-rate').value, 10) || 1;
+      const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
+      try {
+        log('inflate_begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.inflate_begin(
+          state.online, assetId, amounts, BigInt(feeRate), minConf
+        );
+        document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
+        showResult('inflate-output', 'inflate-result', 'Unsigned PSBT created. Proceed to Sign.');
+        log('inflate_begin OK', 'log-ok');
+      } catch (e) {
+        showError('inflate-output', 'inflate-result', 'inflate_begin failed', e);
+        log('inflate_begin failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-inflate-sign').addEventListener('click', () => {
+      if (!requireWallet('inflate-output', 'inflate-result')) return;
+      const unsigned = document.getElementById('inflate-unsigned-psbt').value.trim();
+      if (!unsigned) {
+        showResult('inflate-output', 'inflate-result', 'No unsigned PSBT. Run Begin first.');
+        return;
+      }
+      try {
+        const signed = state.wallet.sign_psbt(unsigned);
+        document.getElementById('inflate-signed-psbt').value = signed;
+        showResult('inflate-output', 'inflate-result', 'PSBT signed. Proceed to End.');
+        log('Inflate PSBT signed', 'log-ok');
+      } catch (e) {
+        showError('inflate-output', 'inflate-result', 'Sign PSBT failed', e);
+        log('Inflate sign failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-inflate-end').addEventListener('click', async () => {
+      if (!requireOnline('inflate-output', 'inflate-result')) return;
+      const signed = document.getElementById('inflate-signed-psbt').value.trim();
+      if (!signed) {
+        showResult('inflate-output', 'inflate-result', 'No signed PSBT. Run Sign first.');
+        return;
+      }
+      try {
+        log('inflate_end...', 'log-warn');
+        const result = await state.wallet.inflate_end(state.online, signed);
+        showJson('inflate-output', 'inflate-result', result);
+        log('inflate_end OK', 'log-ok');
+      } catch (e) {
+        showError('inflate-output', 'inflate-result', 'inflate_end failed', e);
+        log('inflate_end failed: ' + e, 'log-err');
+      }
+    });
+
+    document.getElementById('btn-inflate-auto').addEventListener('click', async () => {
+      if (!requireOnline('inflate-output', 'inflate-result')) return;
+      const assetId = document.getElementById('inflate-asset-id').value.trim();
+      if (!assetId) {
+        showResult('inflate-output', 'inflate-result', 'Enter an asset ID');
+        return;
+      }
+      const amounts = parseAmounts(document.getElementById('inflate-amounts').value);
+      const feeRate = parseInt(document.getElementById('inflate-fee-rate').value, 10) || 1;
+      const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
+      try {
+        log('inflate (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.inflate_begin(
+          state.online, assetId, amounts, BigInt(feeRate), minConf
+        );
+        document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
+
+        log('inflate (auto) sign...', 'log-warn');
+        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        document.getElementById('inflate-signed-psbt').value = signed;
+
+        log('inflate (auto) end...', 'log-warn');
+        const result = await state.wallet.inflate_end(state.online, signed);
+        showJson('inflate-output', 'inflate-result', result);
+        log('inflate (auto) complete', 'log-ok');
+      } catch (e) {
+        showError('inflate-output', 'inflate-result', 'inflate (auto) failed', e);
+        log('inflate (auto) failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Refresh
+    // =======================================================================
+    document.getElementById('btn-refresh').addEventListener('click', async () => {
+      if (!requireOnline('transfer-ops-output', 'transfer-ops-result')) return;
+      const assetId = optionalString('refresh-asset-id');
+      const filterStr = document.getElementById('refresh-filter').value.trim() || '[]';
+      let filter;
+      try { filter = JSON.parse(filterStr); } catch (e) {
+        showResult('transfer-ops-output', 'transfer-ops-result', 'Invalid filter JSON: ' + e);
+        return;
+      }
+      const skipSync = document.getElementById('refresh-skip-sync').checked;
+      try {
+        log('refresh...', 'log-warn');
+        const result = await state.wallet.refresh(state.online, assetId, filter, skipSync);
+        showJson('transfer-ops-output', 'transfer-ops-result', result);
+        log('refresh OK', 'log-ok');
+      } catch (e) {
+        showError('transfer-ops-output', 'transfer-ops-result', 'refresh failed', e);
+        log('refresh failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Fail Transfers
+    // =======================================================================
+    document.getElementById('btn-fail-transfers').addEventListener('click', async () => {
+      if (!requireOnline('transfer-ops-output', 'transfer-ops-result')) return;
+      const batchIdx = optionalInt('fail-batch-idx');
+      const noAssetOnly = document.getElementById('fail-no-asset-only').checked;
+      const skipSync = document.getElementById('fail-skip-sync').checked;
+      try {
+        log('fail_transfers...', 'log-warn');
+        const result = await state.wallet.fail_transfers(
+          state.online, batchIdx, noAssetOnly, skipSync
+        );
+        showResult('transfer-ops-output', 'transfer-ops-result', 'Fail transfers result: ' + result);
+        log('fail_transfers OK: ' + result, 'log-ok');
+      } catch (e) {
+        showError('transfer-ops-output', 'transfer-ops-result', 'fail_transfers failed', e);
+        log('fail_transfers failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Delete Transfers
+    // =======================================================================
+    document.getElementById('btn-delete-transfers').addEventListener('click', () => {
+      if (!requireWallet('transfer-ops-output', 'transfer-ops-result')) return;
+      const batchIdx = optionalInt('fail-batch-idx');
+      const noAssetOnly = document.getElementById('fail-no-asset-only').checked;
+      try {
+        const result = state.wallet.delete_transfers(batchIdx, noAssetOnly);
+        showResult('transfer-ops-output', 'transfer-ops-result', 'Delete transfers result: ' + result);
+        log('delete_transfers OK: ' + result, 'log-ok');
+      } catch (e) {
+        showError('transfer-ops-output', 'transfer-ops-result', 'delete_transfers failed', e);
+        log('delete_transfers failed: ' + e, 'log-err');
+      }
+    });
+  </script>
+</body>
+</html>

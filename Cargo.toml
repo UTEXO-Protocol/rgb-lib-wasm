@@ -1,0 +1,103 @@
+[package]
+name = "rgb-lib-wasm"
+version = "0.3.0-beta.4"
+authors = [
+    "Zoe Faltibà <zoefaltiba@gmail.com>",
+    "Nicola Busanello <nicola.busanello@gmail.com>",
+]
+edition = "2024"
+rust-version = "1.85.0"
+repository = "https://github.com/RGB-Tools/rgb-lib"
+homepage = "https://github.com/RGB-Tools/rgb-lib"
+license = "MIT"
+description = "RGB wallet library (WASM-only)"
+
+[workspace]
+members = [".", "bindings/wasm"]
+
+[dependencies]
+base64 = { version = "0.22.1", default-features = false, features = [
+    "std",
+] }
+bdk_wallet = { version = "=2.0.0", default-features = false, features = [
+    "keys-bip39",
+    "std",
+] }
+bdk_core = { version = "0.6" }
+bdk_esplora = { version = "0.22.0", optional = true, default-features = false, features = [
+    "async-https",
+] }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = [
+    "alloc",
+    "stream",
+] }
+hkdf = { version = "0.12", default-features = false }
+prost = { version = "0.11.6", default-features = false, features = ["prost-derive"] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+generic-array = "=0.14.7"  # temporary pin while waiting for chacha20poly1305 update
+esplora-client = { version = "0.12", default-features = false, features = [
+    "async-https",
+] }
+getrandom = { version = "0.2", features = ["js"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+instant = { version = "0.1", features = ["wasm-bindgen"] }
+js-sys = "0.3"
+rand = { version = "0.9.1", default-features = false }
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+] }
+rexie = "0.6"
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+scrypt = { version = "0.11.0", default-features = false, features = [
+    "simple",
+    "std",
+] }
+serde = { version = "^1.0", default-features = false, features = [
+    "derive",
+] }
+serde_json = { version = "^1.0", default-features = false, features = [
+    "preserve_order",
+] }
+slog = { version = "2.7.0", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+time = { version = "0.3.41", default-features = false, features = ["macros", "formatting", "wasm-bindgen"] }
+typenum = { version = "1.18.0", default-features = false }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["FormData", "Blob", "BlobPropertyBag", "console"] }
+
+# RGB-related deps
+amplify = { version = "=4.8.1", default-features = false }
+rgb-invoicing = { version = "=0.11.1-rc.7", default-features = false }
+rgb-psbt-utils = { version = "=0.11.1-rc.7", default-features = false }
+rgb-schemas = { version = "=0.11.1-rc.6", default-features = false }
+rgb-ops = { version = "=0.11.1-rc.7", default-features = false, features = [
+    "serde",
+] }
+rgb-strict-encoding = { version = "=1.0.0", default-features = false, features = [
+    "bitcoin",
+] }
+rgb-strict-types = { version = "=1.0.0", default-features = false }
+
+[features]
+default = ["esplora"]
+esplora = [
+    "bdk_esplora",
+    "reqwest",
+]
+camel_case = []
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.reldebug]
+inherits = "release"
+debug = 1
+
+[patch.crates-io]
+rgb-strict-encoding = { git = "http://github.com/rgb-protocol/rgb-strict-encoding", branch = "master" }
+rgb-consensus = { git = "http://github.com/rgb-protocol/rgb-consensus", branch = "master" }
+rgb-ops = { git = "http://github.com/rgb-protocol/rgb-ops", branch = "master" }
+rgb-invoicing = { git = "http://github.com/rgb-protocol/rgb-ops", branch = "master" }

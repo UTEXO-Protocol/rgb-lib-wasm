@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, stage, master]
+  pull_request:
+    branches: [dev, stage, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+  check:
+    name: WASM check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --target wasm32-unknown-unknown
+
+  native-tests:
+    name: Native tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib
+
+  wasm-tests:
+    name: WASM tests (Firefox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: cargo install wasm-pack@0.14.0
+      - name: Run key tests
+        run: wasm-pack test --headless --firefox --release -- --test keys_wasm
+      - name: Run wallet tests
+        run: wasm-pack test --headless --firefox --release -- --test wallet_wasm
+
+  integration-tests:
+    name: Integration tests (Firefox + regtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: cargo install wasm-pack@0.14.0
+
+      - name: Start regtest services
+        working-directory: tests
+        run: |
+          docker compose -f docker-compose.ci.yml up -d
+          echo "Waiting for regtest-helper..."
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8080/status > /dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Waiting for esplora..."
+          for i in $(seq 1 120); do
+            if docker compose -f docker-compose.ci.yml logs esplora 2>&1 | grep -q 'run: nginx:'; then
+              break
+            fi
+            if [ $i -eq 120 ]; then
+              echo "Timeout waiting for esplora"
+              docker compose -f docker-compose.ci.yml logs esplora
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "Connecting bitcoind peers..."
+          docker compose -f docker-compose.ci.yml exec -T bitcoind \
+            bitcoin-cli -regtest -rpcuser=user -rpcpassword=default_password \
+            addnode "esplora:18444" "add" || true
+          docker compose -f docker-compose.ci.yml exec -T esplora \
+            cli addnode "bitcoind:18444" "add" || true
+          sleep 2
+
+          echo "Mining initial blocks..."
+          curl -s -X POST http://127.0.0.1:8080/mine \
+            -H 'Content-Type: application/json' \
+            -d '{"blocks": 111}'
+
+          echo "Waiting for esplora to sync..."
+          for i in $(seq 1 120); do
+            HEIGHT=$(curl -sf http://127.0.0.1:8094/regtest/api/blocks/tip/height 2>/dev/null || echo "0")
+            if [ "$HEIGHT" -ge 111 ] 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          echo "Regtest ready at height $HEIGHT"
+
+          echo "Waiting for VSS server (via CORS proxy)..."
+          for i in $(seq 1 120); do
+            if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8082/vss/getObject 2>/dev/null | grep -q "400\|401\|405\|200"; then
+              echo "VSS server ready"
+              break
+            fi
+            if [ $i -eq 120 ]; then
+              echo "Timeout waiting for VSS server"
+              docker compose -f docker-compose.ci.yml logs vss-server
+              docker compose -f docker-compose.ci.yml logs vss-cors-proxy
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run integration tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        run: wasm-pack test --headless --firefox --release --test integration_wasm
+
+      - name: Stop regtest services
+        if: always()
+        working-directory: tests
+        run: docker compose -f docker-compose.ci.yml down
