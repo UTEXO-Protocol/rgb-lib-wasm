@@ -290,6 +290,44 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </div>
   </div>
 
+  <!-- Decode Invoice -->
+  <div class="section">
+    <h2>Decode Invoice</h2>
+    <p class="hint">
+      Parse an RGB invoice string and extract structured data (recipient, asset, network, endpoints, etc.).
+    </p>
+    <div>
+      <label for="decode-invoice-str">Invoice string</label>
+      <input id="decode-invoice-str" type="text" placeholder="rgb:..." />
+    </div>
+    <div class="btn-group">
+      <button id="btn-decode-invoice">Decode Invoice</button>
+    </div>
+    <div class="output" id="decode-invoice-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('decode-invoice-result')">Copy</button></div>
+      <pre id="decode-invoice-result"></pre>
+    </div>
+  </div>
+
+  <!-- Asset Metadata -->
+  <div class="section">
+    <h2>Asset Metadata</h2>
+    <p class="hint">
+      Query detailed metadata for an issued asset (name, ticker, precision, supply, schema, etc.).
+    </p>
+    <div>
+      <label for="metadata-asset-id">Asset ID</label>
+      <input id="metadata-asset-id" type="text" placeholder="Contract ID" />
+    </div>
+    <div class="btn-group">
+      <button id="btn-get-metadata" disabled>Get Metadata</button>
+    </div>
+    <div class="output" id="metadata-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('metadata-result')">Copy</button></div>
+      <pre id="metadata-result"></pre>
+    </div>
+  </div>
+
   <!-- 5. Send RGB -->
   <div class="section">
     <h2>Send RGB</h2>
@@ -438,6 +476,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       generate_keys,
       restore_keys,
       WasmWallet,
+      WasmInvoice,
       state,
       ESPLORA_API,
       PROXY_URL,
@@ -462,10 +501,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     // =======================================================================
     // Button groups
     // =======================================================================
-    const wasmBtns = ['btn-auto-setup', 'btn-generate', 'btn-create-wallet'];
+    const wasmBtns = ['btn-auto-setup', 'btn-generate', 'btn-create-wallet', 'btn-decode-invoice'];
     const walletBtns = [
       'btn-go-online', 'btn-issue-nia', 'btn-issue-ifa',
       'btn-blind-receive', 'btn-witness-receive', 'btn-delete-transfers',
+      'btn-get-metadata',
     ];
     const onlineBtns = [
       'btn-fund', 'btn-create-utxos',
@@ -697,6 +737,48 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       } catch (e) {
         showError('ifa-output', 'ifa-result', 'Issue IFA failed', e);
         log('Issue IFA failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Decode Invoice
+    // =======================================================================
+    document.getElementById('btn-decode-invoice').addEventListener('click', () => {
+      const invoiceStr = document.getElementById('decode-invoice-str').value.trim();
+      if (!invoiceStr) {
+        showResult('decode-invoice-output', 'decode-invoice-result', 'Enter an invoice string');
+        return;
+      }
+      try {
+        log('Decoding invoice...', 'log-warn');
+        const invoice = new WasmInvoice(invoiceStr);
+        const data = invoice.invoiceData();
+        showJson('decode-invoice-output', 'decode-invoice-result', data);
+        log('Invoice decoded', 'log-ok');
+      } catch (e) {
+        showError('decode-invoice-output', 'decode-invoice-result', 'Decode invoice failed', e);
+        log('Decode invoice failed: ' + e, 'log-err');
+      }
+    });
+
+    // =======================================================================
+    // Get Asset Metadata
+    // =======================================================================
+    document.getElementById('btn-get-metadata').addEventListener('click', () => {
+      if (!requireWallet('metadata-output', 'metadata-result')) return;
+      const assetId = document.getElementById('metadata-asset-id').value.trim();
+      if (!assetId) {
+        showResult('metadata-output', 'metadata-result', 'Enter an asset ID');
+        return;
+      }
+      try {
+        log('Getting metadata for ' + assetId + '...', 'log-warn');
+        const metadata = state.wallet.get_asset_metadata(assetId);
+        showJson('metadata-output', 'metadata-result', metadata);
+        log('get_asset_metadata OK', 'log-ok');
+      } catch (e) {
+        showError('metadata-output', 'metadata-result', 'get_asset_metadata failed', e);
+        log('get_asset_metadata failed: ' + e, 'log-err');
       }
     });
 

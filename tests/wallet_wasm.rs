@@ -2,7 +2,7 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-use rgb_lib_wasm::wallet::{DatabaseType, Wallet, WalletData};
+use rgb_lib_wasm::wallet::{DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
@@ -175,6 +175,20 @@ fn test_receive_and_transfers() {
     assert!(format!("{:?}", err).contains("AssetNotFound"));
     // Note: blind_receive requires funded UTXOs even for error paths,
     // so it's only tested in integration_wasm.rs
+
+    // Invoice: parse the invoice from witness_receive
+    let invoice = Invoice::new(recv.invoice.clone()).unwrap();
+    assert_eq!(invoice.invoice_string(), recv.invoice);
+
+    let data = invoice.invoice_data();
+    assert_eq!(data.recipient_id, recv.recipient_id);
+    assert_eq!(data.network, BitcoinNetwork::Regtest);
+    assert_eq!(data.assignment, Assignment::Any);
+    assert!(!data.transport_endpoints.is_empty());
+    assert_eq!(data.expiration_timestamp, recv.expiration_timestamp);
+
+    // Invoice: invalid string should fail
+    assert!(Invoice::new("not-a-valid-invoice".to_string()).is_err());
 }
 
 /// Tests error paths and backup: invalid PSBT, issue without UTXOs,
