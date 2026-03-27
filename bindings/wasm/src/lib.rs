@@ -178,6 +178,16 @@ impl WasmWallet {
         to_js(&balance)
     }
 
+    /// Return metadata for a specific asset (name, ticker, precision, supply, etc.).
+    pub fn get_asset_metadata(&self, asset_id: &str) -> Result<JsValue, JsValue> {
+        let metadata = self
+            .inner
+            .borrow()
+            .get_asset_metadata(asset_id.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&metadata)
+    }
+
     /// Return the balance for a specific asset.
     pub fn get_asset_balance(&self, asset_id: &str) -> Result<JsValue, JsValue> {
         let balance = self
@@ -699,6 +709,35 @@ impl WasmWallet {
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&info)
+    }
+}
+
+/// An RGB invoice parsed from a string. Exposes structured invoice data to JavaScript.
+#[wasm_bindgen]
+pub struct WasmInvoice {
+    inner: rgb_lib_wasm::wallet::Invoice,
+}
+
+#[wasm_bindgen]
+impl WasmInvoice {
+    /// Parse an RGB invoice string. Throws if the string is not a valid RGB invoice.
+    #[wasm_bindgen(constructor)]
+    pub fn new(invoice_string: &str) -> Result<WasmInvoice, JsValue> {
+        let invoice = rgb_lib_wasm::wallet::Invoice::new(invoice_string.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(WasmInvoice { inner: invoice })
+    }
+
+    /// Return the parsed invoice data as a JS object.
+    #[wasm_bindgen(js_name = "invoiceData")]
+    pub fn invoice_data(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.inner.invoice_data())
+    }
+
+    /// Return the original invoice string.
+    #[wasm_bindgen(js_name = "invoiceString")]
+    pub fn invoice_string(&self) -> String {
+        self.inner.invoice_string()
     }
 }
 

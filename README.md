@@ -59,7 +59,7 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 ## Usage
 
 ```javascript
-import init, { generate_keys, restore_keys, check_proxy_url, WasmWallet } from './pkg/rgb_lib_wasm.js';
+import init, { generate_keys, restore_keys, check_proxy_url, WasmWallet, WasmInvoice } from './pkg/rgb_lib_wasm.js';
 
 await init();
 ```
@@ -158,11 +158,22 @@ const blind = wallet.blind_receive(null, 'Any', null, ['rpc://localhost:3000/jso
 const witness = wallet.witness_receive(null, { Fungible: 100 }, null, ['rpc://localhost:3000/json-rpc'], 1);
 ```
 
+### Parsing invoices
+
+```javascript
+const invoice = new WasmInvoice(invoiceString);
+const data = invoice.invoiceData();
+// data: { recipient_id, asset_schema, asset_id, assignment, network, expiration_timestamp, transport_endpoints }
+const str = invoice.invoiceString(); // original string
+```
+
 ### Querying wallet state
 
 ```javascript
 const btcBalance = wallet.get_btc_balance();
 const assetBalance = wallet.get_asset_balance(assetId);
+const metadata = wallet.get_asset_metadata(assetId);
+// metadata: { asset_schema, name, ticker, precision, initial_supply, max_supply, known_circulating_supply, timestamp, ... }
 const assets = wallet.list_assets([]);              // all schemas
 const transfers = wallet.list_transfers(null);       // all assets
 const unspents = wallet.list_unspents(false);
@@ -259,6 +270,14 @@ const finalized = wallet.finalize_psbt(signedPsbtBase64);
 | `restore_keys(network, mnemonic)` | Restore xpubs from a mnemonic |
 | `check_proxy_url(url)` | Validate an RGB proxy server URL |
 
+### `WasmInvoice`
+
+| Method | Description |
+|--------|-------------|
+| `new(invoiceString)` | Parse and validate an RGB invoice string |
+| `invoiceData()` | Return parsed `InvoiceData` as a JS object |
+| `invoiceString()` | Return the original invoice string |
+
 ### `WasmWallet` methods
 
 | Method | Async | Description |
@@ -269,6 +288,7 @@ const finalized = wallet.finalize_psbt(signedPsbtBase64);
 | `get_address()` | no | Get a new Bitcoin address |
 | `get_btc_balance()` | no | Get BTC balance |
 | `get_asset_balance(assetId)` | no | Get balance for an RGB asset |
+| `get_asset_metadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
 | `list_assets(schemas)` | no | List known RGB assets |
 | `list_transfers(assetId?)` | no | List RGB transfers |
 | `list_unspents(settledOnly)` | no | List unspent outputs with RGB allocations |

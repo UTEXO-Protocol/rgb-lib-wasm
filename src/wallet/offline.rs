@@ -2049,7 +2049,40 @@ impl Wallet {
         Ok(transfers_changed)
     }
 
-    /// Return the [`Balance`] for the RGB asset with the provided ID.
+    /// Return the [`Metadata`] of the RGB asset with the given ID.
+    pub fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, Error> {
+        info!(self.logger, "Getting metadata for asset '{}'...", asset_id);
+        let asset = self.database.check_asset_exists(asset_id)?;
+
+        let initial_supply = asset.initial_supply.parse::<u64>().unwrap();
+        let max_supply = if let Some(max_supply) = asset.max_supply {
+            max_supply.parse::<u64>().unwrap()
+        } else {
+            initial_supply
+        };
+        let known_circulating_supply =
+            if let Some(known_circulating_supply) = asset.known_circulating_supply {
+                known_circulating_supply.parse::<u64>().unwrap()
+            } else {
+                initial_supply
+            };
+
+        info!(self.logger, "Get asset metadata completed");
+        Ok(Metadata {
+            asset_schema: asset.schema,
+            initial_supply,
+            max_supply,
+            known_circulating_supply,
+            timestamp: asset.timestamp,
+            name: asset.name,
+            precision: asset.precision,
+            ticker: asset.ticker,
+            details: asset.details,
+            reject_list_url: asset.reject_list_url,
+        })
+    }
+
+    /// Return the [`Balance`] for the RGB asset with the given ID.
     pub fn get_asset_balance(&self, asset_id: String) -> Result<Balance, Error> {
         info!(self.logger, "Getting balance for asset '{}'...", asset_id);
         self.database.check_asset_exists(asset_id.clone())?;
