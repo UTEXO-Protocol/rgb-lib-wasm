@@ -42,6 +42,9 @@ jobs:
           "
           cat package.json
 
+      - name: Copy README into package
+        run: cp README.md bindings/wasm/pkg/README.md
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
