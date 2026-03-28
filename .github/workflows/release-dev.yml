@@ -1,0 +1,101 @@
+name: Release (dev)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Base version (e.g., 0.3.0-beta.4)'
+        required: true
+        type: string
+      suffix:
+        description: 'Dev suffix (e.g., test1 → published as 0.3.0-beta.4.test1)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build WASM (dev)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get full version
+        id: version
+        run: |
+          FULL_VERSION="${{ inputs.version }}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $FULL_VERSION"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack@0.14.0
+
+      - name: Build WASM package
+        working-directory: bindings/wasm
+        run: wasm-pack build --target web --out-dir pkg
+
+      - name: Set package version and name
+        working-directory: bindings/wasm/pkg
+        run: |
+          VERSION="${{ steps.version.outputs.full_version }}"
+          node -e "
+            const pkg = require('./package.json');
+            pkg.name = '@utexo/rgb-lib-wasm';
+            pkg.version = '$VERSION';
+            pkg.repository = { type: 'git', url: 'https://github.com/UTEXO-Protocol/rgb-lib-wasm.git' };
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+          "
+          cat package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm with dev tag
+        working-directory: bindings/wasm/pkg
+        run: npm publish --access public --tag ${{ inputs.suffix }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Get full version
+        id: version
+        run: |
+          FULL_VERSION="${{ inputs.version }}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$FULL_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }} (dev)
+          body: |
+            ## rgb-lib-wasm ${{ steps.version.outputs.tag }} (dev build)
+            
+            Branch: `${{ github.ref_name }}`
+            
+            ### Installation
+            
+            ```bash
+            npm install @utexo/rgb-lib-wasm@${{ steps.version.outputs.full_version }}
+            ```
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

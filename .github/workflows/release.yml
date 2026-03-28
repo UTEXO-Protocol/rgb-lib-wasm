@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.3.0-beta.4)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build WASM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack@0.14.0
+
+      - name: Build WASM package
+        working-directory: bindings/wasm
+        run: wasm-pack build --target web --out-dir pkg
+
+      - name: Set package version and name
+        working-directory: bindings/wasm/pkg
+        run: |
+          VERSION="${{ inputs.version }}"
+          node -e "
+            const pkg = require('./package.json');
+            pkg.name = '@utexo/rgb-lib-wasm';
+            pkg.version = '$VERSION';
+            pkg.repository = { type: 'git', url: 'https://github.com/UTEXO-Protocol/rgb-lib-wasm.git' };
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+          "
+          cat package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        working-directory: bindings/wasm/pkg
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Package artifact
+        run: |
+          cd bindings/wasm
+          tar -czvf ../../rgb-lib-wasm-pkg.tar.gz pkg/
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rgb-lib-wasm-pkg
+          path: rgb-lib-wasm-pkg.tar.gz
+          retention-days: 5
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Normalize version
+        id: version
+        run: |
+          RAW="${{ inputs.version }}"
+          VERSION="${RAW#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          body: |
+            ## rgb-lib-wasm ${{ steps.version.outputs.tag }}
+            
+            ### Installation
+            
+            ```bash
+            npm install @utexo/rgb-lib-wasm@${{ steps.version.outputs.version }}
+            ```
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'rc') }}
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
