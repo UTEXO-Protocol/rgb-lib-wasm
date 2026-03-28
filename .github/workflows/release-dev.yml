@@ -26,7 +26,12 @@ jobs:
         run: |
           RAW="${{ inputs.version }}"
           BASE="${RAW#v}"
-          FULL_VERSION="${BASE}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          SUFFIX="$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          if [[ "$BASE" == *-* ]]; then
+            FULL_VERSION="${BASE}.${SUFFIX}"
+          else
+            FULL_VERSION="${BASE}-${SUFFIX}"
+          fi
           echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
           echo "Version: $FULL_VERSION"
 
@@ -80,7 +85,12 @@ jobs:
         run: |
           RAW="${{ inputs.version }}"
           BASE="${RAW#v}"
-          FULL_VERSION="${BASE}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          SUFFIX="$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          if [[ "$BASE" == *-* ]]; then
+            FULL_VERSION="${BASE}.${SUFFIX}"
+          else
+            FULL_VERSION="${BASE}-${SUFFIX}"
+          fi
           echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
           echo "tag=v$FULL_VERSION" >> $GITHUB_OUTPUT
 
