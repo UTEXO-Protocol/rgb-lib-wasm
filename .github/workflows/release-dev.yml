@@ -24,7 +24,9 @@ jobs:
       - name: Get full version
         id: version
         run: |
-          FULL_VERSION="${{ inputs.version }}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          RAW="${{ inputs.version }}"
+          BASE="${RAW#v}"
+          FULL_VERSION="${BASE}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
           echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
           echo "Version: $FULL_VERSION"
 
@@ -76,7 +78,9 @@ jobs:
       - name: Get full version
         id: version
         run: |
-          FULL_VERSION="${{ inputs.version }}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          RAW="${{ inputs.version }}"
+          BASE="${RAW#v}"
+          FULL_VERSION="${BASE}.$(echo '${{ inputs.suffix }}' | tr '-' '.')"
           echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
           echo "tag=v$FULL_VERSION" >> $GITHUB_OUTPUT
 
