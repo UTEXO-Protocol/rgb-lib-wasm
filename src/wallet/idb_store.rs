@@ -5,6 +5,8 @@ use rexie::{ObjectStore, Rexie, TransactionMode};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
+use std::collections::HashMap;
+
 use crate::database::memory_db::InMemoryDb;
 
 const DB_NAME: &str = "rgb_lib_wallet";
@@ -18,6 +20,12 @@ pub struct WalletSnapshot {
     pub db: InMemoryDb,
     /// The BDK wallet changeset.
     pub bdk_changeset: Option<ChangeSet>,
+    /// Signed PSBTs keyed by txid (for refresh after page reload).
+    #[serde(default)]
+    pub signed_psbts: HashMap<String, String>,
+    /// Received consignment bytes keyed by recipient_id.
+    #[serde(default)]
+    pub received_consignments: HashMap<String, Vec<u8>>,
 }
 
 async fn open_db() -> Result<Rexie, String> {

@@ -2930,6 +2930,16 @@ impl Wallet {
         // Clone data for the async closure
         let db_clone = self.database.as_ref().clone();
         let bdk_changeset = self.bdk_database.get_data().clone();
+        let signed_psbts: std::collections::HashMap<String, String> = self
+            .transfer_artifacts
+            .iter()
+            .filter_map(|(txid, a)| {
+                a.signed_psbt
+                    .as_ref()
+                    .map(|psbt| (txid.clone(), psbt.clone()))
+            })
+            .collect();
+        let received_consignments = self.received_consignments.clone();
         let key = self.idb_key();
         let flag = self.idb_save_in_progress.clone();
 
@@ -2937,6 +2947,8 @@ impl Wallet {
             let snapshot = super::idb_store::WalletSnapshot {
                 db: db_clone,
                 bdk_changeset,
+                signed_psbts,
+                received_consignments,
             };
             if let Err(e) = super::idb_store::save_snapshot(&key, &snapshot).await {
                 web_sys::console::error_1(&format!("IDB save error: {e}").into());
@@ -3007,6 +3019,20 @@ impl Wallet {
                 }
             }
         }
+
+        // Restore transfer artifacts (signed PSBTs only)
+        for (txid, psbt) in snapshot.signed_psbts {
+            self.transfer_artifacts.insert(
+                txid,
+                super::online::TransferArtifacts {
+                    signed_psbt: Some(psbt),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Restore received consignments
+        self.received_consignments = snapshot.received_consignments;
 
         Ok(())
     }

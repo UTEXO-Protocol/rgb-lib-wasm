@@ -174,14 +174,37 @@ async fn test_full_wallet_flow() {
     wallet.sync(online.clone()).await.unwrap();
     wallet_b.sync(online_b.clone()).await.unwrap();
 
-    wallet
-        .refresh(online.clone(), None, vec![], false)
-        .await
-        .unwrap();
-    wallet_b
+    // Receiver refreshes first: picks up consignment from proxy, validates, ACKs
+    let recv_refresh = wallet_b
         .refresh(online_b.clone(), None, vec![], false)
         .await
         .unwrap();
+    for (idx, refreshed) in &recv_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Receiver refresh failed for transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
+
+    // Mine the ACK so sender can see it
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    // Sender refreshes: sees ACK, broadcasts TX → WaitingConfirmations
+    // This is the exact flow that failed with "signed PSBT not found in transfer artifacts"
+    let send_refresh = wallet
+        .refresh(online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for (idx, refreshed) in &send_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Sender refresh failed for transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
 
     let a_assets = wallet.list_assets(vec![AssetSchema::Nia]).unwrap();
     let a_nia = a_assets

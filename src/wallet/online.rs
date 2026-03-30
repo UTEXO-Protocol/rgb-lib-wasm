@@ -2528,6 +2528,8 @@ impl Wallet {
             let witness_id = RgbTxid::from_str(&txid.to_string()).unwrap();
             self._broadcast_and_update_rgb_async(&mut runtime, witness_id, signed_psbt, skip_sync)
                 .await?;
+            // Clean up: signed PSBT no longer needed after broadcast
+            self.transfer_artifacts.remove(txid);
             updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
         } else {
             return Ok(None);
@@ -2658,6 +2660,17 @@ impl Wallet {
         let updated = self
             .database
             .update_batch_transfer(&mut updated_batch_transfer)?;
+
+        // Clean up: received consignment no longer needed after settle
+        if incoming {
+            let batch_transfer_data =
+                batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+            if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data) {
+                if let Some(recipient_id) = &transfer.recipient_id {
+                    self.received_consignments.remove(recipient_id);
+                }
+            }
+        }
 
         Ok(Some(updated))
     }
@@ -3099,8 +3112,15 @@ impl Wallet {
         let mut transfer_info_map = artifacts.asset_infos;
         let consignment_bytes_map = artifacts.consignment_bytes;
 
-        // signed_psbt is consumed; no need to store since we already
-        // removed artifacts from the map
+        // Store signed PSBT for later use by refresh() → _wait_ack_async()
+        // (replaces filesystem "signed.psbt" from upstream)
+        self.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(signed_psbt.clone()),
+                ..Default::default()
+            },
+        );
 
         // Post consignment(s) to proxy server
         for (asset_id, info_contents_asset) in transfer_info_map.iter_mut() {
@@ -3508,6 +3528,15 @@ impl Wallet {
             details: s!("missing batch info in transfer artifacts"),
         })?;
         let transfer_info_map = artifacts.asset_infos;
+
+        // Store signed PSBT for refresh() persistence
+        self.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(signed_psbt.clone()),
+                ..Default::default()
+            },
+        );
 
         let mut runtime = self.rgb_runtime()?;
         let tx = self._broadcast_psbt(psbt, false).await?;
