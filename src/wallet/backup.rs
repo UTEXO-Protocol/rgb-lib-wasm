@@ -168,6 +168,8 @@ impl super::Wallet {
         let snapshot = super::idb_store::WalletSnapshot {
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
+            signed_psbts: Default::default(),
+            received_consignments: Default::default(),
         };
         self.restore_from_snapshot(snapshot)?;
 
@@ -267,6 +269,8 @@ impl super::Wallet {
         let snapshot = super::idb_store::WalletSnapshot {
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
+            signed_psbts: Default::default(),
+            received_consignments: Default::default(),
         };
         self.restore_from_snapshot(snapshot)?;
 
