@@ -3542,6 +3542,8 @@ impl Wallet {
         let tx = self._broadcast_psbt(psbt, false).await?;
         let _ = tx;
         runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
 
         let batch_transfer_idx = self._save_transfers(
             txid.clone(),
