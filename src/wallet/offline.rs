@@ -1610,6 +1610,8 @@ impl Wallet {
         runtime
             .import_contract(validated_contract.clone(), &DumbResolver)
             .expect("failure importing issued contract");
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
 
         let asset_data = LocalAssetData {
             name,
@@ -1816,6 +1818,8 @@ impl Wallet {
         runtime
             .import_contract(validated_contract.clone(), &DumbResolver)
             .expect("failure importing issued contract");
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
 
         let asset_data = LocalAssetData {
             name,
@@ -2742,6 +2746,8 @@ impl Wallet {
 
         let mut runtime = self.rgb_runtime()?;
         runtime.store_secret_seal(blind_seal)?;
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
@@ -2940,6 +2946,20 @@ impl Wallet {
             })
             .collect();
         let received_consignments = self.received_consignments.clone();
+
+        // Serialize RGB Stock if available (None when runtime is active)
+        let (stock_stash_b64, stock_state_b64, stock_index_b64) = {
+            let stock_ref = self.rgb_stock.borrow();
+            if let Some(stock) = stock_ref.as_ref() {
+                match super::idb_store::serialize_stock(stock) {
+                    Some((s, st, i)) => (Some(s), Some(st), Some(i)),
+                    None => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            }
+        };
+
         let key = self.idb_key();
         let flag = self.idb_save_in_progress.clone();
 
@@ -2949,6 +2969,9 @@ impl Wallet {
                 bdk_changeset,
                 signed_psbts,
                 received_consignments,
+                stock_stash_b64,
+                stock_state_b64,
+                stock_index_b64,
             };
             if let Err(e) = super::idb_store::save_snapshot(&key, &snapshot).await {
                 web_sys::console::error_1(&format!("IDB save error: {e}").into());
@@ -3033,6 +3056,17 @@ impl Wallet {
 
         // Restore received consignments
         self.received_consignments = snapshot.received_consignments;
+
+        // Restore RGB Stock from strict-encoded components
+        if let (Some(stash_b64), Some(state_b64), Some(index_b64)) = (
+            snapshot.stock_stash_b64,
+            snapshot.stock_state_b64,
+            snapshot.stock_index_b64,
+        ) {
+            let stock = super::idb_store::deserialize_stock(&stash_b64, &state_b64, &index_b64)
+                .map_err(InternalError::StockError)?;
+            *self.rgb_stock.borrow_mut() = Some(stock);
+        }
 
         Ok(())
     }

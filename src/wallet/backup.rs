@@ -170,6 +170,9 @@ impl super::Wallet {
             bdk_changeset: payload.bdk_changeset,
             signed_psbts: Default::default(),
             received_consignments: Default::default(),
+            stock_stash_b64: None,
+            stock_state_b64: None,
+            stock_index_b64: None,
         };
         self.restore_from_snapshot(snapshot)?;
 
@@ -271,6 +274,9 @@ impl super::Wallet {
             bdk_changeset: payload.bdk_changeset,
             signed_psbts: Default::default(),
             received_consignments: Default::default(),
+            stock_stash_b64: None,
+            stock_state_b64: None,
+            stock_index_b64: None,
         };
         self.restore_from_snapshot(snapshot)?;
 
