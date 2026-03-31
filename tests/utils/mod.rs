@@ -100,7 +100,7 @@ pub async fn wait_for_esplora_sync() {
     panic!("Esplora did not sync to height {} within 60s", target);
 }
 
-async fn sleep_ms(ms: u32) {
+pub async fn sleep_ms(ms: u32) {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         web_sys::window()
             .expect("no window")

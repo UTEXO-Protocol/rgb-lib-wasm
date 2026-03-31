@@ -3030,15 +3030,20 @@ impl Wallet {
                 wallet_params = wallet_params.extract_keys();
             }
 
-            match wallet_params.load_wallet(&mut self.bdk_database)? {
-                Some(wallet) => {
+            match wallet_params.load_wallet(&mut self.bdk_database) {
+                Ok(Some(wallet)) => {
                     self.bdk_wallet = wallet;
                 }
-                None => {
+                Ok(None) => {
                     // Changeset didn't produce a loadable wallet; create fresh
                     self.bdk_wallet = BdkWallet::create(desc_colored, desc_vanilla)
                         .network(bdk_network)
                         .create_wallet(&mut self.bdk_database)?;
+                }
+                Err(_) => {
+                    // BDK changeset load failed (e.g. incomplete changeset from
+                    // early save). Keep the fresh wallet from Wallet::new() — a
+                    // sync after go_online will re-populate BDK state from the indexer.
                 }
             }
         }
