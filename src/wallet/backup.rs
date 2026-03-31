@@ -207,6 +207,9 @@ impl super::Wallet {
         let stock = rgbstd::persistence::Stock::with(stash, state, index);
         *self.rgb_stock.borrow_mut() = Some(stock);
 
+        // Persist restored state to IndexedDB so it survives page reloads
+        self.trigger_auto_backup();
+
         Ok(())
     }
 
@@ -309,6 +312,9 @@ impl super::Wallet {
 
         let stock = rgbstd::persistence::Stock::with(stash, state, index);
         *self.rgb_stock.borrow_mut() = Some(stock);
+
+        // Persist restored state to IndexedDB so it survives page reloads
+        self.trigger_auto_backup();
 
         Ok(())
     }
