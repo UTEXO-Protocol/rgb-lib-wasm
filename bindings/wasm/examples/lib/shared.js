@@ -13,14 +13,14 @@ import init, {
   generate_keys,
   restore_keys,
   check_proxy_url,
-  validateConsignmentOffchain,
+  validate_consignment_offchain,
   WasmWallet,
   WasmInvoice,
 } from '/pkg/rgb_lib_wasm_bindings.js';
 
 export {
   generate_keys, restore_keys, check_proxy_url,
-  validateConsignmentOffchain,
+  validate_consignment_offchain,
   WasmWallet, WasmInvoice,
 };
 

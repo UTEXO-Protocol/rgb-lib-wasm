@@ -309,7 +309,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       showResult, showJson, showError,
       requireWallet, enableBtns, copyOutput,
       generate_keys, restore_keys, check_proxy_url,
-      validateConsignmentOffchain,
+      validate_consignment_offchain,
       WasmWallet,
       fillWalletData,
       PROXY_URL, VSS_URL,
@@ -593,7 +593,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         const arrayBuffer = await file.arrayBuffer();
         const bytes = new Uint8Array(arrayBuffer);
         log('Validating consignment (' + bytes.length + ' bytes, txid=' + txid + ')...', 'log-info');
-        const result = validateConsignmentOffchain(bytes, txid, network);
+        const result = validate_consignment_offchain(bytes, txid, network);
         showJson('consignment-output', 'consignment-result', result);
         if (result.valid) {
           log('Consignment is VALID', 'log-ok');
