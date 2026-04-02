@@ -40,6 +40,20 @@ impl fmt::Display for IndexerProtocol {
     }
 }
 
+/// Result of consignment validation (offchain or indexer-based).
+#[cfg(feature = "esplora")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateConsignmentResult {
+    /// Whether the consignment is valid.
+    pub valid: bool,
+    /// Warnings from validation (when valid).
+    pub warnings: Option<Vec<String>>,
+    /// Error category (when invalid): "invalid" or "resolver".
+    pub error: Option<String>,
+    /// Detailed error/failure description (when invalid).
+    pub details: Option<String>,
+}
+
 impl Wallet {
     /// Color a PSBT.
     ///
@@ -572,4 +586,132 @@ impl Wallet {
 #[cfg(feature = "esplora")]
 pub async fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
     crate::utils::check_proxy_async(proxy_url).await
+}
+
+/// Validate a consignment using the witness bundled in the consignment (offchain).
+///
+/// This works before the witness transaction is broadcast. The consignment bytes are
+/// the raw strict-encoded consignment (not base64). The `txid` is the witness
+/// transaction ID. The fallback resolver uses witness data from the consignment itself.
+///
+/// Returns a `ValidateConsignmentResult` with validity status, warnings, and error details.
+#[cfg(feature = "esplora")]
+pub fn validate_consignment_offchain(
+    consignment_bytes: &[u8],
+    txid: &str,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<ValidateConsignmentResult, Error> {
+    let consignment = RgbTransfer::load(consignment_bytes).map_err(|e| Error::Internal {
+        details: format!("Failed to load consignment: {e}"),
+    })?;
+
+    let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+    let chain_net: ChainNet = bitcoin_network.into();
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+    let trusted_typesystem = asset_schema.types();
+
+    let wasm_resolver = crate::utils::WasmResolver::from_consignment(&consignment, chain_net);
+    let resolver = crate::utils::OffchainResolverWasm {
+        witness_id,
+        consignment: &consignment,
+        fallback: &wasm_resolver,
+    };
+
+    let validation_config = ValidationConfig {
+        chain_net,
+        trusted_typesystem,
+        ..Default::default()
+    };
+
+    match consignment.clone().validate(&resolver, &validation_config) {
+        Ok(valid_consignment) => {
+            let status = valid_consignment.validation_status();
+            Ok(ValidateConsignmentResult {
+                valid: true,
+                warnings: Some(
+                    status
+                        .warnings
+                        .iter()
+                        .map(|w| w.to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                error: None,
+                details: None,
+            })
+        }
+        Err(ValidationError::InvalidConsignment(failure)) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("invalid".to_string()),
+            details: Some(failure.to_string()),
+        }),
+        Err(ValidationError::ResolverError(e)) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("resolver".to_string()),
+            details: Some(e.to_string()),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_consignment_offchain_invalid_bytes() {
+        let result = validate_consignment_offchain(
+            b"not a valid consignment",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            BitcoinNetwork::Regtest,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::Internal { details: ref d } if d.contains("Failed to load consignment")),
+            "expected Internal error with load failure, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_consignment_offchain_invalid_txid() {
+        let result = validate_consignment_offchain(
+            b"not a valid consignment",
+            "not-a-txid",
+            BitcoinNetwork::Regtest,
+        );
+        // Will fail on consignment load before txid parsing
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_consignment_result_serde_roundtrip() {
+        let result = ValidateConsignmentResult {
+            valid: true,
+            warnings: Some(vec!["warn1".to_string()]),
+            error: None,
+            details: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: ValidateConsignmentResult = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.valid);
+        assert_eq!(deserialized.warnings.unwrap(), vec!["warn1".to_string()]);
+        assert!(deserialized.error.is_none());
+
+        let result_invalid = ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("invalid".to_string()),
+            details: Some("schema mismatch".to_string()),
+        };
+        let json = serde_json::to_string(&result_invalid).unwrap();
+        let deserialized: ValidateConsignmentResult = serde_json::from_str(&json).unwrap();
+        assert!(!deserialized.valid);
+        assert_eq!(deserialized.error.unwrap(), "invalid");
+    }
+
+    #[test]
+    fn indexer_protocol_display() {
+        assert_eq!(IndexerProtocol::Esplora.to_string(), "Esplora");
+    }
 }
