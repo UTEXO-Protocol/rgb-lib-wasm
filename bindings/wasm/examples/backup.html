@@ -237,6 +237,44 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
   </div>
 
   <!-- ================================================================== -->
+  <!-- Validate Consignment Offchain -->
+  <!-- ================================================================== -->
+  <div class="section">
+    <h2>Validate Consignment Offchain</h2>
+    <p class="hint">
+      Validate an RGB consignment using witness data bundled inside it (works before the TX is broadcast).
+      Upload a strict-encoded consignment file and provide the witness transaction ID.
+    </p>
+    <div class="field-row">
+      <div>
+        <label for="consignment-file">Consignment file (strict-encoded binary)</label>
+        <input id="consignment-file" type="file" />
+      </div>
+    </div>
+    <div class="field-row">
+      <div>
+        <label for="consignment-txid">Witness Transaction ID</label>
+        <input id="consignment-txid" type="text" placeholder="e.g. abcd1234..." />
+      </div>
+      <div>
+        <label for="consignment-network">Network</label>
+        <select id="consignment-network">
+          <option value="Regtest" selected>Regtest</option>
+          <option value="Testnet">Testnet</option>
+          <option value="Signet">Signet</option>
+          <option value="Mainnet">Mainnet</option>
+        </select>
+      </div>
+      <button id="btn-validate-consignment" disabled>Validate</button>
+    </div>
+
+    <div class="output" id="consignment-output" style="display:none;">
+      <div class="output-label">Result <button class="copy-btn" onclick="copyOutput('consignment-result')">Copy</button></div>
+      <pre id="consignment-result"></pre>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
   <!-- Error Handling Tests -->
   <!-- ================================================================== -->
   <div class="section">
@@ -270,7 +308,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       initWasm, state, log, json,
       showResult, showJson, showError,
       requireWallet, enableBtns, copyOutput,
-      generate_keys, restore_keys, check_proxy_url, WasmWallet,
+      generate_keys, restore_keys, check_proxy_url,
+      validateConsignmentOffchain,
+      WasmWallet,
       fillWalletData,
       PROXY_URL, VSS_URL,
     } from './lib/shared.js';
@@ -282,7 +322,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     if (ok) {
       enableBtns([
         'btn-auto-setup', 'btn-generate', 'btn-create-wallet',
-        'btn-check-proxy', 'btn-error-tests',
+        'btn-check-proxy', 'btn-validate-consignment',
+        'btn-error-tests',
       ]);
     }
 
@@ -528,6 +569,39 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         log('check_proxy_url OK: ' + url, 'log-ok');
       } catch (e) {
         showError('proxy-output', 'proxy-result', 'Proxy check failed', e);
+      }
+    });
+
+    // -----------------------------------------------------------------
+    // Validate Consignment Offchain
+    // -----------------------------------------------------------------
+    document.getElementById('btn-validate-consignment').addEventListener('click', async () => {
+      const fileInput = document.getElementById('consignment-file');
+      const txid = document.getElementById('consignment-txid').value.trim();
+      const network = document.getElementById('consignment-network').value;
+      if (!fileInput.files || fileInput.files.length === 0) {
+        showResult('consignment-output', 'consignment-result', 'Please select a consignment file');
+        return;
+      }
+      if (!txid) {
+        showResult('consignment-output', 'consignment-result', 'Please enter a witness transaction ID');
+        return;
+      }
+      try {
+        log('Reading consignment file...', 'log-info');
+        const file = fileInput.files[0];
+        const arrayBuffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        log('Validating consignment (' + bytes.length + ' bytes, txid=' + txid + ')...', 'log-info');
+        const result = validateConsignmentOffchain(bytes, txid, network);
+        showJson('consignment-output', 'consignment-result', result);
+        if (result.valid) {
+          log('Consignment is VALID', 'log-ok');
+        } else {
+          log('Consignment is INVALID: ' + result.error, 'log-warn');
+        }
+      } catch (e) {
+        showError('consignment-output', 'consignment-result', 'Validation failed', e);
       }
     });
 

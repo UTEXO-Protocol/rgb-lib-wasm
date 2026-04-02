@@ -169,6 +169,22 @@ async fn test_full_wallet_flow() {
         .unwrap();
     assert!(!send_result.txid.is_empty());
 
+    // validate_consignment_offchain: fetch from proxy and validate before broadcast
+    let (consignment_bytes, proxy_txid) = get_consignment_from_proxy(&recv_b.recipient_id).await;
+    assert!(!consignment_bytes.is_empty());
+    assert_eq!(proxy_txid, send_result.txid);
+    let validation = rgb_lib_wasm::wallet::rust_only::validate_consignment_offchain(
+        &consignment_bytes,
+        &send_result.txid,
+        BitcoinNetwork::Regtest,
+    )
+    .unwrap();
+    assert!(
+        validation.valid,
+        "Consignment should be valid, got error: {:?} details: {:?}",
+        validation.error, validation.details,
+    );
+
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();

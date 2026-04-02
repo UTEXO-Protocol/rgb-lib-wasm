@@ -1,3 +1,4 @@
+use base64::{Engine, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 
 pub const REGTEST_HELPER_URL: &str = "http://127.0.0.1:8080";
@@ -108,4 +109,58 @@ pub async fn sleep_ms(ms: u32) {
             .expect("setTimeout failed");
     });
     wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+}
+
+/// Fetch consignment bytes from the proxy server via JSON-RPC.
+///
+/// Returns the decoded consignment bytes and the txid from the proxy response.
+#[allow(dead_code)]
+pub async fn get_consignment_from_proxy(recipient_id: &str) -> (Vec<u8>, String) {
+    #[derive(Serialize)]
+    struct JsonRpcRequest<T: Serialize> {
+        method: String,
+        jsonrpc: String,
+        id: Option<u64>,
+        params: Option<T>,
+    }
+
+    #[derive(Serialize)]
+    struct RecipientIDParam {
+        recipient_id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct GetConsignmentResponse {
+        consignment: String,
+        txid: String,
+    }
+
+    #[derive(Deserialize)]
+    struct JsonRpcResponse<T> {
+        result: Option<T>,
+    }
+
+    let client = reqwest::Client::new();
+    let body = JsonRpcRequest {
+        method: "consignment.get".to_string(),
+        jsonrpc: "2.0".to_string(),
+        id: None,
+        params: Some(RecipientIDParam {
+            recipient_id: recipient_id.to_string(),
+        }),
+    };
+    let resp: JsonRpcResponse<GetConsignmentResponse> = client
+        .post(PROXY_URL)
+        .json(&body)
+        .send()
+        .await
+        .expect("proxy get_consignment request failed")
+        .json()
+        .await
+        .expect("proxy get_consignment response parse failed");
+    let result = resp.result.expect("no consignment found on proxy");
+    let bytes = general_purpose::STANDARD
+        .decode(&result.consignment)
+        .expect("consignment base64 decode failed");
+    (bytes, result.txid)
 }

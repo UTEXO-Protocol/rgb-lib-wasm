@@ -2,6 +2,7 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
 use rgb_lib_wasm::wallet::{DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
 
@@ -248,4 +249,27 @@ fn test_errors_and_backup() {
         !transfers.is_empty(),
         "Transfers should survive backup/restore"
     );
+}
+
+#[wasm_bindgen_test]
+fn test_validate_consignment_offchain_invalid_bytes() {
+    let result = validate_consignment_offchain(
+        b"garbage data",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        BitcoinNetwork::Regtest,
+    );
+    assert!(result.is_err());
+}
+
+#[wasm_bindgen_test]
+fn test_validate_consignment_result_serializes() {
+    let result = ValidateConsignmentResult {
+        valid: true,
+        warnings: Some(vec!["test warning".to_string()]),
+        error: None,
+        details: None,
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(json.contains("\"valid\":true"));
+    assert!(json.contains("test warning"));
 }

@@ -748,3 +748,27 @@ pub async fn check_proxy_url(proxy_url: &str) -> Result<(), JsValue> {
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
+
+/// Validate an RGB consignment using witness data bundled in the consignment (offchain).
+///
+/// Works before the witness transaction is broadcast. Takes the raw consignment
+/// bytes (strict-encoded, not base64), the witness transaction ID, and the Bitcoin network.
+///
+/// Returns a JS object: `{ valid: boolean, warnings?: string[], error?: string, details?: string }`
+#[wasm_bindgen(js_name = "validateConsignmentOffchain")]
+pub fn validate_consignment_offchain(
+    consignment_bytes: &[u8],
+    txid: &str,
+    network: &str,
+) -> Result<JsValue, JsValue> {
+    let bitcoin_network = network
+        .parse::<rgb_lib_wasm::BitcoinNetwork>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let result = rgb_lib_wasm::wallet::rust_only::validate_consignment_offchain(
+        consignment_bytes,
+        txid,
+        bitcoin_network,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&result)
+}

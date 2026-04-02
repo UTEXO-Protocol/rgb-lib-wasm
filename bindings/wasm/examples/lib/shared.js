@@ -13,11 +13,16 @@ import init, {
   generate_keys,
   restore_keys,
   check_proxy_url,
+  validateConsignmentOffchain,
   WasmWallet,
   WasmInvoice,
 } from '/pkg/rgb_lib_wasm_bindings.js';
 
-export { generate_keys, restore_keys, check_proxy_url, WasmWallet, WasmInvoice };
+export {
+  generate_keys, restore_keys, check_proxy_url,
+  validateConsignmentOffchain,
+  WasmWallet, WasmInvoice,
+};
 
 // ---------------------------------------------------------------------------
 // 2. Mutable application state (shared across a single page)

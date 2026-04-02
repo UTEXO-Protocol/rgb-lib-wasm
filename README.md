@@ -59,7 +59,11 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 ## Usage
 
 ```javascript
-import init, { generate_keys, restore_keys, check_proxy_url, WasmWallet, WasmInvoice } from './pkg/rgb_lib_wasm.js';
+import init, {
+  generate_keys, restore_keys, check_proxy_url,
+  validateConsignmentOffchain,
+  WasmWallet, WasmInvoice,
+} from './pkg/rgb_lib_wasm.js';
 
 await init();
 ```
@@ -255,6 +259,12 @@ const deleted = wallet.delete_transfers(null, false);
 // Validate an RGB proxy server
 await check_proxy_url('http://localhost:3000/json-rpc');
 
+// Validate an RGB consignment offchain (before TX is broadcast)
+// consignmentBytes is a Uint8Array of the strict-encoded consignment
+const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
+// result: { valid: true, warnings: [...] }
+// result: { valid: false, error: "invalid", details: "..." }
+
 // PSBT signing and finalization (standalone)
 const signed = wallet.sign_psbt(unsignedPsbtBase64);
 const finalized = wallet.finalize_psbt(signedPsbtBase64);
@@ -269,6 +279,7 @@ const finalized = wallet.finalize_psbt(signedPsbtBase64);
 | `generate_keys(network)` | Generate a new BIP39 mnemonic and derive xpubs |
 | `restore_keys(network, mnemonic)` | Restore xpubs from a mnemonic |
 | `check_proxy_url(url)` | Validate an RGB proxy server URL |
+| `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
 
 ### `WasmInvoice`
 
