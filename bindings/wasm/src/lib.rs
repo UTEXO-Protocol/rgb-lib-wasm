@@ -755,7 +755,7 @@ pub async fn check_proxy_url(proxy_url: &str) -> Result<(), JsValue> {
 /// bytes (strict-encoded, not base64), the witness transaction ID, and the Bitcoin network.
 ///
 /// Returns a JS object: `{ valid: boolean, warnings?: string[], error?: string, details?: string }`
-#[wasm_bindgen(js_name = "validateConsignmentOffchain")]
+#[wasm_bindgen]
 pub fn validate_consignment_offchain(
     consignment_bytes: &[u8],
     txid: &str,
