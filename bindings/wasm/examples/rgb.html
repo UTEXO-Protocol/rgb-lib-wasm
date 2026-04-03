@@ -124,7 +124,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </div>
     <div>
       <label for="wallet-data">WalletData JSON (auto-filled from Generate / Auto Setup)</label>
-      <textarea id="wallet-data" rows="6" placeholder='{"data_dir": ":memory:", "bitcoin_network": "Regtest", ...}'></textarea>
+      <textarea id="wallet-data" rows="6" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-generate" disabled>Generate Keys</button>
@@ -332,7 +332,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </p>
     <div>
       <label for="send-rgb-recipient-map">Recipient Map (JSON)</label>
-      <textarea id="send-rgb-recipient-map" rows="6" placeholder='{"asset_id": [{"recipient_id": "invoice...", "witness_data": {"amount_sat": 1000, "blinding": null}, "amount": 100, "transport_endpoints": ["rpc://127.0.0.1:3000/json-rpc"]}]}'></textarea>
+      <textarea id="send-rgb-recipient-map" rows="6" placeholder='{"assetId": [{"recipientId": "invoice...", "witnessData": {"amountSat": 1000, "blinding": null}, "amount": 100, "transportEndpoints": ["rpc://127.0.0.1:3000/json-rpc"]}]}'></textarea>
     </div>
     <div class="field-row">
       <div>
@@ -703,7 +703,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         log('Issuing NIA: ' + ticker + '...', 'log-warn');
         const asset = state.wallet.issueAssetNia(ticker, name, precision, amounts);
         showJson('nia-output', 'nia-result', asset);
-        log('NIA issued: ' + (asset.asset_id || ticker), 'log-ok');
+        log('NIA issued: ' + (asset.assetId || ticker), 'log-ok');
       } catch (e) {
         showError('nia-output', 'nia-result', 'Issue NIA failed', e);
         log('Issue NIA failed: ' + e, 'log-err');
@@ -728,7 +728,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
           ticker, name, precision, amounts, inflationAmounts, rejectListUrl
         );
         showJson('ifa-output', 'ifa-result', asset);
-        log('IFA issued: ' + (asset.asset_id || ticker), 'log-ok');
+        log('IFA issued: ' + (asset.assetId || ticker), 'log-ok');
       } catch (e) {
         showError('ifa-output', 'ifa-result', 'Issue IFA failed', e);
         log('Issue IFA failed: ' + e, 'log-err');

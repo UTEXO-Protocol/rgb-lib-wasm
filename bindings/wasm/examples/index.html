@@ -117,7 +117,7 @@ code.snippet {
       <span class="step-title">Generate Keys</span>
       <p>Create a new BIP39 mnemonic and derive account xpubs for vanilla (Bitcoin) and colored (RGB) keychains.</p>
       <code class="snippet">const keys = generateKeys("regtest");
-// { mnemonic, account_xpub_vanilla, account_xpub_colored, master_fingerprint }</code>
+// { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint }</code>
     </div>
 
     <div class="step">
@@ -125,16 +125,16 @@ code.snippet {
       <span class="step-title">Create Wallet</span>
       <p>Instantiate a wallet from the generated keys. State is held in-memory and persisted to IndexedDB.</p>
       <code class="snippet">const walletData = {
-  data_dir: ":memory:",
-  bitcoin_network: "Regtest",
-  database_type: "Sqlite",
-  max_allocations_per_utxo: 5,
-  account_xpub_vanilla: keys.account_xpub_vanilla,
-  account_xpub_colored: keys.account_xpub_colored,
+  dataDir: ":memory:",
+  bitcoinNetwork: "Regtest",
+  databaseType: "Sqlite",
+  maxAllocationsPerUtxo: 5,
+  accountXpubVanilla: keys.accountXpubVanilla,
+  accountXpubColored: keys.accountXpubColored,
   mnemonic: keys.mnemonic,
-  master_fingerprint: keys.master_fingerprint,
-  vanilla_keychain: null,
-  supported_schemas: ["Nia", "Ifa"],
+  masterFingerprint: keys.masterFingerprint,
+  vanillaKeychain: null,
+  supportedSchemas: ["Nia", "Ifa"],
 };
 const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
     </div>
@@ -175,7 +175,7 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-title">Receive Assets</span>
       <p>Generate a blind or witness receive to accept incoming RGB transfers.</p>
       <code class="snippet">const receive = await wallet.blindReceive(
-  null, null, null, ["transport_endpoints"], 1
+  null, null, null, ["transportEndpoints"], 1
 );</code>
     </div>
   </div>
@@ -279,16 +279,16 @@ bash tests/regtest.sh stop</pre>
         const keys = generateKeys('regtest');
         append('[1/12] Keys generated');
         append('  mnemonic: ' + keys.mnemonic.split(' ').slice(0, 3).join(' ') + ' ...');
-        append('  fingerprint: ' + keys.master_fingerprint);
+        append('  fingerprint: ' + keys.masterFingerprint);
         log('[1/12] Keys generated', 'log-ok');
 
         // Step 2: Restore keys (round-trip verification)
         log('[2/12] Restoring keys (round-trip)...', 'log-info');
         const restored = restoreKeys('regtest', keys.mnemonic);
         const match =
-          restored.account_xpub_vanilla === keys.account_xpub_vanilla &&
-          restored.account_xpub_colored === keys.account_xpub_colored &&
-          restored.master_fingerprint === keys.master_fingerprint;
+          restored.accountXpubVanilla === keys.accountXpubVanilla &&
+          restored.accountXpubColored === keys.accountXpubColored &&
+          restored.masterFingerprint === keys.masterFingerprint;
         append('[2/12] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'));
         log('[2/12] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'), match ? 'log-ok' : 'log-err');
 
@@ -325,13 +325,13 @@ bash tests/regtest.sh stop</pre>
         // Step 7: Issue NIA asset
         log('[7/12] Issuing NIA asset...', 'log-info');
         const nia = await wallet.issueAssetNia(online, 'DEMO', 'Demo Token', 0, [1000]);
-        append('[7/12] NIA issued: ' + nia.asset_id);
+        append('[7/12] NIA issued: ' + nia.assetId);
         log('[7/12] NIA issued', 'log-ok');
 
         // Step 8: Issue IFA asset
         log('[8/12] Issuing IFA asset...', 'log-info');
         const ifa = wallet.issueAssetIfa('INFL', 'Inflatable Token', 0, [500], [], undefined);
-        append('[8/12] IFA issued: ' + ifa.asset_id);
+        append('[8/12] IFA issued: ' + ifa.assetId);
         log('[8/12] IFA issued', 'log-ok');
 
         // Step 9: Blind receive
@@ -399,18 +399,18 @@ bash tests/regtest.sh stop</pre>
         const keys = generateKeys('regtest');
         append('[1/6] Keys generated');
         append('  mnemonic: ' + keys.mnemonic);
-        append('  xpub_vanilla: ' + keys.account_xpub_vanilla.substring(0, 30) + '...');
-        append('  xpub_colored: ' + keys.account_xpub_colored.substring(0, 30) + '...');
-        append('  fingerprint: ' + keys.master_fingerprint);
+        append('  xpub_vanilla: ' + keys.accountXpubVanilla.substring(0, 30) + '...');
+        append('  xpub_colored: ' + keys.accountXpubColored.substring(0, 30) + '...');
+        append('  fingerprint: ' + keys.masterFingerprint);
         log('[1/6] Keys generated', 'log-ok');
 
         // Step 2: Restore round-trip
         log('[2/6] Restore round-trip...', 'log-info');
         const restored = restoreKeys('regtest', keys.mnemonic);
         const match =
-          restored.account_xpub_vanilla === keys.account_xpub_vanilla &&
-          restored.account_xpub_colored === keys.account_xpub_colored &&
-          restored.master_fingerprint === keys.master_fingerprint;
+          restored.accountXpubVanilla === keys.accountXpubVanilla &&
+          restored.accountXpubColored === keys.accountXpubColored &&
+          restored.masterFingerprint === keys.masterFingerprint;
         append('[2/6] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'));
         if (!match) {
           append('  MISMATCH detected!');

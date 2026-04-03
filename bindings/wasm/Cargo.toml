@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 name = "rgb_lib_wasm_bindings"
 
 [dependencies]
-rgb-lib-wasm = { path = "../../", default-features = false, features = ["esplora"] }
+rgb-lib-wasm = { path = "../../", default-features = false, features = ["esplora", "camel_case"] }
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
