@@ -116,8 +116,8 @@ code.snippet {
       <span class="step-number">1</span>
       <span class="step-title">Generate Keys</span>
       <p>Create a new BIP39 mnemonic and derive account xpubs for vanilla (Bitcoin) and colored (RGB) keychains.</p>
-      <code class="snippet">const keys = generate_keys("regtest");
-// { mnemonic, account_xpub_vanilla, account_xpub_colored, master_fingerprint }</code>
+      <code class="snippet">const keys = generateKeys("regtest");
+// { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint }</code>
     </div>
 
     <div class="step">
@@ -125,16 +125,16 @@ code.snippet {
       <span class="step-title">Create Wallet</span>
       <p>Instantiate a wallet from the generated keys. State is held in-memory and persisted to IndexedDB.</p>
       <code class="snippet">const walletData = {
-  data_dir: ":memory:",
-  bitcoin_network: "Regtest",
-  database_type: "Sqlite",
-  max_allocations_per_utxo: 5,
-  account_xpub_vanilla: keys.account_xpub_vanilla,
-  account_xpub_colored: keys.account_xpub_colored,
+  dataDir: ":memory:",
+  bitcoinNetwork: "Regtest",
+  databaseType: "Sqlite",
+  maxAllocationsPerUtxo: 5,
+  accountXpubVanilla: keys.accountXpubVanilla,
+  accountXpubColored: keys.accountXpubColored,
   mnemonic: keys.mnemonic,
-  master_fingerprint: keys.master_fingerprint,
-  vanilla_keychain: null,
-  supported_schemas: ["Nia", "Ifa"],
+  masterFingerprint: keys.masterFingerprint,
+  vanillaKeychain: null,
+  supportedSchemas: ["Nia", "Ifa"],
 };
 const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
     </div>
@@ -143,14 +143,14 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-number">3</span>
       <span class="step-title">Go Online</span>
       <p>Connect the wallet to an Esplora indexer. Returns an Online object used by subsequent operations.</p>
-      <code class="snippet">const online = await wallet.go_online(true, "http://127.0.0.1:8094/regtest/api");</code>
+      <code class="snippet">const online = await wallet.goOnline(true, "http://127.0.0.1:8094/regtest/api");</code>
     </div>
 
     <div class="step">
       <span class="step-number">4</span>
       <span class="step-title">Fund the Wallet</span>
       <p>Get a Bitcoin address and send funds to it (on regtest, use the helper service).</p>
-      <code class="snippet">const address = await wallet.get_address();
+      <code class="snippet">const address = await wallet.getAddress();
 // Fund via regtest helper or external wallet</code>
     </div>
 
@@ -158,14 +158,14 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-number">5</span>
       <span class="step-title">Create UTXOs</span>
       <p>Allocate colored UTXOs for RGB operations. Required before issuing or receiving assets.</p>
-      <code class="snippet">await wallet.create_utxos(online, true, null, null, 1.5);</code>
+      <code class="snippet">await wallet.createUtxos(online, true, null, null, 1.5);</code>
     </div>
 
     <div class="step">
       <span class="step-number">6</span>
       <span class="step-title">Issue an Asset</span>
       <p>Issue an NIA (fungible) or IFA (inflatable fungible) asset on the RGB protocol.</p>
-      <code class="snippet">const asset = await wallet.issue_asset_nia(
+      <code class="snippet">const asset = await wallet.issueAssetNia(
   online, "ticker", "My Token", 0, [1000]
 );</code>
     </div>
@@ -174,8 +174,8 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-number">7</span>
       <span class="step-title">Receive Assets</span>
       <p>Generate a blind or witness receive to accept incoming RGB transfers.</p>
-      <code class="snippet">const receive = await wallet.blind_receive(
-  null, null, null, ["transport_endpoints"], 1
+      <code class="snippet">const receive = await wallet.blindReceive(
+  null, null, null, ["transportEndpoints"], 1
 );</code>
     </div>
   </div>
@@ -229,9 +229,9 @@ bash tests/regtest.sh stop</pre>
 
   <script type="module">
     import {
-      generate_keys,
-      restore_keys,
-      check_proxy_url,
+      generateKeys,
+      restoreKeys,
+      checkProxyUrl,
       WasmWallet,
       state,
       json,
@@ -276,19 +276,19 @@ bash tests/regtest.sh stop</pre>
       try {
         // Step 1: Generate keys
         log('[1/12] Generating keys...', 'log-info');
-        const keys = generate_keys('regtest');
+        const keys = generateKeys('regtest');
         append('[1/12] Keys generated');
         append('  mnemonic: ' + keys.mnemonic.split(' ').slice(0, 3).join(' ') + ' ...');
-        append('  fingerprint: ' + keys.master_fingerprint);
+        append('  fingerprint: ' + keys.masterFingerprint);
         log('[1/12] Keys generated', 'log-ok');
 
         // Step 2: Restore keys (round-trip verification)
         log('[2/12] Restoring keys (round-trip)...', 'log-info');
-        const restored = restore_keys('regtest', keys.mnemonic);
+        const restored = restoreKeys('regtest', keys.mnemonic);
         const match =
-          restored.account_xpub_vanilla === keys.account_xpub_vanilla &&
-          restored.account_xpub_colored === keys.account_xpub_colored &&
-          restored.master_fingerprint === keys.master_fingerprint;
+          restored.accountXpubVanilla === keys.accountXpubVanilla &&
+          restored.accountXpubColored === keys.accountXpubColored &&
+          restored.masterFingerprint === keys.masterFingerprint;
         append('[2/12] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'));
         log('[2/12] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'), match ? 'log-ok' : 'log-err');
 
@@ -302,14 +302,14 @@ bash tests/regtest.sh stop</pre>
 
         // Step 4: Go online
         log('[4/12] Going online...', 'log-info');
-        const online = await wallet.go_online(true, ESPLORA_API);
+        const online = await wallet.goOnline(true, ESPLORA_API);
         state.online = online;
         append('[4/12] Wallet online (Esplora connected)');
         log('[4/12] Online', 'log-ok');
 
         // Step 5: Get address and fund
         log('[5/12] Funding wallet...', 'log-info');
-        const address = await wallet.get_address();
+        const address = await wallet.getAddress();
         append('[5/12] Address: ' + address);
         await fundAddress(address, 100000);
         await mineAndWait(1);
@@ -318,31 +318,31 @@ bash tests/regtest.sh stop</pre>
 
         // Step 6: Create UTXOs
         log('[6/12] Creating UTXOs...', 'log-info');
-        const utxoCount = await wallet.create_utxos(online, true, null, null, 1.5);
+        const utxoCount = await wallet.createUtxos(online, true, null, null, 1.5);
         append('[6/12] Created ' + utxoCount + ' UTXOs');
         log('[6/12] Created ' + utxoCount + ' UTXOs', 'log-ok');
 
         // Step 7: Issue NIA asset
         log('[7/12] Issuing NIA asset...', 'log-info');
-        const nia = await wallet.issue_asset_nia(online, 'DEMO', 'Demo Token', 0, [1000]);
-        append('[7/12] NIA issued: ' + nia.asset_id);
+        const nia = await wallet.issueAssetNia(online, 'DEMO', 'Demo Token', 0, [1000]);
+        append('[7/12] NIA issued: ' + nia.assetId);
         log('[7/12] NIA issued', 'log-ok');
 
         // Step 8: Issue IFA asset
         log('[8/12] Issuing IFA asset...', 'log-info');
-        const ifa = wallet.issue_asset_ifa('INFL', 'Inflatable Token', 0, [500], [], undefined);
-        append('[8/12] IFA issued: ' + ifa.asset_id);
+        const ifa = wallet.issueAssetIfa('INFL', 'Inflatable Token', 0, [500], [], undefined);
+        append('[8/12] IFA issued: ' + ifa.assetId);
         log('[8/12] IFA issued', 'log-ok');
 
         // Step 9: Blind receive
         log('[9/12] Creating blind receive...', 'log-info');
-        const blindRecv = await wallet.blind_receive(null, null, null, [PROXY_URL], 1);
+        const blindRecv = await wallet.blindReceive(null, null, null, [PROXY_URL], 1);
         append('[9/12] Blind receive invoice: ' + blindRecv.invoice.substring(0, 40) + '...');
         log('[9/12] Blind receive created', 'log-ok');
 
         // Step 10: Witness receive
         log('[10/12] Creating witness receive...', 'log-info');
-        const witnessRecv = await wallet.witness_receive(null, null, null, [PROXY_URL], 1);
+        const witnessRecv = await wallet.witnessReceive(null, null, null, [PROXY_URL], 1);
         append('[10/12] Witness receive invoice: ' + witnessRecv.invoice.substring(0, 40) + '...');
         log('[10/12] Witness receive created', 'log-ok');
 
@@ -356,8 +356,8 @@ bash tests/regtest.sh stop</pre>
 
         // Step 12: Check proxy & fee estimation
         log('[12/12] Checking proxy URL & fee estimation...', 'log-info');
-        const proxyOk = await check_proxy_url(PROXY_URL);
-        const feeRate = await wallet.get_fee_estimation(online, 6);
+        const proxyOk = await checkProxyUrl(PROXY_URL);
+        const feeRate = await wallet.getFeeEstimation(online, 6);
         append('[12/12] Proxy check: ' + (proxyOk ? 'OK' : 'FAIL'));
         append('[12/12] Fee rate (6 blocks): ' + feeRate);
         log('[12/12] Proxy OK, fee estimation OK', 'log-ok');
@@ -396,21 +396,21 @@ bash tests/regtest.sh stop</pre>
       try {
         // Step 1: Generate keys
         log('[1/6] Generating keys...', 'log-info');
-        const keys = generate_keys('regtest');
+        const keys = generateKeys('regtest');
         append('[1/6] Keys generated');
         append('  mnemonic: ' + keys.mnemonic);
-        append('  xpub_vanilla: ' + keys.account_xpub_vanilla.substring(0, 30) + '...');
-        append('  xpub_colored: ' + keys.account_xpub_colored.substring(0, 30) + '...');
-        append('  fingerprint: ' + keys.master_fingerprint);
+        append('  xpub_vanilla: ' + keys.accountXpubVanilla.substring(0, 30) + '...');
+        append('  xpub_colored: ' + keys.accountXpubColored.substring(0, 30) + '...');
+        append('  fingerprint: ' + keys.masterFingerprint);
         log('[1/6] Keys generated', 'log-ok');
 
         // Step 2: Restore round-trip
         log('[2/6] Restore round-trip...', 'log-info');
-        const restored = restore_keys('regtest', keys.mnemonic);
+        const restored = restoreKeys('regtest', keys.mnemonic);
         const match =
-          restored.account_xpub_vanilla === keys.account_xpub_vanilla &&
-          restored.account_xpub_colored === keys.account_xpub_colored &&
-          restored.master_fingerprint === keys.master_fingerprint;
+          restored.accountXpubVanilla === keys.accountXpubVanilla &&
+          restored.accountXpubColored === keys.accountXpubColored &&
+          restored.masterFingerprint === keys.masterFingerprint;
         append('[2/6] Restore round-trip: ' + (match ? 'PASS' : 'FAIL'));
         if (!match) {
           append('  MISMATCH detected!');
@@ -427,7 +427,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 4: Get address
         log('[4/6] Getting address...', 'log-info');
-        const address = await wallet.get_address();
+        const address = await wallet.getAddress();
         append('[4/6] Address: ' + address);
         log('[4/6] Address: ' + address, 'log-ok');
 
@@ -447,7 +447,7 @@ bash tests/regtest.sh stop</pre>
         // Test: invalid network
         errCount++;
         try {
-          generate_keys('invalid_network');
+          generateKeys('invalid_network');
           append('[6/6] ERROR: invalid network should have thrown');
         } catch (e) {
           errPassed++;
@@ -457,7 +457,7 @@ bash tests/regtest.sh stop</pre>
         // Test: bad mnemonic
         errCount++;
         try {
-          restore_keys('regtest', 'not a valid mnemonic phrase at all');
+          restoreKeys('regtest', 'not a valid mnemonic phrase at all');
           append('[6/6] ERROR: bad mnemonic should have thrown');
         } catch (e) {
           errPassed++;

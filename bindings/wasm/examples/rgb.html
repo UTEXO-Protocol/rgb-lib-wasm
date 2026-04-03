@@ -124,7 +124,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </div>
     <div>
       <label for="wallet-data">WalletData JSON (auto-filled from Generate / Auto Setup)</label>
-      <textarea id="wallet-data" rows="6" placeholder='{"data_dir": ":memory:", "bitcoin_network": "Regtest", ...}'></textarea>
+      <textarea id="wallet-data" rows="6" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-generate" disabled>Generate Keys</button>
@@ -332,7 +332,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </p>
     <div>
       <label for="send-rgb-recipient-map">Recipient Map (JSON)</label>
-      <textarea id="send-rgb-recipient-map" rows="6" placeholder='{"asset_id": [{"recipient_id": "invoice...", "witness_data": {"amount_sat": 1000, "blinding": null}, "amount": 100, "transport_endpoints": ["rpc://127.0.0.1:3000/json-rpc"]}]}'></textarea>
+      <textarea id="send-rgb-recipient-map" rows="6" placeholder='{"assetId": [{"recipientId": "invoice...", "witnessData": {"amountSat": 1000, "blinding": null}, "amount": 100, "transportEndpoints": ["rpc://127.0.0.1:3000/json-rpc"]}]}'></textarea>
     </div>
     <div class="field-row">
       <div>
@@ -469,8 +469,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
   <script type="module">
     import {
       initWasm,
-      generate_keys,
-      restore_keys,
+      generateKeys,
+      restoreKeys,
       WasmWallet,
       WasmInvoice,
       state,
@@ -550,7 +550,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Auto setup: generating keys...', 'log-warn');
         const network = document.getElementById('setup-network').value;
-        const keys = generate_keys(network);
+        const keys = generateKeys(network);
         log('Keys generated', 'log-ok');
 
         const wd = fillWalletData(keys, network);
@@ -560,7 +560,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
         const url = document.getElementById('setup-indexer-url').value.trim();
         log('Auto setup: going online (' + url + ')...', 'log-warn');
-        state.online = await state.wallet.go_online(true, url);
+        state.online = await state.wallet.goOnline(true, url);
         log('Online', 'log-ok');
 
         enableBtns(walletBtns);
@@ -582,13 +582,13 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-generate').addEventListener('click', () => {
       const network = document.getElementById('setup-network').value;
       try {
-        const keys = generate_keys(network);
+        const keys = generateKeys(network);
         fillWalletData(keys, network);
         showResult('setup-output', 'setup-result', 'Keys generated.\n\n' + json(keys));
-        log('generate_keys(' + network + ') OK', 'log-ok');
+        log('generateKeys(' + network + ') OK', 'log-ok');
       } catch (e) {
         showError('setup-output', 'setup-result', 'Generate keys failed', e);
-        log('generate_keys failed: ' + e, 'log-err');
+        log('generateKeys failed: ' + e, 'log-err');
       }
     });
 
@@ -604,7 +604,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Creating wallet...', 'log-warn');
         state.wallet = await WasmWallet.create(walletDataJson);
-        showResult('setup-output', 'setup-result', 'Wallet created.\n\n' + json(state.wallet.get_wallet_data()));
+        showResult('setup-output', 'setup-result', 'Wallet created.\n\n' + json(state.wallet.getWalletData()));
         enableBtns(walletBtns);
         log('Wallet created', 'log-ok');
       } catch (e) {
@@ -622,13 +622,13 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('setup-indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.go_online(true, url);
+        state.online = await state.wallet.goOnline(true, url);
         enableBtns(onlineBtns);
         showResult('setup-output', 'setup-result', 'Online!\n\n' + json(state.online));
         log('Online: ' + url, 'log-ok');
       } catch (e) {
         showError('setup-output', 'setup-result', 'Go online failed', e);
-        log('go_online failed: ' + e, 'log-err');
+        log('goOnline failed: ' + e, 'log-err');
       }
     });
 
@@ -639,7 +639,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       if (!requireOnline('setup-output', 'setup-result')) return;
       try {
         log('Getting wallet address...', 'log-warn');
-        const address = state.wallet.get_address();
+        const address = state.wallet.getAddress();
         const amount = parseFloat(document.getElementById('fund-amount').value) || 1.0;
 
         log('Funding ' + address + ' with ' + amount + ' BTC...', 'log-warn');
@@ -653,7 +653,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         log('Syncing wallet...', 'log-warn');
         await state.wallet.sync(state.online);
 
-        const balance = state.wallet.get_btc_balance();
+        const balance = state.wallet.getBtcBalance();
         showResult('setup-output', 'setup-result',
           'Funded ' + address + ' with ' + amount + ' BTC\n' +
           'Mine height: ' + mineResult.height + '\n\n' +
@@ -674,19 +674,19 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const size = optionalInt('utxo-size');
       const feeRate = parseInt(document.getElementById('utxo-fee-rate').value, 10) || 1;
       try {
-        log('create_utxos (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.create_utxos_begin(
+        log('createUtxos (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.createUtxosBegin(
           state.online, true, num, size, BigInt(feeRate), false
         );
-        log('create_utxos (auto) sign...', 'log-warn');
-        const signed = state.wallet.sign_psbt(unsignedPsbt);
-        log('create_utxos (auto) end...', 'log-warn');
-        const count = await state.wallet.create_utxos_end(state.online, signed, false);
+        log('createUtxos (auto) sign...', 'log-warn');
+        const signed = state.wallet.signPsbt(unsignedPsbt);
+        log('createUtxos (auto) end...', 'log-warn');
+        const count = await state.wallet.createUtxosEnd(state.online, signed, false);
         showResult('setup-output', 'setup-result', 'UTXOs created: ' + count);
-        log('create_utxos complete: ' + count + ' UTXOs', 'log-ok');
+        log('createUtxos complete: ' + count + ' UTXOs', 'log-ok');
       } catch (e) {
         showError('setup-output', 'setup-result', 'Create UTXOs failed', e);
-        log('create_utxos failed: ' + e, 'log-err');
+        log('createUtxos failed: ' + e, 'log-err');
       }
     });
 
@@ -701,9 +701,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const amounts = parseAmounts(document.getElementById('nia-amounts').value);
       try {
         log('Issuing NIA: ' + ticker + '...', 'log-warn');
-        const asset = state.wallet.issue_asset_nia(ticker, name, precision, amounts);
+        const asset = state.wallet.issueAssetNia(ticker, name, precision, amounts);
         showJson('nia-output', 'nia-result', asset);
-        log('NIA issued: ' + (asset.asset_id || ticker), 'log-ok');
+        log('NIA issued: ' + (asset.assetId || ticker), 'log-ok');
       } catch (e) {
         showError('nia-output', 'nia-result', 'Issue NIA failed', e);
         log('Issue NIA failed: ' + e, 'log-err');
@@ -724,11 +724,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const rejectListUrl = document.getElementById('ifa-reject-list-url').value.trim() || undefined;
       try {
         log('Issuing IFA: ' + ticker + '...', 'log-warn');
-        const asset = state.wallet.issue_asset_ifa(
+        const asset = state.wallet.issueAssetIfa(
           ticker, name, precision, amounts, inflationAmounts, rejectListUrl
         );
         showJson('ifa-output', 'ifa-result', asset);
-        log('IFA issued: ' + (asset.asset_id || ticker), 'log-ok');
+        log('IFA issued: ' + (asset.assetId || ticker), 'log-ok');
       } catch (e) {
         showError('ifa-output', 'ifa-result', 'Issue IFA failed', e);
         log('Issue IFA failed: ' + e, 'log-err');
@@ -768,12 +768,12 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       }
       try {
         log('Getting metadata for ' + assetId + '...', 'log-warn');
-        const metadata = state.wallet.get_asset_metadata(assetId);
+        const metadata = state.wallet.getAssetMetadata(assetId);
         showJson('metadata-output', 'metadata-result', metadata);
-        log('get_asset_metadata OK', 'log-ok');
+        log('getAssetMetadata OK', 'log-ok');
       } catch (e) {
-        showError('metadata-output', 'metadata-result', 'get_asset_metadata failed', e);
-        log('get_asset_metadata failed: ' + e, 'log-err');
+        showError('metadata-output', 'metadata-result', 'getAssetMetadata failed', e);
+        log('getAssetMetadata failed: ' + e, 'log-err');
       }
     });
 
@@ -788,13 +788,13 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const endpoints = parseEndpoints();
       const minConf = parseInt(document.getElementById('recv-min-conf').value, 10) || 1;
       try {
-        log('blind_receive...', 'log-warn');
-        const data = state.wallet.blind_receive(assetId, assignment, duration, endpoints, minConf);
+        log('blindReceive...', 'log-warn');
+        const data = state.wallet.blindReceive(assetId, assignment, duration, endpoints, minConf);
         showJson('recv-output', 'recv-result', data);
-        log('blind_receive OK', 'log-ok');
+        log('blindReceive OK', 'log-ok');
       } catch (e) {
-        showError('recv-output', 'recv-result', 'blind_receive failed', e);
-        log('blind_receive failed: ' + e, 'log-err');
+        showError('recv-output', 'recv-result', 'blindReceive failed', e);
+        log('blindReceive failed: ' + e, 'log-err');
       }
     });
 
@@ -809,13 +809,13 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const endpoints = parseEndpoints();
       const minConf = parseInt(document.getElementById('recv-min-conf').value, 10) || 1;
       try {
-        log('witness_receive...', 'log-warn');
-        const data = state.wallet.witness_receive(assetId, assignment, duration, endpoints, minConf);
+        log('witnessReceive...', 'log-warn');
+        const data = state.wallet.witnessReceive(assetId, assignment, duration, endpoints, minConf);
         showJson('recv-output', 'recv-result', data);
-        log('witness_receive OK', 'log-ok');
+        log('witnessReceive OK', 'log-ok');
       } catch (e) {
-        showError('recv-output', 'recv-result', 'witness_receive failed', e);
-        log('witness_receive failed: ' + e, 'log-err');
+        showError('recv-output', 'recv-result', 'witnessReceive failed', e);
+        log('witnessReceive failed: ' + e, 'log-err');
       }
     });
 
@@ -838,16 +838,16 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const feeRate = parseInt(document.getElementById('send-rgb-fee-rate').value, 10) || 1;
       const minConf = parseInt(document.getElementById('send-rgb-min-conf').value, 10) || 1;
       try {
-        log('send_begin (RGB)...', 'log-warn');
-        const unsignedPsbt = await state.wallet.send_begin(
+        log('sendBegin (RGB)...', 'log-warn');
+        const unsignedPsbt = await state.wallet.sendBegin(
           state.online, recipientMap, donation, BigInt(feeRate), minConf
         );
         document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
         showResult('send-rgb-output', 'send-rgb-result', 'Unsigned PSBT created. Proceed to Sign.');
-        log('send_begin OK', 'log-ok');
+        log('sendBegin OK', 'log-ok');
       } catch (e) {
-        showError('send-rgb-output', 'send-rgb-result', 'send_begin failed', e);
-        log('send_begin failed: ' + e, 'log-err');
+        showError('send-rgb-output', 'send-rgb-result', 'sendBegin failed', e);
+        log('sendBegin failed: ' + e, 'log-err');
       }
     });
 
@@ -859,7 +859,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        const signed = state.wallet.sign_psbt(unsigned);
+        const signed = state.wallet.signPsbt(unsigned);
         document.getElementById('send-rgb-signed-psbt').value = signed;
         showResult('send-rgb-output', 'send-rgb-result', 'PSBT signed. Proceed to End.');
         log('Send RGB PSBT signed', 'log-ok');
@@ -878,13 +878,13 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       }
       const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
-        log('send_end (RGB)...', 'log-warn');
-        const result = await state.wallet.send_end(state.online, signed, skipSync);
+        log('sendEnd (RGB)...', 'log-warn');
+        const result = await state.wallet.sendEnd(state.online, signed, skipSync);
         showJson('send-rgb-output', 'send-rgb-result', result);
-        log('send_end OK', 'log-ok');
+        log('sendEnd OK', 'log-ok');
       } catch (e) {
-        showError('send-rgb-output', 'send-rgb-result', 'send_end failed', e);
-        log('send_end failed: ' + e, 'log-err');
+        showError('send-rgb-output', 'send-rgb-result', 'sendEnd failed', e);
+        log('sendEnd failed: ' + e, 'log-err');
       }
     });
 
@@ -906,17 +906,17 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
         log('send RGB (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.send_begin(
+        const unsignedPsbt = await state.wallet.sendBegin(
           state.online, recipientMap, donation, BigInt(feeRate), minConf
         );
         document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
 
         log('send RGB (auto) sign...', 'log-warn');
-        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        const signed = state.wallet.signPsbt(unsignedPsbt);
         document.getElementById('send-rgb-signed-psbt').value = signed;
 
         log('send RGB (auto) end...', 'log-warn');
-        const result = await state.wallet.send_end(state.online, signed, skipSync);
+        const result = await state.wallet.sendEnd(state.online, signed, skipSync);
         showJson('send-rgb-output', 'send-rgb-result', result);
         log('send RGB (auto) complete', 'log-ok');
       } catch (e) {
@@ -939,16 +939,16 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const feeRate = parseInt(document.getElementById('inflate-fee-rate').value, 10) || 1;
       const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
       try {
-        log('inflate_begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.inflate_begin(
+        log('inflateBegin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.inflateBegin(
           state.online, assetId, amounts, BigInt(feeRate), minConf
         );
         document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
         showResult('inflate-output', 'inflate-result', 'Unsigned PSBT created. Proceed to Sign.');
-        log('inflate_begin OK', 'log-ok');
+        log('inflateBegin OK', 'log-ok');
       } catch (e) {
-        showError('inflate-output', 'inflate-result', 'inflate_begin failed', e);
-        log('inflate_begin failed: ' + e, 'log-err');
+        showError('inflate-output', 'inflate-result', 'inflateBegin failed', e);
+        log('inflateBegin failed: ' + e, 'log-err');
       }
     });
 
@@ -960,7 +960,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        const signed = state.wallet.sign_psbt(unsigned);
+        const signed = state.wallet.signPsbt(unsigned);
         document.getElementById('inflate-signed-psbt').value = signed;
         showResult('inflate-output', 'inflate-result', 'PSBT signed. Proceed to End.');
         log('Inflate PSBT signed', 'log-ok');
@@ -978,13 +978,13 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        log('inflate_end...', 'log-warn');
-        const result = await state.wallet.inflate_end(state.online, signed);
+        log('inflateEnd...', 'log-warn');
+        const result = await state.wallet.inflateEnd(state.online, signed);
         showJson('inflate-output', 'inflate-result', result);
-        log('inflate_end OK', 'log-ok');
+        log('inflateEnd OK', 'log-ok');
       } catch (e) {
-        showError('inflate-output', 'inflate-result', 'inflate_end failed', e);
-        log('inflate_end failed: ' + e, 'log-err');
+        showError('inflate-output', 'inflate-result', 'inflateEnd failed', e);
+        log('inflateEnd failed: ' + e, 'log-err');
       }
     });
 
@@ -1000,17 +1000,17 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
       try {
         log('inflate (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.inflate_begin(
+        const unsignedPsbt = await state.wallet.inflateBegin(
           state.online, assetId, amounts, BigInt(feeRate), minConf
         );
         document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
 
         log('inflate (auto) sign...', 'log-warn');
-        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        const signed = state.wallet.signPsbt(unsignedPsbt);
         document.getElementById('inflate-signed-psbt').value = signed;
 
         log('inflate (auto) end...', 'log-warn');
-        const result = await state.wallet.inflate_end(state.online, signed);
+        const result = await state.wallet.inflateEnd(state.online, signed);
         showJson('inflate-output', 'inflate-result', result);
         log('inflate (auto) complete', 'log-ok');
       } catch (e) {
@@ -1052,15 +1052,15 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const noAssetOnly = document.getElementById('fail-no-asset-only').checked;
       const skipSync = document.getElementById('fail-skip-sync').checked;
       try {
-        log('fail_transfers...', 'log-warn');
-        const result = await state.wallet.fail_transfers(
+        log('failTransfers...', 'log-warn');
+        const result = await state.wallet.failTransfers(
           state.online, batchIdx, noAssetOnly, skipSync
         );
         showResult('transfer-ops-output', 'transfer-ops-result', 'Fail transfers result: ' + result);
-        log('fail_transfers OK: ' + result, 'log-ok');
+        log('failTransfers OK: ' + result, 'log-ok');
       } catch (e) {
-        showError('transfer-ops-output', 'transfer-ops-result', 'fail_transfers failed', e);
-        log('fail_transfers failed: ' + e, 'log-err');
+        showError('transfer-ops-output', 'transfer-ops-result', 'failTransfers failed', e);
+        log('failTransfers failed: ' + e, 'log-err');
       }
     });
 
@@ -1072,12 +1072,12 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const batchIdx = optionalInt('fail-batch-idx');
       const noAssetOnly = document.getElementById('fail-no-asset-only').checked;
       try {
-        const result = state.wallet.delete_transfers(batchIdx, noAssetOnly);
+        const result = state.wallet.deleteTransfers(batchIdx, noAssetOnly);
         showResult('transfer-ops-output', 'transfer-ops-result', 'Delete transfers result: ' + result);
-        log('delete_transfers OK: ' + result, 'log-ok');
+        log('deleteTransfers OK: ' + result, 'log-ok');
       } catch (e) {
-        showError('transfer-ops-output', 'transfer-ops-result', 'delete_transfers failed', e);
-        log('delete_transfers failed: ' + e, 'log-err');
+        showError('transfer-ops-output', 'transfer-ops-result', 'deleteTransfers failed', e);
+        log('deleteTransfers failed: ' + e, 'log-err');
       }
     });
   </script>
