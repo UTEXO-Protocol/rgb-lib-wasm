@@ -253,7 +253,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
   <script type="module">
     import {
       initWasm,
-      generate_keys,
+      generateKeys,
       WasmWallet,
       state,
       ESPLORA_API,
@@ -307,7 +307,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Auto setup: generating keys...', 'log-warn');
         const network = document.getElementById('gen-network').value;
-        const keys = generate_keys(network);
+        const keys = generateKeys(network);
         const wd = fillWalletData(keys, network);
         log('Auto setup: keys generated', 'log-ok');
 
@@ -318,7 +318,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
         log('Auto setup: going online...', 'log-warn');
         const url = document.getElementById('indexer-url').value.trim();
-        state.online = await state.wallet.go_online(true, url);
+        state.online = await state.wallet.goOnline(true, url);
         enableBtns(onlineBtns);
         log('Auto setup: online at ' + url, 'log-ok');
 
@@ -336,11 +336,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-generate').addEventListener('click', () => {
       const network = document.getElementById('gen-network').value;
       try {
-        const keys = generate_keys(network);
+        const keys = generateKeys(network);
         fillWalletData(keys, network);
         showResult('setup-output', 'setup-result',
           'Keys generated for ' + network + '\nMnemonic: ' + keys.mnemonic);
-        log('generate_keys(' + network + ') OK', 'log-ok');
+        log('generateKeys(' + network + ') OK', 'log-ok');
       } catch (e) {
         showError('setup-output', 'setup-result', 'Generate keys failed', e);
       }
@@ -356,7 +356,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Creating wallet...', 'log-warn');
         state.wallet = await WasmWallet.create(walletDataJson);
-        const wd = state.wallet.get_wallet_data();
+        const wd = state.wallet.getWalletData();
         showResult('setup-output', 'setup-result',
           'Wallet created successfully!\n\n' + json(wd));
         enableBtns(walletBtns);
@@ -373,7 +373,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.go_online(true, url);
+        state.online = await state.wallet.goOnline(true, url);
         showResult('setup-output', 'setup-result',
           'Online! Connected to ' + url + '\n\n' + json(state.online));
         enableBtns(onlineBtns);
@@ -412,15 +412,15 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const feeRate = parseInt(document.getElementById('send-btc-fee-rate').value, 10) || 1;
       const skipSync = document.getElementById('send-btc-skip-sync').checked;
       try {
-        log('send_btc_begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.send_btc_begin(
+        log('sendBtcBegin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.sendBtcBegin(
           state.online, address, BigInt(amount), BigInt(feeRate), skipSync
         );
         document.getElementById('send-btc-unsigned-psbt').value = unsignedPsbt;
         showResult('send-btc-output', 'send-btc-result', 'Unsigned PSBT created. Proceed to Sign.');
-        log('send_btc_begin OK', 'log-ok');
+        log('sendBtcBegin OK', 'log-ok');
       } catch (e) {
-        showError('send-btc-output', 'send-btc-result', 'send_btc_begin failed', e);
+        showError('send-btc-output', 'send-btc-result', 'sendBtcBegin failed', e);
       }
     });
 
@@ -433,7 +433,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        const signed = state.wallet.sign_psbt(unsigned);
+        const signed = state.wallet.signPsbt(unsigned);
         document.getElementById('send-btc-signed-psbt').value = signed;
         showResult('send-btc-output', 'send-btc-result', 'PSBT signed. Proceed to End.');
         log('Send BTC PSBT signed', 'log-ok');
@@ -452,12 +452,12 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       }
       const skipSync = document.getElementById('send-btc-skip-sync').checked;
       try {
-        log('send_btc_end...', 'log-warn');
-        const txid = await state.wallet.send_btc_end(state.online, signed, skipSync);
+        log('sendBtcEnd...', 'log-warn');
+        const txid = await state.wallet.sendBtcEnd(state.online, signed, skipSync);
         showResult('send-btc-output', 'send-btc-result', 'Transaction broadcast!\nTxid: ' + txid);
-        log('send_btc_end OK: ' + txid, 'log-ok');
+        log('sendBtcEnd OK: ' + txid, 'log-ok');
       } catch (e) {
-        showError('send-btc-output', 'send-btc-result', 'send_btc_end failed', e);
+        showError('send-btc-output', 'send-btc-result', 'sendBtcEnd failed', e);
       }
     });
 
@@ -473,22 +473,22 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const feeRate = parseInt(document.getElementById('send-btc-fee-rate').value, 10) || 1;
       const skipSync = document.getElementById('send-btc-skip-sync').checked;
       try {
-        log('send_btc (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.send_btc_begin(
+        log('sendBtc (auto) begin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.sendBtcBegin(
           state.online, address, BigInt(amount), BigInt(feeRate), skipSync
         );
         document.getElementById('send-btc-unsigned-psbt').value = unsignedPsbt;
 
-        log('send_btc (auto) sign...', 'log-warn');
-        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        log('sendBtc (auto) sign...', 'log-warn');
+        const signed = state.wallet.signPsbt(unsignedPsbt);
         document.getElementById('send-btc-signed-psbt').value = signed;
 
-        log('send_btc (auto) end...', 'log-warn');
-        const txid = await state.wallet.send_btc_end(state.online, signed, skipSync);
+        log('sendBtc (auto) end...', 'log-warn');
+        const txid = await state.wallet.sendBtcEnd(state.online, signed, skipSync);
         showResult('send-btc-output', 'send-btc-result', 'Transaction broadcast (auto)!\nTxid: ' + txid);
-        log('send_btc (auto) complete: ' + txid, 'log-ok');
+        log('sendBtc (auto) complete: ' + txid, 'log-ok');
       } catch (e) {
-        showError('send-btc-output', 'send-btc-result', 'send_btc (auto) failed', e);
+        showError('send-btc-output', 'send-btc-result', 'sendBtc (auto) failed', e);
       }
     });
 
@@ -507,15 +507,15 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const destroyAssets = document.getElementById('drain-destroy-assets').checked;
       const feeRate = parseInt(document.getElementById('drain-fee-rate').value, 10) || 1;
       try {
-        log('drain_to_begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.drain_to_begin(
+        log('drainToBegin...', 'log-warn');
+        const unsignedPsbt = await state.wallet.drainToBegin(
           state.online, address, destroyAssets, BigInt(feeRate)
         );
         document.getElementById('drain-unsigned-psbt').value = unsignedPsbt;
         showResult('drain-output', 'drain-result', 'Unsigned PSBT created. Proceed to Sign.');
-        log('drain_to_begin OK', 'log-ok');
+        log('drainToBegin OK', 'log-ok');
       } catch (e) {
-        showError('drain-output', 'drain-result', 'drain_to_begin failed', e);
+        showError('drain-output', 'drain-result', 'drainToBegin failed', e);
       }
     });
 
@@ -528,7 +528,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        const signed = state.wallet.sign_psbt(unsigned);
+        const signed = state.wallet.signPsbt(unsigned);
         document.getElementById('drain-signed-psbt').value = signed;
         showResult('drain-output', 'drain-result', 'PSBT signed. Proceed to End.');
         log('Drain PSBT signed', 'log-ok');
@@ -546,12 +546,12 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        log('drain_to_end...', 'log-warn');
-        const txid = await state.wallet.drain_to_end(state.online, signed);
+        log('drainToEnd...', 'log-warn');
+        const txid = await state.wallet.drainToEnd(state.online, signed);
         showResult('drain-output', 'drain-result', 'Wallet drained!\nTxid: ' + txid);
-        log('drain_to_end OK: ' + txid, 'log-ok');
+        log('drainToEnd OK: ' + txid, 'log-ok');
       } catch (e) {
-        showError('drain-output', 'drain-result', 'drain_to_end failed', e);
+        showError('drain-output', 'drain-result', 'drainToEnd failed', e);
       }
     });
 
@@ -567,17 +567,17 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const feeRate = parseInt(document.getElementById('drain-fee-rate').value, 10) || 1;
       try {
         log('drain (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.drain_to_begin(
+        const unsignedPsbt = await state.wallet.drainToBegin(
           state.online, address, destroyAssets, BigInt(feeRate)
         );
         document.getElementById('drain-unsigned-psbt').value = unsignedPsbt;
 
         log('drain (auto) sign...', 'log-warn');
-        const signed = state.wallet.sign_psbt(unsignedPsbt);
+        const signed = state.wallet.signPsbt(unsignedPsbt);
         document.getElementById('drain-signed-psbt').value = signed;
 
         log('drain (auto) end...', 'log-warn');
-        const txid = await state.wallet.drain_to_end(state.online, signed);
+        const txid = await state.wallet.drainToEnd(state.online, signed);
         showResult('drain-output', 'drain-result', 'Wallet drained (auto)!\nTxid: ' + txid);
         log('drain (auto) complete: ' + txid, 'log-ok');
       } catch (e) {
@@ -598,7 +598,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        const signed = state.wallet.sign_psbt(psbt);
+        const signed = state.wallet.signPsbt(psbt);
         document.getElementById('psbt-input').value = signed;
         showResult('psbt-output', 'psbt-result', 'PSBT signed successfully.\n\n' + signed);
         log('PSBT signed (utility)', 'log-ok');
@@ -616,7 +616,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        const finalized = state.wallet.finalize_psbt(psbt);
+        const finalized = state.wallet.finalizePsbt(psbt);
         document.getElementById('psbt-input').value = finalized;
         showResult('psbt-output', 'psbt-result', 'PSBT finalized successfully.\n\n' + finalized);
         log('PSBT finalized (utility)', 'log-ok');
