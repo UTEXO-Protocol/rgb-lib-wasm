@@ -225,10 +225,6 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </div>
     <div class="field-row">
       <div>
-        <label for="ifa-replace-rights-num">Replace Rights Num</label>
-        <input id="ifa-replace-rights-num" type="number" value="1" min="0" max="255" />
-      </div>
-      <div>
         <label for="ifa-reject-list-url">Reject List URL (optional)</label>
         <input id="ifa-reject-list-url" type="text" value="" placeholder="https://..." />
       </div>
@@ -725,12 +721,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const amounts = parseAmounts(document.getElementById('ifa-amounts').value);
       const inflationStr = document.getElementById('ifa-inflation-amounts').value.trim();
       const inflationAmounts = inflationStr ? parseAmounts(inflationStr) : [];
-      const replaceRightsNum = parseInt(document.getElementById('ifa-replace-rights-num').value, 10);
       const rejectListUrl = document.getElementById('ifa-reject-list-url').value.trim() || undefined;
       try {
         log('Issuing IFA: ' + ticker + '...', 'log-warn');
         const asset = state.wallet.issue_asset_ifa(
-          ticker, name, precision, amounts, inflationAmounts, replaceRightsNum, rejectListUrl
+          ticker, name, precision, amounts, inflationAmounts, rejectListUrl
         );
         showJson('ifa-output', 'ifa-result', asset);
         log('IFA issued: ' + (asset.asset_id || ticker), 'log-ok');

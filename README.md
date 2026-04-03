@@ -121,7 +121,7 @@ const count = await wallet.create_utxos_end(online, signedPsbt, false);
 const nia = wallet.issue_asset_nia('TICK', 'My Token', 0, [1000]);
 
 // IFA (inflatable supply)
-const ifa = wallet.issue_asset_ifa('IFAT', 'Inflatable', 0, [1000], [500], 1, undefined);
+const ifa = wallet.issue_asset_ifa('IFAT', 'Inflatable', 0, [1000], [500], undefined);
 ```
 
 ### Sending RGB assets

@@ -137,7 +137,6 @@ impl WasmWallet {
     ///
     /// `amounts_js` is a JS array of u64 values.
     /// `inflation_amounts_js` is a JS array of u64 values for inflation allowances.
-    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
         ticker: &str,
@@ -145,7 +144,6 @@ impl WasmWallet {
         precision: u8,
         amounts_js: JsValue,
         inflation_amounts_js: JsValue,
-        replace_rights_num: u8,
         reject_list_url: Option<String>,
     ) -> Result<JsValue, JsValue> {
         let amounts: Vec<u64> = serde_wasm_bindgen::from_value(amounts_js)
@@ -161,7 +159,6 @@ impl WasmWallet {
                 precision,
                 amounts,
                 inflation_amounts,
-                replace_rights_num,
                 reject_list_url,
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;

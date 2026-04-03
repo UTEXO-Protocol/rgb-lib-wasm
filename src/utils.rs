@@ -57,7 +57,7 @@ pub enum BitcoinNetwork {
     /// Bitcoin's regtest
     Regtest,
     /// Bitcoin's custom signet
-    SignetCustom([u8; 32]),
+    SignetCustom,
 }
 
 impl fmt::Display for BitcoinNetwork {
@@ -71,19 +71,13 @@ impl FromStr for BitcoinNetwork {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.to_lowercase();
-        if let Some(hash) = s.strip_prefix("signet-") {
-            return BlockHash::from_str(hash)
-                .map(|h| BitcoinNetwork::SignetCustom(*h.as_ref()))
-                .map_err(|_| Error::InvalidBitcoinNetwork {
-                    network: s.to_owned(),
-                });
-        }
         Ok(match s.as_str() {
             "mainnet" | "bitcoin" => BitcoinNetwork::Mainnet,
             "testnet" | "testnet3" => BitcoinNetwork::Testnet,
             "testnet4" => BitcoinNetwork::Testnet4,
             "regtest" => BitcoinNetwork::Regtest,
             "signet" => BitcoinNetwork::Signet,
+            "signetcustom" => BitcoinNetwork::SignetCustom,
             _ => {
                 return Err(Error::InvalidBitcoinNetwork {
                     network: s.to_string(),
@@ -103,7 +97,7 @@ impl TryFrom<ChainNet> for BitcoinNetwork {
             ChainNet::BitcoinTestnet4 => Ok(BitcoinNetwork::Testnet4),
             ChainNet::BitcoinSignet => Ok(BitcoinNetwork::Signet),
             ChainNet::BitcoinRegtest => Ok(BitcoinNetwork::Regtest),
-            ChainNet::BitcoinSignetCustom(h) => Ok(BitcoinNetwork::SignetCustom(*h.as_ref())),
+            ChainNet::BitcoinSignetCustom => Ok(BitcoinNetwork::SignetCustom),
             _ => Err(Error::UnsupportedLayer1 {
                 layer_1: x.layer1().to_string(),
             }),
@@ -119,7 +113,7 @@ impl From<BitcoinNetwork> for bitcoin::Network {
             BitcoinNetwork::Testnet4 => bitcoin::Network::Testnet4,
             BitcoinNetwork::Signet => bitcoin::Network::Signet,
             BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
-            BitcoinNetwork::SignetCustom(_) => bitcoin::Network::Signet,
+            BitcoinNetwork::SignetCustom => bitcoin::Network::Signet,
         }
     }
 }
@@ -141,7 +135,7 @@ impl From<BitcoinNetwork> for ChainNet {
             BitcoinNetwork::Testnet4 => ChainNet::BitcoinTestnet4,
             BitcoinNetwork::Signet => ChainNet::BitcoinSignet,
             BitcoinNetwork::Regtest => ChainNet::BitcoinRegtest,
-            BitcoinNetwork::SignetCustom(h) => ChainNet::BitcoinSignetCustom(ChainHash::from(h)),
+            BitcoinNetwork::SignetCustom => ChainNet::BitcoinSignetCustom,
         }
     }
 }
@@ -577,7 +571,6 @@ impl RgbRuntime {
     pub(crate) fn consume_fascia(
         &mut self,
         fascia: Fascia,
-        witness_id: RgbTxid,
         witness_ord: Option<WitnessOrd>,
     ) -> Result<(), InternalError> {
         struct FasciaResolver {
@@ -592,7 +585,7 @@ impl RgbRuntime {
         }
 
         let resolver = FasciaResolver {
-            witness_id,
+            witness_id: fascia.witness_id(),
             witness_ord: witness_ord.unwrap_or(WitnessOrd::Tentative),
         };
 
@@ -713,6 +706,32 @@ impl RgbRuntime {
     ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
         self.stock
             .transfer_with_dag(contract_id, outputs, secret_seals, [], witness_id)
+            .map_err(InternalError::from)
+    }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn transfer_from_fascia(
+        &self,
+        contract_id: ContractId,
+        outputs: impl AsRef<[OutputSeal]>,
+        secret_seals: impl AsRef<[SecretSeal]>,
+        fascia: &Fascia,
+    ) -> Result<RgbTransfer, InternalError> {
+        self.stock
+            .transfer_from_fascia(contract_id, outputs, secret_seals, [], fascia)
+            .map_err(InternalError::from)
+    }
+
+    #[cfg(feature = "esplora")]
+    pub(crate) fn transfer_from_fascia_with_dag(
+        &self,
+        contract_id: ContractId,
+        outputs: impl AsRef<[OutputSeal]>,
+        secret_seals: impl AsRef<[SecretSeal]>,
+        fascia: &Fascia,
+    ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
+        self.stock
+            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, [], fascia)
             .map_err(InternalError::from)
     }
 
@@ -1035,7 +1054,7 @@ mod tests {
         );
         // SignetCustom maps to Signet
         assert_eq!(
-            bitcoin::Network::from(BitcoinNetwork::SignetCustom([0u8; 32])),
+            bitcoin::Network::from(BitcoinNetwork::SignetCustom),
             bitcoin::Network::Signet
         );
     }

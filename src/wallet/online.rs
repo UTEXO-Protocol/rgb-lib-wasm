@@ -41,8 +41,6 @@ pub struct AssignmentsCollection {
     pub non_fungible: bool,
     /// Inflation assignments
     pub inflation: u64,
-    /// Replace right assignments
-    pub replace: u8,
 }
 
 impl AssignmentsCollection {
@@ -58,10 +56,6 @@ impl AssignmentsCollection {
         self.inflation += amt;
     }
 
-    fn add_replace(&mut self) {
-        self.replace += 1;
-    }
-
     fn add_opout_state(&mut self, opout: &Opout, state: &AllocatedState) {
         match state {
             AllocatedState::Amount(amt) if opout.ty == OS_ASSET => {
@@ -72,9 +66,6 @@ impl AssignmentsCollection {
             }
             AllocatedState::Data(_) => {
                 self.add_non_fungible();
-            }
-            AllocatedState::Void if opout.ty == OS_REPLACE => {
-                self.add_replace();
             }
             _ => {}
         }
@@ -89,7 +80,6 @@ impl AssignmentsCollection {
                 needed.inflation.saturating_sub(self.inflation) > 0
             }
             (AllocatedState::Data(_), _) => needed.non_fungible && !self.non_fungible,
-            (AllocatedState::Void, OS_REPLACE) => needed.replace.saturating_sub(self.replace) > 0,
             _ => false,
         }
     }
@@ -99,7 +89,6 @@ impl AssignmentsCollection {
             fungible: self.fungible - needed.fungible,
             non_fungible: false,
             inflation: self.inflation - needed.inflation,
-            replace: self.replace - needed.replace,
         }
     }
 
@@ -111,9 +100,6 @@ impl AssignmentsCollection {
             return false;
         }
         if self.inflation < needed.inflation {
-            return false;
-        }
-        if self.replace < needed.replace {
             return false;
         }
         true
@@ -592,19 +578,6 @@ impl Wallet {
                             }
                         };
                     }
-                    for (no, void_assignment) in typed_assigns.as_declarative().iter().enumerate() {
-                        let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let Assign::ConfidentialSeal { seal, .. } = void_assignment {
-                            if Some(*seal) == known_concealed {
-                                received.insert(opout, Assignment::ReplaceRight);
-                            }
-                        }
-                        if let Assign::Revealed { seal, .. } = void_assignment {
-                            if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
-                                received.insert(opout, Assignment::ReplaceRight);
-                            }
-                        };
-                    }
                 }
             }
         }
@@ -695,13 +668,6 @@ impl Wallet {
                 && asset_allocations
                     .iter()
                     .any(|a| matches!(a.assignment, Assignment::InflationRight(_)))
-            {
-                needed = true;
-            }
-            if assignments_collected.replace < assignments_needed.replace
-                && asset_allocations
-                    .iter()
-                    .any(|a| matches!(a.assignment, Assignment::ReplaceRight))
             {
                 needed = true;
             }
@@ -994,18 +960,6 @@ impl Wallet {
                     ..Default::default()
                 };
                 self.database.set_coloring(db_coloring)?;
-            }
-            if transfer_info.change.replace > 0 {
-                for _ in 0..transfer_info.change.replace {
-                    let db_coloring = DbColoringActMod {
-                        txo_idx: ActiveValue::Set(change_utxo_idx.unwrap()),
-                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                        r#type: ActiveValue::Set(ColoringType::Change),
-                        assignment: ActiveValue::Set(Assignment::ReplaceRight),
-                        ..Default::default()
-                    };
-                    self.database.set_coloring(db_coloring)?;
-                }
             }
 
             for recipient in transfer_info.recipients.clone() {
@@ -1590,10 +1544,6 @@ impl Wallet {
                             *amt,
                         )?;
                     }
-                    Assignment::ReplaceRight => {
-                        asset_transition_builder =
-                            asset_transition_builder.add_rights(RGB_STATE_REPLACE_RIGHT, seal)?;
-                    }
                     _ => unreachable!(),
                 }
             }
@@ -1622,12 +1572,6 @@ impl Wallet {
                         seal,
                         change.inflation,
                     )?;
-                }
-                if change.replace > 0 {
-                    for _ in 0..change.replace {
-                        asset_transition_builder =
-                            asset_transition_builder.add_rights(RGB_STATE_REPLACE_RIGHT, seal)?;
-                    }
                 }
             };
 
@@ -1720,7 +1664,7 @@ impl Wallet {
 
         let witness_txid = psbt.get_txid();
 
-        runtime.consume_fascia(fascia, witness_txid, None)?;
+        runtime.consume_fascia(fascia, None)?;
 
         for (asset_id, transfer_info) in transfer_info_map.iter_mut() {
             let beneficiaries = asset_beneficiaries[asset_id].clone();
@@ -2913,7 +2857,6 @@ impl Wallet {
                             return Err(Error::InvalidAmountZero);
                         }
                     }
-                    (Assignment::ReplaceRight, AssetSchema::Ifa) => {}
                     (Assignment::InflationRight(amt), AssetSchema::Ifa) => {
                         if *amt == 0 {
                             return Err(Error::InvalidAmountZero);
