@@ -10,17 +10,17 @@
 // ---------------------------------------------------------------------------
 
 import init, {
-  generate_keys,
-  restore_keys,
-  check_proxy_url,
-  validate_consignment_offchain,
+  generateKeys,
+  restoreKeys,
+  checkProxyUrl,
+  validateConsignmentOffchain,
   WasmWallet,
   WasmInvoice,
 } from '/pkg/rgb_lib_wasm_bindings.js';
 
 export {
-  generate_keys, restore_keys, check_proxy_url,
-  validate_consignment_offchain,
+  generateKeys, restoreKeys, checkProxyUrl,
+  validateConsignmentOffchain,
   WasmWallet, WasmInvoice,
 };
 
@@ -282,7 +282,7 @@ export function enableBtns(ids) {
 /**
  * Build a WalletData-compatible object from generated keys and fill the
  * #wallet-data textarea if present.
- * @param {Object} keys    - result of generate_keys / restore_keys
+ * @param {Object} keys    - result of generateKeys / restoreKeys
  * @param {string} network - e.g. "regtest"
  * @returns {Object} walletData
  */
