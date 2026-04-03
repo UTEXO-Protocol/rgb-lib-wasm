@@ -145,7 +145,7 @@ use rgbstd::{
     validation::{OpoutsDagData, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
-use schemata::{IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_REPLACE};
+use schemata::{IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION};
 use schemata::{InflatableFungibleAsset, NonInflatableAsset};
 use scrypt::{
     Params, Scrypt,

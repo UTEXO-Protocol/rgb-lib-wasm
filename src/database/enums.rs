@@ -139,6 +139,8 @@ pub enum TransferStatus {
     Settled = 3,
     /// Failed transfer, this status is final
     Failed = 4,
+    /// Transfer has been initiated (PSBT prepared) but not yet finalized
+    Initiated = 5,
 }
 
 impl TransferStatus {
@@ -146,8 +148,13 @@ impl TransferStatus {
         self == &TransferStatus::Failed
     }
 
+    pub(crate) fn initiated(&self) -> bool {
+        self == &TransferStatus::Initiated
+    }
+
     pub(crate) fn pending(&self) -> bool {
         [
+            TransferStatus::Initiated,
             TransferStatus::WaitingCounterparty,
             TransferStatus::WaitingConfirmations,
         ]
@@ -182,8 +189,6 @@ pub enum Assignment {
     NonFungible,
     /// Inflation right
     InflationRight(u64),
-    /// Replace right
-    ReplaceRight,
     /// Any assignment
     Any,
 }
@@ -197,7 +202,6 @@ impl Assignment {
                 Self::InflationRight(amt.as_u64())
             }
             AllocatedState::Data(_) => Self::NonFungible,
-            AllocatedState::Void if opout.ty == OS_REPLACE => Self::ReplaceRight,
             _ => unreachable!(),
         }
     }
@@ -208,7 +212,6 @@ impl Assignment {
             Self::Fungible(amt) => assignments.fungible += amt,
             Self::NonFungible => assignments.non_fungible = true,
             Self::InflationRight(amt) => assignments.inflation += amt,
-            Self::ReplaceRight => assignments.replace += 1,
             _ => unreachable!("when using this method we should know the assignment type"),
         }
     }

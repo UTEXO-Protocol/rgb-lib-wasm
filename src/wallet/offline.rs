@@ -26,7 +26,6 @@ const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
-pub(crate) const RGB_STATE_REPLACE_RIGHT: &str = "replaceRight";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
 #[cfg(feature = "esplora")]
@@ -35,7 +34,7 @@ pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_IFA: &str =
-    "rgb:sch:gmV~iQgvBidk3AR8u~_tlCqCMMBBvKMWQwW6JMWVtGA#jason-ariel-human";
+    "rgb:sch:p6H_wtDgei9HHUVLjKW0tNdHHFLhfHxrn9QX_QQUE78#scale-year-shave";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct LocalAssetData {
@@ -489,9 +488,6 @@ impl Invoice {
                 (Some(InvoiceState::Data(_)), Some(RGB_STATE_ASSET_OWNER) | None) => {
                     Assignment::NonFungible
                 }
-                (Some(InvoiceState::Void), Some(RGB_STATE_REPLACE_RIGHT) | None) => {
-                    Assignment::ReplaceRight
-                }
                 (None, None) => Assignment::Any,
                 (_, _) => {
                     return Err(Error::InvalidInvoice {
@@ -523,9 +519,6 @@ impl Invoice {
                     }
                     (None, Some(RGB_STATE_INFLATION_ALLOWANCE)) => Assignment::InflationRight(0),
                     (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
-                    (Some(InvoiceState::Void), Some(RGB_STATE_REPLACE_RIGHT) | None) => {
-                        Assignment::ReplaceRight
-                    }
                     (None, None) => Assignment::Any,
                     (_, _) => {
                         return Err(Error::InvalidInvoice {
@@ -1673,7 +1666,7 @@ impl Wallet {
     }
 
     /// Issue a new RGB IFA asset with the provided `ticker`, `name`, `precision`, `amounts`,
-    /// `inflation_amounts` and `replace_rights_num`, then return it.
+    /// and `inflation_amounts`, then return it.
     ///
     /// At least 1 amount needs to be provided and the sum of all amounts cannot exceed the maximum
     /// `u64` value.
@@ -1683,9 +1676,6 @@ impl Wallet {
     ///
     /// The `inflation_amounts` can be empty. If provided the sum of its elements plus the sum of
     /// `amounts` cannot exceed the maximum `u64` value.
-    ///
-    /// The `replace_rights_num` can be set to 0. If provided it represents the number of replace
-    /// rights to create.
     pub fn issue_asset_ifa(
         &self,
         ticker: String,
@@ -1693,18 +1683,16 @@ impl Wallet {
         precision: u8,
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
-        replace_rights_num: u8,
         reject_list_url: Option<String>,
     ) -> Result<AssetIFA, Error> {
         info!(
             self.logger,
-            "Issuing IFA asset with ticker '{}' name '{}' precision '{}' amounts '{:?}' inflation amounts {:?} replace rights num {}...",
+            "Issuing IFA asset with ticker '{}' name '{}' precision '{}' amounts '{:?}' inflation amounts {:?}...",
             ticker,
             name,
             precision,
             amounts,
             inflation_amounts,
-            replace_rights_num,
         );
 
         let asset_schema = &AssetSchema::Ifa;
@@ -1801,18 +1789,6 @@ impl Wallet {
             "Assigning inflation rights: {inflation_utxos:?}"
         );
 
-        let mut replace_utxos: HashSet<DbTxo> = HashSet::new();
-        for _ in 0..replace_rights_num {
-            let utxo = self.get_utxo(&exclude_outpoints, Some(&unspents), false, Some(0))?;
-            exclude_outpoints.push(utxo.outpoint());
-            replace_utxos.insert(utxo.clone());
-
-            builder = builder
-                .add_rights(RGB_STATE_REPLACE_RIGHT, self.get_builder_seal(utxo))
-                .expect("invalid global state data");
-        }
-        debug!(self.logger, "Assigning replace rights: {replace_utxos:?}");
-
         let validated_contract = builder.issue_contract().expect("failure issuing contract");
         let asset_id = validated_contract.contract_id().to_string();
         runtime
@@ -1876,16 +1852,6 @@ impl Wallet {
                 asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
                 r#type: ActiveValue::Set(ColoringType::Issue),
                 assignment: ActiveValue::Set(Assignment::InflationRight(amount)),
-                ..Default::default()
-            };
-            self.database.set_coloring(db_coloring)?;
-        }
-        for utxo in replace_utxos {
-            let db_coloring = DbColoringActMod {
-                txo_idx: ActiveValue::Set(utxo.idx),
-                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                r#type: ActiveValue::Set(ColoringType::Issue),
-                assignment: ActiveValue::Set(Assignment::ReplaceRight),
                 ..Default::default()
             };
             self.database.set_coloring(db_coloring)?;
@@ -2607,11 +2573,6 @@ impl Wallet {
             (Assignment::Any, Some(AssetSchema::Nia)) => {
                 invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
                 Assignment::Fungible(0)
-            }
-            (Assignment::ReplaceRight, Some(AssetSchema::Ifa)) => {
-                invoice_builder = invoice_builder.set_void();
-                invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_REPLACE_RIGHT);
-                Assignment::ReplaceRight
             }
             (Assignment::InflationRight(amt), Some(AssetSchema::Ifa)) => {
                 invoice_builder = invoice_builder.set_amount_raw(*amt);

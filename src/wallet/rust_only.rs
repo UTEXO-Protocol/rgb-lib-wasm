@@ -223,7 +223,7 @@ impl Wallet {
         let witness_txid = psbt.get_txid();
 
         let mut runtime = self.rgb_runtime()?;
-        runtime.consume_fascia(fascia, witness_txid, None)?;
+        runtime.consume_fascia(fascia, None)?;
 
         let mut transfers = vec![];
         for (contract_id, beneficiaries) in asset_beneficiaries {
@@ -259,12 +259,11 @@ impl Wallet {
     pub fn consume_fascia(
         &self,
         fascia: Fascia,
-        witness_txid: RgbTxid,
         witness_ord: Option<WitnessOrd>,
     ) -> Result<(), Error> {
         info!(self.logger, "Consuming fascia...");
         self.rgb_runtime()?
-            .consume_fascia(fascia.clone(), witness_txid, witness_ord)?;
+            .consume_fascia(fascia.clone(), witness_ord)?;
         info!(self.logger, "Consume fascia completed");
         Ok(())
     }
