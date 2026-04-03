@@ -173,6 +173,7 @@ impl super::Wallet {
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
+            reuse_address_index: Default::default(),
         };
         self.restore_from_snapshot(snapshot)?;
 
@@ -280,6 +281,7 @@ impl super::Wallet {
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
+            reuse_address_index: Default::default(),
         };
         self.restore_from_snapshot(snapshot)?;
 

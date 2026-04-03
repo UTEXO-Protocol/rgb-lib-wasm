@@ -335,8 +335,14 @@ fn test_rotate_address() {
     let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
     let new_addr = wallet.get_address().unwrap();
 
-    assert_ne!(old_addr, rotated, "rotate should produce a different address");
-    assert_eq!(rotated, new_addr, "get_address should return the rotated address");
+    assert_ne!(
+        old_addr, rotated,
+        "rotate should produce a different address"
+    );
+    assert_eq!(
+        rotated, new_addr,
+        "get_address should return the rotated address"
+    );
 
     // Rotate again — should produce yet another address
     let rotated2 = wallet.rotate_address(KeychainKind::Internal).unwrap();
@@ -389,7 +395,10 @@ fn test_wallet_data_preserves_reuse_field() {
     let wd2 = test_wallet_data(vec![AssetSchema::Nia]);
     let wallet2 = Wallet::new(wd2).unwrap();
     let returned2 = wallet2.get_wallet_data();
-    assert!(!returned2.reuse_addresses, "reuse_addresses should be false");
+    assert!(
+        !returned2.reuse_addresses,
+        "reuse_addresses should be false"
+    );
 }
 
 /// JSON without reuse_addresses deserializes to false (backward compat).

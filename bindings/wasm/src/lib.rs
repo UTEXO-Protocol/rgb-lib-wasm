@@ -327,7 +327,11 @@ impl WasmWallet {
         let kc = match keychain {
             0 => rgb_lib_wasm::bdk_wallet::KeychainKind::External,
             1 => rgb_lib_wasm::bdk_wallet::KeychainKind::Internal,
-            _ => return Err(JsValue::from_str("Invalid keychain: use 0 (External) or 1 (Internal)")),
+            _ => {
+                return Err(JsValue::from_str(
+                    "Invalid keychain: use 0 (External) or 1 (Internal)",
+                ));
+            }
         };
         self.inner
             .borrow_mut()

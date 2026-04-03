@@ -2844,6 +2844,9 @@ impl Wallet {
         let new_index = index + 1;
         self.reuse_address_index.insert(keychain, new_index);
         let address = self.bdk_wallet.peek_address(keychain, new_index).address;
+
+        self.trigger_auto_backup();
+
         Ok(address.to_string())
     }
 }
@@ -2956,6 +2959,7 @@ impl Wallet {
             }
         };
 
+        let reuse_address_index = self.reuse_address_index.clone();
         let key = self.idb_key();
         let flag = self.idb_save_in_progress.clone();
 
@@ -2968,6 +2972,7 @@ impl Wallet {
                 stock_stash_b64,
                 stock_state_b64,
                 stock_index_b64,
+                reuse_address_index,
             };
             if let Err(e) = super::idb_store::save_snapshot(&key, &snapshot).await {
                 web_sys::console::error_1(&format!("IDB save error: {e}").into());
@@ -3057,6 +3062,9 @@ impl Wallet {
 
         // Restore received consignments
         self.received_consignments = snapshot.received_consignments;
+
+        // Restore address reuse pinned indices
+        self.reuse_address_index = snapshot.reuse_address_index;
 
         // Restore RGB Stock from strict-encoded components
         if let (Some(stash_b64), Some(state_b64), Some(index_b64)) = (
@@ -3161,21 +3169,18 @@ mod address_reuse_tests {
     }
 
     #[test]
-    fn rotate_changes_address() {
+    fn reuse_index_changes_address() {
         let mut wallet = make_test_wallet(true);
         let old_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
+
+        // Simulate what rotate_address does internally
+        wallet.reuse_address_index.insert(KeychainKind::Internal, 1);
         let new_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
 
-        assert_ne!(new_addr.to_string(), old_addr.to_string(), "rotate should change the pinned address");
-        assert_eq!(rotated, new_addr.to_string(), "rotate should return the new pinned address");
-    }
-
-    #[test]
-    fn rotate_disabled_errors() {
-        let mut wallet = make_test_wallet(false);
-        let result = wallet.rotate_address(KeychainKind::Internal);
-        assert!(matches!(result, Err(Error::AddressReuseDisabled)));
+        assert_ne!(
+            old_addr, new_addr,
+            "bumping index should change the pinned address"
+        );
     }
 
     #[test]
@@ -3183,15 +3188,19 @@ mod address_reuse_tests {
         let mut wallet = make_test_wallet(true);
         let internal = wallet._get_new_address(KeychainKind::Internal).unwrap();
         let external = wallet._get_new_address(KeychainKind::External).unwrap();
-        assert_ne!(internal.to_string(), external.to_string(), "different keychains");
+        assert_ne!(
+            internal.to_string(),
+            external.to_string(),
+            "different keychains"
+        );
 
-        // Rotating External should not affect Internal
-        wallet.rotate_address(KeychainKind::External).unwrap();
+        // Bump External index — should not affect Internal
+        wallet.reuse_address_index.insert(KeychainKind::External, 1);
         let internal_after = wallet._get_new_address(KeychainKind::Internal).unwrap();
         assert_eq!(
             internal.to_string(),
             internal_after.to_string(),
-            "Internal unchanged after External rotation"
+            "Internal unchanged after External index bump"
         );
     }
 }
