@@ -72,7 +72,7 @@ await init();
 
 ```javascript
 const keys = generateKeys('Regtest');
-// keys: { mnemonic, account_xpub_vanilla, account_xpub_colored, master_fingerprint }
+// keys: { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint }
 
 const restored = restoreKeys('Regtest', keys.mnemonic);
 ```
@@ -81,16 +81,16 @@ const restored = restoreKeys('Regtest', keys.mnemonic);
 
 ```javascript
 const walletData = {
-  data_dir: ':memory:',
-  bitcoin_network: 'Regtest',
-  database_type: 'Sqlite',
-  max_allocations_per_utxo: 5,
-  account_xpub_vanilla: keys.account_xpub_vanilla,
-  account_xpub_colored: keys.account_xpub_colored,
+  dataDir: ':memory:',
+  bitcoinNetwork: 'Regtest',
+  databaseType: 'Sqlite',
+  maxAllocationsPerUtxo: 5,
+  accountXpubVanilla: keys.accountXpubVanilla,
+  accountXpubColored: keys.accountXpubColored,
   mnemonic: keys.mnemonic,
-  master_fingerprint: keys.master_fingerprint,
-  vanilla_keychain: null,
-  supported_schemas: ['Nia', 'Ifa'],
+  masterFingerprint: keys.masterFingerprint,
+  vanillaKeychain: null,
+  supportedSchemas: ['Nia', 'Ifa'],
 };
 
 // create() restores state from IndexedDB if available
@@ -131,16 +131,16 @@ All send operations follow a three-step PSBT workflow: **begin** (build unsigned
 ```javascript
 const recipientMap = {
   [assetId]: [{
-    recipient_id: invoiceString,
-    witness_data: { amount_sat: 1000, blinding: null },
+    recipientId: invoiceString,
+    witnessData: { amountSat: 1000, blinding: null },
     amount: 100,
-    transport_endpoints: ['rpc://localhost:3000/json-rpc'],
+    transportEndpoints: ['rpc://localhost:3000/json-rpc'],
   }]
 };
 const psbt = await wallet.sendBegin(online, recipientMap, false, 1n, 1);
 const signed = wallet.signPsbt(psbt);
 const result = await wallet.sendEnd(online, signed, false);
-// result: { txid, batch_transfer_idx }
+// result: { txid, batchTransferIdx }
 ```
 
 ### Sending BTC
@@ -156,7 +156,7 @@ const txid = await wallet.sendBtcEnd(online, signed, false);
 ```javascript
 // Blind receive (UTXO-based)
 const blind = wallet.blindReceive(null, 'Any', null, ['rpc://localhost:3000/json-rpc'], 1);
-// blind: { invoice, recipient_id, expiration_timestamp, ... }
+// blind: { invoice, recipientId, expirationTimestamp, ... }
 
 // Witness receive (address-based)
 const witness = wallet.witnessReceive(null, { Fungible: 100 }, null, ['rpc://localhost:3000/json-rpc'], 1);
@@ -167,7 +167,7 @@ const witness = wallet.witnessReceive(null, { Fungible: 100 }, null, ['rpc://loc
 ```javascript
 const invoice = new WasmInvoice(invoiceString);
 const data = invoice.invoiceData();
-// data: { recipient_id, asset_schema, asset_id, assignment, network, expiration_timestamp, transport_endpoints }
+// data: { recipientId, assetSchema, assetId, assignment, network, expirationTimestamp, transportEndpoints }
 const str = invoice.invoiceString(); // original string
 ```
 
@@ -177,7 +177,7 @@ const str = invoice.invoiceString(); // original string
 const btcBalance = wallet.getBtcBalance();
 const assetBalance = wallet.getAssetBalance(assetId);
 const metadata = wallet.getAssetMetadata(assetId);
-// metadata: { asset_schema, name, ticker, precision, initial_supply, max_supply, known_circulating_supply, timestamp, ... }
+// metadata: { assetSchema, name, ticker, precision, initialSupply, maxSupply, knownCirculatingSupply, timestamp, ... }
 const assets = wallet.listAssets([]);              // all schemas
 const transfers = wallet.listTransfers(null);       // all assets
 const unspents = wallet.listUnspents(false);
@@ -236,7 +236,7 @@ const version = await wallet.vssBackup();
 
 // Check status
 const info = await wallet.vssBackupInfo();
-// info: { backup_exists, server_version, backup_required }
+// info: { backupExists, serverVersion, backupRequired }
 
 // Restore
 await wallet.vssRestoreBackup();
@@ -341,7 +341,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `esplora` | yes | Online operations via Esplora HTTP indexer |
-| `camel_case` | no | camelCase JSON serialization for all types |
+| `camel_case` | yes | camelCase JSON serialization for all types |
 
 
 ## Running tests

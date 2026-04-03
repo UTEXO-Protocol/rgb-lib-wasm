@@ -289,17 +289,17 @@ export function enableBtns(ids) {
 export function fillWalletData(keys, network) {
   const netCapitalized = network.charAt(0).toUpperCase() + network.slice(1);
   const wd = {
-    data_dir: ':memory:',
-    bitcoin_network: netCapitalized,
-    database_type: 'Sqlite',
-    max_allocations_per_utxo: 5,
-    account_xpub_vanilla: keys.account_xpub_vanilla,
-    account_xpub_colored: keys.account_xpub_colored,
+    dataDir: ':memory:',
+    bitcoinNetwork: netCapitalized,
+    databaseType: 'Sqlite',
+    maxAllocationsPerUtxo: 5,
+    accountXpubVanilla: keys.accountXpubVanilla,
+    accountXpubColored: keys.accountXpubColored,
     mnemonic: keys.mnemonic,
-    master_fingerprint: keys.master_fingerprint,
-    vanilla_keychain: null,
-    supported_schemas: ['Nia', 'Ifa'],
-    reuse_addresses: false,
+    masterFingerprint: keys.masterFingerprint,
+    vanillaKeychain: null,
+    supportedSchemas: ['Nia', 'Ifa'],
+    reuseAddresses: false,
   };
   const el = document.getElementById('wallet-data');
   if (el) el.value = json(wd);

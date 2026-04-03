@@ -339,6 +339,7 @@ impl WasmWallet {
 
     /// Rotate the pinned address for the given keychain.
     /// keychain: 0 = External (colored), 1 = Internal (vanilla)
+    #[wasm_bindgen(js_name = "rotateAddress")]
     pub fn rotate_address(&self, keychain: u32) -> Result<String, JsValue> {
         let kc = match keychain {
             0 => rgb_lib_wasm::bdk_wallet::KeychainKind::External,
