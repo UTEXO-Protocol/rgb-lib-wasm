@@ -34,6 +34,7 @@ fn test_wallet_data(
         master_fingerprint: keys.master_fingerprint.clone(),
         vanilla_keychain: None,
         supported_schemas: schemas,
+        reuse_addresses: false,
     }
 }
 

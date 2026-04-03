@@ -299,6 +299,7 @@ export function fillWalletData(keys, network) {
     master_fingerprint: keys.master_fingerprint,
     vanilla_keychain: null,
     supported_schemas: ['Nia', 'Ifa'],
+    reuse_addresses: false,
   };
   const el = document.getElementById('wallet-data');
   if (el) el.value = json(wd);

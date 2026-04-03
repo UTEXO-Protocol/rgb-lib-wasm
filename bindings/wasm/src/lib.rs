@@ -321,6 +321,20 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Rotate the pinned address for the given keychain.
+    /// keychain: 0 = External (colored), 1 = Internal (vanilla)
+    pub fn rotate_address(&self, keychain: u32) -> Result<String, JsValue> {
+        let kc = match keychain {
+            0 => rgb_lib_wasm::bdk_wallet::KeychainKind::External,
+            1 => rgb_lib_wasm::bdk_wallet::KeychainKind::Internal,
+            _ => return Err(JsValue::from_str("Invalid keychain: use 0 (External) or 1 (Internal)")),
+        };
+        self.inner
+            .borrow_mut()
+            .rotate_address(kc)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Delete failed transfers. Returns true if any were deleted.
     pub fn delete_transfers(
         &self,

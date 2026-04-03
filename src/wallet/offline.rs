@@ -948,6 +948,10 @@ pub struct WalletData {
     /// List of schemas the wallet should support (when issuing, sending and receiving). Empty list
     /// means the wallet should support all the schemas rgb-lib supports.
     pub supported_schemas: Vec<AssetSchema>,
+    /// When `true`, address generation returns a pinned address instead of creating new ones.
+    /// Default: `false`
+    #[serde(default)]
+    pub reuse_addresses: bool,
 }
 
 pub(crate) type BdkPersister = super::memory_store::MemoryStore<ChangeSet>;
@@ -970,6 +974,8 @@ pub struct Wallet {
     pub(crate) wallet_dir: PathBuf,
     pub(crate) bdk_wallet: PersistedWallet<BdkPersister>,
     pub(crate) bdk_database: BdkPersister,
+    /// Pinned derivation index per keychain for address reuse.
+    pub(crate) reuse_address_index: HashMap<KeychainKind, u32>,
     #[cfg(feature = "esplora")]
     pub(crate) wasm_proxy_client: crate::api::proxy::WasmProxyClient,
     #[cfg(feature = "esplora")]
@@ -1099,6 +1105,7 @@ impl Wallet {
             wallet_dir,
             bdk_wallet,
             bdk_database,
+            reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
             wasm_proxy_client,
             #[cfg(feature = "esplora")]
@@ -2791,6 +2798,15 @@ impl Wallet {
     }
 
     pub(crate) fn _get_new_address(&mut self, keychain: KeychainKind) -> Result<BdkAddress, Error> {
+        if self.wallet_data.reuse_addresses {
+            let index = self
+                .reuse_address_index
+                .get(&keychain)
+                .copied()
+                .unwrap_or(0);
+            let address = self.bdk_wallet.peek_address(keychain, index).address;
+            return Ok(address);
+        }
         let address = self.bdk_wallet.reveal_next_address(keychain).address;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         Ok(address)
@@ -2809,6 +2825,25 @@ impl Wallet {
         self.trigger_auto_backup();
 
         info!(self.logger, "Get address completed");
+        Ok(address.to_string())
+    }
+
+    /// Rotate the pinned address for the given keychain.
+    ///
+    /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
+    /// index so subsequent address generation returns a fresh address.
+    pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
+        if !self.wallet_data.reuse_addresses {
+            return Err(Error::AddressReuseDisabled);
+        }
+        let index = self
+            .reuse_address_index
+            .get(&keychain)
+            .copied()
+            .unwrap_or(0);
+        let new_index = index + 1;
+        self.reuse_address_index.insert(keychain, new_index);
+        let address = self.bdk_wallet.peek_address(keychain, new_index).address;
         Ok(address.to_string())
     }
 }
@@ -3035,5 +3070,128 @@ impl Wallet {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod address_reuse_tests {
+    use super::*;
+    use crate::keys::generate_keys;
+    use crate::utils::{get_descriptors, str_to_xpub};
+
+    /// Helper: build a minimal Wallet for native tests.
+    ///
+    /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
+    /// by constructing only the BDK wallet and the fields that
+    /// `_get_new_address` touches.
+    fn make_test_wallet(reuse: bool) -> Wallet {
+        let keys = generate_keys(BitcoinNetwork::Regtest);
+        let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
+        let xpub_rgb = str_to_xpub(&keys.account_xpub_colored, bdk_network).unwrap();
+        let xpub_btc = str_to_xpub(&keys.account_xpub_vanilla, bdk_network).unwrap();
+        let (desc_colored, desc_vanilla) = get_descriptors(
+            BitcoinNetwork::Regtest,
+            &keys.mnemonic,
+            None,
+            xpub_btc,
+            xpub_rgb,
+        )
+        .unwrap();
+        let mut bdk_database: BdkPersister = super::super::memory_store::MemoryStore::new();
+        let bdk_wallet = BdkWallet::create(desc_colored, desc_vanilla)
+            .network(bdk_network)
+            .create_wallet(&mut bdk_database)
+            .unwrap();
+
+        let wd = WalletData {
+            data_dir: ":memory:".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
+            account_xpub_colored: keys.account_xpub_colored.clone(),
+            mnemonic: Some(keys.mnemonic.clone()),
+            master_fingerprint: keys.master_fingerprint.clone(),
+            vanilla_keychain: None,
+            supported_schemas: vec![AssetSchema::Nia],
+            reuse_addresses: reuse,
+        };
+
+        let drain = slog::Discard;
+        let logger = Logger::root(drain, o!());
+
+        Wallet {
+            wallet_data: wd,
+            logger,
+            _logger_guard: (),
+            watch_only: false,
+            database: Arc::new(crate::database::memory_db::InMemoryDb::new()),
+            wallet_dir: PathBuf::from(":memory:"),
+            bdk_wallet,
+            bdk_database,
+            reuse_address_index: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            wasm_proxy_client: crate::api::proxy::WasmProxyClient::new().unwrap(),
+            #[cfg(feature = "esplora")]
+            online_data: None,
+            #[cfg(feature = "esplora")]
+            transfer_artifacts: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            received_consignments: HashMap::new(),
+            idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            vss_client: None,
+        }
+    }
+
+    #[test]
+    fn reuse_returns_same_address() {
+        let mut wallet = make_test_wallet(true);
+        let addr1 = wallet._get_new_address(KeychainKind::Internal).unwrap();
+        let addr2 = wallet._get_new_address(KeychainKind::Internal).unwrap();
+        assert_eq!(addr1, addr2, "reuse enabled: same address expected");
+    }
+
+    #[test]
+    fn no_reuse_returns_different_addresses() {
+        let mut wallet = make_test_wallet(false);
+        let addr1 = wallet._get_new_address(KeychainKind::Internal).unwrap();
+        let addr2 = wallet._get_new_address(KeychainKind::Internal).unwrap();
+        assert_ne!(addr1, addr2, "reuse disabled: different addresses expected");
+    }
+
+    #[test]
+    fn rotate_changes_address() {
+        let mut wallet = make_test_wallet(true);
+        let old_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
+        let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
+        let new_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
+
+        assert_ne!(new_addr.to_string(), old_addr.to_string(), "rotate should change the pinned address");
+        assert_eq!(rotated, new_addr.to_string(), "rotate should return the new pinned address");
+    }
+
+    #[test]
+    fn rotate_disabled_errors() {
+        let mut wallet = make_test_wallet(false);
+        let result = wallet.rotate_address(KeychainKind::Internal);
+        assert!(matches!(result, Err(Error::AddressReuseDisabled)));
+    }
+
+    #[test]
+    fn keychains_have_independent_indices() {
+        let mut wallet = make_test_wallet(true);
+        let internal = wallet._get_new_address(KeychainKind::Internal).unwrap();
+        let external = wallet._get_new_address(KeychainKind::External).unwrap();
+        assert_ne!(internal.to_string(), external.to_string(), "different keychains");
+
+        // Rotating External should not affect Internal
+        wallet.rotate_address(KeychainKind::External).unwrap();
+        let internal_after = wallet._get_new_address(KeychainKind::Internal).unwrap();
+        assert_eq!(
+            internal.to_string(),
+            internal_after.to_string(),
+            "Internal unchanged after External rotation"
+        );
     }
 }
