@@ -19,6 +19,7 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
         master_fingerprint: keys.master_fingerprint,
         vanilla_keychain: None,
         supported_schemas: schemas,
+        reuse_addresses: false,
     }
 }
 
@@ -42,6 +43,7 @@ fn test_wallet_new_watch_only() {
         master_fingerprint: keys.master_fingerprint,
         vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
+        reuse_addresses: false,
     };
     assert!(Wallet::new(wd).is_ok());
 }
@@ -60,6 +62,7 @@ fn test_wallet_new_fingerprint_mismatch() {
         master_fingerprint: "deadbeef".to_string(),
         vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
+        reuse_addresses: false,
     };
     let result = Wallet::new(wd);
     assert!(result.is_err());
@@ -272,4 +275,155 @@ fn test_validate_consignment_result_serializes() {
     let json = serde_json::to_string(&result).unwrap();
     assert!(json.contains("\"valid\":true"));
     assert!(json.contains("test warning"));
+}
+
+// ---------------------------------------------------------------------------
+// Address reuse e2e tests
+// ---------------------------------------------------------------------------
+
+fn test_wallet_data_reuse(schemas: Vec<AssetSchema>) -> WalletData {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    WalletData {
+        data_dir: "/tmp/rgb_test_reuse".to_string(),
+        bitcoin_network: BitcoinNetwork::Regtest,
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: 5,
+        account_xpub_vanilla: keys.account_xpub_vanilla,
+        account_xpub_colored: keys.account_xpub_colored,
+        mnemonic: Some(keys.mnemonic),
+        master_fingerprint: keys.master_fingerprint,
+        vanilla_keychain: None,
+        supported_schemas: schemas,
+        reuse_addresses: true,
+    }
+}
+
+/// With reuse enabled, get_address returns the same address every time.
+#[wasm_bindgen_test]
+fn test_address_reuse_returns_same() {
+    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd).unwrap();
+
+    let addr1 = wallet.get_address().unwrap();
+    let addr2 = wallet.get_address().unwrap();
+    let addr3 = wallet.get_address().unwrap();
+    assert!(addr1.starts_with("bcrt1"));
+    assert_eq!(addr1, addr2);
+    assert_eq!(addr2, addr3);
+}
+
+/// Without reuse, addresses differ (existing behavior preserved).
+#[wasm_bindgen_test]
+fn test_address_no_reuse_returns_different() {
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd).unwrap();
+
+    let addr1 = wallet.get_address().unwrap();
+    let addr2 = wallet.get_address().unwrap();
+    assert_ne!(addr1, addr2);
+}
+
+/// rotate_address bumps to next address; get_address then returns the new one.
+#[wasm_bindgen_test]
+fn test_rotate_address() {
+    use rgb_lib_wasm::bdk_wallet::KeychainKind;
+
+    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd).unwrap();
+
+    let old_addr = wallet.get_address().unwrap();
+    let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
+    let new_addr = wallet.get_address().unwrap();
+
+    assert_ne!(
+        old_addr, rotated,
+        "rotate should produce a different address"
+    );
+    assert_eq!(
+        rotated, new_addr,
+        "get_address should return the rotated address"
+    );
+
+    // Rotate again — should produce yet another address
+    let rotated2 = wallet.rotate_address(KeychainKind::Internal).unwrap();
+    assert_ne!(rotated, rotated2, "second rotation should differ");
+}
+
+/// rotate_address errors when reuse_addresses is false.
+#[wasm_bindgen_test]
+fn test_rotate_address_disabled_errors() {
+    use rgb_lib_wasm::bdk_wallet::KeychainKind;
+
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd).unwrap();
+
+    let result = wallet.rotate_address(KeychainKind::Internal);
+    assert!(result.is_err());
+    assert!(format!("{:?}", result.unwrap_err()).contains("AddressReuseDisabled"));
+}
+
+/// External and Internal keychains have independent pinned indices.
+#[wasm_bindgen_test]
+fn test_keychains_independent() {
+    use rgb_lib_wasm::bdk_wallet::KeychainKind;
+
+    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd).unwrap();
+
+    // get_address uses Internal keychain
+    let internal_addr = wallet.get_address().unwrap();
+
+    // Rotate External — should NOT affect Internal
+    wallet.rotate_address(KeychainKind::External).unwrap();
+    wallet.rotate_address(KeychainKind::External).unwrap();
+
+    let internal_after = wallet.get_address().unwrap();
+    assert_eq!(
+        internal_addr, internal_after,
+        "rotating External must not change Internal"
+    );
+}
+
+/// WalletData round-trip preserves the reuse_addresses field.
+#[wasm_bindgen_test]
+fn test_wallet_data_preserves_reuse_field() {
+    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let wallet = Wallet::new(wd).unwrap();
+    let returned = wallet.get_wallet_data();
+    assert!(returned.reuse_addresses, "reuse_addresses should be true");
+
+    let wd2 = test_wallet_data(vec![AssetSchema::Nia]);
+    let wallet2 = Wallet::new(wd2).unwrap();
+    let returned2 = wallet2.get_wallet_data();
+    assert!(
+        !returned2.reuse_addresses,
+        "reuse_addresses should be false"
+    );
+}
+
+/// JSON without reuse_addresses deserializes to false (backward compat).
+#[wasm_bindgen_test]
+fn test_reuse_addresses_serde_default() {
+    // JSON without the reuse_addresses field should deserialize to false
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let json = format!(
+        r#"{{
+            "data_dir": "/tmp/serde_test",
+            "bitcoin_network": "Regtest",
+            "database_type": "Sqlite",
+            "max_allocations_per_utxo": 5,
+            "account_xpub_vanilla": "{}",
+            "account_xpub_colored": "{}",
+            "mnemonic": "{}",
+            "master_fingerprint": "{}",
+            "vanilla_keychain": null,
+            "supported_schemas": ["Nia"]
+        }}"#,
+        keys.account_xpub_vanilla,
+        keys.account_xpub_colored,
+        keys.mnemonic,
+        keys.master_fingerprint,
+    );
+    let wd: WalletData = serde_json::from_str(&json).unwrap();
+    assert!(!wd.reuse_addresses, "missing field should default to false");
 }

@@ -22,6 +22,7 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
         master_fingerprint: keys.master_fingerprint,
         vanilla_keychain: None,
         supported_schemas: schemas,
+        reuse_addresses: false,
     }
 }
 

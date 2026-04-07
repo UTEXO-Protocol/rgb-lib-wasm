@@ -34,6 +34,7 @@ fn test_wallet_data(
         master_fingerprint: keys.master_fingerprint.clone(),
         vanilla_keychain: None,
         supported_schemas: schemas,
+        reuse_addresses: false,
     }
 }
 
@@ -75,6 +76,110 @@ async fn simulate_reload(wd: &WalletData) -> Wallet {
         wallet.restore_from_snapshot(snapshot).unwrap();
     }
     wallet
+}
+
+/// Test: Address reuse pinned index survives page reload.
+#[wasm_bindgen_test]
+async fn test_address_reuse_persists_across_reload() {
+    use rgb_lib_wasm::bdk_wallet::KeychainKind;
+
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = WalletData {
+        data_dir: "/tmp/persist_reuse".to_string(),
+        bitcoin_network: BitcoinNetwork::Regtest,
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: 5,
+        account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
+        account_xpub_colored: keys.account_xpub_colored.clone(),
+        mnemonic: Some(keys.mnemonic.clone()),
+        master_fingerprint: keys.master_fingerprint.clone(),
+        vanilla_keychain: None,
+        supported_schemas: vec![AssetSchema::Nia],
+        reuse_addresses: true,
+    };
+
+    // Session 1: get pinned address, rotate, verify new pinned address
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let addr_initial = wallet.get_address().unwrap();
+    assert!(addr_initial.starts_with("bcrt1"));
+
+    // Same address on repeated calls
+    assert_eq!(addr_initial, wallet.get_address().unwrap());
+
+    // Rotate to index 1
+    let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
+    assert_ne!(addr_initial, rotated);
+    assert_eq!(rotated, wallet.get_address().unwrap());
+
+    // Simulate browser refresh
+    drop(wallet);
+    let mut wallet = simulate_reload(&wd).await;
+
+    // After reload, rotated address should be preserved
+    let addr_after_reload = wallet.get_address().unwrap();
+    assert_eq!(
+        rotated, addr_after_reload,
+        "rotated address must survive page reload"
+    );
+
+    // Reuse still works after reload
+    assert_eq!(addr_after_reload, wallet.get_address().unwrap());
+
+    // Rotate again after reload — should work and produce a new address
+    let rotated2 = wallet.rotate_address(KeychainKind::Internal).unwrap();
+    assert_ne!(addr_after_reload, rotated2);
+    assert_eq!(rotated2, wallet.get_address().unwrap());
+}
+
+/// Test: Address reuse pinned index survives encrypted backup + restore.
+#[wasm_bindgen_test]
+async fn test_address_reuse_persists_across_backup_restore() {
+    use rgb_lib_wasm::bdk_wallet::KeychainKind;
+
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = WalletData {
+        data_dir: "/tmp/persist_reuse_backup".to_string(),
+        bitcoin_network: BitcoinNetwork::Regtest,
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: 5,
+        account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
+        account_xpub_colored: keys.account_xpub_colored.clone(),
+        mnemonic: Some(keys.mnemonic.clone()),
+        master_fingerprint: keys.master_fingerprint.clone(),
+        vanilla_keychain: None,
+        supported_schemas: vec![AssetSchema::Nia],
+        reuse_addresses: true,
+    };
+
+    // Create wallet, rotate address a few times
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let addr_index_0 = wallet.get_address().unwrap();
+    wallet.rotate_address(KeychainKind::Internal).unwrap();
+    wallet.rotate_address(KeychainKind::Internal).unwrap();
+    let addr_index_2 = wallet.get_address().unwrap();
+    assert_ne!(addr_index_0, addr_index_2);
+
+    // Create encrypted backup
+    let password = "test_password_42";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    // Restore into a fresh wallet
+    let mut wallet2 = Wallet::new(wd.clone()).unwrap();
+    // Fresh wallet starts at index 0
+    assert_eq!(addr_index_0, wallet2.get_address().unwrap());
+
+    // Restore from backup — should bring back index 2
+    wallet2.restore_backup(&backup_bytes, password).unwrap();
+    let addr_after_restore = wallet2.get_address().unwrap();
+    assert_eq!(
+        addr_index_2, addr_after_restore,
+        "backup/restore must preserve the pinned address index"
+    );
+
+    // Rotate should continue from index 2 → 3
+    let rotated = wallet2.rotate_address(KeychainKind::Internal).unwrap();
+    assert_ne!(addr_index_2, rotated);
+    assert_eq!(rotated, wallet2.get_address().unwrap());
 }
 
 /// Test: BDK wallet state (BTC balance) survives page reload.

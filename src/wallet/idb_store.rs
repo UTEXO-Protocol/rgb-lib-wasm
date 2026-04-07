@@ -1,6 +1,6 @@
 //! IndexedDB persistence for WASM wallet snapshots.
 
-use bdk_wallet::ChangeSet;
+use bdk_wallet::{ChangeSet, KeychainKind};
 use rexie::{ObjectStore, Rexie, TransactionMode};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
@@ -35,6 +35,9 @@ pub struct WalletSnapshot {
     /// Strict-encoded RGB Stock index (base64).
     #[serde(default)]
     pub stock_index_b64: Option<String>,
+    /// Pinned derivation index per keychain for address reuse.
+    #[serde(default)]
+    pub reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
 async fn open_db() -> Result<Rexie, String> {
@@ -248,6 +251,7 @@ mod tests {
             stock_stash_b64: Some(s),
             stock_state_b64: Some(st),
             stock_index_b64: Some(i),
+            reuse_address_index: HashMap::new(),
         };
 
         // JSON round-trip (what IndexedDB does)
