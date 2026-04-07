@@ -2804,6 +2804,9 @@ impl Wallet {
                 .get(&keychain)
                 .copied()
                 .unwrap_or(0);
+            // reveal_addresses_to ensures BDK's sync engine tracks this address
+            let _ = self.bdk_wallet.reveal_addresses_to(keychain, index);
+            self.bdk_wallet.persist(&mut self.bdk_database)?;
             let address = self.bdk_wallet.peek_address(keychain, index).address;
             return Ok(address);
         }
@@ -2845,6 +2848,8 @@ impl Wallet {
             .unwrap_or(0);
         let new_index = index + 1;
         self.reuse_address_index.insert(keychain, new_index);
+        let _ = self.bdk_wallet.reveal_addresses_to(keychain, new_index);
+        self.bdk_wallet.persist(&mut self.bdk_database)?;
         let address = self.bdk_wallet.peek_address(keychain, new_index).address;
 
         self.trigger_auto_backup();

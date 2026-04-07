@@ -461,6 +461,16 @@ impl Wallet {
         size: u32,
         fee_rate: FeeRate,
     ) -> Result<Psbt, bdk_wallet::error::CreateTxError> {
+        let change_script = if self.wallet_data.reuse_addresses {
+            Some(
+                self._get_new_address(KeychainKind::Internal)
+                    .map_err(|_| bdk_wallet::error::CreateTxError::NoUtxosSelected)?
+                    .script_pubkey(),
+            )
+        } else {
+            None
+        };
+
         let mut tx_builder = self.bdk_wallet.build_tx();
         tx_builder
             .add_utxos(inputs)
@@ -469,6 +479,9 @@ impl Wallet {
             .fee_rate(fee_rate);
         for address in addresses {
             tx_builder.add_recipient(address.clone(), BdkAmount::from_sat(size as u64));
+        }
+        if let Some(change) = change_script {
+            tx_builder.drain_to(change);
         }
         tx_builder.finish()
     }
@@ -3185,11 +3198,24 @@ impl Wallet {
 
         let unspendable = self._get_unspendable_bdk_outpoints()?;
 
+        let change_script = if self.wallet_data.reuse_addresses {
+            Some(
+                self._get_new_address(KeychainKind::Internal)?
+                    .script_pubkey(),
+            )
+        } else {
+            None
+        };
+
         let mut tx_builder = self.bdk_wallet.build_tx();
         tx_builder
             .unspendable(unspendable)
             .add_recipient(script_pubkey, BdkAmount::from_sat(amount))
             .fee_rate(fee_rate_checked);
+
+        if let Some(change) = change_script {
+            tx_builder.drain_to(change);
+        }
 
         let psbt = tx_builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
