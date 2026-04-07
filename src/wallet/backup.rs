@@ -36,6 +36,9 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) stock_state_b64: String,
     /// Strict-encoded MemIndex, base64
     pub(crate) stock_index_b64: String,
+    /// Pinned derivation index per keychain for address reuse.
+    #[serde(default)]
+    pub(crate) reuse_address_index: std::collections::HashMap<bdk_wallet::KeychainKind, u32>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -173,7 +176,7 @@ impl super::Wallet {
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
-            reuse_address_index: Default::default(),
+            reuse_address_index: payload.reuse_address_index,
         };
         self.restore_from_snapshot(snapshot)?;
 
@@ -281,7 +284,7 @@ impl super::Wallet {
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
-            reuse_address_index: Default::default(),
+            reuse_address_index: payload.reuse_address_index,
         };
         self.restore_from_snapshot(snapshot)?;
 
@@ -364,6 +367,7 @@ impl super::Wallet {
             stock_stash_b64: general_purpose::STANDARD.encode(stash_bytes.as_unconfined()),
             stock_state_b64: general_purpose::STANDARD.encode(state_bytes.as_unconfined()),
             stock_index_b64: general_purpose::STANDARD.encode(index_bytes.as_unconfined()),
+            reuse_address_index: self.reuse_address_index.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())

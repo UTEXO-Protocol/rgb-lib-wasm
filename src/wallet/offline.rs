@@ -2821,8 +2821,10 @@ impl Wallet {
         info!(self.logger, "Getting address...");
         let address = self._get_new_address(KeychainKind::Internal)?;
 
-        self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        if !self.wallet_data.reuse_addresses {
+            self.update_backup_info(false)?;
+            self.trigger_auto_backup();
+        }
 
         info!(self.logger, "Get address completed");
         Ok(address.to_string())
