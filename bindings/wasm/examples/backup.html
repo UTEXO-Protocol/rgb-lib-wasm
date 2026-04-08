@@ -123,7 +123,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </div>
     <div>
       <label for="wallet-data">WalletData JSON</label>
-      <textarea id="wallet-data" rows="6" placeholder='{"data_dir": ":memory:", "bitcoin_network": "Regtest", ...}'></textarea>
+      <textarea id="wallet-data" rows="6" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-create-wallet" disabled>Create Wallet</button>
@@ -308,8 +308,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       initWasm, state, log, json,
       showResult, showJson, showError,
       requireWallet, enableBtns, copyOutput,
-      generate_keys, restore_keys, check_proxy_url,
-      validate_consignment_offchain,
+      generateKeys, restoreKeys, checkProxyUrl,
+      validateConsignmentOffchain,
       WasmWallet,
       fillWalletData,
       PROXY_URL, VSS_URL,
@@ -340,11 +340,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-auto-setup').addEventListener('click', async () => {
       try {
         log('Auto-setup: generating keys...', 'log-info');
-        const keys = generate_keys('regtest');
+        const keys = generateKeys('regtest');
         const wd = fillWalletData(keys, 'regtest');
         log('Auto-setup: creating wallet...', 'log-info');
         state.wallet = await WasmWallet.create(JSON.stringify(wd));
-        const walletData = state.wallet.get_wallet_data();
+        const walletData = state.wallet.getWalletData();
         showResult('setup-output', 'setup-result',
           'Wallet created (auto-setup)\n\nMnemonic: ' + keys.mnemonic + '\n\n' + json(walletData));
         enableBtns(walletBtns);
@@ -360,11 +360,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-generate').addEventListener('click', () => {
       const network = document.getElementById('gen-network').value;
       try {
-        const keys = generate_keys(network);
+        const keys = generateKeys(network);
         fillWalletData(keys, network);
         showResult('setup-output', 'setup-result',
           'Keys generated for ' + network + '\n\nMnemonic: ' + keys.mnemonic + '\n\nWalletData JSON filled below.');
-        log('generate_keys(' + network + ') OK', 'log-ok');
+        log('generateKeys(' + network + ') OK', 'log-ok');
       } catch (e) {
         showError('setup-output', 'setup-result', 'Generate keys failed', e);
       }
@@ -382,7 +382,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Creating wallet...', 'log-info');
         state.wallet = await WasmWallet.create(walletDataJson);
-        const wd = state.wallet.get_wallet_data();
+        const wd = state.wallet.getWalletData();
         showResult('setup-output', 'setup-result',
           'Wallet created successfully\n\n' + json(wd));
         enableBtns(walletBtns);
@@ -430,12 +430,12 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-backup-info').addEventListener('click', () => {
       if (!requireWallet('backup-output', 'backup-result')) return;
       try {
-        const needsBackup = state.wallet.backup_info();
+        const needsBackup = state.wallet.backupInfo();
         const msg = needsBackup
           ? 'Backup required: wallet has been modified since last backup'
           : 'Backup up to date: no changes since last backup';
         showResult('backup-output', 'backup-result', msg);
-        log('backup_info: needs_backup=' + needsBackup, 'log-ok');
+        log('backupInfo: needs_backup=' + needsBackup, 'log-ok');
       } catch (e) {
         showError('backup-output', 'backup-result', 'Backup info failed', e);
       }
@@ -464,7 +464,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         const arrayBuffer = await file.arrayBuffer();
         const bytes = new Uint8Array(arrayBuffer);
         log('Restoring backup (' + bytes.length + ' bytes)...', 'log-info');
-        state.wallet.restore_backup(bytes, password);
+        state.wallet.restoreBackup(bytes, password);
         showResult('backup-output', 'backup-result',
           'Backup restored successfully from "' + file.name + '" (' + bytes.length + ' bytes)');
         log('Backup restored from "' + file.name + '"', 'log-ok');
@@ -487,7 +487,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        state.wallet.configure_vss_backup(url, storeId, signingKey);
+        state.wallet.configureVssBackup(url, storeId, signingKey);
         showResult('vss-output', 'vss-result',
           'VSS backup configured\n  Server: ' + url + '\n  Store ID: ' + storeId);
         log('VSS configured: ' + url + ' / ' + storeId, 'log-ok');
@@ -501,7 +501,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     // -----------------------------------------------------------------
     document.getElementById('btn-vss-disable').addEventListener('click', () => {
       if (!requireWallet('vss-output', 'vss-result')) return;
-      state.wallet.disable_vss_backup();
+      state.wallet.disableVssBackup();
       showResult('vss-output', 'vss-result', 'VSS backup disabled');
       log('VSS backup disabled', 'log-ok');
     });
@@ -513,7 +513,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       if (!requireWallet('vss-output', 'vss-result')) return;
       try {
         log('VSS backup in progress...', 'log-info');
-        const version = await state.wallet.vss_backup();
+        const version = await state.wallet.vssBackup();
         showResult('vss-output', 'vss-result',
           'VSS backup complete\n  Server version: ' + version);
         log('VSS backup OK, version=' + version, 'log-ok');
@@ -529,7 +529,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       if (!requireWallet('vss-output', 'vss-result')) return;
       try {
         log('VSS restore in progress...', 'log-info');
-        await state.wallet.vss_restore_backup();
+        await state.wallet.vssRestoreBackup();
         showResult('vss-output', 'vss-result', 'VSS restore complete');
         log('VSS restore OK', 'log-ok');
       } catch (e) {
@@ -544,7 +544,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       if (!requireWallet('vss-output', 'vss-result')) return;
       try {
         log('Querying VSS info...', 'log-info');
-        const info = await state.wallet.vss_backup_info();
+        const info = await state.wallet.vssBackupInfo();
         showJson('vss-output', 'vss-result', info);
         log('VSS info retrieved', 'log-ok');
       } catch (e) {
@@ -563,10 +563,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       }
       try {
         log('Checking proxy: ' + url + '...', 'log-info');
-        await check_proxy_url(url);
+        await checkProxyUrl(url);
         showResult('proxy-output', 'proxy-result',
           'Proxy URL is valid: ' + url);
-        log('check_proxy_url OK: ' + url, 'log-ok');
+        log('checkProxyUrl OK: ' + url, 'log-ok');
       } catch (e) {
         showError('proxy-output', 'proxy-result', 'Proxy check failed', e);
       }
@@ -593,7 +593,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         const arrayBuffer = await file.arrayBuffer();
         const bytes = new Uint8Array(arrayBuffer);
         log('Validating consignment (' + bytes.length + ' bytes, txid=' + txid + ')...', 'log-info');
-        const result = validate_consignment_offchain(bytes, txid, network);
+        const result = validateConsignmentOffchain(bytes, txid, network);
         showJson('consignment-output', 'consignment-result', result);
         if (result.valid) {
           log('Consignment is VALID', 'log-ok');
@@ -619,36 +619,36 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         if (pass) passCount++; else failCount++;
       }
 
-      // Test 1: invalid network in generate_keys
+      // Test 1: invalid network in generateKeys
       try {
-        generate_keys('invalid_network');
-        record(false, 'generate_keys("invalid_network")', 'expected error but succeeded');
+        generateKeys('invalid_network');
+        record(false, 'generateKeys("invalid_network")', 'expected error but succeeded');
       } catch (e) {
-        record(true, 'generate_keys("invalid_network")', 'rejected: ' + e);
+        record(true, 'generateKeys("invalid_network")', 'rejected: ' + e);
       }
 
-      // Test 2: bad mnemonic in restore_keys
+      // Test 2: bad mnemonic in restoreKeys
       try {
-        restore_keys('regtest', 'not a valid mnemonic phrase at all');
-        record(false, 'restore_keys(bad mnemonic)', 'expected error but succeeded');
+        restoreKeys('regtest', 'not a valid mnemonic phrase at all');
+        record(false, 'restoreKeys(bad mnemonic)', 'expected error but succeeded');
       } catch (e) {
-        record(true, 'restore_keys(bad mnemonic)', 'rejected: ' + e);
+        record(true, 'restoreKeys(bad mnemonic)', 'rejected: ' + e);
       }
 
-      // Test 3: empty mnemonic in restore_keys
+      // Test 3: empty mnemonic in restoreKeys
       try {
-        restore_keys('regtest', '');
-        record(false, 'restore_keys(empty mnemonic)', 'expected error but succeeded');
+        restoreKeys('regtest', '');
+        record(false, 'restoreKeys(empty mnemonic)', 'expected error but succeeded');
       } catch (e) {
-        record(true, 'restore_keys(empty mnemonic)', 'rejected: ' + e);
+        record(true, 'restoreKeys(empty mnemonic)', 'rejected: ' + e);
       }
 
       // Test 4: round-trip verification for all networks
       const networks = ['regtest', 'testnet', 'signet', 'mainnet'];
       for (const net of networks) {
         try {
-          const generated = generate_keys(net);
-          const restored = restore_keys(net, generated.mnemonic);
+          const generated = generateKeys(net);
+          const restored = restoreKeys(net, generated.mnemonic);
           const fields = Object.keys(generated);
           let allMatch = true;
           for (const field of fields) {
