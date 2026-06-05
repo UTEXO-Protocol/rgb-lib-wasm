@@ -2572,9 +2572,9 @@ impl Wallet {
             let valid_consignment = consignment
                 .validate(&wasm_resolver, &validation_config)
                 .map_err(|_| InternalError::Unexpected)?;
+            let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
-            let validation_status =
-                runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
+            runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
             if asset_schema == AssetSchema::Ifa {
                 let contract_id = valid_consignment.contract_id();
                 let contract_wrapper =
