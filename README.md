@@ -95,7 +95,28 @@ const walletData = {
 
 // create() restores state from IndexedDB if available
 const wallet = await WasmWallet.create(JSON.stringify(walletData));
+
+// Await durable IndexedDB commit before persisting dependent application state.
+await wallet.flush();
 ```
+
+### Persistence ordering
+
+`WasmWallet.create()` and Rust `Wallet::restore()` finish IndexedDB restoration
+before returning. They return an error instead of silently starting from fresh
+state when a stored snapshot cannot be read or decoded.
+
+Rust `Wallet::flush()` and JavaScript `wallet.flush()` resolve only after the
+IndexedDB read-write transaction commits. Persist dependent application state,
+acknowledge accepted RGB funding, or broadcast a transaction that depends on an
+RGB mutation only after the flush succeeds. A failed flush leaves the current
+in-memory wallet state intact and can be retried. Snapshots carry a monotonic
+sequence, and IndexedDB rejects stale writes so an earlier automatic save cannot
+overwrite a later explicit flush.
+
+Lightning-specific `consume_fascia`, `color_psbt_and_consume`, and
+`accept_transfer` operations await this durable commit before returning
+success.
 
 ### Going online
 
@@ -294,7 +315,8 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | Method | Async | Description |
 |--------|-------|-------------|
 | `new(walletDataJson)` | no | Create wallet (no IndexedDB restore) |
-| `create(walletDataJson)` | yes | Create wallet with IndexedDB restore |
+| `create(walletDataJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
+| `flush()` | yes | Durably commit current wallet state to IndexedDB |
 | `getWalletData()` | no | Return WalletData as JS object |
 | `getAddress()` | no | Get a new Bitcoin address |
 | `getBtcBalance()` | no | Get BTC balance |

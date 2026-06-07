@@ -55,6 +55,16 @@ pub struct ValidateConsignmentResult {
 }
 
 impl Wallet {
+    /// Return all contract IDs currently held in the RGB stock.
+    pub fn rgb_contract_ids(&self) -> Result<Vec<ContractId>, Error> {
+        let runtime = self.rgb_runtime()?;
+        Ok(runtime
+            .contracts()?
+            .into_iter()
+            .map(|contract| contract.id)
+            .collect())
+    }
+
     /// Color a PSBT.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
@@ -212,7 +222,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    pub fn color_psbt_and_consume(
+    pub async fn color_psbt_and_consume(
         &self,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
@@ -247,6 +257,8 @@ impl Wallet {
                 Some(witness_txid),
             )?);
         }
+        drop(runtime);
+        self.flush().await?;
 
         info!(self.logger, "Color PSBT and consume completed");
         Ok(transfers)
@@ -256,14 +268,17 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    pub fn consume_fascia(
+    pub async fn consume_fascia(
         &self,
         fascia: Fascia,
         witness_ord: Option<WitnessOrd>,
     ) -> Result<(), Error> {
         info!(self.logger, "Consuming fascia...");
-        self.rgb_runtime()?
-            .consume_fascia(fascia.clone(), witness_ord)?;
+        {
+            let mut runtime = self.rgb_runtime()?;
+            runtime.consume_fascia(fascia, witness_ord)?;
+        }
+        self.flush().await?;
         info!(self.logger, "Consume fascia completed");
         Ok(())
     }
@@ -519,6 +534,8 @@ impl Wallet {
             self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
 
         runtime.accept_transfer(valid_consignment, &resolver)?;
+        drop(runtime);
+        self.flush().await?;
 
         info!(self.logger, "Accept transfer completed");
         Ok((

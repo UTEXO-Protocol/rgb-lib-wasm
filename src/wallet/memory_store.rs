@@ -36,7 +36,7 @@ impl WalletPersister for MemoryStore<ChangeSet> {
     type Error = std::convert::Infallible;
 
     fn initialize(persister: &mut Self) -> Result<ChangeSet, Self::Error> {
-        Ok(persister.data.take().unwrap_or_default())
+        Ok(persister.data.clone().unwrap_or_default())
     }
 
     fn persist(persister: &mut Self, changeset: &ChangeSet) -> Result<(), Self::Error> {
@@ -44,5 +44,28 @@ impl WalletPersister for MemoryStore<ChangeSet> {
         current.merge(changeset.clone());
         persister.data = Some(current);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bdk_wallet::bitcoin::Network;
+
+    #[test]
+    fn initialize_keeps_complete_changeset_for_snapshotting() {
+        let changeset = ChangeSet {
+            network: Some(Network::Regtest),
+            ..Default::default()
+        };
+        let mut store = MemoryStore {
+            data: Some(changeset.clone()),
+        };
+
+        assert_eq!(
+            <MemoryStore<ChangeSet> as WalletPersister>::initialize(&mut store).unwrap(),
+            changeset
+        );
+        assert_eq!(store.get_data(), &Some(changeset));
     }
 }

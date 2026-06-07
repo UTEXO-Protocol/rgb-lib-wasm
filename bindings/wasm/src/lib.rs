@@ -88,24 +88,22 @@ impl WasmWallet {
     pub async fn create(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid WalletData JSON: {e}")))?;
-        let mut wallet = Wallet::new(wd).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let idb_key = wallet.idb_key();
-        match rgb_lib_wasm::wallet::idb_store::load_snapshot(&idb_key).await {
-            Ok(Some(snapshot)) => {
-                wallet
-                    .restore_from_snapshot(snapshot)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                web_sys::console::warn_1(
-                    &format!("IDB load warning (continuing fresh): {e}").into(),
-                );
-            }
-        }
+        let wallet = Wallet::restore(wd)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmWallet {
             inner: RefCell::new(wallet),
         })
+    }
+
+    /// Durably persist current wallet state to IndexedDB.
+    #[wasm_bindgen(js_name = "flush")]
+    pub async fn flush(&self) -> Result<(), JsValue> {
+        self.inner
+            .borrow()
+            .flush()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Return the WalletData as a JS object.

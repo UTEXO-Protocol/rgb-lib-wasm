@@ -989,12 +989,39 @@ pub struct Wallet {
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent in-memory RGB stock.
     pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<rgbstd::persistence::Stock>>>,
     pub(crate) vss_client: Option<super::vss::VssBackupClient>,
 }
 
 impl Wallet {
+    /// Create a wallet and restore its latest durable IndexedDB snapshot, if one exists.
+    ///
+    /// The returned wallet is ready for use only after the IndexedDB read and snapshot
+    /// restoration complete. IndexedDB and snapshot decoding failures are returned to the caller.
+    pub async fn restore(wallet_data: WalletData) -> Result<Self, Error> {
+        let mut wallet = Self::new(wallet_data)?;
+        let snapshot = super::idb_store::load_snapshot(&wallet.idb_key())
+            .await
+            .map_err(|details| Error::Persistence { details })?;
+        if let Some(snapshot) = snapshot {
+            if snapshot.stock_stash_b64.is_none()
+                || snapshot.stock_state_b64.is_none()
+                || snapshot.stock_index_b64.is_none()
+            {
+                return Err(Error::Persistence {
+                    details: s!("persisted wallet snapshot is missing RGB stock state"),
+                });
+            }
+            wallet
+                .idb_sequence
+                .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
+            wallet.restore_from_snapshot(snapshot)?;
+        }
+        Ok(wallet)
+    }
+
     /// Create a new RGB wallet based on the provided [`WalletData`].
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
     pub fn new(wallet_data: WalletData) -> Result<Self, Error> {
@@ -1115,6 +1142,7 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: {
                 let stock =
                     std::mem::replace(&mut runtime.stock, rgbstd::persistence::Stock::in_memory());
@@ -2926,6 +2954,58 @@ impl Wallet {
         self.save_to_idb();
     }
 
+    fn snapshot(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
+        let stock = self
+            .rgb_stock
+            .try_borrow()
+            .map_err(|_| Error::Persistence {
+                details: s!("RGB runtime is active; wallet state cannot be snapshotted"),
+            })?;
+        let stock = stock.as_ref().ok_or_else(|| Error::Persistence {
+            details: s!("RGB runtime is active; wallet state cannot be snapshotted"),
+        })?;
+        let (stock_stash_b64, stock_state_b64, stock_index_b64) =
+            super::idb_store::serialize_stock(stock).ok_or_else(|| Error::Persistence {
+                details: s!("failed to serialize RGB stock"),
+            })?;
+
+        Ok(super::idb_store::WalletSnapshot {
+            sequence: self
+                .idb_sequence
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1,
+            db: self.database.as_ref().clone(),
+            bdk_changeset: self.bdk_database.get_data().clone(),
+            signed_psbts: self
+                .transfer_artifacts
+                .iter()
+                .filter_map(|(txid, artifact)| {
+                    artifact
+                        .signed_psbt
+                        .as_ref()
+                        .map(|psbt| (txid.clone(), psbt.clone()))
+                })
+                .collect(),
+            received_consignments: self.received_consignments.clone(),
+            stock_stash_b64: Some(stock_stash_b64),
+            stock_state_b64: Some(stock_state_b64),
+            stock_index_b64: Some(stock_index_b64),
+            reuse_address_index: self.reuse_address_index.clone(),
+        })
+    }
+
+    /// Durably persist the current wallet state to IndexedDB.
+    ///
+    /// This method resolves only after the IndexedDB read-write transaction commits. Callers must
+    /// not persist dependent application state until this method succeeds. A failure leaves the
+    /// current in-memory wallet state intact and may be retried.
+    pub async fn flush(&self) -> Result<(), Error> {
+        let snapshot = self.snapshot()?;
+        super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
+            .await
+            .map_err(|details| Error::Persistence { details })
+    }
+
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.
     fn save_to_idb(&self) {
         use std::sync::atomic::Ordering;
@@ -2939,48 +3019,18 @@ impl Wallet {
             return;
         }
 
-        // Clone data for the async closure
-        let db_clone = self.database.as_ref().clone();
-        let bdk_changeset = self.bdk_database.get_data().clone();
-        let signed_psbts: std::collections::HashMap<String, String> = self
-            .transfer_artifacts
-            .iter()
-            .filter_map(|(txid, a)| {
-                a.signed_psbt
-                    .as_ref()
-                    .map(|psbt| (txid.clone(), psbt.clone()))
-            })
-            .collect();
-        let received_consignments = self.received_consignments.clone();
-
-        // Serialize RGB Stock if available (None when runtime is active)
-        let (stock_stash_b64, stock_state_b64, stock_index_b64) = {
-            let stock_ref = self.rgb_stock.borrow();
-            if let Some(stock) = stock_ref.as_ref() {
-                match super::idb_store::serialize_stock(stock) {
-                    Some((s, st, i)) => (Some(s), Some(st), Some(i)),
-                    None => (None, None, None),
-                }
-            } else {
-                (None, None, None)
+        let snapshot = match self.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                web_sys::console::error_1(&error.to_string().into());
+                self.idb_save_in_progress.store(false, Ordering::SeqCst);
+                return;
             }
         };
-
-        let reuse_address_index = self.reuse_address_index.clone();
         let key = self.idb_key();
         let flag = self.idb_save_in_progress.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
-            let snapshot = super::idb_store::WalletSnapshot {
-                db: db_clone,
-                bdk_changeset,
-                signed_psbts,
-                received_consignments,
-                stock_stash_b64,
-                stock_state_b64,
-                stock_index_b64,
-                reuse_address_index,
-            };
             if let Err(e) = super::idb_store::save_snapshot(&key, &snapshot).await {
                 web_sys::console::error_1(&format!("IDB save error: {e}").into());
             }
@@ -3043,15 +3093,14 @@ impl Wallet {
                     self.bdk_wallet = wallet;
                 }
                 Ok(None) => {
-                    // Changeset didn't produce a loadable wallet; create fresh
-                    self.bdk_wallet = BdkWallet::create(desc_colored, desc_vanilla)
-                        .network(bdk_network)
-                        .create_wallet(&mut self.bdk_database)?;
+                    return Err(Error::Persistence {
+                        details: s!("persisted BDK changeset did not contain a loadable wallet"),
+                    });
                 }
-                Err(_) => {
-                    // BDK changeset load failed (e.g. incomplete changeset from
-                    // early save). Keep the fresh wallet from Wallet::new() — a
-                    // sync after go_online will re-populate BDK state from the indexer.
+                Err(error) => {
+                    return Err(Error::Persistence {
+                        details: format!("failed to load persisted BDK wallet: {error}"),
+                    });
                 }
             }
         }
@@ -3154,6 +3203,7 @@ mod address_reuse_tests {
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
             vss_client: None,
         }

@@ -16,6 +16,8 @@ const STORE_NAME: &str = "snapshots";
 /// A serializable snapshot of wallet state for IndexedDB persistence.
 #[derive(Serialize, Deserialize)]
 pub struct WalletSnapshot {
+    /// Monotonic wallet-local snapshot sequence used to reject stale writes.
+    pub sequence: u64,
     /// The in-memory RGB-lib database.
     pub db: InMemoryDb,
     /// The BDK wallet changeset.
@@ -62,6 +64,23 @@ pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), S
 
     let json_str = serde_json::to_string(snapshot).map_err(|e| format!("Serialize error: {e}"))?;
     let js_key = JsValue::from_str(key);
+    if let Some(existing) = store
+        .get(js_key.clone())
+        .await
+        .map_err(|e| format!("IndexedDB get error: {e:?}"))?
+    {
+        let json = existing
+            .as_string()
+            .ok_or_else(|| "IndexedDB value is not a string".to_string())?;
+        let existing: WalletSnapshot =
+            serde_json::from_str(&json).map_err(|e| format!("Deserialize error: {e}"))?;
+        if existing.sequence >= snapshot.sequence {
+            tx.done()
+                .await
+                .map_err(|e| format!("IndexedDB commit error: {e:?}"))?;
+            return Ok(());
+        }
+    }
     let js_val = JsValue::from_str(&json_str);
 
     store
@@ -244,6 +263,7 @@ mod tests {
         let (s, st, i) = serialize_stock(&stock).expect("serialize stock with contract");
 
         let snapshot = WalletSnapshot {
+            sequence: 1,
             db: InMemoryDb::new(),
             bdk_changeset: None,
             signed_psbts: HashMap::new(),
