@@ -2976,16 +2976,7 @@ impl Wallet {
                 + 1,
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
-            signed_psbts: self
-                .transfer_artifacts
-                .iter()
-                .filter_map(|(txid, artifact)| {
-                    artifact
-                        .signed_psbt
-                        .as_ref()
-                        .map(|psbt| (txid.clone(), psbt.clone()))
-                })
-                .collect(),
+            transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
             stock_stash_b64: Some(stock_stash_b64),
             stock_state_b64: Some(stock_state_b64),
@@ -3001,9 +2992,10 @@ impl Wallet {
     /// current in-memory wallet state intact and may be retried.
     pub async fn flush(&self) -> Result<(), Error> {
         let snapshot = self.snapshot()?;
-        super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
+        let result = super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
             .await
-            .map_err(|details| Error::Persistence { details })
+            .map_err(|details| Error::Persistence { details });
+        result
     }
 
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.
@@ -3105,16 +3097,8 @@ impl Wallet {
             }
         }
 
-        // Restore transfer artifacts (signed PSBTs only)
-        for (txid, psbt) in snapshot.signed_psbts {
-            self.transfer_artifacts.insert(
-                txid,
-                super::online::TransferArtifacts {
-                    signed_psbt: Some(psbt),
-                    ..Default::default()
-                },
-            );
-        }
+        // Restore complete pending transfers so send_end can resume after a page reload.
+        self.transfer_artifacts = snapshot.transfer_artifacts;
 
         // Restore received consignments
         self.received_consignments = snapshot.received_consignments;

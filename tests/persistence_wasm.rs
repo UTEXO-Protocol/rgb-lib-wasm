@@ -481,3 +481,94 @@ async fn test_accept_transfer_is_durable_before_success() {
     let restored = Wallet::restore(wd_b).await.unwrap();
     assert_eq!(restored.rgb_contract_ids().unwrap(), contract_ids);
 }
+
+/// Test: Lightning-style funding can post a consignment before broadcast, survive a browser
+/// reload, and complete without posting the already-used recipient endpoint again.
+#[wasm_bindgen_test]
+async fn test_pending_funding_transfer_completes_after_reload() {
+    let unique = js_sys::Date::now().to_string();
+    let keys_a = generate_keys(BitcoinNetwork::Regtest);
+    let keys_b = generate_keys(BitcoinNetwork::Regtest);
+    let wd_a = test_wallet_data(
+        &keys_a,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-pending-funding-a-{unique}"),
+    );
+    let wd_b = test_wallet_data(
+        &keys_b,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-pending-funding-b-{unique}"),
+    );
+    let mut wallet_a = Wallet::new(wd_a.clone()).unwrap();
+    let mut wallet_b = Wallet::new(wd_b).unwrap();
+    let online_a = wallet_a
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+
+    fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
+    create_utxos(&mut wallet_a, &online_a, 5).await;
+    let asset = wallet_a
+        .issue_asset_nia("LDKF".to_string(), "LDK Funding".to_string(), 0, vec![1000])
+        .unwrap();
+
+    let transport = transport_endpoint();
+    let receive = wallet_b
+        .witness_receive(
+            None,
+            Assignment::Fungible(100),
+            None,
+            vec![transport.clone()],
+            1,
+        )
+        .unwrap();
+    let recipient = Recipient {
+        recipient_id: receive.recipient_id.clone(),
+        witness_data: Some(WitnessData {
+            amount_sat: 2000,
+            blinding: Some(777),
+        }),
+        assignment: Assignment::Fungible(100),
+        transport_endpoints: vec![transport],
+    };
+    let recipient_map = HashMap::from([(asset.asset_id, vec![recipient])]);
+
+    let unsigned = wallet_a
+        .send_begin(online_a.clone(), recipient_map, true, 1, 1)
+        .await
+        .unwrap();
+    let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
+    let funding_txid = Psbt::from_str(&signed)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    // Persist the not-yet-posted state, then simulate a page exit after the proxy accepted the
+    // consignment but before the used endpoint flag could be flushed.
+    wallet_a.flush().await.unwrap();
+    wallet_a
+        .post_pending_consignments(funding_txid.clone())
+        .await
+        .unwrap();
+    let (consignment, proxy_txid) = get_consignment_from_proxy(&receive.recipient_id).await;
+    assert!(!consignment.is_empty());
+    assert_eq!(proxy_txid, funding_txid);
+
+    drop(wallet_a);
+    let mut wallet_a = Wallet::restore(wd_a.clone()).await.unwrap();
+    wallet_a
+        .post_pending_consignments(funding_txid.clone())
+        .await
+        .unwrap();
+    let mut wallet_a = simulate_reload(wallet_a, &wd_a).await;
+    let restored_online = wallet_a
+        .go_online(true, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    let completed = wallet_a
+        .send_end(restored_online, signed, false)
+        .await
+        .unwrap();
+    assert_eq!(completed.txid, funding_txid);
+    wallet_a.flush().await.unwrap();
+}

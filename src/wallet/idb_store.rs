@@ -22,9 +22,8 @@ pub struct WalletSnapshot {
     pub db: InMemoryDb,
     /// The BDK wallet changeset.
     pub bdk_changeset: Option<ChangeSet>,
-    /// Signed PSBTs keyed by txid (for refresh after page reload).
-    #[serde(default)]
-    pub signed_psbts: HashMap<String, String>,
+    /// Complete pending transfer state keyed by txid.
+    pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
     /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
@@ -262,11 +261,16 @@ mod tests {
         // Serialize → JSON round-trip (simulates IndexedDB save/load)
         let (s, st, i) = serialize_stock(&stock).expect("serialize stock with contract");
 
+        let mut transfer_artifact = crate::wallet::online::TransferArtifacts::default();
+        transfer_artifact
+            .consignment_bytes
+            .insert("asset-id".to_owned(), vec![1, 2, 3, 4]);
+        transfer_artifact.signed_psbt = Some("signed-psbt".to_owned());
         let snapshot = WalletSnapshot {
             sequence: 1,
             db: InMemoryDb::new(),
             bdk_changeset: None,
-            signed_psbts: HashMap::new(),
+            transfer_artifacts: HashMap::from([("funding-txid".to_owned(), transfer_artifact)]),
             received_consignments: HashMap::new(),
             stock_stash_b64: Some(s),
             stock_state_b64: Some(st),
@@ -278,6 +282,18 @@ mod tests {
         let json = serde_json::to_string(&snapshot).expect("serialize snapshot to JSON");
         let restored_snapshot: WalletSnapshot =
             serde_json::from_str(&json).expect("deserialize snapshot from JSON");
+        let restored_artifact = restored_snapshot
+            .transfer_artifacts
+            .get("funding-txid")
+            .expect("restore pending transfer artifact");
+        assert_eq!(
+            restored_artifact.consignment_bytes.get("asset-id"),
+            Some(&vec![1, 2, 3, 4])
+        );
+        assert_eq!(
+            restored_artifact.signed_psbt.as_deref(),
+            Some("signed-psbt")
+        );
 
         let restored = deserialize_stock(
             restored_snapshot.stock_stash_b64.as_ref().unwrap(),

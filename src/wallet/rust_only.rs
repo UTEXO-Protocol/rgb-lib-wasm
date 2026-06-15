@@ -268,16 +268,27 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
+    pub fn consume_fascia_in_memory(
+        &self,
+        fascia: Fascia,
+        witness_ord: Option<WitnessOrd>,
+    ) -> Result<(), Error> {
+        let mut runtime = self.rgb_runtime()?;
+        runtime.consume_fascia(fascia, witness_ord)?;
+        Ok(())
+    }
+
+    /// Consume an RGB fascia and durably flush the updated stock.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
     pub async fn consume_fascia(
         &self,
         fascia: Fascia,
         witness_ord: Option<WitnessOrd>,
     ) -> Result<(), Error> {
         info!(self.logger, "Consuming fascia...");
-        {
-            let mut runtime = self.rgb_runtime()?;
-            runtime.consume_fascia(fascia, witness_ord)?;
-        }
+        self.consume_fascia_in_memory(fascia, witness_ord)?;
         self.flush().await?;
         info!(self.logger, "Consume fascia completed");
         Ok(())
@@ -296,6 +307,25 @@ impl Wallet {
         let mut runtime = self.rgb_runtime()?;
         runtime.upsert_witness(witness_id, witness_ord)?;
         Ok(())
+    }
+
+    /// Return `true` if a batch transfer with the given `txid` exists in the wallet database
+    /// and is not in `Failed` status. Used to detect idempotent replay of `send_end` after a
+    /// crash-inject reload: if the transfer is already present with a non-failed status, the
+    /// broadcast already happened and the caller may treat the operation as succeeded.
+    pub fn is_batch_transfer_sent(&self, txid: &str) -> Result<bool, Error> {
+        let batch_transfers = self.database.iter_batch_transfers()?;
+        Ok(batch_transfers
+            .iter()
+            .any(|bt| bt.txid.as_deref() == Some(txid) && bt.status != TransferStatus::Failed))
+    }
+
+    /// Return the current `Online` handle if the wallet has gone online, or `None` otherwise.
+    pub fn get_online(&self) -> Option<Online> {
+        self.online_data.as_ref().map(|od| Online {
+            id: od.id,
+            indexer_url: od.indexer_url.clone(),
+        })
     }
 
     #[cfg(feature = "esplora")]
