@@ -597,7 +597,7 @@ impl Wallet {
             if let Some((tx, block_height, block_time)) =
                 self.indexer().get_tx_with_status(&txid).await?
             {
-                let witness_ord = match block_height.and_then(|h| block_time.map(|t| (h, t))) {
+                let witness_ord = match block_height.zip(block_time) {
                     Some((h, t)) => {
                         if let Some(height) = NonZeroU32::new(h) {
                             if let Some(pos) = WitnessPos::bitcoin(height, t as i64) {

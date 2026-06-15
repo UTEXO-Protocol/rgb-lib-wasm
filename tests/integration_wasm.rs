@@ -159,7 +159,7 @@ async fn test_full_wallet_flow() {
     recipient_map.insert(nia.asset_id.clone(), vec![recipient]);
 
     let unsigned_psbt = wallet
-        .send_begin(online.clone(), recipient_map, false, 1, 1)
+        .send_begin(online.clone(), recipient_map, false, 1, 1, None)
         .await
         .unwrap();
     let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();

@@ -2924,23 +2924,21 @@ impl Wallet {
                 self.database.set_backup_info(act)?;
                 Ok(self.database.get_backup_info()?)
             }
+        } else if let Some(_info) = existing {
+            let mut act = DbBackupInfoActMod {
+                last_operation_timestamp: ActiveValue::Set(now_str),
+                ..Default::default()
+            };
+            let updated = self.database.update_backup_info(&mut act)?;
+            Ok(Some(updated))
         } else {
-            if let Some(_info) = existing {
-                let mut act = DbBackupInfoActMod {
-                    last_operation_timestamp: ActiveValue::Set(now_str),
-                    ..Default::default()
-                };
-                let updated = self.database.update_backup_info(&mut act)?;
-                Ok(Some(updated))
-            } else {
-                let act = DbBackupInfoActMod {
-                    last_backup_timestamp: ActiveValue::Set(String::new()),
-                    last_operation_timestamp: ActiveValue::Set(now_str),
-                    ..Default::default()
-                };
-                self.database.set_backup_info(act)?;
-                Ok(self.database.get_backup_info()?)
-            }
+            let act = DbBackupInfoActMod {
+                last_backup_timestamp: ActiveValue::Set(String::new()),
+                last_operation_timestamp: ActiveValue::Set(now_str),
+                ..Default::default()
+            };
+            self.database.set_backup_info(act)?;
+            Ok(self.database.get_backup_info()?)
         }
     }
 
@@ -2992,10 +2990,9 @@ impl Wallet {
     /// current in-memory wallet state intact and may be retried.
     pub async fn flush(&self) -> Result<(), Error> {
         let snapshot = self.snapshot()?;
-        let result = super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
+        super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
             .await
-            .map_err(|details| Error::Persistence { details });
-        result
+            .map_err(|details| Error::Persistence { details })
     }
 
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.

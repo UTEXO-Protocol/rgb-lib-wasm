@@ -443,6 +443,7 @@ impl WasmWallet {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
+        lock_time: Option<u32>,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
@@ -451,7 +452,14 @@ impl WasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Invalid recipient map: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .send_begin(online, recipient_map, donation, fee_rate, min_confirmations)
+            .send_begin(
+                online,
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                lock_time,
+            )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
