@@ -88,24 +88,22 @@ impl WasmWallet {
     pub async fn create(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid WalletData JSON: {e}")))?;
-        let mut wallet = Wallet::new(wd).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let idb_key = wallet.idb_key();
-        match rgb_lib_wasm::wallet::idb_store::load_snapshot(&idb_key).await {
-            Ok(Some(snapshot)) => {
-                wallet
-                    .restore_from_snapshot(snapshot)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                web_sys::console::warn_1(
-                    &format!("IDB load warning (continuing fresh): {e}").into(),
-                );
-            }
-        }
+        let wallet = Wallet::restore(wd)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmWallet {
             inner: RefCell::new(wallet),
         })
+    }
+
+    /// Durably persist current wallet state to IndexedDB.
+    #[wasm_bindgen(js_name = "flush")]
+    pub async fn flush(&self) -> Result<(), JsValue> {
+        self.inner
+            .borrow()
+            .flush()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Return the WalletData as a JS object.
@@ -445,6 +443,7 @@ impl WasmWallet {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
+        lock_time: Option<u32>,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
@@ -453,7 +452,14 @@ impl WasmWallet {
                 .map_err(|e| JsValue::from_str(&format!("Invalid recipient map: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .send_begin(online, recipient_map, donation, fee_rate, min_confirmations)
+            .send_begin(
+                online,
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                lock_time,
+            )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }

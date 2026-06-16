@@ -112,6 +112,13 @@ pub enum Error {
         details: String,
     },
 
+    /// Durable wallet persistence failed
+    #[error("Persistence error: {details}")]
+    Persistence {
+        /// Error details
+        details: String,
+    },
+
     /// An error was received from the indexer
     #[error("Indexer error: {details}")]
     Indexer {

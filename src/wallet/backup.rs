@@ -169,9 +169,10 @@ impl super::Wallet {
 
         // 4. Restore InMemoryDb + BDK via existing snapshot mechanism
         let snapshot = super::idb_store::WalletSnapshot {
+            sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
-            signed_psbts: Default::default(),
+            transfer_artifacts: Default::default(),
             received_consignments: Default::default(),
             stock_stash_b64: None,
             stock_state_b64: None,
@@ -277,9 +278,10 @@ impl super::Wallet {
             serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
 
         let snapshot = super::idb_store::WalletSnapshot {
+            sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
-            signed_psbts: Default::default(),
+            transfer_artifacts: Default::default(),
             received_consignments: Default::default(),
             stock_stash_b64: None,
             stock_state_b64: None,

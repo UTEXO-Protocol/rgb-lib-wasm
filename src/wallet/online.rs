@@ -3,6 +3,7 @@
 //! This module defines the online methods of the [`Wallet`] structure and all its related data.
 
 use super::*;
+use crate::api::proxy::WasmProxyClient;
 
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
@@ -132,7 +133,7 @@ struct BtcChange {
 // map txo idx to assignments
 type TxoAssignments = HashMap<i32, Vec<Assignment>>;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct InfoBatchTransfer {
     btc_change: Option<BtcChange>,
     change_utxo_idx: Option<i32>,
@@ -175,12 +176,35 @@ pub(crate) struct InfoAssetTransfer {
 }
 
 /// In-memory storage for transfer artifacts (replaces filesystem directories).
-#[derive(Default)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub(crate) struct TransferArtifacts {
     pub(crate) batch_info: Option<InfoBatchTransfer>,
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
     pub(crate) signed_psbt: Option<String>,
+}
+
+async fn pending_consignment_matches(
+    proxy_client: &WasmProxyClient,
+    endpoint: &str,
+    recipient_id: &str,
+    consignment_bytes: &[u8],
+    txid: &str,
+    vout: Option<u32>,
+) -> bool {
+    let Ok(response) = proxy_client
+        .get_consignment(endpoint, recipient_id.to_owned())
+        .await
+    else {
+        return false;
+    };
+    let Some(existing) = response.result else {
+        return false;
+    };
+    let Ok(existing_bytes) = general_purpose::STANDARD.decode(existing.consignment) else {
+        return false;
+    };
+    existing.txid == txid && existing.vout == vout && existing_bytes == consignment_bytes
 }
 
 pub(crate) enum Indexer {
@@ -355,7 +379,7 @@ impl Indexer {
 }
 
 pub(crate) struct OnlineData {
-    id: u64,
+    pub(crate) id: u64,
     pub(crate) indexer_url: String,
     indexer: Indexer,
 }
@@ -725,6 +749,7 @@ impl Wallet {
         input_outpoints: HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
+        lock_time: Option<u32>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let change_addr = self.get_new_address()?.script_pubkey();
         let mut builder = self.bdk_wallet.build_tx();
@@ -735,6 +760,18 @@ impl Wallet {
             .manually_selected_only()
             .fee_rate(fee_rate)
             .ordering(bdk_wallet::tx_builder::TxOrdering::Untouched);
+        // When the caller pins a locktime (e.g. 0 for an LN funding tx that must be final),
+        // honor it; otherwise keep BDK's anti-fee-sniping default. LDK's
+        // funding_transaction_generated rejects a funding tx whose absolute timelock is non-final.
+        if let Some(height) = lock_time {
+            builder.nlocktime(
+                bdk_wallet::bitcoin::locktime::absolute::LockTime::from_height(height).map_err(
+                    |e| Error::Internal {
+                        details: e.to_string(),
+                    },
+                )?,
+            );
+        }
         for (script_buf, amount_sat) in witness_recipients {
             builder.add_recipient(script_buf.clone(), BdkAmount::from_sat(*amount_sat));
         }
@@ -776,9 +813,15 @@ impl Wallet {
         all_inputs: &mut HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
+        lock_time: Option<u32>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         Ok(loop {
-            break match self._prepare_psbt(all_inputs.clone(), witness_recipients, fee_rate) {
+            break match self._prepare_psbt(
+                all_inputs.clone(),
+                witness_recipients,
+                fee_rate,
+                lock_time,
+            ) {
                 Ok(res) => res,
                 Err(Error::InsufficientBitcoins { .. }) => {
                     let used_txos: Vec<Outpoint> =
@@ -810,6 +853,42 @@ impl Wallet {
                 Err(e) => return Err(e),
             };
         })
+    }
+
+    async fn _restore_missing_bdk_inputs(
+        &mut self,
+        input_outpoints: &HashSet<BdkOutPoint>,
+    ) -> Result<(), Error> {
+        let missing_txids: HashSet<Txid> = input_outpoints
+            .iter()
+            .filter(|outpoint| self.bdk_wallet.get_utxo(**outpoint).is_none())
+            .map(|outpoint| outpoint.txid)
+            .collect();
+        if missing_txids.is_empty() {
+            return Ok(());
+        }
+
+        let mut transactions = Vec::with_capacity(missing_txids.len());
+        for txid in missing_txids {
+            let tx = self
+                .bdk_wallet
+                .tx_graph()
+                .get_tx(txid)
+                .ok_or_else(|| Error::Internal {
+                    details: format!(
+                        "selected RGB input transaction {txid} is missing from the BDK graph"
+                    ),
+                })?;
+            transactions.push(tx);
+        }
+
+        // Re-observe local full transactions immediately before PSBT construction so BDK can
+        // resolve selected RGB outpoints even after an incremental sync evicted them.
+        let last_seen = ((js_sys::Date::now() / 1000.0) as u64).saturating_add(1);
+        self.bdk_wallet
+            .apply_unconfirmed_txs(transactions.into_iter().map(|tx| (tx, last_seen)));
+        self.bdk_wallet.persist(&mut self.bdk_database)?;
+        Ok(())
     }
 
     fn _get_change_seal(
@@ -1296,6 +1375,18 @@ impl Wallet {
             self.sync_db_txos(false).await?;
         }
 
+        // Keep the transaction in BDK's graph after the optional sync. Esplora may not have
+        // indexed a freshly broadcast transaction yet and can mark it evicted during that sync,
+        // leaving rgb-lib's TXO database aware of its outputs while BDK cannot later use them
+        // as PSBT inputs.
+        // Esplora's sync uses second-resolution timestamps for evictions. Advance the local
+        // observation by one second so a same-second "not indexed yet" eviction cannot make the
+        // transaction non-canonical.
+        let last_seen = ((js_sys::Date::now() / 1000.0) as u64).saturating_add(1);
+        self.bdk_wallet
+            .apply_unconfirmed_txs([(tx.clone(), last_seen)]);
+        self.bdk_wallet.persist(&mut self.bdk_database)?;
+
         Ok(tx)
     }
 
@@ -1767,7 +1858,7 @@ impl Wallet {
                 .insert(asset_id.clone(), transfer_info.clone());
         }
 
-        runtime.upsert_witness(witness_txid, WitnessOrd::Archived)?;
+        runtime.upsert_witness(witness_txid, WitnessOrd::Tentative)?;
 
         // Store batch transfer info in memory instead of filesystem
         let info_contents = InfoBatchTransfer {
@@ -1794,6 +1885,7 @@ impl Wallet {
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate_checked: FeeRate,
         min_confirmations: u8,
+        lock_time: Option<u32>,
         runtime: &mut RgbRuntime,
         rejected: &mut HashSet<Opout>,
     ) -> Result<PrepareTransferPsbtResult, Error> {
@@ -1802,11 +1894,13 @@ impl Wallet {
             .values()
             .flat_map(|ti| ti.asset_spend.txo_map.values().map(|o| o.clone().into()))
             .collect();
+        self._restore_missing_bdk_inputs(&all_inputs).await?;
         let (mut psbt, btc_change) = self._try_prepare_psbt(
             input_unspents,
             &mut all_inputs,
             witness_recipients,
             fee_rate_checked,
+            lock_time,
         )?;
         psbt.unsigned_tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
 
@@ -2572,9 +2666,9 @@ impl Wallet {
             let valid_consignment = consignment
                 .validate(&wasm_resolver, &validation_config)
                 .map_err(|_| InternalError::Unexpected)?;
+            let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
-            let validation_status =
-                runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
+            runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
             if asset_schema == AssetSchema::Ifa {
                 let contract_id = valid_consignment.contract_id();
                 let contract_wrapper =
@@ -2844,6 +2938,7 @@ impl Wallet {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
+        lock_time: Option<u32>,
     ) -> Result<String, Error> {
         info!(self.logger, "Sending (begin) to: {:?}...", recipient_map);
 
@@ -3023,6 +3118,7 @@ impl Wallet {
                     &witness_recipients,
                     fee_rate_checked,
                     min_confirmations,
+                    lock_time,
                     &mut runtime,
                     &mut rejected,
                 )
@@ -3088,6 +3184,10 @@ impl Wallet {
                 let recipient_id = &recipient.recipient_id;
                 let mut found_valid = false;
                 for transport_endpoint in recipient.transport_endpoints.iter_mut() {
+                    if transport_endpoint.used {
+                        found_valid = true;
+                        break;
+                    }
                     if transport_endpoint.transport_type != TransportType::JsonRpc
                         || !transport_endpoint.usable
                     {
@@ -3173,6 +3273,95 @@ impl Wallet {
             txid,
             batch_transfer_idx,
         })
+    }
+
+    /// Post consignments prepared by [`Wallet::send_begin`] without completing or broadcasting
+    /// the transfer.
+    ///
+    /// This is required for protocols such as Lightning channel funding where the counterparty
+    /// must validate the consignment before it is safe to broadcast the funding transaction.
+    /// The transfer artifacts remain available for a later [`Wallet::send_end`] call.
+    pub async fn post_pending_consignments(&mut self, txid: String) -> Result<(), Error> {
+        let artifacts = self
+            .transfer_artifacts
+            .get_mut(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+
+        for (asset_id, info_contents_asset) in artifacts.asset_infos.iter_mut() {
+            let consignment_bytes =
+                artifacts
+                    .consignment_bytes
+                    .get(asset_id)
+                    .ok_or(Error::Internal {
+                        details: s!("missing consignment bytes"),
+                    })?;
+
+            for recipient in &mut info_contents_asset.recipients {
+                let mut found_valid = false;
+                for transport_endpoint in recipient.transport_endpoints.iter_mut() {
+                    if transport_endpoint.used {
+                        found_valid = true;
+                        break;
+                    }
+                    if transport_endpoint.transport_type != TransportType::JsonRpc
+                        || !transport_endpoint.usable
+                    {
+                        continue;
+                    }
+                    let vout = recipient.local_recipient_data.vout();
+                    let response = self
+                        .wasm_proxy_client
+                        .post_consignment(
+                            &transport_endpoint.endpoint,
+                            recipient.recipient_id.clone(),
+                            consignment_bytes,
+                            txid.clone(),
+                            vout,
+                        )
+                        .await;
+                    let already_used = match &response {
+                        Err(Error::RecipientIDAlreadyUsed) => true,
+                        Ok(response) => response
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.message.contains("already used")),
+                        _ => false,
+                    };
+                    if already_used {
+                        if pending_consignment_matches(
+                            &self.wasm_proxy_client,
+                            &transport_endpoint.endpoint,
+                            &recipient.recipient_id,
+                            consignment_bytes,
+                            &txid,
+                            vout,
+                        )
+                        .await
+                        {
+                            transport_endpoint.used = true;
+                            found_valid = true;
+                            break;
+                        }
+                        return Err(Error::RecipientIDAlreadyUsed);
+                    }
+                    match response {
+                        Err(_) => continue,
+                        Ok(res) => {
+                            if res.error.is_some() {
+                                continue;
+                            }
+                        }
+                    }
+                    transport_endpoint.used = true;
+                    found_valid = true;
+                    break;
+                }
+                if !found_valid {
+                    return Err(Error::NoValidTransportEndpoint);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Prepare the PSBT to send bitcoins (wasm32 async).
@@ -3457,6 +3646,7 @@ impl Wallet {
                 &witness_recipients,
                 fee_rate_checked,
                 min_confirmations,
+                None,
                 &mut runtime,
                 &mut rejected,
             )
