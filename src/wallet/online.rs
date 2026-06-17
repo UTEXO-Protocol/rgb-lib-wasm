@@ -3364,6 +3364,92 @@ impl Wallet {
         Ok(())
     }
 
+    /// Post the pending funding consignment(s) for `txid` to the proxy keyed by the **txid**
+    /// recipient_id (in addition to the witness/P2V recipient_id used by
+    /// [`Self::post_pending_consignments`]).
+    ///
+    /// This mirrors the canonical native `rgb-lib` funding flow, whose acceptor
+    /// (`accept_transfer`) resolves the funding consignment by raw bitcoin txid. Posting under the
+    /// txid lets a WASM sender fund an RGB channel to a *native* acceptor without the acceptor
+    /// having to resolve the P2V (witness) recipient_id. Unlike `post_pending_consignments` this
+    /// does not require/mutate `transport_endpoint.used`, so it can run after it.
+    pub async fn post_consignment_by_txid(&self, txid: String) -> Result<(), Error> {
+        let artifacts = self
+            .transfer_artifacts
+            .get(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+
+        for (asset_id, info_contents_asset) in artifacts.asset_infos.iter() {
+            let consignment_bytes =
+                artifacts
+                    .consignment_bytes
+                    .get(asset_id)
+                    .ok_or(Error::Internal {
+                        details: s!("missing consignment bytes"),
+                    })?;
+
+            for recipient in &info_contents_asset.recipients {
+                let mut found_valid = false;
+                for transport_endpoint in &recipient.transport_endpoints {
+                    if transport_endpoint.transport_type != TransportType::JsonRpc
+                        || !transport_endpoint.usable
+                    {
+                        continue;
+                    }
+                    let vout = recipient.local_recipient_data.vout();
+                    let response = self
+                        .wasm_proxy_client
+                        .post_consignment(
+                            &transport_endpoint.endpoint,
+                            txid.clone(),
+                            consignment_bytes,
+                            txid.clone(),
+                            vout,
+                        )
+                        .await;
+                    let already_used = match &response {
+                        Err(Error::RecipientIDAlreadyUsed) => true,
+                        Ok(response) => response
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.message.contains("already used")),
+                        _ => false,
+                    };
+                    if already_used {
+                        if pending_consignment_matches(
+                            &self.wasm_proxy_client,
+                            &transport_endpoint.endpoint,
+                            &txid,
+                            consignment_bytes,
+                            &txid,
+                            vout,
+                        )
+                        .await
+                        {
+                            found_valid = true;
+                            break;
+                        }
+                        return Err(Error::RecipientIDAlreadyUsed);
+                    }
+                    match response {
+                        Err(_) => continue,
+                        Ok(res) => {
+                            if res.error.is_some() {
+                                continue;
+                            }
+                        }
+                    }
+                    found_valid = true;
+                    break;
+                }
+                if !found_valid {
+                    return Err(Error::NoValidTransportEndpoint);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare the PSBT to send bitcoins (wasm32 async).
     ///
     /// See native [`send_btc_begin`](Wallet::send_btc_begin) for full documentation.
