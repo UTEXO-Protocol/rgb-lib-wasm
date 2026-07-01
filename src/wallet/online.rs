@@ -1305,12 +1305,27 @@ impl Wallet {
         Ok(())
     }
 
-    /// Sync the wallet and save new RGB UTXOs to the DB (wasm32 async).
+    /// Incrementally sync the wallet and save new RGB UTXOs to the DB (wasm32 async).
+    ///
+    /// Re-queries only already-revealed SPKs. To rediscover UTXOs for unrevealed SPKs (e.g. a thin
+    /// restored state) use [`Wallet::full_scan`].
     pub async fn sync(&mut self, online: Online) -> Result<(), Error> {
         info!(self.logger, "Syncing...");
         self.check_online(online)?;
         self.sync_db_txos(false).await?;
         info!(self.logger, "Sync completed");
+        Ok(())
+    }
+
+    /// Run a BIP44 stop-gap full scan and save new RGB UTXOs to the DB (wasm32 async).
+    ///
+    /// Derives and queries SPKs up to the indexer stop-gap, rebuilding a thin BDK state (no
+    /// revealed SPKs) from the indexer when an incremental [`Wallet::sync`] cannot.
+    pub async fn full_scan(&mut self, online: Online) -> Result<(), Error> {
+        info!(self.logger, "Full scanning...");
+        self.check_online(online)?;
+        self.sync_db_txos(true).await?;
+        info!(self.logger, "Full scan completed");
         Ok(())
     }
 

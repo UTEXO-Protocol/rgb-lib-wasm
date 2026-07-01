@@ -383,12 +383,30 @@ impl WasmWallet {
     }
 
     /// Sync the wallet with the indexer.
+    ///
+    /// Incremental: re-queries only already-revealed SPKs. Use `fullScan` to recover a thin
+    /// restored state.
     pub async fn sync(&self, online_js: JsValue) -> Result<(), JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
             .sync(online)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Run a BIP44 stop-gap full scan against the indexer.
+    ///
+    /// Rebuilds a thin BDK state (no revealed SPKs) after a restore, recovering the BTC balance
+    /// when an incremental `sync` cannot.
+    #[wasm_bindgen(js_name = "fullScan")]
+    pub async fn full_scan(&self, online_js: JsValue) -> Result<(), JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .full_scan(online)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }

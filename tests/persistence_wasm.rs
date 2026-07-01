@@ -176,6 +176,59 @@ async fn test_address_reuse_persists_across_backup_restore() {
     assert_eq!(rotated, wallet2.get_address().unwrap());
 }
 
+/// A wallet restored with a thin BDK state (no revealed SPKs) cannot recover its BTC balance
+/// through an incremental `sync`; `full_scan` rebuilds it from the indexer.
+#[wasm_bindgen_test]
+async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
+    let unique = js_sys::Date::now().to_string();
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+
+    // Fund a vanilla address and confirm a non-zero BTC balance.
+    let wd1 = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/fullscan-funded-{unique}"),
+    );
+    let mut funded = Wallet::new(wd1.clone()).unwrap();
+    let online = funded
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    let addr = funded.get_address().unwrap();
+    fund_address(&addr, "1.0").await;
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    funded.sync(online.clone()).await.unwrap();
+    let funded_balance = funded.get_btc_balance(None, true).unwrap();
+    assert!(funded_balance.vanilla.settled > 0);
+
+    // Same keys, fresh BDK store (distinct data_dir): a thin state with no revealed SPKs.
+    let wd2 = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/fullscan-thin-{unique}"),
+    );
+    let mut thin = Wallet::new(wd2).unwrap();
+    let online = thin
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+
+    thin.sync(online.clone()).await.unwrap();
+    let after_incremental = thin.get_btc_balance(None, true).unwrap();
+    assert_eq!(
+        after_incremental.vanilla.settled, 0,
+        "incremental sync cannot recover a thin BDK state"
+    );
+
+    thin.full_scan(online.clone()).await.unwrap();
+    let after_full_scan = thin.get_btc_balance(None, true).unwrap();
+    assert_eq!(
+        after_full_scan.vanilla.settled, funded_balance.vanilla.settled,
+        "full_scan recovers the BTC balance"
+    );
+}
+
 /// Test: BDK wallet state (BTC balance) survives page reload.
 /// Test: Issued RGB asset survives reload — list_assets, get_asset_balance,
 ///       get_asset_metadata, and send_begin all work after reload.
