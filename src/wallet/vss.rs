@@ -255,9 +255,15 @@ impl WasmVssClient {
 const BACKUP_BUFFER_LEN_ENCRYPT: usize = 239;
 const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
-/// 19-byte nonce for streaming XChaCha20Poly1305 (EncryptorBE32)
-const BACKUP_NONCE_LENGTH: usize = 19;
-const BACKUP_SALT_LENGTH: usize = 32;
+/// 19-byte nonce for streaming XChaCha20Poly1305 (EncryptorBE32).
+///
+/// Public because external consumers of [`encrypt_data`]/[`decrypt_data`] (e.g. the
+/// rgb-lightning-node wasm-sdk VSS KV store) build [`VssEncryptionMetadata`] by hand
+/// and must agree on this length to parse their wire envelopes.
+pub const BACKUP_NONCE_LENGTH: usize = 19;
+/// HKDF salt length used by [`encrypt_data`]/[`decrypt_data`]. Public for the same
+/// reason as [`BACKUP_NONCE_LENGTH`].
+pub const BACKUP_SALT_LENGTH: usize = 32;
 const VSS_BACKUP_VERSION: u8 = 1;
 
 const HKDF_INFO: &[u8] = b"rgb-lib-vss-backup-encryption-v1";
