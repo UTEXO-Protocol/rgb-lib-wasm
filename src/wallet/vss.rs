@@ -316,7 +316,7 @@ fn derive_encryption_key(
 }
 
 /// Encrypt `data` for VSS storage. `info` domain-separates the derived key via
-/// HKDF; pass `None` to use the default wallet-backup tag ([`HKDF_INFO`]), or a
+/// HKDF; pass `None` to use the default wallet-backup tag (`HKDF_INFO`), or a
 /// distinct tag (e.g. for an LDK KV stream) so its keys never collide with the
 /// wallet-backup stream even under the same signing key.
 pub fn encrypt_data(
@@ -360,7 +360,7 @@ pub fn encrypt_data(
 }
 
 /// Decrypt VSS-stored `encrypted` data. `info` must match the tag passed to
-/// [`encrypt_data`] (`None` = default [`HKDF_INFO`]) for the round-trip to succeed.
+/// [`encrypt_data`] (`None` = default `HKDF_INFO`) for the round-trip to succeed.
 pub fn decrypt_data(
     encrypted: &[u8],
     signing_key: &SecretKey,
