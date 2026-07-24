@@ -993,6 +993,7 @@ pub struct Wallet {
     /// Persistent in-memory RGB stock.
     pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<rgbstd::persistence::Stock>>>,
     pub(crate) vss_client: Option<super::vss::VssBackupClient>,
+    pub(crate) last_vss_backup_error: std::cell::RefCell<Option<String>>,
 }
 
 impl Wallet {
@@ -1149,6 +1150,7 @@ impl Wallet {
                 std::rc::Rc::new(std::cell::RefCell::new(Some(stock)))
             },
             vss_client: None,
+            last_vss_backup_error: std::cell::RefCell::new(None),
         })
     }
 
@@ -3187,6 +3189,7 @@ mod address_reuse_tests {
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
             vss_client: None,
+            last_vss_backup_error: std::cell::RefCell::new(None),
         }
     }
 
