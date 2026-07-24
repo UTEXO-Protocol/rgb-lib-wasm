@@ -504,6 +504,48 @@ async fn test_full_wallet_flow() {
     // Restore correct config for cleanup
     wallet.configure_vss_backup(&vss_config);
 
+    // ensure_initial_backup: uploads when the wallet has unsaved changes,
+    // no-ops when it does not.
+    let fresh_store_id = format!("test-wallet-init-{}", js_sys::Date::now() as u64);
+    let fresh_config = VssBackupConfig::new(
+        utils::VSS_SERVER_URL.to_string(),
+        fresh_store_id,
+        signing_key,
+    );
+    wallet.configure_vss_backup(&fresh_config);
+    let initial = wallet.ensure_initial_backup().await.unwrap();
+    assert!(
+        initial.is_some(),
+        "ensure_initial_backup must upload when changes are pending"
+    );
+    let noop = wallet.ensure_initial_backup().await.unwrap();
+    assert!(
+        noop.is_none(),
+        "ensure_initial_backup must no-op right after a backup"
+    );
+
+    // A failed upload is recorded and surfaces in vss_backup_info; the next
+    // successful one clears it.
+    let dead_config = VssBackupConfig::new(
+        "http://127.0.0.1:9/vss".to_string(),
+        "dead-store".to_string(),
+        signing_key,
+    );
+    wallet.configure_vss_backup(&dead_config);
+    assert!(wallet.vss_backup().await.is_err());
+    wallet.configure_vss_backup(&fresh_config);
+    let info_err = wallet.vss_backup_info().await.unwrap();
+    assert!(
+        info_err.last_backup_error.is_some(),
+        "failed upload must be visible in vss_backup_info"
+    );
+    let _ = wallet.vss_backup().await.unwrap();
+    let info_ok = wallet.vss_backup_info().await.unwrap();
+    assert!(
+        info_ok.last_backup_error.is_none(),
+        "successful upload must clear the recorded error"
+    );
+
     // disable_vss_backup: verify it doesn't crash
     wallet.disable_vss_backup();
 

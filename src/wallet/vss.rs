@@ -449,6 +449,8 @@ pub struct VssBackupInfo {
     pub backup_exists: bool,
     pub server_version: Option<i64>,
     pub backup_required: bool,
+    /// Error of the most recent failed backup upload, cleared on success
+    pub last_backup_error: Option<String>,
 }
 
 /// WASM-compatible VSS backup client.

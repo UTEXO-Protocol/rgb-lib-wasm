@@ -259,12 +259,31 @@ impl super::Wallet {
 
         self.update_backup_info(true)?;
         match client.upload_backup(&payload_json, &fingerprint).await {
-            Ok(version) => Ok(version),
+            Ok(version) => {
+                *self.last_vss_backup_error.borrow_mut() = None;
+                Ok(version)
+            }
             Err(e) => {
                 let _ = self.update_backup_info(false);
+                *self.last_vss_backup_error.borrow_mut() = Some(e.to_string());
                 Err(e)
             }
         }
+    }
+
+    /// Upload a backup if the wallet has changes not yet backed up. Call after
+    /// `configure_vss_backup` so enabling backups never leaves an empty store.
+    /// Returns the new server version, or `None` when no upload was needed.
+    pub async fn ensure_initial_backup(&self) -> Result<Option<i64>, Error> {
+        if self.vss_client.is_none() {
+            return Err(Error::Internal {
+                details: s!("VSS backup not configured"),
+            });
+        }
+        if !self.backup_info()? {
+            return Ok(None);
+        }
+        self.vss_backup().await.map(Some)
     }
 
     /// Download and restore wallet state from VSS server.
@@ -338,6 +357,7 @@ impl super::Wallet {
             backup_exists: server_version.is_some(),
             server_version,
             backup_required,
+            last_backup_error: self.last_vss_backup_error.borrow().clone(),
         })
     }
 
