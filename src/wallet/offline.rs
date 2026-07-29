@@ -741,6 +741,18 @@ pub enum TransactionType {
     User,
 }
 
+/// An asset filter for listing transfers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub enum AssetFilter {
+    /// Match transfers of any asset, including those not connected to one
+    Any,
+    /// Match only transfers not connected to a specific asset
+    NoAsset,
+    /// Match only transfers of the asset with the given ID
+    Id(String),
+}
+
 /// An RGB transfer.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -2408,20 +2420,42 @@ impl Wallet {
 
     /// List the RGB [`Transfer`]s known to the wallet.
     ///
-    /// When an `asset_id` is not provided, return transfers that are not connected to a specific
-    /// asset.
-    pub fn list_transfers(&self, asset_id: Option<String>) -> Result<Vec<Transfer>, Error> {
-        if let Some(asset_id) = &asset_id {
-            info!(self.logger, "Listing transfers for asset '{}'...", asset_id);
+    /// `filter` selects transfers by asset. When a `txid` is provided, restrict the result to the
+    /// transfers committed by the on-chain transaction with that ID; an unknown `txid` yields an
+    /// empty list.
+    pub fn list_transfers(
+        &self,
+        filter: AssetFilter,
+        txid: Option<String>,
+    ) -> Result<Vec<Transfer>, Error> {
+        info!(
+            self.logger,
+            "Listing transfers for filter '{:?}' and txid '{:?}'...", filter, txid
+        );
+        if let AssetFilter::Id(asset_id) = &filter {
             self.database.check_asset_exists(asset_id.clone())?;
-        } else {
-            info!(self.logger, "Listing transfers...");
         }
         let db_data = self.database.get_db_data(false)?;
+        let batch_transfer_idx = match &txid {
+            Some(txid) => match db_data
+                .batch_transfers
+                .iter()
+                .find(|b| b.txid.as_deref() == Some(txid))
+            {
+                Some(batch_transfer) => Some(batch_transfer.idx),
+                None => return Ok(vec![]),
+            },
+            None => None,
+        };
         let asset_transfer_ids: Vec<i32> = db_data
             .asset_transfers
             .iter()
-            .filter(|t| t.asset_id == asset_id)
+            .filter(|t| match &filter {
+                AssetFilter::Any => true,
+                AssetFilter::NoAsset => t.asset_id.is_none(),
+                AssetFilter::Id(asset_id) => t.asset_id.as_ref() == Some(asset_id),
+            })
+            .filter(|t| batch_transfer_idx.is_none_or(|idx| t.batch_transfer_idx == idx))
             .filter(|t| t.user_driven)
             .map(|t| t.idx)
             .collect();

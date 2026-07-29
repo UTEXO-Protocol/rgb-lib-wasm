@@ -3,7 +3,7 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
-use rgb_lib_wasm::wallet::{DatabaseType, Invoice, Wallet, WalletData};
+use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
@@ -108,7 +108,7 @@ fn test_wallet_queries_fresh() {
     assert!(txs.is_empty());
 
     // list_transfers: empty on fresh wallet
-    let transfers = wallet.list_transfers(None).unwrap();
+    let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
     assert!(transfers.is_empty());
 
     // list_unspents: empty on fresh wallet
@@ -154,7 +154,7 @@ fn test_receive_and_transfers() {
     assert!(recv.expiration_timestamp.is_some());
 
     // list_transfers: should have a pending transfer from witness_receive
-    let transfers = wallet.list_transfers(None).unwrap();
+    let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
     assert!(
         !transfers.is_empty(),
         "Should have transfers after witness_receive"
@@ -247,7 +247,7 @@ fn test_errors_and_backup() {
     wallet.restore_backup(&backup_bytes, password).unwrap();
 
     // State survives: transfer still exists
-    let transfers = wallet.list_transfers(None).unwrap();
+    let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
     assert!(
         !transfers.is_empty(),
         "Transfers should survive backup/restore"

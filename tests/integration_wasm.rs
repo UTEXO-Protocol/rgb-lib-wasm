@@ -5,7 +5,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
-use rgb_lib_wasm::wallet::{DatabaseType, Recipient, Wallet, WalletData, WitnessData};
+use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
 use utils::*;
 
@@ -237,10 +237,41 @@ async fn test_full_wallet_flow() {
     );
 
     // list_transfers: verify NIA send created transfer records
-    let a_transfers = wallet.list_transfers(Some(nia.asset_id.clone())).unwrap();
+    let a_transfers = wallet
+        .list_transfers(AssetFilter::Id(nia.asset_id.clone()), None)
+        .unwrap();
     assert!(
         !a_transfers.is_empty(),
         "Sender should have NIA transfer records"
+    );
+
+    // txid filter: the send tx's transfers
+    let by_txid = wallet
+        .list_transfers(AssetFilter::Any, Some(send_result.txid.clone()))
+        .unwrap();
+    assert!(!by_txid.is_empty(), "Send txid should resolve to transfers");
+    assert!(
+        by_txid
+            .iter()
+            .all(|t| t.txid == Some(send_result.txid.clone()))
+    );
+
+    // asset + txid intersection
+    let nia_by_txid = wallet
+        .list_transfers(
+            AssetFilter::Id(nia.asset_id.clone()),
+            Some(send_result.txid.clone()),
+        )
+        .unwrap();
+    assert!(!nia_by_txid.is_empty(), "NIA + send txid should intersect");
+
+    // unknown txid: empty
+    let unknown = "0000000000000000000000000000000000000000000000000000000000000000";
+    assert!(
+        wallet
+            .list_transfers(AssetFilter::Any, Some(unknown.to_string()))
+            .unwrap()
+            .is_empty()
     );
     // At least one transfer should be settled or waiting confirmations
     assert!(
