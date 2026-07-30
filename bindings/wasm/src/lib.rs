@@ -214,13 +214,21 @@ impl WasmWallet {
         to_js(&assets)
     }
 
-    /// List RGB transfers, optionally filtered by asset ID.
+    /// List RGB transfers matching an asset filter ("Any", "NoAsset" or {"Id": "<asset_id>"}),
+    /// optionally restricted to the transfers of an on-chain txid.
     #[wasm_bindgen(js_name = "listTransfers")]
-    pub fn list_transfers(&self, asset_id: Option<String>) -> Result<JsValue, JsValue> {
+    pub fn list_transfers(
+        &self,
+        filter_js: JsValue,
+        txid: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let filter: rgb_lib_wasm::wallet::AssetFilter =
+            serde_wasm_bindgen::from_value(filter_js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid filter: {e}")))?;
         let transfers = self
             .inner
             .borrow()
-            .list_transfers(asset_id)
+            .list_transfers(filter, txid)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&transfers)
     }
