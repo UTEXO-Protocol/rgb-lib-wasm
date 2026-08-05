@@ -235,3 +235,23 @@ impl Assignment {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The SCHEMA_ID_* constants must match the schemas actually shipped by the
+    // rgb-schemas crate: every receive path maps a consignment's schema ID back
+    // to an AssetSchema through them, and a stale constant makes that mapping
+    // fail with UnknownRgbSchema before the ack/refuse step (issue #126).
+    #[test]
+    fn schema_id_constants_match_rgb_schemas_crate() {
+        for asset_schema in AssetSchema::VALUES {
+            assert_eq!(
+                SchemaId::from(asset_schema),
+                asset_schema.schema().schema_id(),
+                "SCHEMA_ID constant for {asset_schema} is stale"
+            );
+        }
+    }
+}

@@ -125,7 +125,7 @@ async fn test_full_wallet_flow() {
 
     // Two-wallet NIA send: wallet A → wallet B
     // Must happen before blind_receive which locks the NIA UTXO via pending_blinded
-    let wd_b = test_wallet_data(vec![AssetSchema::Nia]);
+    let wd_b = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let mut wallet_b = Wallet::new(wd_b).unwrap();
     let online_b = wallet_b
         .go_online(false, ESPLORA_URL.to_string())
@@ -367,6 +367,104 @@ async fn test_full_wallet_flow() {
             || ifa_after.balance.spendable > ifa_balance_before,
         "IFA balance should increase after inflation, got: {:?}",
         ifa_after.balance,
+    );
+
+    // Two-wallet IFA send: wallet A → wallet B via a blank blinded invoice.
+    // Regression test for UTEXO-Protocol/rgb-lightning-node#126: the receiver
+    // must recognize the IFA schema, accept the consignment and post the ack.
+    let recv_ifa = wallet_b
+        .blind_receive(
+            None,
+            Assignment::Any,
+            Some(3600),
+            vec![transport.clone()],
+            1,
+        )
+        .unwrap();
+
+    let ifa_recipient = Recipient {
+        recipient_id: recv_ifa.recipient_id.clone(),
+        witness_data: None,
+        assignment: Assignment::Fungible(5),
+        transport_endpoints: vec![transport.clone()],
+    };
+    let mut ifa_recipient_map = HashMap::new();
+    ifa_recipient_map.insert(ifa.asset_id.clone(), vec![ifa_recipient]);
+
+    let unsigned_ifa = wallet
+        .send_begin(online.clone(), ifa_recipient_map, false, 1, 1, None)
+        .await
+        .unwrap();
+    let signed_ifa = wallet.sign_psbt(unsigned_ifa, None).unwrap();
+    let ifa_send = wallet
+        .send_end(online.clone(), signed_ifa, false)
+        .await
+        .unwrap();
+    assert!(!ifa_send.txid.is_empty());
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    wallet_b.sync(online_b.clone()).await.unwrap();
+
+    // Receiver refreshes: must accept the IFA consignment and ACK it
+    let ifa_recv_refresh = wallet_b
+        .refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for (idx, refreshed) in &ifa_recv_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Receiver refresh failed for IFA transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    // Sender refreshes: must see the ACK and leave WaitingCounterparty
+    let ifa_send_refresh = wallet
+        .refresh(online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for (idx, refreshed) in &ifa_send_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Sender refresh failed for IFA transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
+    let ifa_transfers = wallet
+        .list_transfers(
+            AssetFilter::Id(ifa.asset_id.clone()),
+            Some(ifa_send.txid.clone()),
+        )
+        .unwrap();
+    assert!(!ifa_transfers.is_empty(), "Sender should have IFA transfer");
+    assert!(
+        ifa_transfers
+            .iter()
+            .all(|t| t.status != TransferStatus::WaitingCounterparty),
+        "Sender IFA transfer must leave WaitingCounterparty, got: {:?}",
+        ifa_transfers.iter().map(|t| &t.status).collect::<Vec<_>>(),
+    );
+
+    // Receiver must see the received IFA asset in list_assets and its balance
+    let b_ifa_assets = wallet_b.list_assets(vec![AssetSchema::Ifa]).unwrap();
+    let b_ifa = b_ifa_assets
+        .ifa
+        .unwrap()
+        .into_iter()
+        .find(|a| a.asset_id == ifa.asset_id)
+        .expect("receiver must list the received IFA asset");
+    assert_eq!(b_ifa.ticker, "TIFA");
+    let b_ifa_balance = wallet_b.get_asset_balance(ifa.asset_id.clone()).unwrap();
+    assert!(
+        b_ifa_balance.settled + b_ifa_balance.future + b_ifa_balance.spendable >= 5,
+        "Receiver IFA balance should include the received amount, got: {:?}",
+        b_ifa_balance,
     );
 
     // List unspents vanilla
