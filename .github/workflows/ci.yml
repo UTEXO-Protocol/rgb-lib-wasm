@@ -159,6 +159,11 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test integration_wasm
 
+      - name: Run persistence tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        run: wasm-pack test --headless --firefox --release --test persistence_wasm
+
       - name: Stop regtest services
         if: always()
         working-directory: tests
