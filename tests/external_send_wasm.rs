@@ -234,12 +234,10 @@ async fn wait_for_tx_observed(txid: &str) {
 /// Sender's first coloured UTXO carrying the full 1000 units.
 async fn sender_colored_utxo(
     wallet: &mut Wallet,
-    online: &rgb_lib_wasm::wallet::Online,
+    _online: &rgb_lib_wasm::wallet::Online,
     asset_id: &str,
 ) -> (OutPoint, ScriptBuf, u64) {
-    let unspents = wallet
-        .list_unspents(Some(online.clone()), true, false)
-        .unwrap();
+    let unspents = wallet.list_unspents(None, false, true).unwrap();
     let u = unspents
         .iter()
         .find(|u| {
