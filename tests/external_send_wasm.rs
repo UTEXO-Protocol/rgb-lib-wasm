@@ -370,6 +370,19 @@ fn contract_id(asset_id: &str) -> rgb_lib_wasm::ContractId {
     rgb_lib_wasm::ContractId::from_str(asset_id).expect("contract id")
 }
 
+/// Persist, drop and reopen the wallet through the production restore API, then
+/// go back online. Mirrors a browser page/runtime reconstruction.
+async fn reopen(wd: WalletData, wallet: Wallet) -> (Wallet, rgb_lib_wasm::wallet::Online) {
+    wallet.flush().await.unwrap();
+    drop(wallet);
+    let mut wallet = Wallet::restore(wd).await.unwrap();
+    let online = wallet
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    (wallet, online)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -564,7 +577,8 @@ async fn external_prepare_survives_reload() {
 
 #[wasm_bindgen_test]
 async fn external_finalize_modified_transaction_rejected() {
-    let (mut wallet, online, asset_id) = funded_sender(wallet_data("t8")).await;
+    let wd = wallet_data("t8");
+    let (mut wallet, online, asset_id) = funded_sender(wd.clone()).await;
     let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
@@ -583,13 +597,15 @@ async fn external_finalize_modified_transaction_rejected() {
     let mut tx = sign_extract(&wallet, &psbt);
     // Substitute a modified transaction (same txid input, changed output value).
     tx.output[A_CHANGE_VOUT as usize].value = Amount::from_sat(1);
+    let (mut wallet, _online) = reopen(wd, wallet).await;
     let err = wallet.finalize_external_rgb_send(prepared.txid, &tx).await;
     assert!(err.is_err(), "modified transaction must be rejected");
 }
 
 #[wasm_bindgen_test]
 async fn external_finalize_happy_path() {
-    let (mut wallet, online, asset_id) = funded_sender(wallet_data("t9")).await;
+    let wd = wallet_data("t9");
+    let (mut wallet, online, asset_id) = funded_sender(wd.clone()).await;
     let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
@@ -608,6 +624,7 @@ async fn external_finalize_happy_path() {
     let tx = sign_extract(&wallet, &psbt);
     assert_eq!(broadcast(&tx).await, prepared.txid);
     wait_for_tx_observed(&prepared.txid).await;
+    let (mut wallet, online) = reopen(wd, wallet).await;
     let result = wallet
         .finalize_external_rgb_send(prepared.txid.clone(), &tx)
         .await
@@ -634,7 +651,8 @@ async fn external_finalize_happy_path() {
 
 #[wasm_bindgen_test]
 async fn external_finalize_identical_retry_is_idempotent() {
-    let (mut wallet, online, asset_id) = funded_sender(wallet_data("t10")).await;
+    let wd = wallet_data("t10");
+    let (mut wallet, online, asset_id) = funded_sender(wd.clone()).await;
     let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
@@ -653,6 +671,7 @@ async fn external_finalize_identical_retry_is_idempotent() {
     let tx = sign_extract(&wallet, &psbt);
     broadcast(&tx).await;
     wait_for_tx_observed(&prepared.txid).await;
+    let (mut wallet, _online) = reopen(wd, wallet).await;
     let first = wallet
         .finalize_external_rgb_send(prepared.txid.clone(), &tx)
         .await
