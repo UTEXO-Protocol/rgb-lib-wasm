@@ -182,6 +182,43 @@ pub(crate) struct TransferArtifacts {
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
     pub(crate) signed_psbt: Option<String>,
+    /// Externally constructed collaborative RGB send state (if any). Persisted so
+    /// the prepared operation survives a reload/reopen before finalisation.
+    #[serde(default)]
+    pub(crate) external_send: Option<ExternalSendArtifact>,
+}
+
+/// Durable lifecycle state of an externally constructed RGB send.
+///
+/// `Prepared -> BroadcastRecorded -> Finalized`. The prepared state holds the
+/// immutable input needed to re-validate and finalise the exact transaction; the
+/// transition to `Finalized` is only persisted after the fascia is consumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) enum ExternalSendStatus {
+    #[default]
+    Prepared,
+    BroadcastRecorded,
+    Finalized,
+}
+
+/// Immutable, reload-safe data for one externally constructed RGB send.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExternalSendArtifact {
+    /// Canonical serialisation of the exact prepared transaction (hex). Used for
+    /// exact equality on finalise, not merely the txid.
+    pub(crate) expected_tx_hex: String,
+    /// The exact RGB fascia as canonical JSON (serde).
+    pub(crate) fascia_json: String,
+    pub(crate) status: ExternalSendStatus,
+}
+
+/// Stable result of preparing an externally constructed RGB send.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExternalSendPrepareResult {
+    /// Transaction id of the prepared external send.
+    pub txid: String,
+    /// Batch transfer index of the prepared operation.
+    pub batch_transfer_idx: i32,
 }
 
 async fn pending_consignment_matches(
@@ -1365,7 +1402,24 @@ impl Wallet {
         let tx = self
             ._broadcast_tx(signed_psbt.extract_tx().map_err(InternalError::from)?)
             .await?;
+        self.record_broadcast_transaction(tx.clone(), skip_sync)
+            .await?;
+        Ok(tx)
+    }
 
+    /// Apply an already externally broadcast transaction to the wallet's local
+    /// BDK graph and DB **without rebroadcasting it**.
+    ///
+    /// Factored out of [`_broadcast_psbt`](Wallet::_broadcast_psbt) so an
+    /// externally constructed collaborative transaction can be recorded locally
+    /// after it has been broadcast by the coordinator/other participant. Never
+    /// calls the network broadcast primitive. Safe to call again for the same
+    /// exact transaction (BDK graph insertion is idempotent).
+    pub(crate) async fn record_broadcast_transaction(
+        &mut self,
+        tx: BdkTransaction,
+        skip_sync: bool,
+    ) -> Result<(), Error> {
         let internal_unspents_outpoints: Vec<(String, u32)> = self
             .internal_unspents()
             .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout))
@@ -1377,13 +1431,11 @@ impl Wallet {
             if internal_unspents_outpoints.contains(&(txid.clone(), vout)) {
                 continue;
             }
-            let mut db_txo: DbTxoActMod = self
-                .database
-                .get_txo(&Outpoint { txid, vout })?
-                .expect("outpoint should be in the DB")
-                .into();
-            db_txo.spent = ActiveValue::Set(true);
-            self.database.update_txo(db_txo)?;
+            if let Some(db_txo) = self.database.get_txo(&Outpoint { txid, vout })? {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.spent = ActiveValue::Set(true);
+                self.database.update_txo(db_txo)?;
+            }
         }
 
         if !skip_sync {
@@ -1402,7 +1454,23 @@ impl Wallet {
             .apply_unconfirmed_txs([(tx.clone(), last_seen)]);
         self.bdk_wallet.persist(&mut self.bdk_database)?;
 
-        Ok(tx)
+        Ok(())
+    }
+
+    /// Look up the batch transfer belonging to a transaction id, if any.
+    ///
+    /// Distinguishes "no operation" (`None`) from an existing operation so
+    /// callers can implement idempotent replay vs. conflicting reuse by
+    /// comparing the immutable prepared data, not merely record presence.
+    pub(crate) fn batch_transfer_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        let db_data = self.database.get_db_data(false)?;
+        Ok(db_data
+            .batch_transfers
+            .into_iter()
+            .find(|b| b.txid.as_deref() == Some(txid)))
     }
 
     /// Prepare a transaction to create new UTXOs for RGB allocations (wasm32 async).
