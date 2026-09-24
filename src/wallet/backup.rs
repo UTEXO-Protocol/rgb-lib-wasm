@@ -39,6 +39,10 @@ pub(crate) struct WalletBackupPayload {
     /// Pinned derivation index per keychain for address reuse.
     #[serde(default)]
     pub(crate) reuse_address_index: std::collections::HashMap<bdk_wallet::KeychainKind, u32>,
+    /// Artifacts of sends not yet broadcast, keyed by TXID.
+    #[serde(default)]
+    pub(crate) transfer_artifacts:
+        std::collections::HashMap<String, super::online::TransferArtifacts>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -157,22 +161,29 @@ impl super::Wallet {
     /// Restore wallet state from an encrypted backup.
     /// The wallet must be created first via `Wallet::new()` with the same mnemonic/xpubs.
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
-        // 1. Decode envelope
         let (pub_data, ciphertext) = decode_backup(backup_bytes)?;
-
-        // 2. Decrypt
         let payload_json = decrypt_payload(ciphertext, password, &pub_data)?;
+        self.restore_payload(&payload_json)?;
 
-        // 3. Deserialize payload
+        // Persist restored state to IndexedDB so it survives page reloads
+        self.trigger_auto_backup();
+
+        Ok(())
+    }
+
+    /// Decode a serialized backup payload and restore wallet + RGB stock state.
+    /// Shared by `restore_backup` and `vss_restore_backup` so a fix in one cannot miss the other.
+    fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
+        // 1. Deserialize payload
         let payload: WalletBackupPayload =
-            serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
+            serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
 
-        // 4. Restore InMemoryDb + BDK via existing snapshot mechanism
+        // 2. Restore InMemoryDb + BDK via existing snapshot mechanism
         let snapshot = super::idb_store::WalletSnapshot {
             sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
-            transfer_artifacts: Default::default(),
+            transfer_artifacts: payload.transfer_artifacts,
             received_consignments: Default::default(),
             stock_stash_b64: None,
             stock_state_b64: None,
@@ -181,7 +192,7 @@ impl super::Wallet {
         };
         self.restore_from_snapshot(snapshot)?;
 
-        // 5. Restore RGB stock from strict-encoded components
+        // 3. Restore RGB stock from strict-encoded components
         let stash_bytes = general_purpose::STANDARD
             .decode(&payload.stock_stash_b64)
             .map_err(InternalError::from)?;
@@ -211,9 +222,6 @@ impl super::Wallet {
 
         let stock = rgbstd::persistence::Stock::with(stash, state, index);
         *self.rgb_stock.borrow_mut() = Some(stock);
-
-        // Persist restored state to IndexedDB so it survives page reloads
-        self.trigger_auto_backup();
 
         Ok(())
     }
@@ -293,51 +301,7 @@ impl super::Wallet {
         })?;
 
         let payload_json = client.download_backup().await?;
-        let payload: WalletBackupPayload =
-            serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
-
-        let snapshot = super::idb_store::WalletSnapshot {
-            sequence: 0,
-            db: payload.db,
-            bdk_changeset: payload.bdk_changeset,
-            transfer_artifacts: Default::default(),
-            received_consignments: Default::default(),
-            stock_stash_b64: None,
-            stock_state_b64: None,
-            stock_index_b64: None,
-            reuse_address_index: payload.reuse_address_index,
-        };
-        self.restore_from_snapshot(snapshot)?;
-
-        const MAX: usize = u32::MAX as usize;
-        let stash_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_stash_b64)
-            .map_err(InternalError::from)?;
-        let state_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_state_b64)
-            .map_err(InternalError::from)?;
-        let index_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_index_b64)
-            .map_err(InternalError::from)?;
-
-        let stash = MemStash::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(stash_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let state = MemState::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(state_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let index = MemIndex::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(index_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-
-        let stock = rgbstd::persistence::Stock::with(stash, state, index);
-        *self.rgb_stock.borrow_mut() = Some(stock);
+        self.restore_payload(&payload_json)?;
 
         // Persist restored state to IndexedDB so it survives page reloads
         self.trigger_auto_backup();
@@ -390,6 +354,7 @@ impl super::Wallet {
             stock_state_b64: general_purpose::STANDARD.encode(state_bytes.as_unconfined()),
             stock_index_b64: general_purpose::STANDARD.encode(index_bytes.as_unconfined()),
             reuse_address_index: self.reuse_address_index.clone(),
+            transfer_artifacts: self.transfer_artifacts.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -475,5 +440,237 @@ mod tests {
 
         let k3 = derive_key("different", salt.as_str()).unwrap();
         assert_ne!(k1, k3);
+    }
+
+    // The rows send_end writes for one outgoing transfer, ACK already received.
+    // `asset_id` is `None` for a vanilla (sats-only) transfer, `Some` for an RGB asset send.
+    fn seed_acknowledged_transfer(
+        wallet: &mut crate::wallet::Wallet,
+        txid: &str,
+        asset_id: Option<&str>,
+    ) -> i32 {
+        use crate::database::enums::{AssetSchema, TransferStatus};
+        use crate::database::memory_db::{
+            ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
+            DbTransferActMod,
+        };
+
+        let batch_idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+                expiration: ActiveValue::Set(Some(i64::MAX)),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        if let Some(id) = asset_id {
+            wallet
+                .database
+                .set_asset(DbAssetActMod {
+                    id: ActiveValue::Set(id.to_string()),
+                    schema: ActiveValue::Set(AssetSchema::Nia),
+                    added_at: ActiveValue::Set(1000),
+                    name: ActiveValue::Set(s!("Test Asset")),
+                    precision: ActiveValue::Set(8),
+                    initial_supply: ActiveValue::Set(s!("1000")),
+                    timestamp: ActiveValue::Set(1000),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let asset_transfer_idx = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                asset_id: ActiveValue::Set(asset_id.map(String::from)),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                incoming: ActiveValue::Set(false),
+                recipient_id: ActiveValue::Set(Some(s!("recipient"))),
+                ack: ActiveValue::Set(Some(true)),
+                ..Default::default()
+            })
+            .unwrap();
+        batch_idx
+    }
+
+    // asset_id: None for a vanilla (sats-only) transfer, Some for an RGB asset send.
+    fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
+        use crate::keys::generate_keys;
+        use crate::wallet::Online;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::online::{OnlineData, TransferArtifacts};
+        use rgbstd::persistence::Stock;
+
+        let txid = "1".repeat(64);
+        let indexer_url = "http://127.0.0.1:1";
+        let password = "pw";
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+
+        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
+        *sender.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id);
+        // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
+        sender.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(s!("not a psbt")),
+                ..Default::default()
+            },
+        );
+
+        // `backup()` without its final `update_backup_info`, which needs JS time on native.
+        let payload = sender.serialize_backup_payload().unwrap();
+        let (ciphertext, pub_data) = encrypt_payload(&payload, password).unwrap();
+        let backup_bytes = encode_backup(&ciphertext, &pub_data).unwrap();
+        drop(sender);
+
+        let mut rebuilt = make_test_wallet_with_keys(keys, false);
+        // `restore_backup` ends in `trigger_auto_backup`, which panics on native once the state is restored.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rebuilt.restore_backup(&backup_bytes, password)
+        }));
+        assert!(rebuilt.rgb_stock.borrow().is_some(), "restore did not run");
+
+        rebuilt.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(rebuilt.refresh(online, None, vec![], true))
+            .unwrap();
+
+        let refreshed = &result[&batch_idx];
+        assert!(
+            matches!(refreshed.failure, Some(Error::InvalidPsbt { .. })),
+            "rebuilt wallet lost the signed PSBT: {:?}",
+            refreshed.failure
+        );
+    }
+
+    #[test]
+    fn refresh_after_restore_backup_reads_signed_psbt() {
+        refresh_after_restore_backup_reads_signed_psbt_impl(None);
+    }
+
+    #[test]
+    fn refresh_after_restore_backup_reads_signed_psbt_for_rgb_asset() {
+        refresh_after_restore_backup_reads_signed_psbt_impl(Some("rgb:test-asset"));
+    }
+
+    // asset_id: None for a vanilla (sats-only) transfer, Some for an RGB asset send.
+    fn refresh_fails_transfer_without_signed_psbt_impl(asset_id: Option<&str>) {
+        use crate::database::enums::TransferStatus;
+        use crate::wallet::Online;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::online::OnlineData;
+
+        let txid = "1".repeat(64);
+        let indexer_url = "http://127.0.0.1:1";
+        // A wallet restored from a backup without artifacts, ACK already received.
+        let mut wallet = make_test_wallet(false);
+        let batch_idx = seed_acknowledged_transfer(&mut wallet, &txid, asset_id);
+        let seeded_expiration = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .iter()
+            .find(|t| t.idx == batch_idx)
+            .unwrap()
+            .expiration;
+
+        wallet.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = rt
+            .block_on(wallet.refresh(online.clone(), None, vec![], true))
+            .unwrap();
+
+        let refreshed = &result[&batch_idx];
+        assert!(
+            matches!(&refreshed.failure, Some(Error::MissingTransferArtifacts { txid: t }) if *t == txid),
+            "unexpected failure: {:?}",
+            refreshed.failure
+        );
+        assert_eq!(refreshed.updated_status, Some(TransferStatus::Failed));
+        let failed_expiration = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .iter()
+            .find(|t| t.idx == batch_idx)
+            .unwrap()
+            .expiration;
+        assert_ne!(
+            failed_expiration, seeded_expiration,
+            "expiration was not refreshed when the transfer failed"
+        );
+        let result = rt
+            .block_on(wallet.refresh(online, None, vec![], true))
+            .unwrap();
+        assert!(!result.contains_key(&batch_idx));
+    }
+
+    #[test]
+    fn refresh_fails_transfer_without_signed_psbt() {
+        refresh_fails_transfer_without_signed_psbt_impl(None);
+    }
+
+    #[test]
+    fn refresh_fails_transfer_without_signed_psbt_for_rgb_asset() {
+        refresh_fails_transfer_without_signed_psbt_impl(Some("rgb:test-asset"));
+    }
+
+    #[test]
+    fn vss_restore_payload_keeps_transfer_artifacts() {
+        // vss_restore_backup shares restore_payload with restore_backup, so this
+        // exercises the exact code the VSS path runs on the downloaded backup.
+        use crate::keys::generate_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::online::TransferArtifacts;
+        use rgbstd::persistence::Stock;
+
+        let txid = "2".repeat(64);
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+
+        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
+        *sender.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        sender.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(s!("psbt")),
+                ..Default::default()
+            },
+        );
+        let payload_json = sender.serialize_backup_payload().unwrap();
+
+        let mut restored = make_test_wallet_with_keys(keys, false);
+        restored.restore_payload(&payload_json).unwrap();
+
+        assert_eq!(
+            restored
+                .transfer_artifacts
+                .get(&txid)
+                .and_then(|a| a.signed_psbt.clone()),
+            Some(s!("psbt"))
+        );
     }
 }

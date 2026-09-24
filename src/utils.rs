@@ -514,10 +514,16 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
     Ok((logger, ()))
 }
 
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn now() -> OffsetDateTime {
     let ms = js_sys::Date::now();
     let secs = (ms / 1000.0).floor() as i64;
     OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn now() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
 }
 
 pub(crate) struct DumbResolver;

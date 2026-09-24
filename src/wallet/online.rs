@@ -384,6 +384,18 @@ pub(crate) struct OnlineData {
     indexer: Indexer,
 }
 
+#[cfg(test)]
+impl OnlineData {
+    /// Build online data for a native test. No connection is made.
+    pub(crate) fn for_test(indexer_url: &str) -> Self {
+        Self {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+            indexer: crate::utils::build_indexer(indexer_url).unwrap(),
+        }
+    }
+}
+
 /// A transfer refresh filter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -2582,13 +2594,15 @@ impl Wallet {
                 .as_ref()
                 .expect("batch transfer should have a TXID");
             // read signed PSBT from in-memory transfer artifacts
-            let signed_psbt = self
+            let Some(signed_psbt) = self
                 .transfer_artifacts
                 .get(txid)
                 .and_then(|a| a.signed_psbt.as_ref())
-                .ok_or_else(|| Error::Internal {
-                    details: s!("signed PSBT not found in transfer artifacts"),
-                })?;
+            else {
+                let txid = txid.clone();
+                self._fail_batch_transfer(batch_transfer)?;
+                return Err(Error::MissingTransferArtifacts { txid });
+            };
             let signed_psbt = Psbt::from_str(signed_psbt)?;
             let mut runtime = self.rgb_runtime()?;
             let witness_id = RgbTxid::from_str(&txid.to_string()).unwrap();
@@ -2828,7 +2842,12 @@ impl Wallet {
                 .await
             {
                 Ok(Some(updated_transfer)) => updated_status = Some(updated_transfer.status),
-                Err(e) => failure = Some(e),
+                Err(e) => {
+                    if matches!(e, Error::MissingTransferArtifacts { .. }) {
+                        updated_status = Some(TransferStatus::Failed);
+                    }
+                    failure = Some(e);
+                }
                 _ => {}
             }
             refresh_result.insert(
