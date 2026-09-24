@@ -2607,6 +2607,71 @@ impl Wallet {
         ))
     }
 
+    /// The consignment an incoming transfer was ACKed with, kept in memory since the ACK.
+    ///
+    /// A wallet restored from a backup taken before consignments were part of it holds the
+    /// transfer in `WaitingConfirmations` without them, so fetch it again from the transfer's
+    /// transport endpoints. A fetched consignment is only used for the same anchor txid and asset,
+    /// and is validated again before being accepted, as on the regular path.
+    async fn _received_consignment_async(
+        &mut self,
+        transfer: &DbTransfer,
+        recipient_id: &str,
+        asset_id: Option<&str>,
+        txid: &str,
+    ) -> Result<Vec<u8>, Error> {
+        if let Some(bytes) = self.received_consignments.get(recipient_id) {
+            return Ok(bytes.clone());
+        }
+        let mut tte_data = self
+            .database
+            .get_transfer_transport_endpoints_data(transfer.idx)?;
+        // the endpoint the consignment was received from first
+        tte_data.sort_by_key(|(tte, _)| !tte.used);
+        for (_, transport_endpoint) in tte_data {
+            let res = match self
+                ._get_consignment_async(&transport_endpoint.endpoint, recipient_id.to_string())
+                .await
+            {
+                Ok(res) => res,
+                Err(Error::NoConsignment) => continue,
+                Err(e) => return Err(e),
+            };
+            if res.txid != txid {
+                warn!(
+                    self.logger,
+                    "Ignoring re-fetched consignment for another TXID: {}", res.txid
+                );
+                continue;
+            }
+            let Ok(bytes) = general_purpose::STANDARD.decode(&res.consignment) else {
+                continue;
+            };
+            if let Some(asset_id) = asset_id {
+                match RgbTransfer::load(&bytes[..]) {
+                    Ok(c) if c.contract_id().to_string() == asset_id => {}
+                    _ => {
+                        warn!(
+                            self.logger,
+                            "Ignoring re-fetched consignment for another asset"
+                        );
+                        continue;
+                    }
+                }
+            }
+            info!(
+                self.logger,
+                "Re-fetched missing consignment for recipient {recipient_id}"
+            );
+            self.received_consignments
+                .insert(recipient_id.to_string(), bytes.clone());
+            return Ok(bytes);
+        }
+        Err(Error::Internal {
+            details: s!("consignment not found in memory"),
+        })
+    }
+
     async fn _wait_confirmations_async(
         &mut self,
         batch_transfer: &DbBatchTransfer,
@@ -2645,14 +2710,14 @@ impl Wallet {
                 .expect("transfer should have a recipient ID");
             debug!(self.logger, "Recipient ID: {recipient_id}");
 
-            // load consignment from in-memory storage
             let consignment_bytes = self
-                .received_consignments
-                .get(&recipient_id)
-                .ok_or_else(|| Error::Internal {
-                    details: s!("consignment not found in memory"),
-                })?
-                .clone();
+                ._received_consignment_async(
+                    &transfer,
+                    &recipient_id,
+                    asset_transfer.asset_id.as_deref(),
+                    &txid,
+                )
+                .await?;
             let consignment =
                 RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
 

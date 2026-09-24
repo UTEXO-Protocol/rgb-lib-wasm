@@ -17,7 +17,9 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, RgbTransport, generate_keys};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, RgbTransport, TransferStatus, generate_keys,
+};
 use utils::*;
 
 fn test_wallet_data(
@@ -626,4 +628,314 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         .unwrap();
     assert_eq!(completed.txid, funding_txid);
     wallet_a.flush().await.unwrap();
+}
+
+/// A receive between the recipient's ACK and the anchor's confirmation: the sender has broadcast,
+/// the recipient holds the transfer in `WaitingConfirmations` and still needs the consignment it
+/// received to settle.
+struct PendingIncoming {
+    wallet_b: Wallet,
+    wd_b: WalletData,
+    asset_id: String,
+    recipient_id: String,
+}
+
+fn assert_refresh_ok(result: &rgb_lib_wasm::wallet::RefreshResult, who: &str) {
+    for (idx, refreshed) in result {
+        assert!(
+            refreshed.failure.is_none(),
+            "{who} refresh failed for transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
+}
+
+fn incoming_transfer(
+    wallet: &Wallet,
+    recipient_id: &str,
+) -> Option<rgb_lib_wasm::wallet::Transfer> {
+    wallet
+        .list_transfers(AssetFilter::Any, None)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.recipient_id.as_deref() == Some(recipient_id))
+}
+
+fn incoming_status(wallet: &Wallet, recipient_id: &str) -> Option<TransferStatus> {
+    incoming_transfer(wallet, recipient_id).map(|t| t.status)
+}
+
+/// Esplora's view of the anchor, so a transfer stuck in `WaitingConfirmations` says whether the
+/// transaction was ever broadcast and confirmed.
+async fn anchor_status(txid: Option<&str>) -> String {
+    let Some(txid) = txid else {
+        return "transfer has no txid".to_string();
+    };
+    let client = reqwest::Client::new();
+    let status = match client
+        .get(format!("{ESPLORA_URL}/tx/{txid}/status"))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(e) => format!("request failed: {e}"),
+    };
+    let tip = match client
+        .get(format!("{ESPLORA_URL}/blocks/tip/height"))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(e) => format!("request failed: {e}"),
+    };
+    format!("txid {txid}, esplora status {status}, tip {tip}")
+}
+
+/// A send the recipient has not ACKed yet: A has posted the consignment and holds the signed
+/// PSBT it will broadcast once the ACK arrives.
+struct SentAwaitingAck {
+    wallet_a: Wallet,
+    wd_a: WalletData,
+    online_a: rgb_lib_wasm::wallet::Online,
+    wallet_b: Wallet,
+    wd_b: WalletData,
+    online_b: rgb_lib_wasm::wallet::Online,
+    asset_id: String,
+    recipient_id: String,
+}
+
+/// Issue on A, receive on B through a blank blinded invoice (B has never held the asset), then
+/// stop right after A's `send_end`.
+async fn sent_awaiting_ack(dir: &str) -> SentAwaitingAck {
+    let wd_a = test_wallet_data(
+        &generate_keys(BitcoinNetwork::Regtest),
+        vec![AssetSchema::Nia],
+        &format!("/tmp/{dir}_a"),
+    );
+    let wd_b = test_wallet_data(
+        &generate_keys(BitcoinNetwork::Regtest),
+        vec![AssetSchema::Nia],
+        &format!("/tmp/{dir}_b"),
+    );
+    let mut wallet_a = Wallet::new(wd_a.clone()).unwrap();
+    let online_a = wallet_a
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
+    create_utxos(&mut wallet_a, &online_a, 5).await;
+    let asset_id = wallet_a
+        .issue_asset_nia(
+            "PEND".to_string(),
+            "Pending Token".to_string(),
+            0,
+            vec![1000],
+        )
+        .unwrap()
+        .asset_id;
+
+    let mut wallet_b = Wallet::new(wd_b.clone()).unwrap();
+    let online_b = wallet_b
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
+    create_utxos(&mut wallet_b, &online_b, 5).await;
+
+    let transport = transport_endpoint();
+    let recv = wallet_b
+        .blind_receive(
+            None,
+            Assignment::Fungible(100),
+            None,
+            vec![transport.clone()],
+            1,
+        )
+        .unwrap();
+    let mut recipient_map = HashMap::new();
+    recipient_map.insert(
+        asset_id.clone(),
+        vec![Recipient {
+            recipient_id: recv.recipient_id.clone(),
+            witness_data: None,
+            assignment: Assignment::Fungible(100),
+            transport_endpoints: vec![transport],
+        }],
+    );
+    let unsigned = wallet_a
+        .send_begin(online_a.clone(), recipient_map, false, 1, 1, None)
+        .await
+        .unwrap();
+    let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
+    wallet_a
+        .send_end(online_a.clone(), signed, false)
+        .await
+        .unwrap();
+
+    SentAwaitingAck {
+        wallet_a,
+        wd_a,
+        online_a,
+        wallet_b,
+        wd_b,
+        online_b,
+        asset_id,
+        recipient_id: recv.recipient_id,
+    }
+}
+
+/// B fetches, validates and ACKs the consignment.
+async fn ack(wallet_b: &mut Wallet, online_b: &rgb_lib_wasm::wallet::Online, recipient_id: &str) {
+    let refreshed = wallet_b
+        .refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_refresh_ok(&refreshed, "Receiver (ACK)");
+    assert_eq!(
+        incoming_status(wallet_b, recipient_id),
+        Some(TransferStatus::WaitingConfirmations),
+        "receiver should be waiting for confirmations after the ACK",
+    );
+}
+
+/// A sees the ACK and broadcasts the signed PSBT it kept from `send_end`.
+async fn broadcast(wallet_a: &mut Wallet, online_a: &rgb_lib_wasm::wallet::Online, who: &str) {
+    let refreshed = wallet_a
+        .refresh(online_a.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_refresh_ok(&refreshed, who);
+}
+
+/// The same send, carried on until A has broadcast.
+async fn pending_incoming(dir: &str) -> PendingIncoming {
+    let mut s = sent_awaiting_ack(dir).await;
+    ack(&mut s.wallet_b, &s.online_b, &s.recipient_id).await;
+    broadcast(&mut s.wallet_a, &s.online_a, "Sender (broadcast)").await;
+    PendingIncoming {
+        wallet_b: s.wallet_b,
+        wd_b: s.wd_b,
+        asset_id: s.asset_id,
+        recipient_id: s.recipient_id,
+    }
+}
+
+/// Mine until esplora reports `txid` confirmed. The sender broadcasts through esplora's node while
+/// blocks are mined on bitcoind, so a block mined straight after the broadcast can miss the tx.
+async fn confirm_tx(txid: &str) {
+    let client = reqwest::Client::new();
+    for _ in 0..20 {
+        mine_blocks(1).await;
+        wait_for_esplora_sync().await;
+        if let Ok(r) = client
+            .get(format!("{ESPLORA_URL}/tx/{txid}/status"))
+            .send()
+            .await
+        {
+            if r.text()
+                .await
+                .unwrap_or_default()
+                .contains("\"confirmed\":true")
+            {
+                return;
+            }
+        }
+        sleep_ms(1000).await;
+    }
+    panic!("anchor {txid} did not confirm after 20 blocks");
+}
+
+/// Confirm the anchor, refresh the receiver and require the receive to settle into a spendable
+/// balance — not just appear in `future`.
+async fn confirm_and_assert_settled(mut wallet_b: Wallet, asset_id: &str, recipient_id: &str) {
+    let online_b = wallet_b
+        .go_online(true, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    let txid = incoming_transfer(&wallet_b, recipient_id)
+        .and_then(|t| t.txid)
+        .expect("incoming transfer should carry the anchor txid after the ACK");
+    confirm_tx(&txid).await;
+    wallet_b.sync(online_b.clone()).await.unwrap();
+
+    let refreshed = wallet_b
+        .refresh(online_b, None, vec![], false)
+        .await
+        .unwrap();
+    assert_refresh_ok(&refreshed, "Receiver (settle)");
+    let transfer = incoming_transfer(&wallet_b, recipient_id);
+    let status = transfer.as_ref().map(|t| t.status);
+    if status != Some(TransferStatus::Settled) {
+        let anchor = anchor_status(transfer.as_ref().and_then(|t| t.txid.as_deref())).await;
+        panic!(
+            "incoming transfer should settle once its anchor confirms, got {status:?} ({anchor})"
+        );
+    }
+    let balance = wallet_b.get_asset_balance(asset_id.to_string()).unwrap();
+    assert_eq!(
+        balance.settled, 100,
+        "received amount should be settled, got {balance:?}"
+    );
+    assert_eq!(
+        balance.spendable, 100,
+        "received amount should be spendable, got {balance:?}"
+    );
+}
+
+/// Control for the two tests below: the same receive settles when the recipient stays up.
+#[wasm_bindgen_test]
+async fn test_incoming_transfer_settles_without_restart() {
+    let p = pending_incoming("settle_ctl").await;
+    confirm_and_assert_settled(p.wallet_b, &p.asset_id, &p.recipient_id).await;
+}
+
+/// A browser/extension reload between the ACK and the anchor's confirmation must not strand the
+/// receive: settling needs the received consignment, which has to come back from IndexedDB.
+#[wasm_bindgen_test]
+async fn test_incoming_transfer_settles_after_receiver_reload() {
+    let p = pending_incoming("settle_reload").await;
+    let wallet_b = simulate_reload(p.wallet_b, &p.wd_b).await;
+    confirm_and_assert_settled(wallet_b, &p.asset_id, &p.recipient_id).await;
+}
+
+/// Same, across a backup restore: the restored wallet keeps the `WaitingConfirmations` transfer,
+/// so it must also be able to settle it.
+#[wasm_bindgen_test]
+async fn test_incoming_transfer_settles_after_backup_restore() {
+    let p = pending_incoming("settle_restore").await;
+    let password = "pending_incoming_pw";
+    let backup_bytes = p.wallet_b.backup(password).unwrap();
+    drop(p.wallet_b);
+
+    let mut restored = Wallet::new(p.wd_b.clone()).unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    confirm_and_assert_settled(restored, &p.asset_id, &p.recipient_id).await;
+}
+
+/// The sender side of the same gap: restored from a backup taken between `send_end` and the
+/// recipient's ACK, A still has to broadcast the signed PSBT once the ACK arrives. The
+/// no-restart path is covered by the tests above; a sender reload by
+/// `test_persistence_across_reload`.
+#[wasm_bindgen_test]
+async fn test_outgoing_transfer_broadcasts_after_sender_backup_restore() {
+    let mut s = sent_awaiting_ack("send_restore").await;
+    let password = "sent_awaiting_ack_pw";
+    let backup_bytes = s.wallet_a.backup(password).unwrap();
+    drop(s.wallet_a);
+
+    let mut restored = Wallet::new(s.wd_a.clone()).unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    let online_a = restored
+        .go_online(true, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+
+    ack(&mut s.wallet_b, &s.online_b, &s.recipient_id).await;
+    broadcast(
+        &mut restored,
+        &online_a,
+        "Sender restored from backup (broadcast)",
+    )
+    .await;
+    confirm_and_assert_settled(s.wallet_b, &s.asset_id, &s.recipient_id).await;
 }
