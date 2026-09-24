@@ -786,6 +786,31 @@ async fn pending_incoming(dir: &str) -> PendingIncoming {
     }
 }
 
+/// Mine until esplora reports `txid` confirmed. The sender broadcasts through esplora's node while
+/// blocks are mined on bitcoind, so a block mined straight after the broadcast can miss the tx.
+async fn confirm_tx(txid: &str) {
+    let client = reqwest::Client::new();
+    for _ in 0..20 {
+        mine_blocks(1).await;
+        wait_for_esplora_sync().await;
+        if let Ok(r) = client
+            .get(format!("{ESPLORA_URL}/tx/{txid}/status"))
+            .send()
+            .await
+        {
+            if r.text()
+                .await
+                .unwrap_or_default()
+                .contains("\"confirmed\":true")
+            {
+                return;
+            }
+        }
+        sleep_ms(1000).await;
+    }
+    panic!("anchor {txid} did not confirm after 20 blocks");
+}
+
 /// Confirm the anchor, refresh the receiver and require the receive to settle into a spendable
 /// balance — not just appear in `future`.
 async fn confirm_and_assert_settled(mut wallet_b: Wallet, asset_id: &str, recipient_id: &str) {
@@ -793,8 +818,10 @@ async fn confirm_and_assert_settled(mut wallet_b: Wallet, asset_id: &str, recipi
         .go_online(true, ESPLORA_URL.to_string())
         .await
         .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    let txid = incoming_transfer(&wallet_b, recipient_id)
+        .and_then(|t| t.txid)
+        .expect("incoming transfer should carry the anchor txid after the ACK");
+    confirm_tx(&txid).await;
     wallet_b.sync(online_b.clone()).await.unwrap();
 
     let refreshed = wallet_b
