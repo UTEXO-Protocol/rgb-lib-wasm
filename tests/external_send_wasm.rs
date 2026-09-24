@@ -128,12 +128,14 @@ async fn funded_sender(wd: WalletData) -> (Wallet, rgb_lib_wasm::wallet::Online,
 }
 
 /// Receiver witness receive intent + its decoded witness script.
-fn receiver_witness(asset_id: &str) -> (String, ScriptBuf) {
+fn receiver_witness() -> (String, ScriptBuf) {
     let wd = wallet_data("recv");
     let mut wallet = Wallet::new(wd).unwrap();
+    // Generic (asset-agnostic) witness receive: creates a witness vout at a
+    // fresh receiver address; the asset is bound by the sender's recipient map.
     let data = wallet
         .witness_receive(
-            Some(asset_id.to_string()),
+            None,
             Assignment::Fungible(TRADE_RGB),
             None,
             vec![transport_endpoint()],
@@ -372,7 +374,7 @@ fn contract_id(asset_id: &str) -> rgb_lib_wasm::ContractId {
 #[wasm_bindgen_test]
 async fn external_prepare_happy_path() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t1")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -393,7 +395,7 @@ async fn external_prepare_happy_path() {
 #[wasm_bindgen_test]
 async fn external_prepare_does_not_consume_fascia() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t2")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -418,7 +420,7 @@ async fn external_prepare_does_not_consume_fascia() {
 #[wasm_bindgen_test]
 async fn external_prepare_identical_retry_is_idempotent() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t3")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -443,7 +445,7 @@ async fn external_prepare_identical_retry_is_idempotent() {
 #[wasm_bindgen_test]
 async fn external_prepare_conflicting_same_txid_rejected() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t4")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -478,7 +480,7 @@ async fn external_prepare_conflicting_same_txid_rejected() {
 #[wasm_bindgen_test]
 async fn external_prepare_mismatched_witness_rejected() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t5")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -500,7 +502,7 @@ async fn external_prepare_mismatched_witness_rejected() {
 #[wasm_bindgen_test]
 async fn external_prepare_missing_commitment_rejected() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t6")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -523,7 +525,7 @@ async fn external_prepare_missing_commitment_rejected() {
 async fn external_prepare_survives_reload() {
     let wd = wallet_data("t7");
     let (mut wallet, online, asset_id) = funded_sender(wd.clone()).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -560,7 +562,7 @@ async fn external_prepare_survives_reload() {
 #[wasm_bindgen_test]
 async fn external_finalize_modified_transaction_rejected() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t8")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -585,7 +587,7 @@ async fn external_finalize_modified_transaction_rejected() {
 #[wasm_bindgen_test]
 async fn external_finalize_happy_path() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t9")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -630,7 +632,7 @@ async fn external_finalize_happy_path() {
 #[wasm_bindgen_test]
 async fn external_finalize_identical_retry_is_idempotent() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t10")).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -662,7 +664,7 @@ async fn external_finalize_identical_retry_is_idempotent() {
 #[wasm_bindgen_test]
 async fn external_finalize_unrelated_operation_rejected() {
     let (mut wallet, online, asset_id) = funded_sender(wallet_data("t11")).await;
-    let (_rid, b_script) = receiver_witness(&asset_id);
+    let (_rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
@@ -685,7 +687,7 @@ async fn external_finalize_unrelated_operation_rejected() {
 async fn external_finalize_recovers_after_interrupted_state() {
     let wd = wallet_data("t12");
     let (mut wallet, online, asset_id) = funded_sender(wd.clone()).await;
-    let (rid, b_script) = receiver_witness(&asset_id);
+    let (rid, b_script) = receiver_witness();
     let change = ScriptBuf::from_hex(
         &rgb_lib_wasm::bitcoin::Address::from_str(&wallet.get_address().unwrap())
             .unwrap()
