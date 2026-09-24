@@ -476,4 +476,93 @@ mod tests {
         let k3 = derive_key("different", salt.as_str()).unwrap();
         assert_ne!(k1, k3);
     }
+
+    #[test]
+    fn refresh_after_restore_backup_reads_signed_psbt() {
+        use crate::database::enums::TransferStatus;
+        use crate::database::memory_db::{
+            ActiveValue, DbAssetTransferActMod, DbBatchTransferActMod, DbTransferActMod,
+        };
+        use crate::keys::generate_keys;
+        use crate::wallet::Online;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::online::{OnlineData, TransferArtifacts};
+        use rgbstd::persistence::Stock;
+
+        let txid = "1".repeat(64);
+        let indexer_url = "http://127.0.0.1:1";
+        let password = "pw";
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+
+        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
+        *sender.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        // The rows send_end writes for one outgoing transfer, ACK already received.
+        let batch_idx = sender
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.clone())),
+                status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+                expiration: ActiveValue::Set(Some(i64::MAX)),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let asset_transfer_idx = sender
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                ..Default::default()
+            })
+            .unwrap();
+        sender
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                incoming: ActiveValue::Set(false),
+                recipient_id: ActiveValue::Set(Some(s!("recipient"))),
+                ack: ActiveValue::Set(Some(true)),
+                ..Default::default()
+            })
+            .unwrap();
+        // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
+        sender.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(s!("not a psbt")),
+                ..Default::default()
+            },
+        );
+
+        // `backup()` without its final `update_backup_info`, which needs JS time on native.
+        let payload = sender.serialize_backup_payload().unwrap();
+        let (ciphertext, pub_data) = encrypt_payload(&payload, password).unwrap();
+        let backup_bytes = encode_backup(&ciphertext, &pub_data).unwrap();
+        drop(sender);
+
+        let mut rebuilt = make_test_wallet_with_keys(keys, false);
+        // `restore_backup` ends in `trigger_auto_backup`, which panics on native once the state is restored.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rebuilt.restore_backup(&backup_bytes, password)
+        }));
+        assert!(rebuilt.rgb_stock.borrow().is_some(), "restore did not run");
+
+        rebuilt.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(rebuilt.refresh(online, None, vec![], true))
+            .unwrap();
+
+        let refreshed = &result[&batch_idx];
+        assert!(
+            matches!(refreshed.failure, Some(Error::InvalidPsbt { .. })),
+            "rebuilt wallet lost the signed PSBT: {:?}",
+            refreshed.failure
+        );
+    }
 }

@@ -3155,7 +3155,7 @@ impl Wallet {
 }
 
 #[cfg(test)]
-mod address_reuse_tests {
+pub(crate) mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
     use crate::utils::{get_descriptors, str_to_xpub};
@@ -3165,8 +3165,11 @@ mod address_reuse_tests {
     /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
-    fn make_test_wallet(reuse: bool) -> Wallet {
-        let keys = generate_keys(BitcoinNetwork::Regtest);
+    pub(crate) fn make_test_wallet(reuse: bool) -> Wallet {
+        make_test_wallet_with_keys(generate_keys(BitcoinNetwork::Regtest), reuse)
+    }
+
+    pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys, reuse: bool) -> Wallet {
         let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
         let xpub_rgb = str_to_xpub(&keys.account_xpub_colored, bdk_network).unwrap();
         let xpub_btc = str_to_xpub(&keys.account_xpub_vanilla, bdk_network).unwrap();

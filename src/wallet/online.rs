@@ -384,6 +384,18 @@ pub(crate) struct OnlineData {
     indexer: Indexer,
 }
 
+#[cfg(test)]
+impl OnlineData {
+    /// Build online data for a native test. No connection is made.
+    pub(crate) fn for_test(indexer_url: &str) -> Self {
+        Self {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+            indexer: crate::utils::build_indexer(indexer_url).unwrap(),
+        }
+    }
+}
+
 /// A transfer refresh filter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
