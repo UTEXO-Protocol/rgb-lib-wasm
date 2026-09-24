@@ -83,7 +83,7 @@ async fn funded_sender(wd: WalletData) -> (Wallet, rgb_lib_wasm::wallet::Online,
         sleep_ms(1000).await;
     }
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(5), None, 1, true)
+        .create_utxos_begin(online.clone(), true, Some(5), Some(100_000), 1, true)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -248,7 +248,12 @@ async fn sender_colored_utxo(
                 })
         })
         .expect("a coloured UTXO with at least 1000 units");
-    let (script, value) = fetch_txout(&u.utxo.outpoint.txid, u.utxo.outpoint.vout).await;
+    let (script, _esplora_value) = fetch_txout(&u.utxo.outpoint.txid, u.utxo.outpoint.vout).await;
+    let value = u.utxo.btc_amount;
+    assert!(
+        value >= RGB_LEG_SATS + MINER_FEE,
+        "coloured UTXO must carry enough sats (got {value})"
+    );
     (
         OutPoint {
             txid: Txid::from_str(&u.utxo.outpoint.txid).unwrap(),
