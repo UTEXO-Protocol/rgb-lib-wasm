@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::api::proxy::WasmProxyClient;
+use bitcoin::hashes::{Hash as _, sha256};
 
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
@@ -209,6 +210,10 @@ pub(crate) struct ExternalSendArtifact {
     pub(crate) expected_tx_hex: String,
     /// The exact RGB fascia as canonical JSON (serde).
     pub(crate) fascia_json: String,
+    /// Deterministic digest of the declared recipient map, so a same-txid
+    /// prepare with different recipients is detected as a conflict rather than
+    /// treated as an idempotent retry.
+    pub(crate) recipients_digest: String,
     pub(crate) status: ExternalSendStatus,
 }
 
@@ -1529,15 +1534,21 @@ impl Wallet {
 
         let expected_tx_hex = Self::tx_stripped_hex_from_unsigned(&psbt.unsigned_tx);
         let fascia_json = serde_json::to_string(fascia).map_err(InternalError::from)?;
+        let recipients_digest = Self::recipients_digest(&recipient_map);
 
         // Idempotency / conflict: prove the retry is the same operation by the
-        // immutable prepared data, not mere record presence.
+        // immutable prepared data (transaction, fascia AND declared recipients),
+        // not mere record presence.
         if let Some(existing) = self.batch_transfer_by_txid(&txid)? {
             let same = self
                 .transfer_artifacts
                 .get(&txid)
                 .and_then(|a| a.external_send.as_ref())
-                .map(|art| art.expected_tx_hex == expected_tx_hex && art.fascia_json == fascia_json)
+                .map(|art| {
+                    art.expected_tx_hex == expected_tx_hex
+                        && art.fascia_json == fascia_json
+                        && art.recipients_digest == recipients_digest
+                })
                 .unwrap_or(false);
             if same && !existing.status.failed() {
                 return Ok(ExternalSendPrepareResult {
@@ -1806,6 +1817,7 @@ impl Wallet {
                 external_send: Some(ExternalSendArtifact {
                     expected_tx_hex,
                     fascia_json,
+                    recipients_digest,
                     status: ExternalSendStatus::Prepared,
                 }),
                 ..Default::default()
@@ -1826,6 +1838,13 @@ impl Wallet {
             input.witness = bitcoin::Witness::default();
         }
         hex::encode(bitcoin::consensus::encode::serialize(&stripped))
+    }
+
+    /// Deterministic digest of a declared recipient map (sorted by asset id).
+    fn recipients_digest(recipient_map: &HashMap<String, Vec<Recipient>>) -> String {
+        let sorted: BTreeMap<&String, &Vec<Recipient>> = recipient_map.iter().collect();
+        let bytes = serde_json::to_vec(&sorted).unwrap_or_default();
+        <sha256::Hash as bitcoin::hashes::Hash>::hash(&bytes).to_string()
     }
 
     /// Finalize a prepared externally constructed RGB send.
