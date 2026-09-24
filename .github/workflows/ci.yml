@@ -168,7 +168,7 @@ jobs:
           failed=""
           for t in $(grep -A1 '#\[wasm_bindgen_test\]' tests/persistence_wasm.rs | sed -nE 's/.*fn (test_[a-z0-9_]+)\(.*/\1/p'); do
             echo "::group::$t"
-            wasm-pack test --headless --firefox --release -- --test persistence_wasm "$t" || failed="$failed $t"
+            wasm-pack test --headless --firefox --release -- --test persistence_wasm -- "$t" || failed="$failed $t"
             echo "::endgroup::"
           done
           if [ -n "$failed" ]; then
