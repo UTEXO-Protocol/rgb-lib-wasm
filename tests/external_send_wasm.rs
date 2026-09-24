@@ -545,8 +545,8 @@ async fn external_prepare_survives_reload() {
         .expect("prepare");
     drop(wallet);
 
-    // Reopen the persisted wallet state (same WalletData) from scratch.
-    let mut wallet = Wallet::new(wd).unwrap();
+    // Reopen the persisted wallet state via the production restore API.
+    let mut wallet = Wallet::restore(wd).await.unwrap();
     let _online = wallet
         .go_online(false, ESPLORA_URL.to_string())
         .await
@@ -710,8 +710,9 @@ async fn external_finalize_recovers_after_interrupted_state() {
     wait_for_tx_observed(&prepared.txid).await;
 
     // Interruption: drop the runtime after broadcast but before finalisation.
+    wallet.flush().await.unwrap();
     drop(wallet);
-    let mut wallet = Wallet::new(wd).unwrap();
+    let mut wallet = Wallet::restore(wd).await.unwrap();
     let _online = wallet
         .go_online(false, ESPLORA_URL.to_string())
         .await
