@@ -159,10 +159,15 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test integration_wasm
 
-      - name: Run external-send tests
+      - name: Run external-send prepare tests
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test external_send_wasm
+
+      - name: Run external-send finalize tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        run: wasm-pack test --headless --firefox --release --test external_send_finalize_wasm
 
       - name: Stop regtest services
         if: always()
