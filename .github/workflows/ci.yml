@@ -159,10 +159,22 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test integration_wasm
 
+      # One browser session per test: a panic in wasm-bindgen-test poisons the
+      # panic hook and fails every test that runs after it in the same session.
       - name: Run persistence tests
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
-        run: wasm-pack test --headless --firefox --release --test persistence_wasm
+        run: |
+          failed=""
+          for t in $(grep -A1 '#\[wasm_bindgen_test\]' tests/persistence_wasm.rs | sed -nE 's/.*fn (test_[a-z0-9_]+)\(.*/\1/p'); do
+            echo "::group::$t"
+            wasm-pack test --headless --firefox --release -- --test persistence_wasm "$t" || failed="$failed $t"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "Failed:$failed"
+            exit 1
+          fi
 
       - name: Stop regtest services
         if: always()

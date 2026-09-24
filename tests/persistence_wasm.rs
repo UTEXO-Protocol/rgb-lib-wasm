@@ -650,13 +650,45 @@ fn assert_refresh_ok(result: &rgb_lib_wasm::wallet::RefreshResult, who: &str) {
     }
 }
 
-fn incoming_status(wallet: &Wallet, recipient_id: &str) -> Option<TransferStatus> {
+fn incoming_transfer(
+    wallet: &Wallet,
+    recipient_id: &str,
+) -> Option<rgb_lib_wasm::wallet::Transfer> {
     wallet
         .list_transfers(AssetFilter::Any, None)
         .unwrap()
         .into_iter()
         .find(|t| t.recipient_id.as_deref() == Some(recipient_id))
-        .map(|t| t.status)
+}
+
+fn incoming_status(wallet: &Wallet, recipient_id: &str) -> Option<TransferStatus> {
+    incoming_transfer(wallet, recipient_id).map(|t| t.status)
+}
+
+/// Esplora's view of the anchor, so a transfer stuck in `WaitingConfirmations` says whether the
+/// transaction was ever broadcast and confirmed.
+async fn anchor_status(txid: Option<&str>) -> String {
+    let Some(txid) = txid else {
+        return "transfer has no txid".to_string();
+    };
+    let client = reqwest::Client::new();
+    let status = match client
+        .get(format!("{ESPLORA_URL}/tx/{txid}/status"))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(e) => format!("request failed: {e}"),
+    };
+    let tip = match client
+        .get(format!("{ESPLORA_URL}/blocks/tip/height"))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(e) => format!("request failed: {e}"),
+    };
+    format!("txid {txid}, esplora status {status}, tip {tip}")
 }
 
 /// Issue on A, receive on B through a blank blinded invoice (B has never held the asset), then
@@ -770,11 +802,14 @@ async fn confirm_and_assert_settled(mut wallet_b: Wallet, asset_id: &str, recipi
         .await
         .unwrap();
     assert_refresh_ok(&refreshed, "Receiver (settle)");
-    assert_eq!(
-        incoming_status(&wallet_b, recipient_id),
-        Some(TransferStatus::Settled),
-        "incoming transfer should settle once its anchor confirms",
-    );
+    let transfer = incoming_transfer(&wallet_b, recipient_id);
+    let status = transfer.as_ref().map(|t| t.status);
+    if status != Some(TransferStatus::Settled) {
+        let anchor = anchor_status(transfer.as_ref().and_then(|t| t.txid.as_deref())).await;
+        panic!(
+            "incoming transfer should settle once its anchor confirms, got {status:?} ({anchor})"
+        );
+    }
     let balance = wallet_b.get_asset_balance(asset_id.to_string()).unwrap();
     assert_eq!(
         balance.settled, 100,
@@ -788,7 +823,7 @@ async fn confirm_and_assert_settled(mut wallet_b: Wallet, asset_id: &str, recipi
 
 /// Control for the two tests below: the same receive settles when the recipient stays up.
 #[wasm_bindgen_test]
-async fn test_incoming_transfer_settles() {
+async fn test_incoming_transfer_settles_without_restart() {
     let p = pending_incoming("settle_ctl").await;
     confirm_and_assert_settled(p.wallet_b, &p.asset_id, &p.recipient_id).await;
 }
