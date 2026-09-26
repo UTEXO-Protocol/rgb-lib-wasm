@@ -172,6 +172,15 @@ where
                 .map_err(de::Error::custom)
         }
 
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            T::from_str(&value.to_string())
+                .map(Some)
+                .map_err(de::Error::custom)
+        }
+
         fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
         where
             E: de::Error,
@@ -1344,6 +1353,39 @@ mod tests {
         let json = r#"{"value": null}"#;
         let parsed: OptionalField = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.value, None);
+    }
+
+    // serde_json reaches visit_u64 for a positive integer, so the signed arm is only taken by
+    // deserializers that hand integers over as i64 -- serde_wasm_bindgen does, for every
+    // integral JS number.
+    #[test]
+    fn mandatory_from_signed_integer() {
+        let de = serde::de::value::I64Deserializer::<serde::de::value::Error>::new(1000);
+        let parsed: u64 = from_str_or_number_mandatory(de).unwrap();
+        assert_eq!(parsed, 1000);
+    }
+
+    #[test]
+    fn optional_from_signed_integer() {
+        let de = serde::de::value::I64Deserializer::<serde::de::value::Error>::new(7);
+        let parsed: Option<u64> = from_str_or_number_optional(de).unwrap();
+        assert_eq!(parsed, Some(7));
+    }
+
+    // `deserialize_with` suppresses the default an Option would otherwise get, so without
+    // `#[serde(default)]` an absent key is an error rather than None.
+    #[test]
+    fn witness_data_blinding_may_be_absent() {
+        // the camel_case feature renames the fields, so the fixture key follows it
+        let key = if cfg!(feature = "camel_case") {
+            "amountSat"
+        } else {
+            "amount_sat"
+        };
+        let json = format!(r#"{{"{key}": 1000}}"#);
+        let parsed: crate::wallet::WitnessData = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.amount_sat, 1000);
+        assert_eq!(parsed.blinding, None);
     }
 
     #[test]

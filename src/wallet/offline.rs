@@ -671,7 +671,7 @@ pub struct WitnessData {
     #[serde(deserialize_with = "from_str_or_number_mandatory")]
     pub amount_sat: u64,
     /// An optional blinding
-    #[serde(deserialize_with = "from_str_or_number_optional")]
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
     pub blinding: Option<u64>,
 }
 
@@ -955,7 +955,7 @@ pub struct WalletData {
     /// Wallet master fingerprint
     pub master_fingerprint: String,
     /// Keychain index for the vanilla-side of the wallet (default: 0)
-    #[serde(deserialize_with = "from_str_or_number_optional")]
+    #[serde(default, deserialize_with = "from_str_or_number_optional")]
     pub vanilla_keychain: Option<u8>,
     /// List of schemas the wallet should support (when issuing, sending and receiving). Empty list
     /// means the wallet should support all the schemas rgb-lib supports.
