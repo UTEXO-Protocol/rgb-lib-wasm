@@ -1376,8 +1376,14 @@ mod tests {
     // `#[serde(default)]` an absent key is an error rather than None.
     #[test]
     fn witness_data_blinding_may_be_absent() {
-        let json = r#"{"amount_sat": 1000}"#;
-        let parsed: crate::wallet::WitnessData = serde_json::from_str(json).unwrap();
+        // the camel_case feature renames the fields, so the fixture key follows it
+        let key = if cfg!(feature = "camel_case") {
+            "amountSat"
+        } else {
+            "amount_sat"
+        };
+        let json = format!(r#"{{"{key}": 1000}}"#);
+        let parsed: crate::wallet::WitnessData = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.amount_sat, 1000);
         assert_eq!(parsed.blinding, None);
     }
