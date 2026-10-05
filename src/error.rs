@@ -370,6 +370,13 @@ pub enum Error {
         txid: String,
     },
 
+    /// The signed PSBT of a transfer is missing, so the transfer has failed
+    #[error("Signed PSBT not found for transfer with TXID: {txid}, the transfer has failed")]
+    MissingTransferArtifacts {
+        /// TXID of the failed transfer
+        txid: String,
+    },
+
     /// A network error occurred
     #[error("Network error: {details}")]
     Network {
