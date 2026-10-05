@@ -1124,6 +1124,14 @@ impl InMemoryDb {
         let colorings = colorings.unwrap_or_else(|| self.iter_colorings().unwrap_or_default());
         let txos = txos.unwrap_or_else(|| self.iter_txos().unwrap_or_default());
 
+        // Asset transfers whose received allocations are already on a TXO, and so already in
+        // the pending allocations below.
+        let colored_receives: std::collections::HashSet<i32> = colorings
+            .iter()
+            .filter(|c| c.r#type == ColoringType::Receive)
+            .map(|c| c.asset_transfer_idx)
+            .collect();
+
         let txos_allocations = self.get_rgb_allocations(
             txos,
             Some(colorings),
@@ -1162,6 +1170,10 @@ impl InMemoryDb {
                     Ok((at, bt)) => {
                         if bt.status.waiting_confirmations() {
                             if at.asset_id.as_deref() != Some(asset_id.as_str()) {
+                                return None;
+                            }
+                            // NOTE: counting a colored receive here too doubles the incoming amount.
+                            if colored_receives.contains(&at.idx) {
                                 return None;
                             }
                             Some(Ok(t
@@ -2126,6 +2138,51 @@ mod tests {
         assert_eq!(balance.settled, 1000);
         assert_eq!(balance.future, 1000);
         assert_eq!(balance.spendable, 1000);
+    }
+
+    /// A witness receive waiting for confirmations, with its allocation already colored or not.
+    fn witness_receive_balance(colored: bool) -> Balance {
+        let db = make_db();
+        let bt = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Settled))
+            .unwrap();
+        let at = db.set_asset_transfer(make_asset_transfer_mod(bt, Some("a1"))).unwrap();
+        let txo = db.set_txo(make_txo_mod("tx1", 0, "50000")).unwrap();
+        db.set_coloring(make_coloring_mod(txo, at, ColoringType::Issue, 1000))
+            .unwrap();
+
+        let bt = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::WaitingConfirmations))
+            .unwrap();
+        let at = db.set_asset_transfer(make_asset_transfer_mod(bt, Some("a1"))).unwrap();
+        db.set_transfer(DbTransferActMod {
+            requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(500))),
+            recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: Some(1) })),
+            ..make_transfer_mod(at, true)
+        })
+        .unwrap();
+        if colored {
+            let txo = db
+                .set_txo(DbTxoActMod {
+                    exists: ActiveValue::Set(false),
+                    pending_witness: ActiveValue::Set(true),
+                    ..make_txo_mod("tx2", 1, "0")
+                })
+                .unwrap();
+            db.set_coloring(make_coloring_mod(txo, at, ColoringType::Receive, 500))
+                .unwrap();
+        }
+        db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_get_asset_balance_witness_receive_counted_once() {
+        for colored in [false, true] {
+            let balance = witness_receive_balance(colored);
+            assert_eq!(balance.settled, 1000, "colored: {colored}");
+            assert_eq!(balance.future, 1500, "colored: {colored}");
+        }
     }
 
     #[test]
