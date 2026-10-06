@@ -264,6 +264,49 @@ impl Wallet {
         Ok(transfers)
     }
 
+    /// Create one consignment per contract from a fascia **without consuming it**.
+    ///
+    /// This is the non-mutating counterpart of
+    /// [`color_psbt_and_consume`](Wallet::color_psbt_and_consume): it builds the
+    /// same transfers from the fascia's own witness identity, but leaves the
+    /// authoritative RGB runtime untouched. The sender's allocation is therefore
+    /// not consumed until the caller explicitly commits the fascia (for example
+    /// after the corresponding Bitcoin transaction has been broadcast).
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn create_transfers_from_fascia(
+        &self,
+        fascia: &Fascia,
+        asset_beneficiaries: &AssetBeneficiariesMap,
+    ) -> Result<Vec<RgbTransfer>, Error> {
+        info!(self.logger, "Creating transfers from fascia...");
+        let witness_txid = fascia.witness_id();
+        let runtime = self.rgb_runtime()?;
+        let mut transfers = vec![];
+        for (contract_id, beneficiaries) in asset_beneficiaries.clone() {
+            let mut beneficiaries_witness = vec![];
+            let mut beneficiaries_blinded = vec![];
+            for builder_seal in beneficiaries {
+                match builder_seal {
+                    BuilderSeal::Revealed(seal) => {
+                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                        beneficiaries_witness.push(explicit_seal);
+                    }
+                    BuilderSeal::Concealed(secret_seal) => beneficiaries_blinded.push(secret_seal),
+                };
+            }
+            transfers.push(runtime.transfer_from_fascia(
+                contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                fascia,
+            )?);
+        }
+        info!(self.logger, "Create transfers from fascia completed");
+        Ok(transfers)
+    }
+
     /// Consume an RGB fascia.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
