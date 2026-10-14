@@ -673,4 +673,29 @@ mod tests {
             Some(s!("psbt"))
         );
     }
+
+    #[test]
+    fn restore_payload_keeps_received_consignments() {
+        use crate::keys::generate_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use rgbstd::persistence::Stock;
+
+        let recipient_id = s!("utxob:recipient");
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+
+        let mut receiver = make_test_wallet_with_keys(keys.clone(), false);
+        *receiver.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        receiver
+            .received_consignments
+            .insert(recipient_id.clone(), b"consignment".to_vec());
+        let payload_json = receiver.serialize_backup_payload().unwrap();
+
+        let mut restored = make_test_wallet_with_keys(keys, false);
+        restored.restore_payload(&payload_json).unwrap();
+
+        assert_eq!(
+            restored.received_consignments.get(&recipient_id),
+            Some(&b"consignment".to_vec())
+        );
+    }
 }
