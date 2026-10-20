@@ -54,9 +54,22 @@ pub enum Error {
     #[error("The given PSBT cannot be finalized")]
     CannotFinalizePsbt,
 
+    /// Cannot use BFA schema on mainnet
+    #[error("Cannot use BFA schema on mainnet")]
+    CannotUseBfaOnMainnet,
+
     /// Cannot use IFA schema on mainnet
     #[error("Cannot use IFA schema on mainnet")]
     CannotUseIfaOnMainnet,
+
+    /// The EVM RPC endpoint is on a chain other than the configured one
+    #[error("EVM chain ID mismatch: expected {expected}, the RPC endpoint is on {actual}")]
+    EvmChainIdMismatch {
+        /// Configured chain ID
+        expected: u64,
+        /// Chain ID reported by the EVM RPC endpoint
+        actual: u64,
+    },
 
     /// The provided file is empty
     #[error("Empty file: {file_path}")]
@@ -231,6 +244,20 @@ pub enum Error {
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
 
+    /// The provided EVM contract address is invalid
+    #[error("Invalid EVM contract address: {details}")]
+    InvalidEvmContractAddress {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided EVM RPC URL is invalid or the endpoint cannot be reached
+    #[error("Invalid EVM RPC URL: {details}")]
+    InvalidEvmRpcUrl {
+        /// Error details
+        details: String,
+    },
+
     /// The provided fee rate is invalid
     #[error("Invalid fee rate: {details}")]
     InvalidFeeRate {
@@ -370,6 +397,13 @@ pub enum Error {
         txid: String,
     },
 
+    /// No confirmed mint event for the mint operation was found on the EVM chain
+    #[error("Mint event for operation {opid} not found on the EVM chain")]
+    MintEventNotFound {
+        /// ID of the mint operation
+        opid: String,
+    },
+
     /// The signed PSBT of a transfer is missing, so the transfer has failed
     #[error("Signed PSBT not found for transfer with TXID: {txid}, the transfer has failed")]
     MissingTransferArtifacts {
@@ -388,6 +422,13 @@ pub enum Error {
     #[error("No consignment found")]
     NoConsignment,
 
+    /// No EVM RPC URL is configured for the chain
+    #[error("No EVM RPC URL configured for chain ID {chain_id}")]
+    NoEvmRpcUrl {
+        /// EVM chain ID
+        chain_id: u64,
+    },
+
     /// Cannot inflate an asset with unknown o zero amounts
     #[error("Inflation request with no amounts or zero amounts")]
     NoInflationAmounts,
@@ -395,6 +436,10 @@ pub enum Error {
     /// Cannot issue an asset without knowing the amounts
     #[error("Issuance request with no provided amounts")]
     NoIssuanceAmounts,
+
+    /// Cannot issue an asset with zero mint rights
+    #[error("Issuance request with zero mint rights")]
+    NoMintRights,
 
     /// Cannot create a wallet with no supported schemas
     #[error("Cannot create a wallet with no supported schemas")]

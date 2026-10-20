@@ -13,7 +13,7 @@ const ASSETS_DIR: &str = "assets";
 
 const MIN_BTC_REQUIRED: u64 = 2000;
 
-pub(crate) const NUM_KNOWN_SCHEMAS: usize = 2;
+pub(crate) const NUM_KNOWN_SCHEMAS: usize = 3;
 
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
@@ -26,7 +26,10 @@ const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
+pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
+pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
+pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
 #[cfg(feature = "esplora")]
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
@@ -35,6 +38,8 @@ pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_IFA: &str =
     "rgb:sch:Y2a6SW4rY3gRwLE40OxILhwOyL2FR9ppte790oLbIe0#athena-paul-horizon";
+pub(crate) const SCHEMA_ID_BFA: &str =
+    "rgb:sch:Ryl5eQZ3IHrU05e3AWdQZJR4FB5GvxZPy96cwhJiApc#amazon-norway-harris";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct LocalAssetData {
@@ -303,6 +308,80 @@ impl AssetIFA {
     }
 }
 
+/// A Bridged Fungible Asset.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct AssetBFA {
+    /// ID of the asset
+    pub asset_id: String,
+    /// Ticker of the asset
+    pub ticker: String,
+    /// Name of the asset
+    pub name: String,
+    /// Details of the asset
+    pub details: Option<String>,
+    /// Precision, also known as divisibility, of the asset
+    pub precision: u8,
+    /// Initial issued supply
+    pub initial_supply: u64,
+    /// Timestamp of asset genesis
+    pub timestamp: i64,
+    /// Timestamp of asset import
+    pub added_at: i64,
+    /// Current balance of the asset
+    pub balance: Balance,
+    /// Asset media attachment
+    pub media: Option<Media>,
+    /// Reject list URL
+    pub reject_list_url: Option<String>,
+}
+
+impl AssetBFA {
+    pub(crate) fn get_asset_details(
+        wallet: &Wallet,
+        asset: &DbAsset,
+        transfers: Option<Vec<DbTransfer>>,
+        asset_transfers: Option<Vec<DbAssetTransfer>>,
+        batch_transfers: Option<Vec<DbBatchTransfer>>,
+        colorings: Option<Vec<DbColoring>>,
+        txos: Option<Vec<DbTxo>>,
+        medias: Option<Vec<DbMedia>>,
+    ) -> Result<AssetBFA, Error> {
+        let media = {
+            let medias = if let Some(m) = medias {
+                m
+            } else {
+                wallet.database.iter_media()?
+            };
+            medias
+                .iter()
+                .find(|m| Some(m.idx) == asset.media_idx)
+                .map(|m| Media::from_db_media(m, wallet.get_media_dir()))
+        };
+        let balance = wallet.database.get_asset_balance(
+            asset.id.clone(),
+            transfers,
+            asset_transfers,
+            batch_transfers,
+            colorings,
+            txos,
+        )?;
+        Ok(AssetBFA {
+            asset_id: asset.id.clone(),
+            ticker: asset.ticker.clone().unwrap(),
+            name: asset.name.clone(),
+            details: asset.details.clone(),
+            precision: asset.precision,
+            initial_supply: asset.initial_supply.parse::<u64>().unwrap(),
+            timestamp: asset.timestamp,
+            added_at: asset.added_at,
+            balance,
+            media,
+            reject_list_url: asset.reject_list_url.clone(),
+        })
+    }
+}
+
 /// List of RGB assets, grouped by asset schema.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -311,6 +390,8 @@ pub struct Assets {
     pub nia: Option<Vec<AssetNIA>>,
     /// List of IFA assets
     pub ifa: Option<Vec<AssetIFA>>,
+    /// List of BFA assets
+    pub bfa: Option<Vec<AssetBFA>>,
 }
 
 /// A balance.
@@ -518,6 +599,21 @@ impl Invoice {
                         Assignment::InflationRight(v.value())
                     }
                     (None, Some(RGB_STATE_INFLATION_ALLOWANCE)) => Assignment::InflationRight(0),
+                    (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
+                    (None, None) => Assignment::Any,
+                    (_, _) => {
+                        return Err(Error::InvalidInvoice {
+                            details: s!("invalid assignment"),
+                        });
+                    }
+                }
+            }
+            Some(AssetSchema::Bfa) => {
+                match (decoded.assignment_state, assignment_name.as_deref()) {
+                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
+                        Assignment::Fungible(v.value())
+                    }
+                    (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
                     (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
                     (None, None) => Assignment::Any,
                     (_, _) => {
@@ -1111,10 +1207,13 @@ impl Wallet {
         if supported_schemas.is_empty() {
             return Err(Error::NoSupportedSchemas);
         }
-        if wdata.bitcoin_network == BitcoinNetwork::Mainnet
-            && supported_schemas.contains(&AssetSchema::Ifa)
-        {
-            return Err(Error::CannotUseIfaOnMainnet);
+        if wdata.bitcoin_network == BitcoinNetwork::Mainnet {
+            if supported_schemas.contains(&AssetSchema::Ifa) {
+                return Err(Error::CannotUseIfaOnMainnet);
+            }
+            if supported_schemas.contains(&AssetSchema::Bfa) {
+                return Err(Error::CannotUseBfaOnMainnet);
+            }
         }
         let mut runtime = load_rgb_runtime(wallet_dir.clone())?;
         let known_schemas = runtime.schemata()?;
@@ -1405,6 +1504,22 @@ impl Wallet {
             });
         }
         Details::from_str(&details).map_err(|e| Error::InvalidDetails {
+            details: e.to_string(),
+        })
+    }
+
+    fn _check_contract_address(&self, contract_address: String) -> Result<EvmAddress, Error> {
+        let hex_part = contract_address.strip_prefix("0x").ok_or_else(|| {
+            Error::InvalidEvmContractAddress {
+                details: s!("address must start with 0x"),
+            }
+        })?;
+        if hex_part.len() != 40 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::InvalidEvmContractAddress {
+                details: s!("address must be 20 hex-encoded bytes"),
+            });
+        }
+        EvmAddress::from_str(hex_part).map_err(|e| Error::InvalidEvmContractAddress {
             details: e.to_string(),
         })
     }
@@ -1908,6 +2023,176 @@ impl Wallet {
         Ok(asset)
     }
 
+    /// Issue a new RGB BFA asset with the provided `ticker`, `name`, `precision` and
+    /// `mint_rights`, then return it.
+    ///
+    /// The asset is bridged from the bridge contract at `contract_address` on the EVM chain with
+    /// the given `chain_id`. The optional `reject_list_address` is a reject list contract on the
+    /// same chain.
+    ///
+    /// A BFA genesis issues no units. Each mint right goes on its own UTXO.
+    pub fn issue_asset_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+    ) -> Result<AssetBFA, Error> {
+        info!(
+            self.logger,
+            "Issuing BFA asset with ticker '{}' name '{}' precision '{}' mint rights '{}'...",
+            ticker,
+            name,
+            precision,
+            mint_rights,
+        );
+
+        let asset_schema = &AssetSchema::Bfa;
+
+        self.check_schema_support(asset_schema)?;
+
+        if mint_rights == 0 {
+            return Err(Error::NoMintRights);
+        }
+
+        let db_data = self.database.get_db_data(false)?;
+
+        let mut unspents: Vec<LocalUnspent> = self.database.get_rgb_allocations(
+            self.database.get_unspent_txos(db_data.txos.clone())?,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        unspents.retain(|u| {
+            !(u.rgb_allocations
+                .iter()
+                .any(|a| !a.incoming && a.status.waiting_counterparty()))
+        });
+
+        let created_at = now().unix_timestamp();
+        let text = RicardianContract::default();
+        let terms = self.new_asset_terms(text, None);
+        let spec = AssetSpec {
+            ticker: self._check_ticker(ticker.clone())?,
+            name: self._check_name(name.clone())?,
+            details: None,
+            precision: self._check_precision(precision)?,
+        };
+
+        let mut builder = ContractBuilder::with(
+            Identity::default(),
+            BridgedFungibleAsset::schema_rules(),
+            self.chain_net(),
+        )
+        .add_global_state("spec", spec.clone())
+        .expect("invalid spec")
+        .add_global_state("terms", terms)
+        .expect("invalid terms")
+        .add_global_state(
+            RGB_GLOBAL_BRIDGE_LOCATION,
+            BridgeLocation::Evm(EvmContract {
+                chain_id,
+                address: self._check_contract_address(contract_address)?,
+            }),
+        )
+        .expect("invalid bridgeLocation");
+        if let Some(reject_list_address) = reject_list_address {
+            builder = builder
+                .add_global_state(
+                    RGB_GLOBAL_REJECT_LIST,
+                    RejectListLocation::Evm(EvmContract {
+                        chain_id,
+                        address: self._check_contract_address(reject_list_address)?,
+                    }),
+                )
+                .expect("invalid rejectList");
+        }
+
+        let mut issue_utxos: Vec<DbTxo> = vec![];
+        let mut exclude_outpoints: Vec<Outpoint> = vec![];
+        for _ in 0..mint_rights {
+            let utxo = self.get_utxo(&exclude_outpoints, Some(&unspents), false, Some(0))?;
+            exclude_outpoints.push(utxo.outpoint());
+            issue_utxos.push(utxo.clone());
+
+            builder = builder
+                .add_rights(RGB_STATE_MINT_RIGHT, self.get_builder_seal(utxo))
+                .expect("invalid mintRight");
+        }
+        debug!(self.logger, "Assigning mint rights: {issue_utxos:?}");
+
+        let mut runtime = self.rgb_runtime()?;
+        let validated_contract = builder.issue_contract().expect("failure issuing contract");
+        let asset_id = validated_contract.contract_id().to_string();
+        runtime
+            .import_contract(validated_contract.clone(), &DumbResolver)
+            .expect("failure importing issued contract");
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
+
+        let asset_data = LocalAssetData {
+            name,
+            precision,
+            ticker: Some(ticker),
+            details: None,
+            media_idx: None,
+            initial_supply: 0,
+            max_supply: None,
+            known_circulating_supply: None,
+            reject_list_url: None,
+        };
+        let asset = self.add_asset_to_db(
+            asset_id.clone(),
+            asset_schema,
+            Some(created_at),
+            created_at,
+            asset_data,
+        )?;
+        let batch_transfer = DbBatchTransferActMod {
+            status: ActiveValue::Set(TransferStatus::Settled),
+            expiration: ActiveValue::Set(None),
+            created_at: ActiveValue::Set(created_at),
+            min_confirmations: ActiveValue::Set(0),
+            ..Default::default()
+        };
+        let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
+        let asset_transfer = DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(true),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            asset_id: ActiveValue::Set(Some(asset_id)),
+            ..Default::default()
+        };
+        let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
+        let transfer = DbTransferActMod {
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            incoming: ActiveValue::Set(true),
+            ..Default::default()
+        };
+        self.database.set_transfer(transfer)?;
+        for utxo in issue_utxos {
+            let db_coloring = DbColoringActMod {
+                txo_idx: ActiveValue::Set(utxo.idx),
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                r#type: ActiveValue::Set(ColoringType::Issue),
+                assignment: ActiveValue::Set(Assignment::MintRight),
+                ..Default::default()
+            };
+            self.database.set_coloring(db_coloring)?;
+        }
+
+        let asset = AssetBFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
+
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+
+        info!(self.logger, "Issue asset BFA completed");
+        Ok(asset)
+    }
+
     /// Finalize a PSBT, optionally providing BDK sign options to tweak the behavior of the
     /// finalizer.
     pub fn finalize_psbt(
@@ -2147,6 +2432,7 @@ impl Wallet {
         let assets = self.database.iter_assets()?;
         let mut nia = None;
         let mut ifa = None;
+        let mut bfa = None;
         for schema in filter_asset_schemas {
             match schema {
                 AssetSchema::Nia => {
@@ -2189,11 +2475,31 @@ impl Wallet {
                             .collect::<Result<Vec<AssetIFA>, Error>>()?,
                     );
                 }
+                AssetSchema::Bfa => {
+                    bfa = Some(
+                        assets
+                            .iter()
+                            .filter(|a| a.schema == schema)
+                            .map(|a| {
+                                AssetBFA::get_asset_details(
+                                    self,
+                                    a,
+                                    transfers.clone(),
+                                    asset_transfers.clone(),
+                                    batch_transfers.clone(),
+                                    colorings.clone(),
+                                    txos.clone(),
+                                    medias.clone(),
+                                )
+                            })
+                            .collect::<Result<Vec<AssetBFA>, Error>>()?,
+                    );
+                }
             }
         }
 
         info!(self.logger, "List assets completed");
-        Ok(Assets { nia, ifa })
+        Ok(Assets { nia, ifa, bfa })
     }
 
     pub(crate) fn sync_if_requested(
@@ -2629,7 +2935,10 @@ impl Wallet {
         let transports: Vec<&str> = transport_endpoints.iter().map(AsRef::as_ref).collect();
         invoice_builder = invoice_builder.add_transports(transports).unwrap();
         let detected_assignment = match (&assignment, schema) {
-            (Assignment::Fungible(amt), Some(AssetSchema::Nia) | Some(AssetSchema::Ifa) | None) => {
+            (
+                Assignment::Fungible(amt),
+                Some(AssetSchema::Nia) | Some(AssetSchema::Ifa) | Some(AssetSchema::Bfa) | None,
+            ) => {
                 invoice_builder = invoice_builder.set_amount_raw(*amt);
                 invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
                 assignment

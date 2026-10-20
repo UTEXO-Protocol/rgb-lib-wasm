@@ -1,4 +1,6 @@
 #[cfg(feature = "esplora")]
+pub(crate) mod evm;
+#[cfg(feature = "esplora")]
 pub(crate) mod proxy;
 
 #[cfg(feature = "esplora")]
