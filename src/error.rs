@@ -614,9 +614,6 @@ pub(crate) enum InternalError {
     #[error("Serde JSON error: {0}")]
     SerdeJSON(#[from] serde_json::Error),
 
-    #[error("Stash error: {0}")]
-    StashError(String),
-
     #[error("Stock error: {0}")]
     StockError(String),
 
@@ -686,58 +683,10 @@ impl From<psrgbt::MpcPsbtError> for InternalError {
     }
 }
 
-impl From<rgbstd::persistence::StashProviderError<std::convert::Infallible>> for InternalError {
-    fn from(e: rgbstd::persistence::StashProviderError<std::convert::Infallible>) -> Self {
-        InternalError::StashError(e.to_string())
-    }
-}
-
-impl From<rgbstd::persistence::StockError> for InternalError {
-    fn from(e: rgbstd::persistence::StockError) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    > for InternalError
+impl<S: rgbstd::persistence::RgbStore, E: std::error::Error>
+    From<rgbstd::persistence::StockError<S, E>> for InternalError
 {
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    ) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    > for InternalError
-{
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    ) -> Self {
+    fn from(e: rgbstd::persistence::StockError<S, E>) -> Self {
         InternalError::StockError(e.to_string())
     }
 }
