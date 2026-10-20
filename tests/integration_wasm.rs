@@ -57,7 +57,7 @@ async fn test_full_wallet_flow() {
     let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let mut wallet = Wallet::new(wd.clone()).unwrap();
     let online = wallet
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
 
@@ -128,7 +128,7 @@ async fn test_full_wallet_flow() {
     let wd_b = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let mut wallet_b = Wallet::new(wd_b).unwrap();
     let online_b = wallet_b
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
 
@@ -595,7 +595,7 @@ async fn test_full_wallet_flow() {
 
     // The restored RGB state must allow a new inflation
     let online_r = restored
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     restored.sync(online_r.clone()).await.unwrap();
