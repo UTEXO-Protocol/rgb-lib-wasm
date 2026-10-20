@@ -7,8 +7,8 @@
 //! ## Wallet
 //! The main component of the library is the [`Wallet`].
 //!
-//! It allows to create and operate an RGB wallet that can issue, send and receive NIA and IFA
-//! assets. The library also manages UTXOs and asset allocations.
+//! It allows to create and operate an RGB wallet that can issue, send and receive NIA, IFA and
+//! BFA assets. The library also manages UTXOs and asset allocations.
 //!
 //! ## Backend
 //! The library uses BDK for walleting operations and several components from the RGB ecosystem for
@@ -132,8 +132,8 @@ use rgbstd::{
     },
     rgbcore::commit_verify::Conceal,
     stl::{
-        AssetSpec, Attachment, ContractTerms, Details, MediaType, Name, RejectListUrl,
-        RicardianContract, Ticker,
+        AssetSpec, Attachment, BridgeLocation, ContractTerms, Details, EvmAddress, EvmContract,
+        MediaType, Name, RejectListLocation, RejectListUrl, RicardianContract, Ticker,
     },
     txout::{BlindSeal, CloseMethod, ExplicitSeal},
     validation::{
@@ -143,16 +143,16 @@ use rgbstd::{
 };
 #[cfg(feature = "esplora")]
 use rgbstd::{
-    Assign, KnownTransition,
-    containers::Consignment,
+    Assign, AssignmentType, KnownTransition, OpId,
+    containers::{Consignment, PendingConsignment},
     contract::SchemaWrapper,
     daggy::Walker,
     txout::TxPtr,
-    validation::{OpoutsDagData, Validity, Warning},
+    validation::{ExternalAnchor, OpoutsDagData, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
-use schemata::{IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION};
-use schemata::{InflatableFungibleAsset, NonInflatableAsset};
+use schemata::{BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT};
+use schemata::{BridgedFungibleAsset, InflatableFungibleAsset, NonInflatableAsset};
 use scrypt::{
     Params, Scrypt,
     password_hash::{PasswordHasher, Salt, SaltString, rand_core::OsRng},
@@ -179,7 +179,7 @@ use crate::utils::INDEXER_PARALLEL_REQUESTS;
 use crate::utils::{OffchainResolverWasm, WasmResolver};
 #[cfg(feature = "esplora")]
 use crate::{
-    api::proxy::GetConsignmentResponse,
+    api::{evm::EvmClient, proxy::GetConsignmentResponse},
     database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
     error::IndexerError,
     utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},
@@ -197,5 +197,5 @@ use crate::{
         get_descriptors, get_descriptors_from_xpubs, load_rgb_runtime, now, parse_address_str,
         setup_logger, str_to_xpub,
     },
-    wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
+    wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_BFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
 };
