@@ -5,6 +5,8 @@ pub const REGTEST_HELPER_URL: &str = "http://127.0.0.1:8080";
 pub const ESPLORA_URL: &str = "http://127.0.0.1:8094/regtest/api";
 pub const PROXY_URL: &str = "http://127.0.0.1:3000/json-rpc";
 pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
+#[allow(dead_code)]
+pub const EVM_RPC_URL: &str = "http://127.0.0.1:8545";
 
 #[derive(Serialize)]
 struct MineRequest {
