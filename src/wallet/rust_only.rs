@@ -384,9 +384,10 @@ impl Wallet {
                 };
                 let initial_supply = contract.total_issued_supply().into();
                 let max_supply = contract.max_supply().into();
-                let known_circulating_supply = IfaWrapper::with(valid_transfer.contract_data())
-                    .total_issued_supply()
-                    .into();
+                let known_circulating_supply =
+                    IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
+                        .total_issued_supply()
+                        .into();
                 let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
                 LocalAssetData {
                     name,
@@ -533,25 +534,33 @@ impl Wallet {
 
         debug!(self.logger, "Validating consignment...");
         let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
+        let schema_rules = asset_schema.schema_rules();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            trusted_typesystem,
             ..Default::default()
         };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger, "Consignment is invalid: {}", e);
-                return Err(Error::InvalidConsignment);
-            }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger, "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-        };
+        let valid_consignment =
+            match consignment
+                .clone()
+                .validate(&schema_rules, &resolver, &validation_config)
+            {
+                Ok(consignment) => consignment,
+                Err(ValidationError::InvalidConsignment(e)) => {
+                    error!(self.logger, "Consignment is invalid: {}", e);
+                    return Err(Error::InvalidConsignment);
+                }
+                Err(ValidationError::ResolverError(e)) => {
+                    warn!(self.logger, "Network error during consignment validation");
+                    return Err(Error::Network {
+                        details: e.to_string(),
+                    });
+                }
+                Err(e) => {
+                    return Err(Error::Internal {
+                        details: format!("unexpected consignment validation error: {e}"),
+                    });
+                }
+            };
         let validity = valid_consignment.validation_status().validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
 
@@ -654,7 +663,7 @@ pub fn validate_consignment_offchain(
     let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
     let chain_net: ChainNet = bitcoin_network.into();
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-    let trusted_typesystem = asset_schema.types();
+    let schema_rules = asset_schema.schema_rules();
 
     let wasm_resolver = crate::utils::WasmResolver::from_consignment(&consignment, chain_net);
     let resolver = crate::utils::OffchainResolverWasm {
@@ -665,11 +674,13 @@ pub fn validate_consignment_offchain(
 
     let validation_config = ValidationConfig {
         chain_net,
-        trusted_typesystem,
         ..Default::default()
     };
 
-    match consignment.clone().validate(&resolver, &validation_config) {
+    match consignment
+        .clone()
+        .validate(&schema_rules, &resolver, &validation_config)
+    {
         Ok(valid_consignment) => {
             let status = valid_consignment.validation_status();
             Ok(ValidateConsignmentResult {
@@ -695,6 +706,12 @@ pub fn validate_consignment_offchain(
             valid: false,
             warnings: None,
             error: Some("resolver".to_string()),
+            details: Some(e.to_string()),
+        }),
+        Err(e) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("unexpected".to_string()),
             details: Some(e.to_string()),
         }),
     }
