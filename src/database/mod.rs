@@ -1,5 +1,4 @@
 pub(crate) mod memory_db;
-pub(crate) mod rgb_store;
 
 use super::*;
 

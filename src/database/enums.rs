@@ -7,8 +7,6 @@ pub enum AssetSchema {
     Nia = 1,
     /// IFA schema
     Ifa = 4,
-    /// BFA schema
-    Bfa = 5,
 }
 
 impl fmt::Display for AssetSchema {
@@ -24,7 +22,6 @@ impl TryFrom<String> for AssetSchema {
         Ok(match &schema_id[..] {
             SCHEMA_ID_NIA => AssetSchema::Nia,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
-            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -39,13 +36,12 @@ impl TryFrom<SchemaId> for AssetSchema {
 }
 
 impl AssetSchema {
-    pub(crate) const VALUES: [Self; NUM_KNOWN_SCHEMAS] = [Self::Nia, Self::Ifa, Self::Bfa];
+    pub(crate) const VALUES: [Self; NUM_KNOWN_SCHEMAS] = [Self::Nia, Self::Ifa];
 
     fn from_schema_id_str(schema_id: String) -> Result<Self, Error> {
         Ok(match &schema_id[..] {
             SCHEMA_ID_NIA => AssetSchema::Nia,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
-            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -63,24 +59,38 @@ impl AssetSchema {
         Self::from_schema_id(schema_id)
     }
 
-    pub(crate) fn schema_rules(&self) -> SchemaRules {
+    fn schema(&self) -> Schema {
         match self {
-            Self::Nia => NonInflatableAsset::schema_rules(),
-            Self::Ifa => InflatableFungibleAsset::schema_rules(),
-            Self::Bfa => BridgedFungibleAsset::schema_rules(),
+            Self::Nia => NonInflatableAsset::schema(),
+            Self::Ifa => InflatableFungibleAsset::schema(),
         }
     }
 
-    pub(crate) fn schema_definition(&self) -> SchemaDefinition {
+    fn scripts(&self) -> Scripts {
         match self {
-            Self::Nia => NonInflatableAsset::schema_definition(),
-            Self::Ifa => InflatableFungibleAsset::schema_definition(),
-            Self::Bfa => BridgedFungibleAsset::schema_definition(),
+            Self::Nia => NonInflatableAsset::scripts(),
+            Self::Ifa => InflatableFungibleAsset::scripts(),
         }
     }
 
-    pub(crate) fn import_schema_definition(&self, runtime: &mut RgbRuntime) -> Result<(), Error> {
-        runtime.import_schema_definition(self.schema_definition())?;
+    /// Returns the type system for this asset schema.
+    pub fn types(&self) -> TypeSystem {
+        match self {
+            Self::Nia => NonInflatableAsset::types(),
+            Self::Ifa => InflatableFungibleAsset::types(),
+        }
+    }
+
+    pub(crate) fn import_kit(&self, runtime: &mut RgbRuntime) -> Result<(), Error> {
+        let schema = self.schema();
+        let lib = self.scripts();
+        let types = self.types();
+        let mut kit = Kit::default();
+        kit.schemata.push(schema).unwrap();
+        kit.scripts.extend(lib.into_values()).unwrap();
+        kit.types = types;
+        let valid_kit = kit.validate().map_err(|_| InternalError::Unexpected)?;
+        runtime.import_kit(valid_kit)?;
         Ok(())
     }
 }
@@ -90,7 +100,6 @@ impl From<AssetSchema> for SchemaId {
         match asset_schema {
             AssetSchema::Ifa => SchemaId::from_str(SCHEMA_ID_IFA).unwrap(),
             AssetSchema::Nia => SchemaId::from_str(SCHEMA_ID_NIA).unwrap(),
-            AssetSchema::Bfa => SchemaId::from_str(SCHEMA_ID_BFA).unwrap(),
         }
     }
 }
@@ -180,8 +189,6 @@ pub enum Assignment {
     NonFungible,
     /// Inflation right
     InflationRight(u64),
-    /// Mint right
-    MintRight,
     /// Any assignment
     Any,
 }
@@ -195,7 +202,6 @@ impl Assignment {
                 Self::InflationRight(amt.as_u64())
             }
             AllocatedState::Data(_) => Self::NonFungible,
-            AllocatedState::Void if opout.ty == OS_MINT => Self::MintRight,
             _ => unreachable!(),
         }
     }
@@ -206,7 +212,6 @@ impl Assignment {
             Self::Fungible(amt) => assignments.fungible += amt,
             Self::NonFungible => assignments.non_fungible = true,
             Self::InflationRight(amt) => assignments.inflation += amt,
-            Self::MintRight => assignments.mint += 1,
             _ => unreachable!("when using this method we should know the assignment type"),
         }
     }
@@ -244,7 +249,7 @@ mod tests {
         for asset_schema in AssetSchema::VALUES {
             assert_eq!(
                 SchemaId::from(asset_schema),
-                asset_schema.schema_definition().schema.schema_id(),
+                asset_schema.schema().schema_id(),
                 "SCHEMA_ID constant for {asset_schema} is stale"
             );
         }

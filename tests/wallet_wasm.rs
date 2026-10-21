@@ -4,7 +4,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
+use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -191,39 +191,9 @@ fn test_receive_and_transfers() {
     assert!(!data.transport_endpoints.is_empty());
     assert_eq!(data.expiration_timestamp, recv.expiration_timestamp);
 
-    // Invoice: BFA assignments
-    let bfa_invoice = |state: &str, name: Option<&str>| {
-        let mut invoice = format!("rgb:~/{BFA_SCHEMA_ID}/{state}/{}", recv.recipient_id);
-        if let Some(name) = name {
-            invoice.push_str(&format!("?assignment_name={name}"));
-        }
-        Invoice::new(invoice)
-    };
-    for (state, name, assignment) in [
-        (AMOUNT_100, Some("assetOwner"), Assignment::Fungible(100)),
-        ("~", Some("assetOwner"), Assignment::Fungible(0)),
-        (AMOUNT_100, None, Assignment::Any),
-        ("~", None, Assignment::Any),
-    ] {
-        let data = bfa_invoice(state, name).unwrap().invoice_data();
-        assert_eq!(data.asset_schema, Some(AssetSchema::Bfa));
-        assert_eq!(data.assignment, assignment);
-    }
-    for (state, name) in [(AMOUNT_100, "inflationAllowance"), ("~", "other")] {
-        assert!(matches!(
-            bfa_invoice(state, Some(name)),
-            Err(Error::InvalidInvoice { .. })
-        ));
-    }
-
     // Invoice: invalid string should fail
     assert!(Invoice::new("not-a-valid-invoice".to_string()).is_err());
 }
-
-/// The BFA schema ID as an invoice carries it
-const BFA_SCHEMA_ID: &str = "Ryl5eQZ3IHrU05e3AWdQZJR4FB5GvxZPy96cwhJiApc";
-/// The amount 100 as an invoice carries it
-const AMOUNT_100: &str = "BF";
 
 /// Tests error paths and backup: invalid PSBT, issue without UTXOs,
 /// nonexistent asset balance, backup/restore round-trip

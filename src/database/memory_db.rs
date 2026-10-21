@@ -196,8 +196,6 @@ pub struct DbTransfer {
     pub recipient_id: Option<String>,
     pub ack: Option<bool>,
     pub invoice_string: Option<String>,
-    #[serde(default)]
-    pub burn_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -210,7 +208,6 @@ pub struct DbTransferActMod {
     pub recipient_id: ActiveValue<Option<String>>,
     pub ack: ActiveValue<Option<bool>>,
     pub invoice_string: ActiveValue<Option<String>>,
-    pub burn_reason: ActiveValue<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,7 +393,6 @@ impl From<DbTransfer> for DbTransferActMod {
             recipient_id: ActiveValue::Unchanged(m.recipient_id),
             ack: ActiveValue::Unchanged(m.ack),
             invoice_string: ActiveValue::Unchanged(m.invoice_string),
-            burn_reason: ActiveValue::Unchanged(m.burn_reason),
         }
     }
 }
@@ -638,7 +634,6 @@ impl InMemoryDb {
             recipient_id: av(t.recipient_id),
             ack: av(t.ack),
             invoice_string: av(t.invoice_string),
-            burn_reason: av(t.burn_reason),
         };
         self.transfers.borrow_mut().push(row);
         Ok(idx)
@@ -741,9 +736,6 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &t.invoice_string {
             row.invoice_string = v.clone();
-        }
-        if let ActiveValue::Set(v) = &t.burn_reason {
-            row.burn_reason = v.clone();
         }
         Ok(row.clone())
     }
