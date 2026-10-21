@@ -15,7 +15,8 @@ rgb-lib-wasm lets you issue, send, and receive RGB assets from a web browser. It
 
 Supported asset types:
 - **NIA** (Non-Inflatable Asset)
-- **IFA** (Inflatable Fungible Asset).
+- **IFA** (Inflatable Fungible Asset)
+- **BFA** (Bridged Fungible Asset): issue, hold, send and receive. Mint and burn are not supported.
 
 ## Prerequisites
 
@@ -326,12 +327,13 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `listTransfers(assetId?)` | no | List RGB transfers |
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions |
-| `goOnline(skipCheck, indexerUrl)` | yes | Connect to an Esplora indexer |
+| `goOnline(skipCheck, indexerUrl, evmRpcUrls?)` | yes | Connect to an Esplora indexer. `evmRpcUrls` maps an EVM chain ID to an RPC URL, for BFA |
 | `sync(online)` | yes | Sync wallet with indexer |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
 | `issueAssetIfa(...)` | no | Issue an Inflatable Fungible Asset |
+| `issueAssetBfa(...)` | no | Issue a Bridged Fungible Asset with mint rights and no units |
 | `blindReceive(...)` | no | Create a blind receive invoice |
 | `witnessReceive(...)` | no | Create a witness receive invoice |
 | `sendBegin(...)` | yes | Prepare RGB send PSBT |

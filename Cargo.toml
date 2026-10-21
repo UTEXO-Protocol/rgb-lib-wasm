@@ -92,6 +92,9 @@ camel_case = []
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+mockito = { version = "1", default-features = false }
+
 [profile.reldebug]
 inherits = "release"
 debug = 1

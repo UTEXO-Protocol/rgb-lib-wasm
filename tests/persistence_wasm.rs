@@ -191,7 +191,7 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     );
     let mut funded = Wallet::new(wd1.clone()).unwrap();
     let online = funded
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     let addr = funded.get_address().unwrap();
@@ -210,7 +210,7 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     );
     let mut thin = Wallet::new(wd2).unwrap();
     let online = thin
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
 
@@ -242,7 +242,7 @@ async fn test_persistence_across_reload() {
     let wd_a = test_wallet_data(&keys_a, vec![AssetSchema::Nia], "/tmp/persist_a");
     let mut wallet = Wallet::new(wd_a.clone()).unwrap();
     let online = wallet
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
 
@@ -264,7 +264,7 @@ async fn test_persistence_across_reload() {
     // Reload
     let mut wallet = simulate_reload(wallet, &wd_a).await;
     let online = wallet
-        .go_online(true, ESPLORA_URL.to_string())
+        .go_online(true, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     wallet.sync(online.clone()).await.unwrap();
@@ -290,7 +290,7 @@ async fn test_persistence_across_reload() {
     let wd_b = test_wallet_data(&keys_b, vec![AssetSchema::Nia], "/tmp/persist_b");
     let mut wallet_b = Wallet::new(wd_b).unwrap();
     let online_b = wallet_b
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
@@ -341,7 +341,7 @@ async fn test_persistence_across_reload() {
     // Reload wallet A after send_end but before refresh
     let mut wallet = simulate_reload(wallet, &wd_a).await;
     let online = wallet
-        .go_online(true, ESPLORA_URL.to_string())
+        .go_online(true, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     wallet.sync(online.clone()).await.unwrap();
@@ -395,7 +395,7 @@ async fn test_persistence_across_reload() {
     // Restore into a fresh wallet with same keys
     let mut fresh_wallet = Wallet::new(wd_a.clone()).unwrap();
     fresh_wallet
-        .go_online(true, ESPLORA_URL.to_string())
+        .go_online(true, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     fresh_wallet
@@ -414,7 +414,7 @@ async fn test_persistence_across_reload() {
     // Reload again: state should survive (Bug 3 regression)
     let mut reloaded = simulate_reload(fresh_wallet, &wd_a).await;
     reloaded
-        .go_online(true, ESPLORA_URL.to_string())
+        .go_online(true, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
 
@@ -446,11 +446,11 @@ async fn test_accept_transfer_is_durable_before_success() {
     let mut wallet_a = Wallet::new(wd_a).unwrap();
     let mut wallet_b = Wallet::new(wd_b.clone()).unwrap();
     let online_a = wallet_a
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     let online_b = wallet_b
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
 
@@ -557,7 +557,7 @@ async fn test_pending_funding_transfer_completes_after_reload() {
     let mut wallet_a = Wallet::new(wd_a.clone()).unwrap();
     let mut wallet_b = Wallet::new(wd_b).unwrap();
     let online_a = wallet_a
-        .go_online(false, ESPLORA_URL.to_string())
+        .go_online(false, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
 
@@ -617,7 +617,7 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         .unwrap();
     let mut wallet_a = simulate_reload(wallet_a, &wd_a).await;
     let restored_online = wallet_a
-        .go_online(true, ESPLORA_URL.to_string())
+        .go_online(true, ESPLORA_URL.to_string(), HashMap::new())
         .await
         .unwrap();
     let completed = wallet_a

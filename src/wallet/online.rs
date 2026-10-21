@@ -42,6 +42,9 @@ pub struct AssignmentsCollection {
     pub non_fungible: bool,
     /// Inflation assignments
     pub inflation: u64,
+    /// Mint rights
+    #[serde(default)]
+    pub mint: u64,
 }
 
 impl AssignmentsCollection {
@@ -68,6 +71,9 @@ impl AssignmentsCollection {
             AllocatedState::Data(_) => {
                 self.add_non_fungible();
             }
+            AllocatedState::Void if opout.ty == OS_MINT => {
+                self.mint += 1;
+            }
             _ => {}
         }
     }
@@ -81,6 +87,7 @@ impl AssignmentsCollection {
                 needed.inflation.saturating_sub(self.inflation) > 0
             }
             (AllocatedState::Data(_), _) => needed.non_fungible && !self.non_fungible,
+            (AllocatedState::Void, OS_MINT) => needed.mint > self.mint,
             _ => false,
         }
     }
@@ -90,6 +97,7 @@ impl AssignmentsCollection {
             fungible: self.fungible - needed.fungible,
             non_fungible: false,
             inflation: self.inflation - needed.inflation,
+            mint: self.mint - needed.mint,
         }
     }
 
@@ -101,6 +109,9 @@ impl AssignmentsCollection {
             return false;
         }
         if self.inflation < needed.inflation {
+            return false;
+        }
+        if self.mint < needed.mint {
             return false;
         }
         true
@@ -146,6 +157,9 @@ pub(crate) struct InfoBatchTransfer {
 enum TypeOfTransition {
     Inflate,
     Transfer,
+    /// A BFA mint after the given EVM block, for tests only
+    #[cfg(test)]
+    Mint(u64),
 }
 
 impl TypeOfTransition {
@@ -153,6 +167,25 @@ impl TypeOfTransition {
         match self {
             Self::Inflate => "inflate",
             Self::Transfer => "transfer",
+            #[cfg(test)]
+            Self::Mint(_) => "mint",
+        }
+    }
+}
+
+/// Where the reject list of an asset is kept.
+pub(crate) enum RejectListSource {
+    /// A list of opouts served at a URL
+    Url(String),
+    /// A list kept by an `IRgbRejectList` EVM contract
+    Evm(EvmContract),
+}
+
+impl From<RejectListLocation> for RejectListSource {
+    fn from(location: RejectListLocation) -> Self {
+        match location {
+            RejectListLocation::Url(url) => Self::Url(url.to_string()),
+            RejectListLocation::Evm(contract) => Self::Evm(contract),
         }
     }
 }
@@ -382,6 +415,8 @@ pub(crate) struct OnlineData {
     pub(crate) id: u64,
     pub(crate) indexer_url: String,
     indexer: Indexer,
+    // EVM RPC URLs by chain ID, checked when going online
+    evm_rpc_urls: HashMap<u64, String>,
 }
 
 #[cfg(test)]
@@ -392,6 +427,7 @@ impl OnlineData {
             id: 1,
             indexer_url: indexer_url.to_string(),
             indexer: crate::utils::build_indexer(indexer_url).unwrap(),
+            evm_rpc_urls: HashMap::new(),
         }
     }
 }
@@ -722,6 +758,13 @@ impl Wallet {
             {
                 needed = true;
             }
+            if assignments_collected.mint < assignments_needed.mint
+                && asset_allocations
+                    .iter()
+                    .any(|a| a.assignment == Assignment::MintRight)
+            {
+                needed = true;
+            }
             // skip UTXOs with no needed allocations
             if !needed {
                 continue;
@@ -933,7 +976,7 @@ impl Wallet {
         Ok(graph_seal)
     }
 
-    fn _check_dag(
+    pub(crate) fn _check_dag(
         &self,
         dag_data: &OpoutsDagData,
         reject_opouts: &HashSet<Opout>,
@@ -1069,7 +1112,8 @@ impl Wallet {
             }
 
             for recipient in transfer_info.recipients.clone() {
-                let recipient_type = if transfer_info.main_transition == TypeOfTransition::Inflate {
+                let recipient_type = if transfer_info.main_transition != TypeOfTransition::Transfer
+                {
                     let vout = if let LocalRecipientData::Witness(local_witness_data) =
                         recipient.local_recipient_data
                     {
@@ -1222,17 +1266,39 @@ impl Wallet {
             id: online.id,
             indexer_url,
             indexer,
+            evm_rpc_urls: HashMap::new(),
         };
         Ok((online, online_data))
     }
 
     /// Return the existing or freshly generated set of wallet [`Online`] data (wasm32 async).
+    ///
+    /// The `evm_rpc_urls` map an EVM chain ID to the RPC URL of a node on that chain. BFA
+    /// operations use them. When the wallet supports BFA, each URL is checked to be on its chain.
     pub async fn go_online(
         &mut self,
         _skip_consistency_check: bool,
         indexer_url: String,
+        mut evm_rpc_urls: HashMap<u64, String>,
     ) -> Result<Online, Error> {
         info!(self.logger, "Going online...");
+        if self.supports_schema(&AssetSchema::Bfa) {
+            for (chain_id, evm_rpc_url) in &evm_rpc_urls {
+                let actual = EvmClient::new(evm_rpc_url).chain_id().await.map_err(|e| {
+                    Error::InvalidEvmRpcUrl {
+                        details: e.to_string(),
+                    }
+                })?;
+                if actual != *chain_id {
+                    return Err(Error::EvmChainIdMismatch {
+                        expected: *chain_id,
+                        actual,
+                    });
+                }
+            }
+        } else {
+            evm_rpc_urls.clear();
+        }
         let online = if let Some(online_data) = &self.online_data {
             let online = Online {
                 id: online_data.id,
@@ -1251,6 +1317,7 @@ impl Wallet {
             self.online_data = Some(online_data);
             online
         };
+        self.online_data.as_mut().unwrap().evm_rpc_urls = evm_rpc_urls;
         info!(self.logger, "Go online completed");
         Ok(online)
     }
@@ -1719,6 +1786,19 @@ impl Wallet {
                     )
                     .unwrap();
             }
+            #[cfg(test)]
+            if let TypeOfTransition::Mint(after_block) = transfer_info.main_transition {
+                let minted: u64 = transfer_info
+                    .recipients
+                    .iter()
+                    .map(|r| r.assignment.main_amount())
+                    .sum();
+                asset_transition_builder = asset_transition_builder
+                    .add_global_state(RGB_GLOBAL_ISSUED_SUPPLY, Amount::from(minted))
+                    .unwrap()
+                    .add_metadata("afterBlock", rgbstd::stl::BlockNumber::from(after_block))
+                    .unwrap();
+            }
 
             let transition = asset_transition_builder.complete_transition()?;
             all_transitions
@@ -1817,8 +1897,21 @@ impl Wallet {
                 },
             );
 
+            let contract_id = transfer_info.asset_info.contract_id;
+            let reject_list_source = match transfer_info.asset_info.reject_list_url.clone() {
+                Some(url) => Some(RejectListSource::Url(url)),
+                None if AssetSchema::get_from_contract_id(contract_id, runtime)?
+                    == AssetSchema::Bfa =>
+                {
+                    runtime
+                        .contract_wrapper::<BridgedFungibleAsset>(contract_id)?
+                        .reject_list()
+                        .map(RejectListSource::from)
+                }
+                None => None,
+            };
             let should_build_dag = transfer_info.main_transition == TypeOfTransition::Transfer
-                && transfer_info.asset_info.reject_list_url.is_some();
+                && reject_list_source.is_some();
 
             let consignment = if should_build_dag {
                 let (consignment, dag_data) = runtime.transfer_with_dag(
@@ -1829,9 +1922,7 @@ impl Wallet {
                 )?;
 
                 let (reject_opouts, allow_opouts) = self
-                    ._get_reject_list_async(
-                        transfer_info.asset_info.reject_list_url.as_ref().unwrap(),
-                    )
+                    ._get_reject_list_async(reject_list_source.as_ref().unwrap())
                     .await?;
                 let asset_opouts = input_opouts
                     .get(&transfer_info.asset_info.contract_id)
@@ -1978,10 +2069,73 @@ impl Wallet {
         Ok(PrepareTransferPsbtResult::Success(psbt.to_string()))
     }
 
-    async fn _get_reject_list_async(
+    fn _evm_client(&self, chain_id: u64) -> Option<EvmClient> {
+        self.online_data
+            .as_ref()
+            .unwrap()
+            .evm_rpc_urls
+            .get(&chain_id)
+            .map(|url| EvmClient::new(url))
+    }
+
+    /// Confirm the external anchors of a consignment on the EVM chain of its bridge.
+    ///
+    /// Return the ID of a mint that is not confirmed yet, if any. Without an EVM RPC URL for the
+    /// chain, no mint is confirmed.
+    pub(crate) async fn _resolve_anchors(
         &self,
-        reject_list_url: &str,
+        pending: &mut PendingConsignment<true>,
+    ) -> Result<Option<OpId>, Error> {
+        let anchors: Vec<ExternalAnchor> =
+            pending.pending().unresolved_anchors().cloned().collect();
+        let Some(ExternalAnchor::MintEvent { opid, .. }) = anchors.first() else {
+            return Ok(None);
+        };
+        let BridgeLocation::Evm(EvmContract { chain_id, address }) =
+            BridgedFungibleAsset::bridge_location(&pending.consignment().genesis).map_err(|e| {
+                Error::Internal {
+                    details: format!("unexpected bridge location error: {e:?}"),
+                }
+            })?;
+        let Some(evm_client) = self._evm_client(chain_id) else {
+            warn!(self.logger, "No EVM RPC URL for chain ID {chain_id}");
+            return Ok(Some(*opid));
+        };
+        for anchor in &anchors {
+            let ExternalAnchor::MintEvent {
+                opid,
+                amount,
+                after_block,
+            } = anchor;
+            if !evm_client
+                .find_funds_in(&address, opid, *amount, *after_block)
+                .await?
+            {
+                return Ok(Some(*opid));
+            }
+            pending
+                .pending()
+                .resolve_anchor(anchor)
+                .map_err(|e| Error::Internal {
+                    details: format!("unexpected anchor resolution error: {e}"),
+                })?;
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn _get_reject_list_async(
+        &self,
+        source: &RejectListSource,
     ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
+        let reject_list_url = match source {
+            RejectListSource::Url(url) => url,
+            RejectListSource::Evm(EvmContract { chain_id, address }) => {
+                let evm_client = self._evm_client(*chain_id).ok_or(Error::NoEvmRpcUrl {
+                    chain_id: *chain_id,
+                })?;
+                return Ok(evm_client.reject_list_entries(address).await?.decisions());
+            }
+        };
         let list = self
             .wasm_proxy_client
             .get_reject_list(reject_list_url)
@@ -2213,34 +2367,35 @@ impl Wallet {
             build_opouts_dag: true,
             ..Default::default()
         };
-        let valid_consignment =
-            match consignment
-                .clone()
-                .validate(&schema_rules, &resolver, &validation_config)
-            {
-                Ok(consignment) => consignment,
-                Err(ValidationError::InvalidConsignment(e)) => {
-                    error!(self.logger, "Consignment is invalid: {}", e);
-                    return self
-                        ._refuse_consignment_async(
-                            proxy_url,
-                            recipient_id,
-                            &mut updated_batch_transfer,
-                        )
-                        .await;
-                }
-                Err(ValidationError::ResolverError(e)) => {
-                    warn!(self.logger, "Network error during consignment validation");
-                    return Err(Error::Network {
-                        details: e.to_string(),
-                    });
-                }
-                Err(e) => {
-                    return Err(Error::Internal {
-                        details: format!("unexpected consignment validation error: {e}"),
-                    });
-                }
-            };
+        let mut pending = match consignment
+            .clone()
+            .validate_deterministic(&schema_rules, &validation_config)
+            .and_then(|mut p| p.pending().resolve_all(&resolver).map(|_| p))
+        {
+            Ok(pending) => pending,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(self.logger, "Consignment is invalid: {}", e);
+                return self
+                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    .await;
+            }
+            Err(ValidationError::ResolverError(e)) => {
+                warn!(self.logger, "Network error during consignment validation");
+                return Err(Error::Network {
+                    details: e.to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
+                });
+            }
+        };
+        if let Some(opid) = self._resolve_anchors(&mut pending).await? {
+            warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
+            return Ok(None);
+        }
+        let valid_consignment = pending.finalize();
         let validation_status = valid_consignment.validation_status();
         let validity = validation_status.validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
@@ -2334,45 +2489,48 @@ impl Wallet {
                 .await;
         };
 
-        if asset_schema == AssetSchema::Ifa {
-            let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.clone()) {
-                ass.reject_list_url
-            } else {
-                let contract = IfaWrapper::with(runtime.consignment_data(&valid_consignment)?);
-                contract.reject_list_url().map(|u| u.to_string())
-            };
-            if let Some(url) = &url {
-                let (reject_opouts, allow_opouts) = self._get_reject_list_async(url).await?;
-
-                let to_reject = self._check_dag(
-                    validation_status
-                        .dag_data_opt
-                        .as_ref()
-                        .expect("build_opouts_dag is true"),
-                    &reject_opouts,
-                    &allow_opouts,
-                    &received.clone().into_keys().collect(),
-                )?;
-
-                if !to_reject.is_empty() {
-                    error!(
-                        self.logger,
-                        "Found {} opout(s) that must be rejected",
-                        to_reject.len()
-                    );
-                    return self
-                        ._refuse_consignment_async(
-                            proxy_url,
-                            recipient_id,
-                            &mut updated_batch_transfer,
-                        )
-                        .await;
+        let reject_list_source = match asset_schema {
+            AssetSchema::Ifa => {
+                let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.clone()) {
+                    ass.reject_list_url
                 } else {
-                    info!(
-                        self.logger,
-                        "Didn't find any opout(s) that should be rejected"
-                    );
-                }
+                    let contract = IfaWrapper::with(runtime.consignment_data(&valid_consignment)?);
+                    contract.reject_list_url().map(|u| u.to_string())
+                };
+                url.map(RejectListSource::Url)
+            }
+            AssetSchema::Bfa => BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
+                .reject_list()
+                .map(RejectListSource::from),
+            AssetSchema::Nia => None,
+        };
+        if let Some(source) = &reject_list_source {
+            let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
+
+            let to_reject = self._check_dag(
+                validation_status
+                    .dag_data_opt
+                    .as_ref()
+                    .expect("build_opouts_dag is true"),
+                &reject_opouts,
+                &allow_opouts,
+                &received.clone().into_keys().collect(),
+            )?;
+
+            if !to_reject.is_empty() {
+                error!(
+                    self.logger,
+                    "Found {} opout(s) that must be rejected",
+                    to_reject.len()
+                );
+                return self
+                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    .await;
+            } else {
+                info!(
+                    self.logger,
+                    "Didn't find any opout(s) that should be rejected"
+                );
             }
         }
 
@@ -2396,6 +2554,13 @@ impl Wallet {
                     AssetSchema::Ifa => {
                         let contract_data = runtime.consignment_data(&valid_contract)?;
                         let contract = IfaWrapper::with(contract_data);
+                        if let Some(attachment) = contract.contract_terms().media {
+                            attachments.push(attachment)
+                        }
+                    }
+                    AssetSchema::Bfa => {
+                        let contract_data = runtime.consignment_data(&valid_contract)?;
+                        let contract = BfaWrapper::with(contract_data);
                         if let Some(attachment) = contract.contract_terms().media {
                             attachments.push(attachment)
                         }
@@ -2695,13 +2860,15 @@ impl Wallet {
                 chain_net: self.chain_net(),
                 ..Default::default()
             };
-            let valid_consignment = consignment
-                .validate(
-                    &asset_schema.schema_rules(),
-                    &wasm_resolver,
-                    &validation_config,
-                )
+            let mut pending = consignment
+                .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
+                .and_then(|mut p| p.pending().resolve_all(&wasm_resolver).map(|_| p))
                 .map_err(|_| InternalError::Unexpected)?;
+            if let Some(opid) = self._resolve_anchors(&mut pending).await? {
+                warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
+                return Ok(None);
+            }
+            let valid_consignment = pending.finalize();
             let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
             runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
@@ -3001,7 +3168,10 @@ impl Wallet {
             for recipient in recipients.clone() {
                 self.check_transport_endpoints(&recipient.transport_endpoints)?;
                 match (&recipient.assignment, schema) {
-                    (Assignment::Fungible(amt), AssetSchema::Nia | AssetSchema::Ifa) => {
+                    (
+                        Assignment::Fungible(amt),
+                        AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa,
+                    ) => {
                         if *amt == 0 {
                             return Err(Error::InvalidAmountZero);
                         }
@@ -3842,19 +4012,22 @@ impl Wallet {
         )?;
 
         let (asset_id, transfer_info) = transfer_info_map.into_iter().next().unwrap();
-        let inflation = transfer_info.original_assignments_needed.inflation;
-        let db_asset = self.database.get_asset(asset_id).unwrap().unwrap();
-        let updated_known_circulating_supply = db_asset
-            .known_circulating_supply
-            .as_ref()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap()
-            + inflation;
-        let mut updated_asset: DbAssetActMod = db_asset.into();
-        updated_asset.known_circulating_supply =
-            ActiveValue::Set(Some(updated_known_circulating_supply.to_string()));
-        self.database.update_asset(&mut updated_asset)?;
+        // a test BFA mint has no known circulating supply
+        if transfer_info.main_transition == TypeOfTransition::Inflate {
+            let inflation = transfer_info.original_assignments_needed.inflation;
+            let db_asset = self.database.get_asset(asset_id).unwrap().unwrap();
+            let updated_known_circulating_supply = db_asset
+                .known_circulating_supply
+                .as_ref()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                + inflation;
+            let mut updated_asset: DbAssetActMod = db_asset.into();
+            updated_asset.known_circulating_supply =
+                ActiveValue::Set(Some(updated_known_circulating_supply.to_string()));
+            self.database.update_asset(&mut updated_asset)?;
+        }
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
@@ -3864,6 +4037,90 @@ impl Wallet {
             txid,
             batch_transfer_idx,
         })
+    }
+
+    /// Begin a BFA mint of `amounts` on new UTXOs, with one mint right as input, for tests only.
+    ///
+    /// Return the unsigned PSBT and the mint opid. Complete it with `inflate_end`.
+    #[cfg(test)]
+    pub(crate) async fn test_mint_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        amounts: Vec<u64>,
+        after_block: u64,
+    ) -> Result<(String, OpId), Error> {
+        let asset = self.database.check_asset_exists(asset_id.clone())?;
+        let (fee_rate_checked, unspents, input_unspents, mut runtime) =
+            self._get_transfer_begin_data(online, 1)?;
+        let assignments_needed = AssignmentsCollection {
+            mint: 1,
+            ..Default::default()
+        };
+        let asset_spend = self._select_rgb_inputs(
+            asset_id.clone(),
+            &assignments_needed,
+            input_unspents.clone(),
+        )?;
+        let network: ChainNet = self.bitcoin_network().into();
+        let mut local_recipients = vec![];
+        let mut witness_recipients: Vec<(ScriptBuf, u64)> = vec![];
+        for (idx, amt) in amounts.iter().enumerate() {
+            let script_pubkey = self
+                ._get_new_address(KeychainKind::External)?
+                .script_pubkey();
+            let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
+            witness_recipients.push((script_pubkey, 1000));
+            local_recipients.push(LocalRecipient {
+                recipient_id: XChainNet::with(network, beneficiary).to_string(),
+                local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
+                    amount_sat: 1000,
+                    blinding: None,
+                    vout: idx as u32 + 1,
+                }),
+                assignment: Assignment::Fungible(*amt),
+                transport_endpoints: vec![],
+            })
+        }
+        let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
+        let transfer_info = InfoAssetTransfer {
+            asset_info: AssetInfo {
+                contract_id,
+                reject_list_url: asset.reject_list_url,
+            },
+            recipients: local_recipients,
+            asset_spend,
+            change: AssignmentsCollection::default(),
+            original_assignments_needed: assignments_needed.clone(),
+            assignments_needed,
+            assignments_spent: HashMap::new(),
+            main_transition: TypeOfTransition::Mint(after_block),
+        };
+        let mut transfer_info_map = BTreeMap::from([(asset_id, transfer_info)]);
+        let PrepareTransferPsbtResult::Success(psbt_string) = self
+            ._prepare_transfer_psbt_wasm(
+                &mut transfer_info_map,
+                false,
+                unspents,
+                &input_unspents,
+                &witness_recipients,
+                fee_rate_checked,
+                1,
+                None,
+                &mut runtime,
+                &mut HashSet::new(),
+            )
+            .await?
+        else {
+            unreachable!("a mint has no retry")
+        };
+        let opid = Psbt::from_str(&psbt_string)?
+            .rgb_contract_consumers(contract_id)
+            .unwrap()
+            .into_iter()
+            .find_map(|(opout, opid)| (opout.ty == OS_MINT).then_some(opid))
+            .unwrap();
+        Ok((psbt_string, opid))
     }
 
     /// List vanilla (non-colored) unspent outputs.
@@ -3902,5 +4159,109 @@ impl Wallet {
 
         info!(self.logger, "List unspents vanilla completed");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mint_right_is_not_an_input_of_a_fungible_send() {
+        let mint = Opout::new(OpId::from([1u8; 32]), OS_MINT, 0);
+        let needed = AssignmentsCollection {
+            fungible: 30,
+            ..Default::default()
+        };
+        // the send moves it as an extra allocation
+        assert!(!AssignmentsCollection::default().opout_contributes(
+            &mint,
+            &AllocatedState::Void,
+            &needed
+        ));
+        assert_eq!(
+            Assignment::from_opout_and_state(mint, &AllocatedState::Void),
+            Assignment::MintRight
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn evm_reject_list_rejects_descendants_of_rejected_opout() {
+        use crate::api::evm::tests::*;
+        use crate::api::evm::{REJECT_LIST_ENTRIES_SELECTOR, REJECT_LIST_LENGTH_SELECTOR};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        // entry 1 rejects, entry 2 allows, both finalized
+        let mut server = mockito::Server::new();
+        let length = format!("0x{:064x}", 2);
+        let zero = EvmAddress::default().to_string();
+        let _mocks = [
+            mock_rpc(
+                &mut server,
+                r#"{"method":"eth_blockNumber"}"#,
+                r#""result":"0x10""#,
+            ),
+            mock_finalized_block(&mut server, 8),
+            mock_eth_call(&mut server, &zero, 8, REJECT_LIST_LENGTH_SELECTOR, &length),
+            mock_eth_call(
+                &mut server,
+                &zero,
+                0x10,
+                REJECT_LIST_LENGTH_SELECTOR,
+                &length,
+            ),
+            mock_eth_call(
+                &mut server,
+                &zero,
+                0x10,
+                &format!("{REJECT_LIST_ENTRIES_SELECTOR}{:064x}{:064x}", 0, 2),
+                &encode_entries(&[(1, true), (2, false)]),
+            ),
+        ];
+        let mut wallet = make_test_wallet(false);
+        let mut online_data = OnlineData::for_test(&server.url());
+        online_data.evm_rpc_urls = HashMap::from([(31337, server.url())]);
+        wallet.online_data = Some(online_data);
+        let source = RejectListSource::Evm(EvmContract {
+            chain_id: 31337,
+            address: Default::default(),
+        });
+        let (reject, allow) = block_on(wallet._get_reject_list_async(&source)).unwrap();
+        assert_eq!(reject, HashSet::from([test_opout(1)]));
+        assert_eq!(allow, HashSet::from([test_opout(2)]));
+
+        // 1 -> 3 and 1 -> 2 -> 4: the allowed opout 2 shields 4 but not 3
+        let mut dag = rgbstd::validation::OpoutsDagInfo::new();
+        for b in 1..=4 {
+            let node = dag.register_output(test_opout(b));
+            dag.cache_outputs(&test_opout(b).op, vec![node]);
+        }
+        for (parent, child) in [(1, 3), (1, 2), (2, 4)] {
+            dag.connect_input_to_outputs_by_opid(test_opout(parent), &test_opout(child).op);
+        }
+        let to_reject = wallet
+            ._check_dag(
+                &dag.to_opouts_dag_data(),
+                &reject,
+                &allow,
+                &HashSet::from([test_opout(3), test_opout(4)]),
+            )
+            .unwrap();
+        assert_eq!(to_reject, HashSet::from([test_opout(3)]));
+
+        // a chain with no URL gives an error, not an empty list
+        wallet.online_data.as_mut().unwrap().evm_rpc_urls.clear();
+        assert!(matches!(
+            block_on(wallet._get_reject_list_async(&source)),
+            Err(Error::NoEvmRpcUrl { chain_id: 31337 })
+        ));
+    }
+
+    #[test]
+    fn assignments_collection_without_mint_deserializes() {
+        let collection: AssignmentsCollection =
+            serde_json::from_str(r#"{"fungible":5,"non_fungible":false,"inflation":0}"#).unwrap();
+        assert_eq!(collection.mint, 0);
     }
 }
