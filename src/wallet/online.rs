@@ -2621,6 +2621,71 @@ impl Wallet {
         ))
     }
 
+    /// The consignment an incoming transfer was ACKed with, kept in memory since the ACK.
+    ///
+    /// A wallet restored from a backup taken before consignments were part of it holds the
+    /// transfer in `WaitingConfirmations` without them, so fetch it again from the transfer's
+    /// transport endpoints. A fetched consignment is only used for the same anchor txid and asset,
+    /// and is validated again before being accepted, as on the regular path.
+    async fn _received_consignment_async(
+        &mut self,
+        transfer: &DbTransfer,
+        recipient_id: &str,
+        asset_id: Option<&str>,
+        txid: &str,
+    ) -> Result<Vec<u8>, Error> {
+        if let Some(bytes) = self.received_consignments.get(recipient_id) {
+            return Ok(bytes.clone());
+        }
+        let mut tte_data = self
+            .database
+            .get_transfer_transport_endpoints_data(transfer.idx)?;
+        // the endpoint the consignment was received from first
+        tte_data.sort_by_key(|(tte, _)| !tte.used);
+        for (_, transport_endpoint) in tte_data {
+            let res = match self
+                ._get_consignment_async(&transport_endpoint.endpoint, recipient_id.to_string())
+                .await
+            {
+                Ok(res) => res,
+                Err(Error::NoConsignment) => continue,
+                Err(e) => return Err(e),
+            };
+            if res.txid != txid {
+                warn!(
+                    self.logger,
+                    "Ignoring re-fetched consignment for another TXID: {}", res.txid
+                );
+                continue;
+            }
+            let Ok(bytes) = general_purpose::STANDARD.decode(&res.consignment) else {
+                continue;
+            };
+            if let Some(asset_id) = asset_id {
+                match RgbTransfer::load(&bytes[..]) {
+                    Ok(c) if c.contract_id().to_string() == asset_id => {}
+                    _ => {
+                        warn!(
+                            self.logger,
+                            "Ignoring re-fetched consignment for another asset"
+                        );
+                        continue;
+                    }
+                }
+            }
+            info!(
+                self.logger,
+                "Re-fetched missing consignment for recipient {recipient_id}"
+            );
+            self.received_consignments
+                .insert(recipient_id.to_string(), bytes.clone());
+            return Ok(bytes);
+        }
+        Err(Error::Internal {
+            details: s!("consignment not found in memory"),
+        })
+    }
+
     async fn _wait_confirmations_async(
         &mut self,
         batch_transfer: &DbBatchTransfer,
@@ -2659,14 +2724,14 @@ impl Wallet {
                 .expect("transfer should have a recipient ID");
             debug!(self.logger, "Recipient ID: {recipient_id}");
 
-            // load consignment from in-memory storage
             let consignment_bytes = self
-                .received_consignments
-                .get(&recipient_id)
-                .ok_or_else(|| Error::Internal {
-                    details: s!("consignment not found in memory"),
-                })?
-                .clone();
+                ._received_consignment_async(
+                    &transfer,
+                    &recipient_id,
+                    asset_transfer.asset_id.as_deref(),
+                    &txid,
+                )
+                .await?;
             let consignment =
                 RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
 
@@ -3895,5 +3960,196 @@ impl Wallet {
 
         info!(self.logger, "List unspents vanilla completed");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod received_consignment_tests {
+    use super::*;
+    use crate::database::memory_db::{
+        ActiveValue, DbAssetTransferActMod, DbBatchTransferActMod, DbTransferActMod,
+        DbTransferTransportEndpointActMod, DbTransportEndpointActMod,
+    };
+    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    const TXID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// A JSON-RPC proxy answering every `consignment.get` with `result`, recording each request.
+    fn serve_proxy(result: serde_json::Value) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/json-rpc", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                seen.lock().unwrap().push(String::from_utf8(body).unwrap());
+                let resp =
+                    serde_json::json!({"jsonrpc": "2.0", "id": null, "result": result}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp.len(),
+                    resp
+                )
+                .unwrap();
+            }
+        });
+        (url, requests)
+    }
+
+    /// An incoming transfer in `WaitingConfirmations` received through `proxy_url`.
+    fn seed_incoming(wallet: &Wallet, proxy_url: &str, recipient_id: &str) -> DbTransfer {
+        let db = &wallet.database;
+        let batch_idx = db
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(TXID.to_string())),
+                status: ActiveValue::Set(TransferStatus::WaitingConfirmations),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let asset_transfer_idx = db
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                ..Default::default()
+            })
+            .unwrap();
+        let transfer_idx = db
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                incoming: ActiveValue::Set(true),
+                recipient_id: ActiveValue::Set(Some(recipient_id.to_string())),
+                ack: ActiveValue::Set(Some(true)),
+                ..Default::default()
+            })
+            .unwrap();
+        let endpoint_idx = db
+            .set_transport_endpoint(DbTransportEndpointActMod {
+                endpoint: ActiveValue::Set(proxy_url.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.set_transfer_transport_endpoint(DbTransferTransportEndpointActMod {
+            transfer_idx: ActiveValue::Set(transfer_idx),
+            transport_endpoint_idx: ActiveValue::Set(endpoint_idx),
+            used: ActiveValue::Set(true),
+            ..Default::default()
+        })
+        .unwrap();
+        db.get_db_data(false)
+            .unwrap()
+            .transfers
+            .into_iter()
+            .find(|t| t.idx == transfer_idx)
+            .unwrap()
+    }
+
+    fn received_consignment(
+        wallet: &mut Wallet,
+        transfer: &DbTransfer,
+        recipient_id: &str,
+        asset_id: Option<&str>,
+    ) -> Result<Vec<u8>, Error> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(wallet._received_consignment_async(transfer, recipient_id, asset_id, TXID))
+    }
+
+    fn consignment_response(txid: &str, bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "consignment": general_purpose::STANDARD.encode(bytes),
+            "txid": txid,
+            "vout": null,
+        })
+    }
+
+    #[test]
+    fn uses_in_memory_consignment_without_fetching() {
+        let (url, requests) = serve_proxy(consignment_response(TXID, b"from proxy"));
+        let mut wallet = make_test_wallet(false);
+        let transfer = seed_incoming(&wallet, &url, "rid");
+        wallet
+            .received_consignments
+            .insert(s!("rid"), b"in memory".to_vec());
+
+        let bytes = received_consignment(&mut wallet, &transfer, "rid", None).unwrap();
+
+        assert_eq!(bytes, b"in memory");
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn refetches_missing_consignment_from_proxy() {
+        let (url, requests) = serve_proxy(consignment_response(TXID, b"from proxy"));
+        let mut wallet = make_test_wallet(false);
+        let transfer = seed_incoming(&wallet, &url, "rid");
+
+        let bytes = received_consignment(&mut wallet, &transfer, "rid", None).unwrap();
+
+        assert_eq!(bytes, b"from proxy");
+        assert_eq!(
+            wallet.received_consignments.get("rid"),
+            Some(&b"from proxy".to_vec())
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("consignment.get") && requests[0].contains("rid"));
+    }
+
+    #[test]
+    fn ignores_refetched_consignment_for_another_txid() {
+        let (url, _) = serve_proxy(consignment_response(&"2".repeat(64), b"from proxy"));
+        let mut wallet = make_test_wallet(false);
+        let transfer = seed_incoming(&wallet, &url, "rid");
+
+        let err = received_consignment(&mut wallet, &transfer, "rid", None).unwrap_err();
+
+        assert!(matches!(err, Error::Internal { .. }), "{err:?}");
+        assert!(wallet.received_consignments.is_empty());
+    }
+
+    #[test]
+    fn ignores_refetched_consignment_for_another_asset() {
+        let (url, _) = serve_proxy(consignment_response(TXID, b"not a consignment"));
+        let mut wallet = make_test_wallet(false);
+        let transfer = seed_incoming(&wallet, &url, "rid");
+
+        let err =
+            received_consignment(&mut wallet, &transfer, "rid", Some("rgb:asset")).unwrap_err();
+
+        assert!(matches!(err, Error::Internal { .. }), "{err:?}");
+        assert!(wallet.received_consignments.is_empty());
+    }
+
+    #[test]
+    fn missing_consignment_on_proxy_keeps_transfer_pending() {
+        let (url, _) = serve_proxy(serde_json::Value::Null);
+        let mut wallet = make_test_wallet(false);
+        let transfer = seed_incoming(&wallet, &url, "rid");
+
+        let err = received_consignment(&mut wallet, &transfer, "rid", None).unwrap_err();
+
+        assert!(matches!(err, Error::Internal { .. }), "{err:?}");
     }
 }

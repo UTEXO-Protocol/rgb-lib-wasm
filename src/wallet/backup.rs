@@ -43,6 +43,9 @@ pub(crate) struct WalletBackupPayload {
     #[serde(default)]
     pub(crate) transfer_artifacts:
         std::collections::HashMap<String, super::online::TransferArtifacts>,
+    /// Received consignment bytes keyed by recipient ID, needed to settle an incoming transfer.
+    #[serde(default)]
+    pub(crate) received_consignments: std::collections::HashMap<String, Vec<u8>>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -184,7 +187,7 @@ impl super::Wallet {
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
-            received_consignments: Default::default(),
+            received_consignments: payload.received_consignments,
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
@@ -355,6 +358,7 @@ impl super::Wallet {
             stock_index_b64: general_purpose::STANDARD.encode(index_bytes.as_unconfined()),
             reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
+            received_consignments: self.received_consignments.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -671,6 +675,31 @@ mod tests {
                 .get(&txid)
                 .and_then(|a| a.signed_psbt.clone()),
             Some(s!("psbt"))
+        );
+    }
+
+    #[test]
+    fn restore_payload_keeps_received_consignments() {
+        use crate::keys::generate_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use rgbstd::persistence::Stock;
+
+        let recipient_id = s!("utxob:recipient");
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+
+        let mut receiver = make_test_wallet_with_keys(keys.clone(), false);
+        *receiver.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        receiver
+            .received_consignments
+            .insert(recipient_id.clone(), b"consignment".to_vec());
+        let payload_json = receiver.serialize_backup_payload().unwrap();
+
+        let mut restored = make_test_wallet_with_keys(keys, false);
+        restored.restore_payload(&payload_json).unwrap();
+
+        assert_eq!(
+            restored.received_consignments.get(&recipient_id),
+            Some(&b"consignment".to_vec())
         );
     }
 }
