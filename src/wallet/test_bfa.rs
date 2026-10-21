@@ -4,7 +4,7 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test_configure!(run_in_browser);
 
 #[path = "../../tests/utils/mod.rs"]
-mod utils;
+pub(super) mod utils;
 
 use crate::wallet::{Online, Recipient, Wallet, WalletData};
 use crate::{
@@ -18,7 +18,7 @@ use utils::*;
 const CHAIN_ID: u64 = 31337;
 const BRIDGE: &str = "0x00000000000000000000000000000000000000b1";
 
-fn wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
+pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
     WalletData {
         data_dir: "/tmp/rgb_bfa".to_string(),
@@ -43,7 +43,7 @@ fn transport_endpoint() -> String {
     format!("rpc://{}", PROXY_URL.trim_start_matches("http://"))
 }
 
-async fn funded_wallet(wd: WalletData, utxos: u8) -> (Wallet, Online) {
+pub(super) async fn funded_wallet(wd: WalletData, utxos: u8) -> (Wallet, Online) {
     let mut wallet = Wallet::new(wd).unwrap();
     let online = wallet
         .go_online(false, ESPLORA_URL.to_string(), evm_rpc_urls())
@@ -67,7 +67,7 @@ async fn funded_wallet(wd: WalletData, utxos: u8) -> (Wallet, Online) {
     (wallet, online)
 }
 
-fn mint_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
+pub(super) fn mint_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
     wallet
         .list_unspents(None, false, true)
         .unwrap()
@@ -80,7 +80,7 @@ fn mint_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
 }
 
 /// Send `amount` of `asset_id` from `sender` to a blinded UTXO of `receiver`.
-async fn send(
+pub(super) async fn send(
     sender: &mut Wallet,
     sender_online: &Online,
     receiver: &mut Wallet,
@@ -115,7 +115,7 @@ async fn send(
 }
 
 /// Refresh both wallets and mine, three times. Return the new transfer statuses of the receiver.
-async fn settle(
+pub(super) async fn settle(
     sender: &mut Wallet,
     sender_online: &Online,
     receiver: &mut Wallet,
@@ -310,7 +310,7 @@ async fn evm_rpc(method: &str, params: Value) -> Value {
 }
 
 /// A new EVM address for each call, so that runs on the same node do not share contracts.
-fn new_evm_address() -> String {
+pub(super) fn new_evm_address() -> String {
     let mut bytes = [0u8; 20];
     getrandom::getrandom(&mut bytes).unwrap();
     format!("0x{}", hex::encode(bytes))
@@ -326,18 +326,18 @@ async fn finalized_block() -> u64 {
 }
 
 /// Mine enough EVM blocks to finalize the current ones.
-async fn finalize_evm() {
+pub(super) async fn finalize_evm() {
     evm_rpc("anvil_mine", json!(["0x50"])).await;
 }
 
 /// Put at `address` a bridge that emits `FundsIn(word 0, word 1, word 2)` from its calldata.
-async fn deploy_bridge(address: &str) {
+pub(super) async fn deploy_bridge(address: &str) {
     let code =
         format!("0x60206040600037602035600035 7f{FUNDS_IN_TOPIC} 60206000a300").replace(' ', "");
     evm_rpc("anvil_setCode", json!([address, code])).await;
 }
 
-async fn emit_funds_in(bridge: &str, opid: OpId, amount: u64) {
+pub(super) async fn emit_funds_in(bridge: &str, opid: OpId, amount: u64) {
     let data = format!(
         "0x{:064x}{}{amount:064x}",
         0,
@@ -352,7 +352,7 @@ async fn emit_funds_in(bridge: &str, opid: OpId, amount: u64) {
 
 /// Put at `address` a reject list that returns `rejected` from `entries` and its count from
 /// `length`, whatever the range.
-async fn deploy_reject_list(address: &str, rejected: &[(OpId, u16)]) {
+pub(super) async fn deploy_reject_list(address: &str, rejected: &[(OpId, u16)]) {
     let mut entries = format!("{:064x}{:064x}", 0x20, rejected.len());
     for (opid, no) in rejected {
         let ty = OS_ASSET.to_inner();
@@ -374,7 +374,7 @@ async fn deploy_reject_list(address: &str, rejected: &[(OpId, u16)]) {
 }
 
 /// Issue a BFA with `bridge` and mint 100 units. The minter does not check the `FundsIn` event.
-async fn bfa_with_units(
+pub(super) async fn bfa_with_units(
     wallet: &mut Wallet,
     online: &Online,
     bridge: &str,
@@ -469,6 +469,6 @@ async fn bfa_receive_refuses_rejected_allocation() {
     assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
 }
 
-fn s(value: &str) -> String {
+pub(super) fn s(value: &str) -> String {
     value.to_string()
 }
