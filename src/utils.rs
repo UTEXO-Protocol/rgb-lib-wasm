@@ -727,24 +727,26 @@ impl RgbRuntime {
         contract_id: ContractId,
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
+        opids: impl IntoIterator<Item = OpId>,
         witness_id: Option<RgbTxid>,
     ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
         self.stock
-            .transfer_with_dag(contract_id, outputs, secret_seals, [], witness_id, None)
+            .transfer_with_dag(contract_id, outputs, secret_seals, opids, witness_id, None)
             .map(|(consignment, dag, _)| (consignment, dag))
             .map_err(InternalError::from)
     }
 
-    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    #[cfg(feature = "esplora")]
     pub(crate) fn transfer_from_fascia(
         &self,
         contract_id: ContractId,
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
+        opids: impl IntoIterator<Item = OpId>,
         fascia: &Fascia,
     ) -> Result<RgbTransfer, InternalError> {
         self.stock
-            .transfer_from_fascia(contract_id, outputs, secret_seals, [], fascia, None)
+            .transfer_from_fascia(contract_id, outputs, secret_seals, opids, fascia, None)
             .map(|(consignment, _)| consignment)
             .map_err(InternalError::from)
     }

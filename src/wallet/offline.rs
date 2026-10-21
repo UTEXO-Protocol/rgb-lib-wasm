@@ -28,6 +28,8 @@ pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
 pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
 pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
+pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
+pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
 pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
@@ -885,6 +887,8 @@ pub struct Transfer {
     pub invoice_string: Option<String>,
     /// Consignment path
     pub consignment_path: Option<String>,
+    /// Hex-encoded 32-byte reason of a burn transfer, if any
+    pub burn_reason: Option<String>,
 }
 
 impl Transfer {
@@ -910,6 +914,7 @@ impl Transfer {
             transport_endpoints,
             invoice_string: x.invoice_string.clone(),
             consignment_path: td.consignment_path,
+            burn_reason: x.burn_reason.clone(),
         }
     }
 }
@@ -952,6 +957,8 @@ pub enum TransferKind {
     Send,
     /// An inflation transfer
     Inflation,
+    /// A burn transfer
+    Burn,
 }
 
 /// A wallet unspent.
@@ -1396,10 +1403,9 @@ impl Wallet {
             .filter(|u| !exclude_utxos.contains(&u.utxo.outpoint()))
             .filter(|u| {
                 (u.rgb_allocations.len() as u32) + u.pending_blinded <= max_allocs
-                    && !u
-                        .rgb_allocations
-                        .iter()
-                        .any(|a| !a.incoming && a.status.waiting_counterparty())
+                    && !u.rgb_allocations.iter().any(|a| {
+                        !a.incoming && (a.status.waiting_counterparty() || a.status.initiated())
+                    })
             })
             .cloned()
             .collect())
@@ -1534,6 +1540,19 @@ impl Wallet {
         Precision::try_from(precision).map_err(|_| Error::InvalidPrecision {
             details: s!("precision is too high"),
         })
+    }
+
+    pub(crate) fn check_burn_reason(&self, burn_reason: String) -> Result<BurnReason, Error> {
+        let bytes = hex::decode(burn_reason).map_err(|e| Error::InvalidBurnReason {
+            details: format!("not a hex string: {e}"),
+        })?;
+        let bytes: [u8; 32] =
+            bytes
+                .try_into()
+                .map_err(|bytes: Vec<u8>| Error::InvalidBurnReason {
+                    details: format!("expected 32 bytes, got {}", bytes.len()),
+                })?;
+        Ok(BurnReason::from(Bytes32::from(bytes)))
     }
 
     fn _check_reject_list_url(&self, opid_reject_url: String) -> Result<RejectListUrl, Error> {
@@ -1717,7 +1736,7 @@ impl Wallet {
         unspents.retain(|u| {
             !(u.rgb_allocations
                 .iter()
-                .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                .any(|a| !a.incoming && (a.status.waiting_counterparty() || a.status.initiated())))
         });
 
         let created_at = now().unix_timestamp();
@@ -1877,7 +1896,7 @@ impl Wallet {
         unspents.retain(|u| {
             !(u.rgb_allocations
                 .iter()
-                .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                .any(|a| !a.incoming && (a.status.waiting_counterparty() || a.status.initiated())))
         });
 
         let created_at = now().unix_timestamp();
@@ -2070,7 +2089,7 @@ impl Wallet {
         unspents.retain(|u| {
             !(u.rgb_allocations
                 .iter()
-                .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                .any(|a| !a.incoming && (a.status.waiting_counterparty() || a.status.initiated())))
         });
 
         let created_at = now().unix_timestamp();
@@ -2627,6 +2646,9 @@ impl Wallet {
                     RecipientTypeFull::Witness { .. } => TransferKind::ReceiveWitness,
                 }
             }
+        } else if transfer.recipient_id.is_none() {
+            // a burn is the only outgoing transfer without a recipient
+            TransferKind::Burn
         } else if filtered_coloring.clone().count() > 0
             && filtered_coloring
                 .clone()
@@ -2666,7 +2688,7 @@ impl Wallet {
         };
         let change_utxo = match kind {
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => None,
-            TransferKind::Send | TransferKind::Inflation => {
+            TransferKind::Send | TransferKind::Inflation | TransferKind::Burn => {
                 let change_txo_idx: Vec<i32> = filtered_coloring
                     .filter(|c| c.r#type == ColoringType::Change)
                     .map(|c| c.txo_idx)
@@ -2683,7 +2705,7 @@ impl Wallet {
         };
 
         let consignment_path = match (&kind, batch_transfer.status) {
-            (TransferKind::Send | TransferKind::Inflation, _) => {
+            (TransferKind::Send | TransferKind::Inflation | TransferKind::Burn, _) => {
                 Some(self.get_send_consignment_path(
                     &asset_transfer.asset_id.clone().unwrap(),
                     &batch_transfer.txid.clone().unwrap(),
@@ -3056,7 +3078,7 @@ impl Wallet {
         unspents.retain(|u| {
             !(u.rgb_allocations
                 .iter()
-                .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                .any(|a| !a.incoming && (a.status.waiting_counterparty() || a.status.initiated())))
         });
         let utxo = self.get_utxo(&[], Some(&unspents), true, None)?;
         let unblinded_utxo = utxo.outpoint();
