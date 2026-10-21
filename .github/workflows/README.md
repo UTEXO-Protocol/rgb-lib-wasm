@@ -4,8 +4,15 @@
 
 Runs formatting, clippy, cargo check, docs, native tests, wasm-pack tests, and integration tests.
 
-- **Trigger**: push/PR to `dev` / `stage` / `master`
+- **Trigger**: push/PR to `dev` / `stage` / `master` / `bfa`
 - **What it does**: fmt → clippy → check → doc → native tests → wasm tests → integration tests (Docker)
+
+## bfa-pr.yml — bfa pull request description
+
+Keeps the description of the open `bfa` into `dev` draft pull request current, so the whole BFA line can be reviewed in one diff.
+
+- **Trigger**: push to `bfa`
+- **What it does**: lists the pull requests merged into `bfa` and the size of the diff against `dev` (`.github/scripts/bfa-pr-body.sh`), then rewrites the description
 
 ## release.yml — Production Release
 

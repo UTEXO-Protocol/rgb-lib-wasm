@@ -1,0 +1,29 @@
+name: bfa pull request
+
+on:
+  push:
+    branches: [bfa]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  describe:
+    name: Update the bfa pull request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rewrite the description of the open bfa into dev pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr=$(gh pr list --head bfa --base dev --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            echo "No open bfa into dev pull request"
+            exit 0
+          fi
+          .github/scripts/bfa-pr-body.sh origin/dev HEAD > body.md
+          gh pr edit "$pr" --body-file body.md
