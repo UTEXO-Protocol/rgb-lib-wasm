@@ -42,6 +42,13 @@ pub enum Error {
     #[error("Batch transfer cannot be deleted")]
     CannotDeleteBatchTransfer,
 
+    /// The transfer has already failed or progressed, so it cannot be ended again
+    #[error("Transfer cannot be ended: {txid}")]
+    CannotEndTransfer {
+        /// Transfer TXID
+        txid: String,
+    },
+
     /// Cannot estimate fees
     #[error("Cannot estimate fees")]
     CannotEstimateFees,
@@ -220,6 +227,13 @@ pub enum Error {
     /// The consignment is invalid
     #[error("Invalid consignment")]
     InvalidConsignment,
+
+    /// The provided burn reason is invalid
+    #[error("Invalid burn reason: {details}")]
+    InvalidBurnReason {
+        /// Error details
+        details: String,
+    },
 
     /// The provided asset details is invalid
     #[error("Invalid details: {details}")]
@@ -418,6 +432,10 @@ pub enum Error {
         details: String,
     },
 
+    /// Cannot burn an asset with zero amount
+    #[error("Burn request with zero amount")]
+    NoBurnAmount,
+
     /// No consignment found
     #[error("No consignment found")]
     NoConsignment,
@@ -519,6 +537,13 @@ pub enum Error {
         version: String,
     },
 
+    /// The schema doesn't support burn transitions
+    #[error("Burn not supported")]
+    UnsupportedBurn {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
     /// The schema doesn't support inflation
     #[error("Inflation not supported")]
     UnsupportedInflation {
@@ -579,6 +604,13 @@ pub enum Error {
     /// The requested operation cannot be processed by a watch-only wallet
     #[error("Operation not allowed on watch only wallet")]
     WatchOnly,
+
+    /// The PSBT belongs to a different kind of operation than the one being ended
+    #[error("PSBT belongs to a different operation: {txid}")]
+    WrongOperation {
+        /// TXID of the PSBT
+        txid: String,
+    },
 
     /// The provided password is incorrect
     #[error("The provided password is incorrect")]

@@ -75,7 +75,7 @@ use std::{
 };
 
 use crate::database::{memory_db::ActiveValue, rgb_store::MemRgbStore};
-use amplify::{Wrapper, bmap, confinement::Confined, s};
+use amplify::{Bytes32, Wrapper, bmap, confinement::Confined, s};
 #[cfg(feature = "esplora")]
 use base64::{Engine as _, engine::general_purpose};
 #[cfg(feature = "esplora")]
@@ -132,8 +132,8 @@ use rgbstd::{
     },
     rgbcore::commit_verify::Conceal,
     stl::{
-        AssetSpec, Attachment, BridgeLocation, ContractTerms, Details, EvmAddress, EvmContract,
-        MediaType, Name, RejectListLocation, RejectListUrl, RicardianContract, Ticker,
+        AssetSpec, Attachment, BridgeLocation, BurnReason, ContractTerms, Details, EvmAddress,
+        EvmContract, MediaType, Name, RejectListLocation, RejectListUrl, RicardianContract, Ticker,
     },
     txout::{BlindSeal, CloseMethod, ExplicitSeal},
     validation::{
@@ -151,7 +151,7 @@ use rgbstd::{
     validation::{ExternalAnchor, OpoutsDagData, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
-use schemata::{BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT};
+use schemata::{BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN};
 use schemata::{BridgedFungibleAsset, InflatableFungibleAsset, NonInflatableAsset};
 use scrypt::{
     Params, Scrypt,
@@ -160,7 +160,9 @@ use scrypt::{
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use slog::{Drain, Logger, debug, error, info, o, warn};
-use strict_encoding::{DecodeError, DeserializeError, FieldName};
+use strict_encoding::{
+    DecodeError, DeserializeError, FieldName, StrictDeserialize, StrictSerialize,
+};
 use time::OffsetDateTime;
 use typenum::consts::U32;
 

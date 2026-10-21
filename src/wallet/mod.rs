@@ -11,6 +11,8 @@ pub(crate) mod online;
 pub mod rust_only;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_bfa;
+#[cfg(all(test, target_arch = "wasm32"))]
+mod test_burn;
 pub mod vss;
 
 pub use offline::*;

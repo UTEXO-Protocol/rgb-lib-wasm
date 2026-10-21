@@ -731,6 +731,85 @@ impl WasmWallet {
         to_js(&result)
     }
 
+    /// Burn RGB assets: begin, sign with the wallet keys and end. Returns an OperationResult JS
+    /// object.
+    ///
+    /// `burn_reason` is an optional hex-encoded 32-byte value.
+    #[wasm_bindgen(js_name = "burn")]
+    pub async fn burn(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .burn(
+                online,
+                asset_id.to_string(),
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Burn RGB assets (begin): prepare a PSBT. Returns a BurnBeginResult JS object.
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = "burnBegin")]
+    pub async fn burn_begin(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .burn_begin(
+                online,
+                asset_id.to_string(),
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Burn RGB assets (end): broadcast a signed PSBT. Returns an OperationResult JS object.
+    #[wasm_bindgen(js_name = "burnEnd")]
+    pub async fn burn_end(
+        &self,
+        online_js: JsValue,
+        signed_psbt: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .burn_end(online, signed_psbt.to_string())
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
     /// List vanilla (non-colored) unspent outputs. Returns a JS array of LocalOutput objects.
     #[wasm_bindgen(js_name = "listUnspentsVanilla")]
     pub async fn list_unspents_vanilla(
