@@ -229,6 +229,16 @@ const signed = wallet.signPsbt(psbt);
 const result = await wallet.inflateEnd(online, signed);
 ```
 
+### Burning IFA or BFA units
+
+```javascript
+// the reason is optional: a hex-encoded 32-byte value, shown on the transfer as `burnReason`
+const result = await wallet.burn(online, assetId, 50n, reason, 1n, 1);
+```
+
+`sendEnd`, `inflateEnd`, `burn` and `burnEnd` return `{ txid, batchTransferIdx, entropy }`, where
+`entropy` is the MPC entropy of the commitment.
+
 ### Local encrypted backup
 
 Wallet state is encrypted with Scrypt + XChaCha20Poly1305 and returned as bytes:
@@ -345,6 +355,9 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
 | `inflateBegin(...)` | yes | Prepare IFA inflation PSBT |
 | `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
+| `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
+| `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
+| `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
