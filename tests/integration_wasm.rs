@@ -1,13 +1,27 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
+use psrgbt::RgbOutExt;
+use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
 use utils::*;
+
+fn mpc_entropy(psbt: &str) -> u64 {
+    let psbt = Psbt::from_str(psbt).unwrap();
+    let opret = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey.is_op_return())
+        .unwrap();
+    psbt.outputs[opret].mpc_entropy().unwrap()
+}
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -162,12 +176,14 @@ async fn test_full_wallet_flow() {
         .send_begin(online.clone(), recipient_map, false, 1, 1, None)
         .await
         .unwrap();
+    let send_entropy = mpc_entropy(&unsigned_psbt);
     let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
     let send_result = wallet
         .send_end(online.clone(), signed_psbt, false)
         .await
         .unwrap();
     assert!(!send_result.txid.is_empty());
+    assert_eq!(send_result.entropy, send_entropy);
 
     // validate_consignment_offchain: fetch from proxy and validate before broadcast
     let (consignment_bytes, proxy_txid) = get_consignment_from_proxy(&recv_b.recipient_id).await;
@@ -343,12 +359,14 @@ async fn test_full_wallet_flow() {
         .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
         .await
         .unwrap();
+    let inflate_entropy = mpc_entropy(&unsigned_inflate);
     let signed_inflate = wallet.sign_psbt(unsigned_inflate, None).unwrap();
     let inflate_result = wallet
         .inflate_end(online.clone(), signed_inflate)
         .await
         .unwrap();
     assert!(!inflate_result.txid.is_empty());
+    assert_eq!(inflate_result.entropy, inflate_entropy);
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
