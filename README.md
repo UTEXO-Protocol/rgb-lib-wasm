@@ -15,8 +15,7 @@ rgb-lib-wasm lets you issue, send, and receive RGB assets from a web browser. It
 
 Supported asset types:
 - **NIA** (Non-Inflatable Asset)
-- **IFA** (Inflatable Fungible Asset)
-- **BFA** (Bridged Fungible Asset): issue, hold, send and receive. Mint and burn are not supported.
+- **IFA** (Inflatable Fungible Asset).
 
 ## Prerequisites
 
@@ -229,16 +228,6 @@ const signed = wallet.signPsbt(psbt);
 const result = await wallet.inflateEnd(online, signed);
 ```
 
-### Burning IFA or BFA units
-
-```javascript
-// the reason is optional: a hex-encoded 32-byte value, shown on the transfer as `burnReason`
-const result = await wallet.burn(online, assetId, 50n, reason, 1n, 1);
-```
-
-`sendEnd`, `inflateEnd`, `burn` and `burnEnd` return `{ txid, batchTransferIdx, entropy }`, where
-`entropy` is the MPC entropy of the commitment.
-
 ### Local encrypted backup
 
 Wallet state is encrypted with Scrypt + XChaCha20Poly1305 and returned as bytes:
@@ -337,13 +326,12 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `listTransfers(assetId?)` | no | List RGB transfers |
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions |
-| `goOnline(skipCheck, indexerUrl, evmRpcUrls?)` | yes | Connect to an Esplora indexer. `evmRpcUrls` maps an EVM chain ID to an RPC URL, for BFA |
+| `goOnline(skipCheck, indexerUrl)` | yes | Connect to an Esplora indexer |
 | `sync(online)` | yes | Sync wallet with indexer |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
 | `issueAssetIfa(...)` | no | Issue an Inflatable Fungible Asset |
-| `issueAssetBfa(...)` | no | Issue a Bridged Fungible Asset with mint rights and no units |
 | `blindReceive(...)` | no | Create a blind receive invoice |
 | `witnessReceive(...)` | no | Create a witness receive invoice |
 | `sendBegin(...)` | yes | Prepare RGB send PSBT |
@@ -355,9 +343,6 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
 | `inflateBegin(...)` | yes | Prepare IFA inflation PSBT |
 | `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
-| `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
-| `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
-| `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |

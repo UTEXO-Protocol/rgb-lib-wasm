@@ -7,12 +7,7 @@ use wasm_bindgen::JsValue;
 
 use std::collections::HashMap;
 
-use rgbstd::persistence::Stock;
-
-use crate::{
-    database::{memory_db::InMemoryDb, rgb_store::MemRgbStore},
-    utils::MemStock,
-};
+use crate::database::memory_db::InMemoryDb;
 
 const DB_NAME: &str = "rgb_lib_wallet";
 const DB_VERSION: u32 = 1;
@@ -32,9 +27,15 @@ pub struct WalletSnapshot {
     /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
-    /// Encoded RGB store (base64).
+    /// Strict-encoded RGB Stock stash (base64).
     #[serde(default)]
-    pub rgb_store: Option<String>,
+    pub stock_stash_b64: Option<String>,
+    /// Strict-encoded RGB Stock state (base64).
+    #[serde(default)]
+    pub stock_state_b64: Option<String>,
+    /// Strict-encoded RGB Stock index (base64).
+    #[serde(default)]
+    pub stock_index_b64: Option<String>,
     /// Pinned derivation index per keychain for address reuse.
     #[serde(default)]
     pub reuse_address_index: HashMap<KeychainKind, u32>,
@@ -91,22 +92,72 @@ pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), S
     Ok(())
 }
 
-/// Serialize the RGB store of a stock to base64 for snapshot persistence.
-pub(crate) fn serialize_stock(stock: &MemStock) -> Option<String> {
+/// Serialize an RGB Stock into base64 components for snapshot persistence.
+///
+/// Returns `(stash_b64, state_b64, index_b64)` or `None` if serialization fails.
+pub fn serialize_stock(stock: &rgbstd::persistence::Stock) -> Option<(String, String, String)> {
     use base64::{Engine as _, engine::general_purpose};
+    use strict_encoding::StrictSerialize;
 
-    let bytes = stock.as_store().to_bytes().ok()?;
-    Some(general_purpose::STANDARD.encode(bytes))
+    let stash = stock
+        .as_stash_provider()
+        .to_strict_serialized::<{ u32::MAX as usize }>()
+        .ok()?;
+    let state = stock
+        .as_state_provider()
+        .to_strict_serialized::<{ u32::MAX as usize }>()
+        .ok()?;
+    let index = stock
+        .as_index_provider()
+        .to_strict_serialized::<{ u32::MAX as usize }>()
+        .ok()?;
+
+    Some((
+        general_purpose::STANDARD.encode(stash.as_unconfined()),
+        general_purpose::STANDARD.encode(state.as_unconfined()),
+        general_purpose::STANDARD.encode(index.as_unconfined()),
+    ))
 }
 
-/// Deserialize an RGB Stock from base64.
-pub(crate) fn deserialize_stock(store_b64: &str) -> Result<MemStock, String> {
+/// Deserialize an RGB Stock from base64 components.
+pub fn deserialize_stock(
+    stash_b64: &str,
+    state_b64: &str,
+    index_b64: &str,
+) -> Result<rgbstd::persistence::Stock, String> {
     use base64::{Engine as _, engine::general_purpose};
+    use rgbstd::persistence::{MemIndex, MemStash, MemState};
+    use strict_encoding::StrictDeserialize;
 
-    let bytes = general_purpose::STANDARD
-        .decode(store_b64)
+    const MAX: usize = u32::MAX as usize;
+
+    let stash_bytes = general_purpose::STANDARD
+        .decode(stash_b64)
         .map_err(|e| e.to_string())?;
-    Ok(Stock::with(MemRgbStore::from_bytes(&bytes)?))
+    let state_bytes = general_purpose::STANDARD
+        .decode(state_b64)
+        .map_err(|e| e.to_string())?;
+    let index_bytes = general_purpose::STANDARD
+        .decode(index_b64)
+        .map_err(|e| e.to_string())?;
+
+    let stash = MemStash::from_strict_serialized::<MAX>(
+        amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(stash_bytes)
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let state = MemState::from_strict_serialized::<MAX>(
+        amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(state_bytes)
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let index = MemIndex::from_strict_serialized::<MAX>(
+        amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(index_bytes)
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(rgbstd::persistence::Stock::with(stash, state, index))
 }
 
 /// Load a wallet snapshot from IndexedDB for the given key.
@@ -143,15 +194,16 @@ mod tests {
     use super::*;
     use rgbstd::containers::ConsignmentExt;
     use rgbstd::contract::IssuerWrapper;
+    use rgbstd::persistence::Stock;
     use schemata::NonInflatableAsset;
 
     #[test]
     fn stock_serialize_round_trip_empty() {
-        let stock = Stock::with(MemRgbStore::default());
-        let s = serialize_stock(&stock).expect("serialize empty stock");
+        let stock = Stock::in_memory();
+        let (s, st, i) = serialize_stock(&stock).expect("serialize empty stock");
 
-        let restored = deserialize_stock(&s).expect("deserialize empty stock");
-        assert_eq!(restored.contracts().count(), 0);
+        let restored = deserialize_stock(&s, &st, &i).expect("deserialize empty stock");
+        assert_eq!(restored.contracts().unwrap().count(), 0);
     }
 
     #[test]
@@ -161,10 +213,7 @@ mod tests {
         use rgbstd::txout::BlindSeal;
         use rgbstd::{Amount, ChainNet, Identity, Txid as RgbTxid};
 
-        let mut stock = Stock::with(MemRgbStore::default());
-        stock
-            .import_schema_definition(NonInflatableAsset::schema_definition())
-            .expect("import schema");
+        let mut stock = Stock::in_memory();
 
         let spec = AssetSpec {
             ticker: crate::Ticker::try_from("TEST".to_string()).unwrap(),
@@ -185,7 +234,9 @@ mod tests {
 
         let builder = ContractBuilder::with(
             Identity::default(),
-            NonInflatableAsset::schema_rules(),
+            NonInflatableAsset::schema(),
+            NonInflatableAsset::types(),
+            NonInflatableAsset::scripts(),
             ChainNet::from(crate::BitcoinNetwork::Regtest),
         )
         .add_global_state("spec", spec)
@@ -205,14 +256,10 @@ mod tests {
             .expect("import contract");
 
         // Verify contract exists before serialization
-        assert!(
-            stock
-                .contracts()
-                .any(|c| c.is_ok_and(|c| c.id == contract_id))
-        );
+        assert!(stock.contracts().unwrap().any(|c| c.id == contract_id));
 
         // Serialize → JSON round-trip (simulates IndexedDB save/load)
-        let s = serialize_stock(&stock).expect("serialize stock with contract");
+        let (s, st, i) = serialize_stock(&stock).expect("serialize stock with contract");
 
         let mut transfer_artifact = crate::wallet::online::TransferArtifacts::default();
         transfer_artifact
@@ -225,7 +272,9 @@ mod tests {
             bdk_changeset: None,
             transfer_artifacts: HashMap::from([("funding-txid".to_owned(), transfer_artifact)]),
             received_consignments: HashMap::new(),
-            rgb_store: Some(s),
+            stock_stash_b64: Some(s),
+            stock_state_b64: Some(st),
+            stock_index_b64: Some(i),
             reuse_address_index: HashMap::new(),
         };
 
@@ -246,20 +295,16 @@ mod tests {
             Some("signed-psbt")
         );
 
-        let restored = deserialize_stock(restored_snapshot.rgb_store.as_ref().unwrap())
-            .expect("deserialize stock");
-
-        assert_eq!(
-            serialize_stock(&restored).as_deref(),
-            restored_snapshot.rgb_store.as_deref(),
-            "every stored table must survive the round-trip"
-        );
+        let restored = deserialize_stock(
+            restored_snapshot.stock_stash_b64.as_ref().unwrap(),
+            restored_snapshot.stock_state_b64.as_ref().unwrap(),
+            restored_snapshot.stock_index_b64.as_ref().unwrap(),
+        )
+        .expect("deserialize stock");
 
         // Contract must survive the round-trip
         assert!(
-            restored
-                .contracts()
-                .any(|c| c.is_ok_and(|c| c.id == contract_id)),
+            restored.contracts().unwrap().any(|c| c.id == contract_id),
             "Contract should exist after snapshot round-trip"
         );
     }

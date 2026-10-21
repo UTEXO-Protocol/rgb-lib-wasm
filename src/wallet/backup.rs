@@ -30,8 +30,12 @@ pub(crate) struct BackupPubData {
 pub(crate) struct WalletBackupPayload {
     pub(crate) db: crate::database::memory_db::InMemoryDb,
     pub(crate) bdk_changeset: Option<bdk_wallet::ChangeSet>,
-    /// Encoded RGB store, base64
-    pub(crate) rgb_store: String,
+    /// Strict-encoded MemStash, base64
+    pub(crate) stock_stash_b64: String,
+    /// Strict-encoded MemState, base64
+    pub(crate) stock_state_b64: String,
+    /// Strict-encoded MemIndex, base64
+    pub(crate) stock_index_b64: String,
     /// Pinned derivation index per keychain for address reuse.
     #[serde(default)]
     pub(crate) reuse_address_index: std::collections::HashMap<bdk_wallet::KeychainKind, u32>,
@@ -137,6 +141,7 @@ pub(crate) fn decode_backup(data: &[u8]) -> Result<(BackupPubData, &[u8]), Error
     Ok((pub_data, ciphertext))
 }
 
+use rgbstd::persistence::{MemIndex, MemStash, MemState};
 use strict_encoding::{StrictDeserialize, StrictSerialize};
 
 impl super::Wallet {
@@ -166,21 +171,59 @@ impl super::Wallet {
         Ok(())
     }
 
-    /// Restores wallet and RGB state from a backup payload. `restore_backup` and `vss_restore_backup` share it.
+    /// Decode a serialized backup payload and restore wallet + RGB stock state.
+    /// Shared by `restore_backup` and `vss_restore_backup` so a fix in one cannot miss the other.
     fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
+        // 1. Deserialize payload
         let payload: WalletBackupPayload =
             serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
 
+        // 2. Restore InMemoryDb + BDK via existing snapshot mechanism
         let snapshot = super::idb_store::WalletSnapshot {
             sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
             received_consignments: Default::default(),
-            rgb_store: Some(payload.rgb_store),
+            stock_stash_b64: None,
+            stock_state_b64: None,
+            stock_index_b64: None,
             reuse_address_index: payload.reuse_address_index,
         };
-        self.restore_from_snapshot(snapshot)
+        self.restore_from_snapshot(snapshot)?;
+
+        // 3. Restore RGB stock from strict-encoded components
+        let stash_bytes = general_purpose::STANDARD
+            .decode(&payload.stock_stash_b64)
+            .map_err(InternalError::from)?;
+        let state_bytes = general_purpose::STANDARD
+            .decode(&payload.stock_state_b64)
+            .map_err(InternalError::from)?;
+        let index_bytes = general_purpose::STANDARD
+            .decode(&payload.stock_index_b64)
+            .map_err(InternalError::from)?;
+
+        const MAX: usize = u32::MAX as usize;
+        let stash = MemStash::from_strict_serialized::<MAX>(
+            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(stash_bytes)
+                .map_err(|e| InternalError::StockError(e.to_string()))?,
+        )
+        .map_err(|e| InternalError::StockError(e.to_string()))?;
+        let state = MemState::from_strict_serialized::<MAX>(
+            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(state_bytes)
+                .map_err(|e| InternalError::StockError(e.to_string()))?,
+        )
+        .map_err(|e| InternalError::StockError(e.to_string()))?;
+        let index = MemIndex::from_strict_serialized::<MAX>(
+            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(index_bytes)
+                .map_err(|e| InternalError::StockError(e.to_string()))?,
+        )
+        .map_err(|e| InternalError::StockError(e.to_string()))?;
+
+        let stock = rgbstd::persistence::Stock::with(stash, state, index);
+        *self.rgb_stock.borrow_mut() = Some(stock);
+
+        Ok(())
     }
 
     /// Returns true if the wallet has been modified since the last backup.
@@ -289,17 +332,27 @@ impl super::Wallet {
             details: s!("RGB stock is currently in use (runtime active)"),
         })?;
 
-        let rgb_store =
-            super::idb_store::serialize_stock(stock).ok_or_else(|| Error::Internal {
-                details: s!("failed to serialize RGB stock"),
-            })?;
+        let stash_bytes = stock
+            .as_stash_provider()
+            .to_strict_serialized::<{ u32::MAX as usize }>()
+            .map_err(|e| InternalError::StockError(e.to_string()))?;
+        let state_bytes = stock
+            .as_state_provider()
+            .to_strict_serialized::<{ u32::MAX as usize }>()
+            .map_err(|e| InternalError::StockError(e.to_string()))?;
+        let index_bytes = stock
+            .as_index_provider()
+            .to_strict_serialized::<{ u32::MAX as usize }>()
+            .map_err(|e| InternalError::StockError(e.to_string()))?;
 
         drop(stock_ref);
 
         let payload = WalletBackupPayload {
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
-            rgb_store,
+            stock_stash_b64: general_purpose::STANDARD.encode(stash_bytes.as_unconfined()),
+            stock_state_b64: general_purpose::STANDARD.encode(state_bytes.as_unconfined()),
+            stock_index_b64: general_purpose::STANDARD.encode(index_bytes.as_unconfined()),
             reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
         };
@@ -389,7 +442,8 @@ mod tests {
         assert_ne!(k1, k3);
     }
 
-    // Rows of one outgoing transfer after the ACK. `asset_id` is `None` for a sats-only send.
+    // The rows send_end writes for one outgoing transfer, ACK already received.
+    // `asset_id` is `None` for a vanilla (sats-only) transfer, `Some` for an RGB asset send.
     fn seed_acknowledged_transfer(
         wallet: &mut crate::wallet::Wallet,
         txid: &str,
@@ -448,8 +502,8 @@ mod tests {
         batch_idx
     }
 
+    // asset_id: None for a vanilla (sats-only) transfer, Some for an RGB asset send.
     fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
-        use crate::database::rgb_store::MemRgbStore;
         use crate::keys::generate_keys;
         use crate::wallet::Online;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
@@ -462,7 +516,7 @@ mod tests {
         let keys = generate_keys(crate::BitcoinNetwork::Regtest);
 
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
-        *sender.rgb_stock.borrow_mut() = Some(Stock::with(MemRgbStore::default()));
+        *sender.rgb_stock.borrow_mut() = Some(Stock::in_memory());
         let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id);
         // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
         sender.transfer_artifacts.insert(
@@ -515,6 +569,7 @@ mod tests {
         refresh_after_restore_backup_reads_signed_psbt_impl(Some("rgb:test-asset"));
     }
 
+    // asset_id: None for a vanilla (sats-only) transfer, Some for an RGB asset send.
     fn refresh_fails_transfer_without_signed_psbt_impl(asset_id: Option<&str>) {
         use crate::database::enums::TransferStatus;
         use crate::wallet::Online;
@@ -588,7 +643,6 @@ mod tests {
     fn vss_restore_payload_keeps_transfer_artifacts() {
         // vss_restore_backup shares restore_payload with restore_backup, so this
         // exercises the exact code the VSS path runs on the downloaded backup.
-        use crate::database::rgb_store::MemRgbStore;
         use crate::keys::generate_keys;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
         use crate::wallet::online::TransferArtifacts;
@@ -598,7 +652,7 @@ mod tests {
         let keys = generate_keys(crate::BitcoinNetwork::Regtest);
 
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
-        *sender.rgb_stock.borrow_mut() = Some(Stock::with(MemRgbStore::default()));
+        *sender.rgb_stock.borrow_mut() = Some(Stock::in_memory());
         sender.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {

@@ -159,11 +159,6 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test integration_wasm
 
-      - name: Run BFA tests
-        env:
-          WASM_BINDGEN_TEST_TIMEOUT: 900
-        run: wasm-pack test --headless --firefox --release --lib
-
       - name: Stop regtest services
         if: always()
         working-directory: tests
