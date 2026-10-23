@@ -20,7 +20,7 @@ Supported asset types:
 
 ## Prerequisites
 
-- Rust 1.85.0+ with the `wasm32-unknown-unknown` target
+- Rust 1.88.0+ with the `wasm32-unknown-unknown` target
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/) 0.14+
 
 ```bash

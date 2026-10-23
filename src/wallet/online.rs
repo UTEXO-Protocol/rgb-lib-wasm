@@ -721,15 +721,16 @@ impl Wallet {
                         typed_assigns.as_structured().iter().enumerate()
                     {
                         let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let BuilderSeal::Concealed(seal) = structured_assignment.seal {
-                            if Some(seal) == known_concealed {
-                                received.insert(opout, Assignment::NonFungible);
-                            }
+                        if let BuilderSeal::Concealed(seal) = structured_assignment.seal
+                            && Some(seal) == known_concealed
+                        {
+                            received.insert(opout, Assignment::NonFungible);
                         }
-                        if let BuilderSeal::Revealed(seal) = structured_assignment.seal {
-                            if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
-                                received.insert(opout, Assignment::NonFungible);
-                            }
+                        if let BuilderSeal::Revealed(seal) = structured_assignment.seal
+                            && seal.txid == TxPtr::WitnessTx
+                            && Some(seal.vout.into_u32()) == vout
+                        {
+                            received.insert(opout, Assignment::NonFungible);
                         };
                     }
                 }
@@ -2205,10 +2206,10 @@ impl Wallet {
             .map_err(InternalError::from)?
             .compute_txid()
             .to_string();
-        if final_txid != txid {
-            if let Some(artifacts) = self.transfer_artifacts.remove(&txid) {
-                self.transfer_artifacts.insert(final_txid, artifacts);
-            }
+        if final_txid != txid
+            && let Some(artifacts) = self.transfer_artifacts.remove(&txid)
+        {
+            self.transfer_artifacts.insert(final_txid, artifacts);
         }
 
         Ok(PrepareTransferPsbtResult::Success(psbt.to_string()))
@@ -2480,16 +2481,16 @@ impl Wallet {
         let asset_id = contract_id.to_string();
 
         // validate consignment
-        if let Some(aid) = asset_transfer.asset_id.clone() {
-            if aid != asset_id {
-                error!(
-                    self.logger,
-                    "Received a different asset than the expected one"
-                );
-                return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                    .await;
-            }
+        if let Some(aid) = asset_transfer.asset_id.clone()
+            && aid != asset_id
+        {
+            error!(
+                self.logger,
+                "Received a different asset than the expected one"
+            );
+            return self
+                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                .await;
         }
 
         let witness_id = match RgbTxid::from_str(&txid) {
@@ -3079,10 +3080,10 @@ impl Wallet {
         if incoming {
             let batch_transfer_data =
                 batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
-            if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data) {
-                if let Some(recipient_id) = &transfer.recipient_id {
-                    self.received_consignments.remove(recipient_id);
-                }
+            if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data)
+                && let Some(recipient_id) = &transfer.recipient_id
+            {
+                self.received_consignments.remove(recipient_id);
             }
         }
 
@@ -4653,10 +4654,10 @@ impl Wallet {
                     .indexer()
                     .get_tx_confirmations(&u.outpoint.txid.to_string())
                     .await?;
-                if let Some(confs) = confirmations {
-                    if confs >= min_confirmations as u64 {
-                        filtered.push(u);
-                    }
+                if let Some(confs) = confirmations
+                    && confs >= min_confirmations as u64
+                {
+                    filtered.push(u);
                 }
             }
             filtered
