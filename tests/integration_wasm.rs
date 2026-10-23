@@ -168,6 +168,7 @@ async fn test_full_wallet_flow() {
         }),
         assignment: Assignment::Fungible(200),
         transport_endpoints: vec![transport.clone()],
+        expiration_timestamp: None,
     };
     let mut recipient_map = HashMap::new();
     recipient_map.insert(nia.asset_id.clone(), vec![recipient]);
@@ -405,6 +406,7 @@ async fn test_full_wallet_flow() {
         witness_data: None,
         assignment: Assignment::Fungible(5),
         transport_endpoints: vec![transport.clone()],
+        expiration_timestamp: None,
     };
     let mut ifa_recipient_map = HashMap::new();
     ifa_recipient_map.insert(ifa.asset_id.clone(), vec![ifa_recipient]);
