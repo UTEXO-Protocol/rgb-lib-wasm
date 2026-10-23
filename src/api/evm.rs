@@ -517,10 +517,10 @@ impl EvmClient {
                 }
             };
             for log in logs {
-                if let Some(event) = log.as_funds_in()? {
-                    if event.confirms(opid, amount, after_block) {
-                        return Ok(true);
-                    }
+                if let Some(event) = log.as_funds_in()?
+                    && event.confirms(opid, amount, after_block)
+                {
+                    return Ok(true);
                 }
             }
             let Some(next_block) = to_block.checked_add(1) else {

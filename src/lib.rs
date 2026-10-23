@@ -46,6 +46,12 @@ pub use rgbstd::{
     validation::{ValidationConfig, ValidationError},
     vm::{WitnessOrd, WitnessPos},
 };
+pub use rgbstd::{
+    Opout,
+    containers::{AnchorResolverError, ResolveAnchor},
+    stl::{BridgeLocation, EvmAddress, EvmContract},
+    validation::ExternalAnchor,
+};
 
 pub use crate::{
     database::enums::{AssetSchema, Assignment, TransferStatus, TransportType},
@@ -118,8 +124,8 @@ use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rand::{Rng, distr::Alphanumeric};
 use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
-    Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, Opout, OutputSeal,
-    OwnedFraction, Precision, Schema, SecretSeal, Transition, TransitionType,
+    Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, OutputSeal, OwnedFraction,
+    Precision, Schema, SecretSeal, Transition, TransitionType,
     containers::{BuilderSeal, ValidConsignment, ValidContract, ValidTransfer},
     contract::{
         AllocatedState, ContractBuilder, ContractData, FilteredContractState, IssuerWrapper,
@@ -132,8 +138,8 @@ use rgbstd::{
     },
     rgbcore::commit_verify::Conceal,
     stl::{
-        AssetSpec, Attachment, BridgeLocation, BurnReason, ContractTerms, Details, EvmAddress,
-        EvmContract, MediaType, Name, RejectListLocation, RejectListUrl, RicardianContract, Ticker,
+        AssetSpec, Attachment, BurnReason, ContractTerms, Details, MediaType, Name,
+        RejectListLocation, RejectListUrl, RicardianContract, Ticker,
     },
     txout::{BlindSeal, CloseMethod, ExplicitSeal},
     validation::{
@@ -148,7 +154,7 @@ use rgbstd::{
     contract::SchemaWrapper,
     daggy::Walker,
     txout::TxPtr,
-    validation::{ExternalAnchor, OpoutsDagData, Validity, Warning},
+    validation::{OpoutsDagData, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
 use schemata::{BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN};
