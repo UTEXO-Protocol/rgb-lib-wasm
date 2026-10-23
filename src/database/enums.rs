@@ -236,6 +236,30 @@ impl Assignment {
     }
 }
 
+/// The main transition of an outgoing operation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TypeOfTransition {
+    /// Inflation transition (issuing new tokens)
+    Inflate = 2,
+    /// Transfer transition (moving existing tokens)
+    Transfer = 1,
+    /// Burn transition (burning existing tokens)
+    Burn = 3,
+    /// Mint transition (minting assets backed by tokens locked on the external chain)
+    Mint = 4,
+}
+
+impl TypeOfTransition {
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            Self::Inflate => "inflate",
+            Self::Transfer => "transfer",
+            Self::Burn => "burn",
+            Self::Mint => "mint",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

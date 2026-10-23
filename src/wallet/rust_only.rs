@@ -590,7 +590,10 @@ impl Wallet {
                 });
             }
         };
-        if let Some(opid) = self._resolve_anchors(&mut pending).await? {
+        if let Some(opid) = self
+            ._resolve_anchors(&mut pending, &HashSet::new(), &mut HashMap::new())
+            .await?
+        {
             return Err(Error::MintEventNotFound {
                 opid: opid.to_string(),
             });

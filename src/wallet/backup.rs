@@ -39,6 +39,9 @@ pub(crate) struct WalletBackupPayload {
     #[serde(default)]
     pub(crate) transfer_artifacts:
         std::collections::HashMap<String, super::online::TransferArtifacts>,
+    /// Received mints, keyed by recipient_id.
+    #[serde(default)]
+    pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -177,6 +180,8 @@ impl super::Wallet {
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
             received_consignments: Default::default(),
+            received_mints: payload.received_mints,
+            mint_scanned_blocks: Default::default(),
             rgb_store: Some(payload.rgb_store),
             reuse_address_index: payload.reuse_address_index,
         };
@@ -302,6 +307,7 @@ impl super::Wallet {
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
+            received_mints: self.received_mints.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())

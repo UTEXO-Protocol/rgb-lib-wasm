@@ -810,6 +810,64 @@ impl WasmWallet {
         to_js(&result)
     }
 
+    /// Begin a BFA mint. Returns a MintBeginResult object.
+    #[wasm_bindgen(js_name = "mintBegin")]
+    pub async fn mint_begin(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        recipient_js: JsValue,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let recipient: Recipient = serde_wasm_bindgen::from_value(recipient_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Recipient object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .mint_begin(
+                online,
+                asset_id.to_string(),
+                recipient,
+                fee_rate,
+                min_confirmations,
+                sender_transport_endpoint.to_string(),
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Complete a BFA mint. Returns an OperationResult object.
+    #[wasm_bindgen(js_name = "mintEnd")]
+    pub async fn mint_end(
+        &self,
+        online_js: JsValue,
+        signed_psbt: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .mint_end(online, signed_psbt.to_string())
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Return the checked mint received on a recipient ID as a ReceivedMint object, or null.
+    #[wasm_bindgen(js_name = "getReceivedMint")]
+    pub fn get_received_mint(&self, recipient_id: &str) -> Result<JsValue, JsValue> {
+        let received_mint = self
+            .inner
+            .borrow()
+            .get_received_mint(recipient_id.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        received_mint.map_or(Ok(JsValue::NULL), |m| to_js(&m))
+    }
+
     /// List vanilla (non-colored) unspent outputs. Returns a JS array of LocalOutput objects.
     #[wasm_bindgen(js_name = "listUnspentsVanilla")]
     pub async fn list_unspents_vanilla(
