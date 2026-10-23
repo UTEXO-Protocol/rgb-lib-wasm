@@ -348,6 +348,70 @@ pub enum Error {
         details: String,
     },
 
+    /// An externally constructed RGB send was presented with a transaction that
+    /// does not match the prepared/expected transaction identity.
+    #[error("External send transaction mismatch: expected {expected}, got {got}")]
+    ExternalSendTxMismatch {
+        /// Expected transaction id
+        expected: String,
+        /// Observed transaction id
+        got: String,
+    },
+
+    /// The same transaction id was reused for a conflicting external send.
+    #[error("External send conflict for TXID: {txid}")]
+    ExternalSendConflict {
+        /// Transaction id of the conflicting operation
+        txid: String,
+    },
+
+    /// No prepared external send exists for the given transaction id.
+    #[error("External send unknown for TXID: {txid}")]
+    ExternalSendUnknown {
+        /// Transaction id
+        txid: String,
+    },
+
+    /// The exact prepared transaction has not been observed by the indexer.
+    #[error("External send transaction not observed: {txid}")]
+    ExternalSendTxNotObserved {
+        /// Transaction id
+        txid: String,
+    },
+
+    /// A declared recipient is not present in the externally constructed PSBT.
+    #[error("External send recipient mismatch for asset: {asset_id}")]
+    ExternalSendRecipientMismatch {
+        /// Asset id
+        asset_id: String,
+    },
+
+    /// The RGB amounts do not match between the fascia and the PSBT/recipients.
+    #[error("External send amount mismatch for asset: {asset_id}")]
+    ExternalSendAmountMismatch {
+        /// Asset id
+        asset_id: String,
+    },
+
+    /// The transition contains a revealed output that is neither a declared
+    /// recipient nor the exact sender change.
+    #[error("External send undeclared beneficiary for asset: {asset_id}")]
+    ExternalSendUndeclaredBeneficiary {
+        /// Asset id
+        asset_id: String,
+    },
+
+    /// The sender change output of the external send could not be identified.
+    #[error("External send change ambiguous for asset: {asset_id}")]
+    ExternalSendChangeAmbiguous {
+        /// Asset id
+        asset_id: String,
+    },
+
+    /// The provided recipient map is empty.
+    #[error("Invalid recipient map")]
+    InvalidRecipientMap,
+
     /// The provided TXID is invalid
     #[error("Invalid TXID")]
     InvalidTxid,
