@@ -315,6 +315,7 @@ async fn test_persistence_across_reload() {
         }),
         assignment: Assignment::Fungible(100),
         transport_endpoints: vec![transport.clone()],
+        expiration_timestamp: None,
     };
     let mut recipient_map = HashMap::new();
     recipient_map.insert(asset_id.clone(), vec![recipient]);
@@ -490,6 +491,7 @@ async fn test_accept_transfer_is_durable_before_success() {
         }),
         assignment: Assignment::Fungible(100),
         transport_endpoints: vec![transport.clone()],
+        expiration_timestamp: None,
     };
     let mut recipient_map = HashMap::new();
     recipient_map.insert(asset.asset_id, vec![recipient]);
@@ -585,6 +587,7 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         }),
         assignment: Assignment::Fungible(100),
         transport_endpoints: vec![transport],
+        expiration_timestamp: None,
     };
     let recipient_map = HashMap::from([(asset.asset_id, vec![recipient])]);
 

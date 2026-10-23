@@ -32,6 +32,12 @@ pub struct WalletSnapshot {
     /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
+    /// Received mints keyed by recipient_id.
+    #[serde(default)]
+    pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
+    /// Scanned EVM blocks of the received mints keyed by recipient_id.
+    #[serde(default)]
+    pub mint_scanned_blocks: HashMap<String, HashMap<String, u64>>,
     /// Encoded RGB store (base64).
     #[serde(default)]
     pub rgb_store: Option<String>,
@@ -225,6 +231,8 @@ mod tests {
             bdk_changeset: None,
             transfer_artifacts: HashMap::from([("funding-txid".to_owned(), transfer_artifact)]),
             received_consignments: HashMap::new(),
+            received_mints: HashMap::new(),
+            mint_scanned_blocks: HashMap::new(),
             rgb_store: Some(s),
             reuse_address_index: HashMap::new(),
         };

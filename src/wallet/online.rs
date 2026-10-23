@@ -19,6 +19,14 @@ pub(crate) const MIN_FEE_RATE: u64 = 1;
 
 pub(crate) const DURATION_SEND_TRANSFER: i64 = 3600;
 
+/// Minimum time, in seconds, the recipient's invoice must have left when a mint begins, to leave
+/// time for the lock on the external chain
+pub(crate) const MIN_MINT_LOCK_WINDOW_SECS: u32 = 3600;
+/// How much older, in seconds, than the invoice the block a received mint commits to can be
+pub(crate) const MINT_AFTER_BLOCK_GRACE_SECS: i64 = 3600;
+/// How long, in seconds, past its deadline a mint whose lock was included by then is waited for
+pub(crate) const MINT_FINALITY_GRACE_SECS: i64 = 86400;
+
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
@@ -168,6 +176,32 @@ pub struct BurnDetails {
     pub burn_reason: Option<String>,
 }
 
+/// The result of a mint begin operation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct MintBeginResult {
+    /// PSBT to inspect and sign
+    pub psbt: String,
+    /// Batch transfer idx
+    pub batch_transfer_idx: i32,
+    /// Operation details
+    pub details: MintDetails,
+}
+
+/// Details for mint operations.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct MintDetails {
+    /// Hex-encoded strict-encoded fascia, for inspection
+    pub fascia: String,
+    /// Minimum confirmations for the operation
+    pub min_confirmations: u8,
+    /// Entropy used for the merkle tree construction operation
+    pub entropy: u64,
+    /// ID of the mint operation
+    pub opid: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct BtcChange {
     vout: u32,
@@ -186,28 +220,6 @@ pub(crate) struct InfoBatchTransfer {
     min_confirmations: u8,
     #[serde(default)]
     entropy: u64,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
-enum TypeOfTransition {
-    Inflate,
-    Transfer,
-    Burn,
-    /// A BFA mint after the given EVM block, for tests only
-    #[cfg(test)]
-    Mint(u64),
-}
-
-impl TypeOfTransition {
-    fn type_name(&self) -> &'static str {
-        match self {
-            Self::Inflate => "inflate",
-            Self::Transfer => "transfer",
-            Self::Burn => "burn",
-            #[cfg(test)]
-            Self::Mint(_) => "mint",
-        }
-    }
 }
 
 /// Where the reject list of an asset is kept.
@@ -245,6 +257,9 @@ pub(crate) struct InfoAssetTransfer {
     main_transition: TypeOfTransition,
     #[serde(default)]
     burn_reason: Option<BurnReason>,
+    /// External chain block a mint commits to
+    #[serde(default)]
+    after_block: Option<u64>,
 }
 
 /// In-memory storage for transfer artifacts (replaces filesystem directories).
@@ -282,6 +297,61 @@ fn burn_opids(fascia: &Fascia, contract_id: ContractId) -> Vec<OpId> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The deadline for the lock of a sent mint: the expiration of the recipient's invoice.
+fn sent_mint_deadline(transfer_info_map: &BTreeMap<String, InfoAssetTransfer>) -> Option<i64> {
+    transfer_info_map
+        .values()
+        .find(|t| t.main_transition == TypeOfTransition::Mint)
+        .and_then(|t| t.recipients.first())
+        .and_then(|r| r.invoice_expiration)
+}
+
+fn fascia_from_bytes(fascia_bytes: Vec<u8>) -> Result<Fascia, Error> {
+    Fascia::from_strict_serialized::<{ amplify::confinement::U32 }>(
+        Confined::try_from(fascia_bytes).map_err(|e| Error::Internal {
+            details: e.to_string(),
+        })?,
+    )
+    .map_err(|e| Error::Internal {
+        details: e.to_string(),
+    })
+}
+
+/// The mint transition of the contract in the fascia.
+fn mint_opid(fascia: &Fascia, contract_id: ContractId) -> Option<OpId> {
+    fascia
+        .bundles()
+        .get(&contract_id)?
+        .known_transitions
+        .iter()
+        .find(|kt| kt.transition.transition_type == TS_MINT)
+        .map(|kt| kt.opid)
+}
+
+/// The blinded seal of a blind receive.
+fn known_concealed(transfer: &DbTransfer, recipient_id: &str) -> Option<SecretSeal> {
+    if let Some(RecipientTypeFull::Blind { .. }) = transfer.recipient_type {
+        let beneficiary = XChainNet::<Beneficiary>::from_str(recipient_id)
+            .expect("saved recipient ID is invalid");
+        match beneficiary.into_inner() {
+            Beneficiary::BlindedSeal(secret_seal) => Some(secret_seal),
+            _ => unreachable!("beneficiary is blinded"),
+        }
+    } else {
+        None
+    }
+}
+
+/// Whether a received mint pays the amount the invoice requests, if it requests one.
+fn mint_pays_requested(transfer: &DbTransfer, received: &HashMap<Opout, Assignment>) -> bool {
+    match transfer.requested_assignment {
+        Some(Assignment::Fungible(requested)) => {
+            received.values().map(|a| a.main_amount()).sum::<u64>() == requested
+        }
+        _ => true,
+    }
 }
 
 async fn pending_consignment_matches(
@@ -1101,6 +1171,8 @@ impl Wallet {
             .all(|t| t.main_transition == TypeOfTransition::Burn)
         {
             None
+        } else if let Some(deadline) = sent_mint_deadline(transfer_info_map) {
+            Some(deadline)
         } else {
             Some(created_at + DURATION_SEND_TRANSFER)
         };
@@ -1145,6 +1217,7 @@ impl Wallet {
                 user_driven: ActiveValue::Set(true),
                 batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
                 asset_id: ActiveValue::Set(Some(asset_id.clone())),
+                transition_type: ActiveValue::Set(Some(transfer_info.main_transition)),
                 ..Default::default()
             };
             let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
@@ -1185,6 +1258,16 @@ impl Wallet {
                 };
                 self.database.set_coloring(db_coloring)?;
             }
+            for _ in 0..transfer_info.change.mint {
+                let db_coloring = DbColoringActMod {
+                    txo_idx: ActiveValue::Set(change_utxo_idx.unwrap()),
+                    asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                    r#type: ActiveValue::Set(ColoringType::Change),
+                    assignment: ActiveValue::Set(Assignment::MintRight),
+                    ..Default::default()
+                };
+                self.database.set_coloring(db_coloring)?;
+            }
 
             for recipient in transfer_info.recipients.clone() {
                 if transfer_info.main_transition == TypeOfTransition::Burn {
@@ -1202,8 +1285,17 @@ impl Wallet {
                     self.database.set_transfer(transfer)?;
                     continue;
                 }
-                let recipient_type = if transfer_info.main_transition != TypeOfTransition::Transfer
-                {
+                // a test mint, with no invoice, pays outputs of the wallet like an inflation
+                #[cfg(test)]
+                let own_outputs = transfer_info.main_transition == TypeOfTransition::Mint
+                    && recipient.invoice_expiration.is_none();
+                #[cfg(not(test))]
+                let own_outputs = false;
+                let recipient_type = if own_outputs
+                    || !matches!(
+                        transfer_info.main_transition,
+                        TypeOfTransition::Transfer | TypeOfTransition::Mint
+                    ) {
                     let vout = if let LocalRecipientData::Witness(local_witness_data) =
                         recipient.local_recipient_data
                     {
@@ -1252,6 +1344,7 @@ impl Wallet {
                 user_driven: ActiveValue::Set(false),
                 batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
                 asset_id: ActiveValue::Set(Some(asset_id.clone())),
+                transition_type: ActiveValue::Set(Some(TypeOfTransition::Transfer)),
                 ..Default::default()
             };
             let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
@@ -1787,14 +1880,16 @@ impl Wallet {
                 transfer_info.asset_info.contract_id,
                 transfer_info.main_transition.clone().type_name(),
             )?;
+            // a retry raises the need, but the transition spends no more mint rights than asked
+            let inputs_needed = AssignmentsCollection {
+                mint: transfer_info.original_assignments_needed.mint,
+                ..transfer_info.assignments_needed.clone()
+            };
             for (txo_idx, opout, state) in all_opout_state_vec {
                 let mut should_add_as_input = !rejected.contains(&opout);
                 if should_add_as_input {
-                    should_add_as_input = inputs_added.opout_contributes(
-                        &opout,
-                        &state,
-                        &transfer_info.assignments_needed,
-                    );
+                    should_add_as_input =
+                        inputs_added.opout_contributes(&opout, &state, &inputs_needed);
                 }
                 if !should_add_as_input {
                     extra_state
@@ -1884,6 +1979,10 @@ impl Wallet {
                         change.inflation,
                     )?;
                 }
+                for _ in 0..change.mint {
+                    asset_transition_builder =
+                        asset_transition_builder.add_rights(RGB_STATE_MINT_RIGHT, seal)?;
+                }
             };
 
             if transfer_info.main_transition == TypeOfTransition::Inflate {
@@ -1907,8 +2006,10 @@ impl Wallet {
                         .add_global_state(RGB_GLOBAL_BURN_REASON, burn_reason)?;
                 }
             }
-            #[cfg(test)]
-            if let TypeOfTransition::Mint(after_block) = transfer_info.main_transition {
+            if transfer_info.main_transition == TypeOfTransition::Mint {
+                let after_block = transfer_info.after_block.ok_or(Error::Internal {
+                    details: s!("mint transfer is missing the external chain block"),
+                })?;
                 let minted: u64 = transfer_info
                     .recipients
                     .iter()
@@ -2037,9 +2138,14 @@ impl Wallet {
                 None => None,
             };
             let is_burn = transfer_info.main_transition == TypeOfTransition::Burn;
-            let should_build_dag = (transfer_info.main_transition == TypeOfTransition::Transfer
-                || is_burn)
-                && reject_list_source.is_some();
+            let keeps_fascia = matches!(
+                transfer_info.main_transition,
+                TypeOfTransition::Burn | TypeOfTransition::Mint
+            );
+            let should_build_dag = matches!(
+                transfer_info.main_transition,
+                TypeOfTransition::Transfer | TypeOfTransition::Burn | TypeOfTransition::Mint
+            ) && reject_list_source.is_some();
 
             let consignment = if should_build_dag {
                 let (consignment, dag_data) = runtime.transfer_with_dag(
@@ -2097,7 +2203,7 @@ impl Wallet {
                 .transfer_artifacts
                 .entry(txid_key.to_string())
                 .or_default();
-            if is_burn {
+            if keeps_fascia {
                 artifacts.fascia = Some(
                     fascia
                         .to_strict_serialized::<{ amplify::confinement::U32 }>()
@@ -2106,7 +2212,8 @@ impl Wallet {
                         })?
                         .release(),
                 );
-            } else if let Some(consignment) = consignment {
+            }
+            if let Some(consignment) = consignment {
                 // Store consignment bytes in memory instead of filesystem
                 let mut consignment_bytes = Vec::new();
                 consignment.save(&mut consignment_bytes)?;
@@ -2232,6 +2339,8 @@ impl Wallet {
     pub(crate) async fn _resolve_anchors(
         &self,
         pending: &mut PendingConsignment<true>,
+        terminal_opids: &HashSet<OpId>,
+        scanned_blocks: &mut HashMap<OpId, u64>,
     ) -> Result<Option<OpId>, Error> {
         let anchors: Vec<ExternalAnchor> =
             pending.pending().unresolved_anchors().cloned().collect();
@@ -2248,10 +2357,17 @@ impl Wallet {
             warn!(self.logger, "No EVM RPC URL for chain ID {chain_id}");
             return Ok(Some(*opid));
         };
-        let resolver = BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks());
+        let resolver = MintAnchorResolver::new(
+            &evm_client,
+            terminal_opids,
+            std::mem::take(scanned_blocks),
+            max_mint_scan_blocks(),
+        );
         for anchor in &anchors {
             let ExternalAnchor::MintEvent { opid, .. } = anchor;
-            if !resolver.is_confirmed(&address, anchor).await? {
+            let confirmed = resolver.is_confirmed(&address, anchor).await?;
+            *scanned_blocks = resolver.scanned_blocks();
+            if !confirmed {
                 if resolver.is_exhausted(opid) {
                     return Err(Error::MintEventOutOfScanWindow {
                         opid: opid.to_string(),
@@ -2385,6 +2501,127 @@ impl Wallet {
         let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
         runtime.upsert_witness(witness_id, WitnessOrd::Tentative)?;
         Ok(tx)
+    }
+
+    /// Validate what a consignment pays and its history. `None` means refuse the consignment.
+    async fn _check_received_consignment(
+        &self,
+        runtime: &RgbRuntime,
+        pending: PendingConsignment<true>,
+        consignment: &RgbTransfer,
+        asset_schema: AssetSchema,
+        asset_id: &str,
+        witness_id: RgbTxid,
+        vout: Option<u32>,
+        transfer: &DbTransfer,
+        recipient_id: &str,
+    ) -> Result<Option<(ValidConsignment<true>, HashMap<Opout, Assignment>)>, Error> {
+        let valid_consignment = pending.finalize();
+        let validation_status = valid_consignment.validation_status();
+        let validity = validation_status.validity();
+        debug!(self.logger, "Consignment validity: {:?}", validity);
+
+        // check the info provided via the proxy is correct
+        if let Some(anchored_bundle) = consignment
+            .bundles
+            .iter()
+            .find(|ab| ab.witness_id() == witness_id)
+        {
+            if let Some(RecipientTypeFull::Witness { .. }) = transfer.recipient_type {
+                if let Some(vout) = vout {
+                    let tx = &anchored_bundle.tx;
+                    if let Some(output) = tx.output.get(vout as usize) {
+                        let script_pubkey =
+                            script_buf_from_recipient_id(recipient_id.to_string())?.unwrap();
+                        if output.script_pubkey != script_pubkey {
+                            error!(
+                                self.logger,
+                                "The provided vout pays an incorrect script pubkey"
+                            );
+                            return Ok(None);
+                        }
+                    } else {
+                        error!(self.logger, "Cannot find the expected outpoint");
+                        return Ok(None);
+                    }
+                } else {
+                    error!(
+                        self.logger,
+                        "The vout should be provided when receiving via witness"
+                    );
+                    return Ok(None);
+                }
+            }
+        } else {
+            error!(
+                self.logger,
+                "Cannot find the provided TXID in the consignment"
+            );
+            return Ok(None);
+        }
+
+        if !self.supports_schema(&asset_schema) {
+            error!(
+                self.logger,
+                "The wallet doesn't support the provided schema: {}", asset_schema
+            );
+            return Ok(None);
+        }
+
+        let received = self.extract_received_assignments(
+            &consignment,
+            witness_id,
+            vout,
+            known_concealed(&transfer, &recipient_id),
+        );
+        if received.is_empty() {
+            error!(self.logger, "Cannot find any receiving assignment");
+            return Ok(None);
+        };
+        let reject_list_source = match asset_schema {
+            AssetSchema::Ifa => {
+                let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.to_string()) {
+                    ass.reject_list_url
+                } else {
+                    let contract = IfaWrapper::with(runtime.consignment_data(&valid_consignment)?);
+                    contract.reject_list_url().map(|u| u.to_string())
+                };
+                url.map(RejectListSource::Url)
+            }
+            AssetSchema::Bfa => BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
+                .reject_list()
+                .map(RejectListSource::from),
+            AssetSchema::Nia => None,
+        };
+        if let Some(source) = &reject_list_source {
+            let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
+
+            let to_reject = self._check_dag(
+                validation_status
+                    .dag_data_opt
+                    .as_ref()
+                    .expect("build_opouts_dag is true"),
+                &reject_opouts,
+                &allow_opouts,
+                &received.clone().into_keys().collect(),
+            )?;
+
+            if !to_reject.is_empty() {
+                error!(
+                    self.logger,
+                    "Found {} opout(s) that must be rejected",
+                    to_reject.len()
+                );
+                return Ok(None);
+            } else {
+                info!(
+                    self.logger,
+                    "Didn't find any opout(s) that should be rejected"
+                );
+            }
+        }
+
+        Ok(Some((valid_consignment, received)))
     }
 
     async fn _wait_consignment_async(
@@ -2542,9 +2779,153 @@ impl Wallet {
                 });
             }
         };
-        match self._resolve_anchors(&mut pending).await {
+        // the mint paying this recipient, as opposed to those in its history
+        let terminal_opids: HashSet<OpId> = consignment
+            .bundles
+            .iter()
+            .filter(|ab| ab.witness_id() == witness_id)
+            .flat_map(|ab| ab.bundle.known_transitions.iter().map(|kt| kt.opid))
+            .collect();
+        let received_mint = pending
+            .pending()
+            .unresolved_anchors()
+            .find_map(|anchor| {
+                let ExternalAnchor::MintEvent {
+                    opid,
+                    amount,
+                    after_block,
+                } = anchor;
+                terminal_opids
+                    .contains(opid)
+                    .then_some((*opid, *amount, *after_block))
+            })
+            .map(|(opid, amount, after_block)| {
+                let BridgeLocation::Evm(EvmContract { chain_id, address }) =
+                    BridgedFungibleAsset::bridge_location(&consignment.genesis).map_err(|e| {
+                        Error::Internal {
+                            details: format!("unexpected bridge location error: {e:?}"),
+                        }
+                    })?;
+                Ok::<_, Error>(ReceivedMint {
+                    opid: opid.to_string(),
+                    amount,
+                    after_block,
+                    evm_chain_id: chain_id,
+                    bridge_contract: address.to_string(),
+                })
+            })
+            .transpose()?;
+        let mint_saved = self.received_mints.contains_key(&recipient_id);
+        if let Some(mint) = &received_mint {
+            // past its deadline a mint is waited for only if its lock was included by then
+            let now = now().unix_timestamp();
+            if let Some(deadline) = batch_transfer.expiration
+                && now > deadline
+                && !self._mint_in_finality_grace(mint, deadline, now).await
+            {
+                info!(self.logger, "Mint {} expired with no lock", mint.opid);
+                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+            }
+            if self._evm_client(mint.evm_chain_id).is_none() {
+                warn!(
+                    self.logger,
+                    "No EVM RPC URL for chain ID {}, will retry", mint.evm_chain_id
+                );
+                return Ok(None);
+            }
+            // the mint follows the invoice, so the block it commits to cannot be much older
+            if !mint_saved {
+                let evm_client = self
+                    ._evm_client(mint.evm_chain_id)
+                    .expect("EVM client checked above");
+                let after_block_timestamp =
+                    evm_client.block_timestamp(mint.after_block).await? as i64;
+                if after_block_timestamp < batch_transfer.created_at - MINT_AFTER_BLOCK_GRACE_SECS {
+                    error!(
+                        self.logger,
+                        "Mint {} commits to a block before the invoice", mint.opid
+                    );
+                    return self
+                        ._refuse_consignment_async(
+                            proxy_url,
+                            recipient_id,
+                            &mut updated_batch_transfer,
+                        )
+                        .await;
+                }
+            }
+        }
+        let mut scanned_blocks: HashMap<OpId, u64> = self
+            .mint_scanned_blocks
+            .get(&recipient_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|(opid, block)| OpId::from_str(opid).ok().map(|o| (o, *block)))
+            .collect();
+        let resolved = self
+            ._resolve_anchors(&mut pending, &terminal_opids, &mut scanned_blocks)
+            .await;
+        if received_mint.is_some() {
+            self.mint_scanned_blocks.insert(
+                recipient_id.clone(),
+                scanned_blocks
+                    .into_iter()
+                    .map(|(opid, block)| (opid.to_string(), block))
+                    .collect(),
+            );
+        }
+        match resolved {
             Ok(Some(opid)) => {
                 warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
+                // check the mint once before the lock, so the user knows what to lock
+                if let Some(mint) = received_mint
+                    && !mint_saved
+                {
+                    let mut assumed = pending.clone();
+                    let unresolved: Vec<ExternalAnchor> =
+                        assumed.pending().unresolved_anchors().cloned().collect();
+                    for anchor in &unresolved {
+                        assumed
+                            .pending()
+                            .resolve_anchor(anchor)
+                            .map_err(|e| Error::Internal {
+                                details: format!("unexpected anchor resolution error: {e}"),
+                            })?;
+                    }
+                    let checked = self
+                        ._check_received_consignment(
+                            &runtime,
+                            assumed,
+                            &consignment,
+                            asset_schema,
+                            &asset_id,
+                            witness_id,
+                            vout,
+                            &transfer,
+                            &recipient_id,
+                        )
+                        .await?;
+                    let Some((_, received)) = checked else {
+                        return self
+                            ._refuse_consignment_async(
+                                proxy_url,
+                                recipient_id,
+                                &mut updated_batch_transfer,
+                            )
+                            .await;
+                    };
+                    if !mint_pays_requested(&transfer, &received) {
+                        error!(self.logger, "Mint does not pay the invoice");
+                        return self
+                            ._refuse_consignment_async(
+                                proxy_url,
+                                recipient_id,
+                                &mut updated_batch_transfer,
+                            )
+                            .await;
+                    }
+                    self.received_mints.insert(recipient_id, mint);
+                }
                 return Ok(None);
             }
             Ok(None) => {}
@@ -2556,143 +2937,33 @@ impl Wallet {
             }
             Err(e) => return Err(e),
         }
-        let valid_consignment = pending.finalize();
-        let validation_status = valid_consignment.validation_status();
-        let validity = validation_status.validity();
-        debug!(self.logger, "Consignment validity: {:?}", validity);
-
-        // check the info provided via the proxy is correct
-        if let Some(anchored_bundle) = consignment
-            .bundles
-            .iter()
-            .find(|ab| ab.witness_id() == witness_id)
-        {
-            if let Some(RecipientTypeFull::Witness { .. }) = transfer.recipient_type {
-                if let Some(vout) = vout {
-                    let tx = &anchored_bundle.tx;
-                    if let Some(output) = tx.output.get(vout as usize) {
-                        let script_pubkey =
-                            script_buf_from_recipient_id(recipient_id.clone())?.unwrap();
-                        if output.script_pubkey != script_pubkey {
-                            error!(
-                                self.logger,
-                                "The provided vout pays an incorrect script pubkey"
-                            );
-                            return self
-                                ._refuse_consignment_async(
-                                    proxy_url,
-                                    recipient_id,
-                                    &mut updated_batch_transfer,
-                                )
-                                .await;
-                        }
-                    } else {
-                        error!(self.logger, "Cannot find the expected outpoint");
-                        return self
-                            ._refuse_consignment_async(
-                                proxy_url,
-                                recipient_id,
-                                &mut updated_batch_transfer,
-                            )
-                            .await;
-                    }
-                } else {
-                    error!(
-                        self.logger,
-                        "The vout should be provided when receiving via witness"
-                    );
-                    return self
-                        ._refuse_consignment_async(
-                            proxy_url,
-                            recipient_id,
-                            &mut updated_batch_transfer,
-                        )
-                        .await;
-                }
-            }
-        } else {
-            error!(
-                self.logger,
-                "Cannot find the provided TXID in the consignment"
-            );
+        let Some((valid_consignment, received)) = self
+            ._check_received_consignment(
+                &runtime,
+                pending,
+                &consignment,
+                asset_schema,
+                &asset_id,
+                witness_id,
+                vout,
+                &transfer,
+                &recipient_id,
+            )
+            .await?
+        else {
+            return self
+                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                .await;
+        };
+        if received_mint.is_some() && !mint_pays_requested(&transfer, &received) {
+            error!(self.logger, "Mint does not pay the invoice");
             return self
                 ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
                 .await;
         }
 
-        if !self.supports_schema(&asset_schema) {
-            error!(
-                self.logger,
-                "The wallet doesn't support the provided schema: {}", asset_schema
-            );
-            return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                .await;
-        }
-
-        let known_concealed = if let Some(RecipientTypeFull::Blind { .. }) = transfer.recipient_type
-        {
-            let beneficiary = XChainNet::<Beneficiary>::from_str(&recipient_id)
-                .expect("saved recipient ID is invalid");
-            match beneficiary.into_inner() {
-                Beneficiary::BlindedSeal(secret_seal) => Some(secret_seal),
-                _ => unreachable!("beneficiary is blinded"),
-            }
-        } else {
-            None
-        };
-        let received =
-            self.extract_received_assignments(&consignment, witness_id, vout, known_concealed);
-        if received.is_empty() {
-            error!(self.logger, "Cannot find any receiving assignment");
-            return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                .await;
-        };
-
-        let reject_list_source = match asset_schema {
-            AssetSchema::Ifa => {
-                let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.clone()) {
-                    ass.reject_list_url
-                } else {
-                    let contract = IfaWrapper::with(runtime.consignment_data(&valid_consignment)?);
-                    contract.reject_list_url().map(|u| u.to_string())
-                };
-                url.map(RejectListSource::Url)
-            }
-            AssetSchema::Bfa => BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
-                .reject_list()
-                .map(RejectListSource::from),
-            AssetSchema::Nia => None,
-        };
-        if let Some(source) = &reject_list_source {
-            let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
-
-            let to_reject = self._check_dag(
-                validation_status
-                    .dag_data_opt
-                    .as_ref()
-                    .expect("build_opouts_dag is true"),
-                &reject_opouts,
-                &allow_opouts,
-                &received.clone().into_keys().collect(),
-            )?;
-
-            if !to_reject.is_empty() {
-                error!(
-                    self.logger,
-                    "Found {} opout(s) that must be rejected",
-                    to_reject.len()
-                );
-                return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                    .await;
-            } else {
-                info!(
-                    self.logger,
-                    "Didn't find any opout(s) that should be rejected"
-                );
-            }
+        if let Some(mint) = received_mint {
+            self.received_mints.insert(recipient_id.clone(), mint);
         }
 
         // add asset info to transfer if missing
@@ -3025,7 +3296,10 @@ impl Wallet {
                 .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
                 .and_then(|mut p| p.pending().resolve_all(&wasm_resolver).map(|_| p))
                 .map_err(|_| InternalError::Unexpected)?;
-            if let Some(opid) = self._resolve_anchors(&mut pending).await? {
+            if let Some(opid) = self
+                ._resolve_anchors(&mut pending, &HashSet::new(), &mut HashMap::new())
+                .await?
+            {
                 warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
                 return Ok(None);
             }
@@ -3084,6 +3358,7 @@ impl Wallet {
                 && let Some(recipient_id) = &transfer.recipient_id
             {
                 self.received_consignments.remove(recipient_id);
+                self.mint_scanned_blocks.remove(recipient_id);
             }
         }
 
@@ -3274,12 +3549,19 @@ impl Wallet {
         } else {
             // fail all transfers in status WaitingCounterparty
             let now = now().unix_timestamp();
-            let mut expired_batch_transfers: Vec<DbBatchTransfer> = db_data
-                .batch_transfers
-                .clone()
-                .into_iter()
-                .filter(|t| t.waiting_counterparty() && t.expiration.unwrap_or(now) < now)
-                .collect();
+            let mut expired_batch_transfers: Vec<DbBatchTransfer> = vec![];
+            for t in &db_data.batch_transfers {
+                let pending_mint = Self::_is_pending_mint(t, &db_data);
+                let incoming = t.incoming(&db_data.asset_transfers, &db_data.transfers)?;
+                let expired = if pending_mint || (incoming && t.waiting_counterparty()) {
+                    self._is_expired_with_mint_grace(t, &db_data, now).await?
+                } else {
+                    t.waiting_counterparty() && t.expiration.unwrap_or(now) < now
+                };
+                if expired {
+                    expired_batch_transfers.push(t.clone());
+                }
+            }
             for batch_transfer in expired_batch_transfers.iter_mut() {
                 if no_asset_only {
                     let connected_assets = batch_transfer
@@ -3298,6 +3580,101 @@ impl Wallet {
 
         info!(self.logger, "Fail transfers completed");
         Ok(transfers_changed)
+    }
+
+    /// Check a recipient and turn it into a local one.
+    async fn _parse_recipient(
+        &self,
+        recipient: &Recipient,
+        schema: AssetSchema,
+        chainnet: ChainNet,
+        witness_recipients: &mut Vec<(ScriptBuf, u64)>,
+        recipient_vout: &mut u32,
+    ) -> Result<LocalRecipient, Error> {
+        self.check_transport_endpoints(&recipient.transport_endpoints)?;
+        match (&recipient.assignment, schema) {
+            (Assignment::Fungible(amt), AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa) => {
+                if *amt == 0 {
+                    return Err(Error::InvalidAmountZero);
+                }
+            }
+            (Assignment::InflationRight(amt), AssetSchema::Ifa) => {
+                if *amt == 0 {
+                    return Err(Error::InvalidAmountZero);
+                }
+            }
+            _ => {
+                return Err(Error::InvalidAssignment);
+            }
+        }
+        let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
+        let mut found_valid = false;
+        for endpoint_str in &recipient.transport_endpoints {
+            let transport_endpoint = TransportEndpoint::new(endpoint_str.clone())?;
+            let mut local_transport_endpoint = LocalTransportEndpoint {
+                transport_type: transport_endpoint.transport_type,
+                endpoint: transport_endpoint.endpoint.clone(),
+                used: false,
+                usable: false,
+            };
+            if crate::utils::check_proxy_async(&transport_endpoint.endpoint)
+                .await
+                .is_ok()
+            {
+                local_transport_endpoint.usable = true;
+                found_valid = true;
+            }
+            transport_endpoints.push(local_transport_endpoint);
+        }
+
+        if !found_valid {
+            return Err(Error::InvalidTransportEndpoints {
+                details: s!("no valid transport endpoints"),
+            });
+        }
+
+        let xchainnet_beneficiary = XChainNet::<Beneficiary>::from_str(&recipient.recipient_id)
+            .map_err(|_| Error::InvalidRecipientID)?;
+
+        if xchainnet_beneficiary.chain_network() != chainnet {
+            return Err(Error::InvalidRecipientNetwork);
+        }
+
+        let local_recipient_data = match xchainnet_beneficiary.into_inner() {
+            Beneficiary::BlindedSeal(secret_seal) => {
+                if recipient.witness_data.is_some() {
+                    return Err(Error::InvalidRecipientData {
+                        details: s!("cannot provide witness data for a blinded recipient"),
+                    });
+                }
+                LocalRecipientData::Blind(secret_seal)
+            }
+            Beneficiary::WitnessVout(pay_2_vout, _) => {
+                if let Some(ref witness_data) = recipient.witness_data {
+                    let script_buf = pay_2_vout.to_script();
+                    witness_recipients.push((script_buf.clone(), witness_data.amount_sat));
+                    let local_witness_data = LocalWitnessData {
+                        amount_sat: witness_data.amount_sat,
+                        blinding: witness_data.blinding,
+                        vout: *recipient_vout,
+                    };
+                    *recipient_vout += 1;
+                    LocalRecipientData::Witness(local_witness_data)
+                } else {
+                    return Err(Error::InvalidRecipientData {
+                        details: s!("missing witness data for a witness recipient"),
+                    });
+                }
+            }
+        };
+
+        Ok(LocalRecipient {
+            recipient_id: recipient.recipient_id.clone(),
+            local_recipient_data,
+            assignment: recipient.assignment.clone(),
+            transport_endpoints,
+            invoice_expiration: recipient.expiration_timestamp.map(|e| e as i64),
+        })
     }
 
     /// Prepare the PSBT to send RGB assets (wasm32 async).
@@ -3330,96 +3707,19 @@ impl Wallet {
 
             let mut original_assignments_needed = AssignmentsCollection::default();
             for recipient in recipients.clone() {
-                self.check_transport_endpoints(&recipient.transport_endpoints)?;
-                match (&recipient.assignment, schema) {
-                    (
-                        Assignment::Fungible(amt),
-                        AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa,
-                    ) => {
-                        if *amt == 0 {
-                            return Err(Error::InvalidAmountZero);
-                        }
-                    }
-                    (Assignment::InflationRight(amt), AssetSchema::Ifa) => {
-                        if *amt == 0 {
-                            return Err(Error::InvalidAmountZero);
-                        }
-                    }
-                    _ => {
-                        return Err(Error::InvalidAssignment);
-                    }
-                }
-                let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
-                let mut found_valid = false;
-                for endpoint_str in &recipient.transport_endpoints {
-                    let transport_endpoint = TransportEndpoint::new(endpoint_str.clone())?;
-                    let mut local_transport_endpoint = LocalTransportEndpoint {
-                        transport_type: transport_endpoint.transport_type,
-                        endpoint: transport_endpoint.endpoint.clone(),
-                        used: false,
-                        usable: false,
-                    };
-                    if crate::utils::check_proxy_async(&transport_endpoint.endpoint)
-                        .await
-                        .is_ok()
-                    {
-                        local_transport_endpoint.usable = true;
-                        found_valid = true;
-                    }
-                    transport_endpoints.push(local_transport_endpoint);
-                }
-
-                if !found_valid {
-                    return Err(Error::InvalidTransportEndpoints {
-                        details: s!("no valid transport endpoints"),
-                    });
-                }
-
-                let xchainnet_beneficiary =
-                    XChainNet::<Beneficiary>::from_str(&recipient.recipient_id)
-                        .map_err(|_| Error::InvalidRecipientID)?;
-
-                if xchainnet_beneficiary.chain_network() != chainnet {
-                    return Err(Error::InvalidRecipientNetwork);
-                }
-
-                let local_recipient_data = match xchainnet_beneficiary.into_inner() {
-                    Beneficiary::BlindedSeal(secret_seal) => {
-                        if recipient.witness_data.is_some() {
-                            return Err(Error::InvalidRecipientData {
-                                details: s!("cannot provide witness data for a blinded recipient"),
-                            });
-                        }
-                        LocalRecipientData::Blind(secret_seal)
-                    }
-                    Beneficiary::WitnessVout(pay_2_vout, _) => {
-                        if let Some(ref witness_data) = recipient.witness_data {
-                            let script_buf = pay_2_vout.to_script();
-                            witness_recipients.push((script_buf.clone(), witness_data.amount_sat));
-                            let local_witness_data = LocalWitnessData {
-                                amount_sat: witness_data.amount_sat,
-                                blinding: witness_data.blinding,
-                                vout: recipient_vout,
-                            };
-                            recipient_vout += 1;
-                            LocalRecipientData::Witness(local_witness_data)
-                        } else {
-                            return Err(Error::InvalidRecipientData {
-                                details: s!("missing witness data for a witness recipient"),
-                            });
-                        }
-                    }
-                };
-
+                let local_recipient = self
+                    ._parse_recipient(
+                        &recipient,
+                        schema,
+                        chainnet,
+                        &mut witness_recipients,
+                        &mut recipient_vout,
+                    )
+                    .await?;
                 local_recipients
                     .entry(asset_id.clone())
                     .or_default()
-                    .push(LocalRecipient {
-                        recipient_id: recipient.recipient_id,
-                        local_recipient_data,
-                        assignment: recipient.assignment.clone(),
-                        transport_endpoints,
-                    });
+                    .push(local_recipient);
 
                 recipient
                     .assignment
@@ -3481,6 +3781,7 @@ impl Wallet {
                     assignments_spent: HashMap::new(),
                     main_transition,
                     burn_reason: None,
+                    after_block: None,
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -4085,6 +4386,7 @@ impl Wallet {
                 }),
                 assignment: Assignment::Fungible(*amt),
                 transport_endpoints: vec![],
+                invoice_expiration: None,
             })
         }
 
@@ -4103,6 +4405,7 @@ impl Wallet {
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Inflate,
             burn_reason: None,
+            after_block: None,
         };
         let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> =
             BTreeMap::from([(asset_id.clone(), transfer_info)]);
@@ -4157,7 +4460,7 @@ impl Wallet {
             .is_operation(|t| match t {
                 TypeOfTransition::Inflate => true,
                 #[cfg(test)]
-                TypeOfTransition::Mint(_) => true,
+                TypeOfTransition::Mint => true,
                 _ => false,
             })
         {
@@ -4331,6 +4634,7 @@ impl Wallet {
             }),
             assignment: Assignment::Fungible(0),
             transport_endpoints: vec![],
+            invoice_expiration: None,
         };
 
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
@@ -4347,6 +4651,7 @@ impl Wallet {
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Burn,
             burn_reason,
+            after_block: None,
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
         let mut rejected = HashSet::new();
@@ -4445,24 +4750,7 @@ impl Wallet {
         let txid = psbt.unsigned_tx.compute_txid().to_string();
 
         // only a burn begun without dry run, and not failed or ended, has a batch transfer
-        let db_data = self.database.get_db_data(false)?;
-        let batch_transfer = db_data
-            .batch_transfers
-            .iter()
-            .find(|bt| {
-                bt.txid.as_ref() == Some(&txid)
-                    && matches!(
-                        bt.incoming(&db_data.asset_transfers, &db_data.transfers),
-                        Ok(false)
-                    )
-            })
-            .cloned();
-        if batch_transfer
-            .as_ref()
-            .is_some_and(|bt| !bt.status.initiated())
-        {
-            return Err(Error::CannotEndTransfer { txid });
-        }
+        let batch_transfer = self._check_end_initiated(&txid)?;
 
         let artifacts = self
             .transfer_artifacts
@@ -4478,14 +4766,7 @@ impl Wallet {
         let fascia_bytes = artifacts.fascia.clone().ok_or(Error::Internal {
             details: s!("missing fascia in transfer artifacts"),
         })?;
-        let mut fascia = Fascia::from_strict_serialized::<{ amplify::confinement::U32 }>(
-            Confined::try_from(fascia_bytes).map_err(|e| Error::Internal {
-                details: e.to_string(),
-            })?,
-        )
-        .map_err(|e| Error::Internal {
-            details: e.to_string(),
-        })?;
+        let mut fascia = fascia_from_bytes(fascia_bytes)?;
 
         // the consignment carries the signed transaction
         fascia.update_witness_tx(psbt.clone().extract_tx().map_err(InternalError::from)?);
@@ -4546,6 +4827,441 @@ impl Wallet {
         })
     }
 
+    /// The outgoing batch transfer of `txid`, if any. Fail with [`Error::CannotEndTransfer`] if
+    /// it is no longer initiated.
+    fn _check_end_initiated(&self, txid: &str) -> Result<Option<DbBatchTransfer>, Error> {
+        let db_data = self.database.get_db_data(false)?;
+        let batch_transfer = db_data
+            .batch_transfers
+            .iter()
+            .find(|bt| {
+                bt.txid.as_deref() == Some(txid)
+                    && matches!(
+                        bt.incoming(&db_data.asset_transfers, &db_data.transfers),
+                        Ok(false)
+                    )
+            })
+            .cloned();
+        if batch_transfer
+            .as_ref()
+            .is_some_and(|bt| !bt.status.initiated())
+        {
+            return Err(Error::CannotEndTransfer {
+                txid: txid.to_string(),
+            });
+        }
+        Ok(batch_transfer)
+    }
+
+    /// The mint the artifacts of an outgoing mint carry: what its lock has to match.
+    fn _sent_mint(&self, artifacts: &TransferArtifacts) -> Result<ReceivedMint, Error> {
+        let transfer_info = artifacts
+            .asset_infos
+            .values()
+            .find(|t| t.main_transition == TypeOfTransition::Mint)
+            .ok_or(Error::Internal {
+                details: s!("not a mint transfer"),
+            })?;
+        let after_block = transfer_info.after_block.ok_or(Error::Internal {
+            details: s!("mint transfer is missing the external chain block"),
+        })?;
+        let contract_id = transfer_info.asset_info.contract_id;
+        let fascia = fascia_from_bytes(artifacts.fascia.clone().ok_or(Error::Internal {
+            details: s!("missing fascia in transfer artifacts"),
+        })?)?;
+        let opid = mint_opid(&fascia, contract_id).ok_or(Error::Internal {
+            details: s!("mint transition missing from fascia"),
+        })?;
+        let BridgeLocation::Evm(EvmContract { chain_id, address }) = self
+            .rgb_runtime()?
+            .contract_wrapper::<BridgedFungibleAsset>(contract_id)?
+            .bridge_location();
+        Ok(ReceivedMint {
+            opid: opid.to_string(),
+            amount: transfer_info
+                .recipients
+                .iter()
+                .map(|r| r.assignment.main_amount())
+                .sum(),
+            after_block,
+            evm_chain_id: chain_id,
+            bridge_contract: address.to_string(),
+        })
+    }
+
+    /// Whether the lock of `mint` was included on the external chain by `expiration`.
+    async fn _mint_lock_included_by(
+        &self,
+        mint: &ReceivedMint,
+        expiration: i64,
+    ) -> Result<bool, Error> {
+        let evm_client = self
+            ._evm_client(mint.evm_chain_id)
+            .ok_or(Error::NoEvmRpcUrl {
+                chain_id: mint.evm_chain_id,
+            })?;
+        let address = EvmAddress::from_str(&mint.bridge_contract).map_err(|e| Error::Internal {
+            details: format!("invalid bridge contract address: {e}"),
+        })?;
+        let opid = OpId::from_str(&mint.opid).map_err(|e| Error::Internal {
+            details: format!("invalid mint operation ID: {e}"),
+        })?;
+        Ok(evm_client
+            .funds_in_inclusion(&address, &opid, mint.amount, mint.after_block)
+            .await?
+            .is_some_and(|timestamp| timestamp as i64 <= expiration))
+    }
+
+    /// Whether an expired mint is still waited for: its lock was included by the expiration and
+    /// the finality grace has not passed yet.
+    async fn _mint_in_finality_grace(
+        &self,
+        mint: &ReceivedMint,
+        expiration: i64,
+        now: i64,
+    ) -> bool {
+        if now > expiration + MINT_FINALITY_GRACE_SECS {
+            return false;
+        }
+        match self._mint_lock_included_by(mint, expiration).await {
+            Ok(included) => included,
+            // the lock cannot be looked up: keep waiting until the grace passes
+            Err(e) => {
+                warn!(
+                    self.logger,
+                    "Cannot check the lock of expired mint {}: {e}", mint.opid
+                );
+                true
+            }
+        }
+    }
+
+    /// Whether the batch transfer is an outgoing mint that has not reached `mint_end` yet.
+    fn _is_pending_mint(batch_transfer: &DbBatchTransfer, db_data: &DbData) -> bool {
+        batch_transfer.status == TransferStatus::Initiated
+            && batch_transfer.txid.is_some()
+            && db_data.asset_transfers.iter().any(|at| {
+                at.batch_transfer_idx == batch_transfer.idx
+                    && at.transition_type == Some(TypeOfTransition::Mint)
+            })
+    }
+
+    /// Whether the batch transfer has expired. A mint whose lock was included by its deadline
+    /// expires only once the finality grace has passed.
+    async fn _is_expired_with_mint_grace(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+        db_data: &DbData,
+        now: i64,
+    ) -> Result<bool, Error> {
+        let mint = if Self::_is_pending_mint(batch_transfer, db_data) {
+            let txid = batch_transfer.txid.as_ref().expect("checked");
+            match self.transfer_artifacts.get(txid) {
+                Some(artifacts) => Some(self._sent_mint(artifacts)?),
+                None => None,
+            }
+        } else {
+            let (_, transfer) = self.database.get_incoming_transfer(
+                &batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?,
+            )?;
+            transfer
+                .recipient_id
+                .as_ref()
+                .and_then(|r| self.received_mints.get(r))
+                .cloned()
+        };
+        let deadline = batch_transfer.expiration.unwrap_or(now);
+        Ok(match mint {
+            Some(mint) => {
+                now > deadline && !self._mint_in_finality_grace(&mint, deadline, now).await
+            }
+            None => deadline < now,
+        })
+    }
+
+    /// Begin a BFA mint: spend one mint right to mint `recipient`'s amount, backed by a lock of
+    /// tokens on the external chain.
+    ///
+    /// The consignment is posted to the recipient before the PSBT is signed. The invoice must
+    /// leave at least one hour for the lock. The last mint right of the wallet is never spent.
+    ///
+    /// Complete the mint with [`mint_end`](Wallet::mint_end) once the lock is finalized.
+    pub async fn mint_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        recipient: Recipient,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: String,
+    ) -> Result<MintBeginResult, Error> {
+        info!(self.logger, "Minting (begin) to: {:?}...", recipient);
+        self.check_online(online.clone())?;
+
+        let asset = self.database.check_asset_exists(asset_id.clone())?;
+        let schema = asset.schema;
+        self.check_schema_support(&schema)?;
+        if schema != AssetSchema::Bfa {
+            return Err(Error::UnsupportedMint {
+                asset_schema: schema,
+            });
+        }
+        match recipient.assignment {
+            Assignment::Fungible(0) => return Err(Error::InvalidAmountZero),
+            Assignment::Fungible(_) => {}
+            _ => return Err(Error::InvalidAssignment),
+        }
+        TransportEndpoint::new(sender_transport_endpoint)?;
+
+        let (fee_rate_checked, unspents, input_unspents, mut runtime) =
+            self._get_transfer_begin_data(online, fee_rate)?;
+
+        // refuse to spend the last mint right, so the wallet can still mint
+        let mint_rights = input_unspents
+            .iter()
+            .flat_map(|u| &u.rgb_allocations)
+            .filter(|a| {
+                a.asset_id.as_ref() == Some(&asset_id)
+                    && a.status.settled()
+                    && a.assignment == Assignment::MintRight
+            })
+            .count();
+        if mint_rights == 1 {
+            return Err(Error::LastMintRight);
+        }
+
+        let assignments_needed = AssignmentsCollection {
+            mint: 1,
+            ..Default::default()
+        };
+        let asset_spend = self._select_rgb_inputs(
+            asset_id.clone(),
+            &assignments_needed,
+            input_unspents.clone(),
+        )?;
+
+        let now_ts = now().unix_timestamp();
+        let mut witness_recipients: Vec<(ScriptBuf, u64)> = vec![];
+        let local_recipient = self
+            ._parse_recipient(
+                &recipient,
+                schema,
+                self.bitcoin_network().into(),
+                &mut witness_recipients,
+                &mut 1,
+            )
+            .await?;
+        // the lock has to be included by the invoice expiration: refuse one too close
+        let expiration = local_recipient
+            .invoice_expiration
+            .ok_or(Error::InvalidRecipientData {
+                details: s!("missing invoice expiration"),
+            })?;
+        if expiration < now_ts + MIN_MINT_LOCK_WINDOW_SECS as i64 {
+            return Err(Error::InvoiceExpired);
+        }
+
+        // the lock can only follow the latest finalized block, so the transition commits to it
+        let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
+        let BridgeLocation::Evm(EvmContract { chain_id, .. }) = runtime
+            .contract_wrapper::<BridgedFungibleAsset>(contract_id)?
+            .bridge_location();
+        let evm_client = self
+            ._evm_client(chain_id)
+            .ok_or(Error::NoEvmRpcUrl { chain_id })?;
+        let after_block = evm_client.finalized_block_number().await?;
+
+        let transfer_info = InfoAssetTransfer {
+            asset_info: AssetInfo {
+                contract_id,
+                reject_list_url: asset.reject_list_url,
+            },
+            recipients: vec![local_recipient],
+            asset_spend,
+            change: AssignmentsCollection::default(),
+            original_assignments_needed: assignments_needed.clone(),
+            assignments_needed,
+            assignments_spent: HashMap::new(),
+            main_transition: TypeOfTransition::Mint,
+            burn_reason: None,
+            after_block: Some(after_block),
+        };
+        let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
+        let mut rejected = HashSet::new();
+        let psbt_string = loop {
+            match self
+                ._prepare_transfer_psbt_wasm(
+                    &mut transfer_info_map,
+                    false,
+                    unspents.clone(),
+                    &input_unspents,
+                    &witness_recipients,
+                    fee_rate_checked,
+                    min_confirmations,
+                    None,
+                    &mut runtime,
+                    &mut rejected,
+                )
+                .await?
+            {
+                PrepareTransferPsbtResult::Retry => {
+                    // select inputs again, without the rejected ones
+                    let assignments_needed =
+                        transfer_info_map[&asset_id].assignments_needed.clone();
+                    let asset_spend = self._select_rgb_inputs(
+                        asset_id.clone(),
+                        &assignments_needed,
+                        input_unspents.clone(),
+                    )?;
+                    transfer_info_map = BTreeMap::from([(
+                        asset_id.clone(),
+                        InfoAssetTransfer {
+                            asset_spend,
+                            assignments_needed,
+                            ..transfer_info.clone()
+                        },
+                    )]);
+                }
+                PrepareTransferPsbtResult::Success(psbt_string) => break psbt_string,
+            }
+        };
+        drop(runtime);
+
+        let txid = Psbt::from_str(&psbt_string)?
+            .unsigned_tx
+            .compute_txid()
+            .to_string();
+        let artifacts = self.transfer_artifacts[&txid].clone();
+        let info_contents = artifacts.batch_info.clone().unwrap();
+        let batch_transfer_idx = self._save_transfers(
+            txid.clone(),
+            &artifacts.asset_infos,
+            info_contents.extra_allocations,
+            info_contents.change_utxo_idx,
+            info_contents.btc_change,
+            TransferStatus::Initiated,
+            min_confirmations,
+        )?;
+        // post the consignment now, so the recipient can check the mint before the lock
+        self.post_pending_consignments(txid).await?;
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+
+        let fascia = artifacts.fascia.unwrap();
+        let opid =
+            mint_opid(&fascia_from_bytes(fascia.clone())?, contract_id).ok_or(Error::Internal {
+                details: s!("mint transition missing from fascia"),
+            })?;
+        info!(self.logger, "Mint (begin) completed");
+        Ok(MintBeginResult {
+            psbt: psbt_string,
+            batch_transfer_idx,
+            details: MintDetails {
+                fascia: hex::encode(fascia),
+                min_confirmations,
+                entropy: info_contents.entropy,
+                opid: opid.to_string(),
+            },
+        })
+    }
+
+    /// Complete the mint operation by broadcasting the provided PSBT and saving the transfer.
+    ///
+    /// The provided PSBT, prepared with the [`mint_begin`](Wallet::mint_begin) function, needs to
+    /// have already been signed. The lock on the external chain has to be finalized, otherwise
+    /// [`Error::MintEventNotFound`] is returned. Past the invoice expiration, the mint is
+    /// broadcast only if its lock was included by then, for up to 24 hours.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    pub async fn mint_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Minting (end)...");
+        self.check_online(online)?;
+
+        let psbt = Psbt::from_str(&signed_psbt)?;
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let batch_transfer = self._check_end_initiated(&txid)?;
+        let artifacts = self
+            .transfer_artifacts
+            .get(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+        if !artifacts.is_operation(|t| *t == TypeOfTransition::Mint) {
+            return Err(Error::WrongOperation { txid });
+        }
+        let batch_transfer = batch_transfer.ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+        let entropy = artifacts
+            .batch_info
+            .as_ref()
+            .ok_or(Error::Internal {
+                details: s!("missing batch info in transfer artifacts"),
+            })?
+            .entropy;
+        let consignment_bytes = artifacts.consignment_bytes.clone();
+        let mint = self._sent_mint(artifacts)?;
+
+        // past the deadline the recipient may fail the transfer: broadcast only a mint whose lock
+        // was included by then, until the finality grace passes
+        let now = now().unix_timestamp();
+        let deadline = batch_transfer.expiration.unwrap_or(now);
+        if deadline < now
+            && (now > deadline + MINT_FINALITY_GRACE_SECS
+                || !self._mint_lock_included_by(&mint, deadline).await?)
+        {
+            return Err(Error::TransferExpired);
+        }
+
+        let evm_client = self
+            ._evm_client(mint.evm_chain_id)
+            .ok_or(Error::NoEvmRpcUrl {
+                chain_id: mint.evm_chain_id,
+            })?;
+        let opid = OpId::from_str(&mint.opid).expect("valid opid");
+        let address = EvmAddress::from_str(&mint.bridge_contract).expect("valid address");
+        let finalized_block = evm_client.finalized_block_number().await?;
+        if !evm_client
+            .find_funds_in(
+                &address,
+                &opid,
+                mint.amount,
+                mint.after_block,
+                finalized_block,
+            )
+            .await?
+        {
+            return Err(Error::MintEventNotFound { opid: mint.opid });
+        }
+
+        let mut runtime = self.rgb_runtime()?;
+        self._broadcast_psbt(psbt, false).await?;
+        runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
+        drop(runtime);
+
+        let mut updated: DbBatchTransferActMod = batch_transfer.into();
+        updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+        let batch_transfer_idx = self.database.update_batch_transfer(&mut updated)?.idx;
+        self.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(signed_psbt),
+                consignment_bytes,
+                ..Default::default()
+            },
+        );
+
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+
+        info!(self.logger, "Mint (end) completed");
+        Ok(OperationResult {
+            txid,
+            batch_transfer_idx,
+            entropy,
+        })
+    }
+
     /// Begin a BFA mint of `amounts` on new UTXOs, with one mint right as input, for tests only.
     ///
     /// Return the unsigned PSBT and the mint opid. Complete it with `inflate_end`.
@@ -4587,6 +5303,7 @@ impl Wallet {
                 }),
                 assignment: Assignment::Fungible(*amt),
                 transport_endpoints: vec![],
+                invoice_expiration: None,
             })
         }
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
@@ -4601,8 +5318,9 @@ impl Wallet {
             original_assignments_needed: assignments_needed.clone(),
             assignments_needed,
             assignments_spent: HashMap::new(),
-            main_transition: TypeOfTransition::Mint(after_block),
+            main_transition: TypeOfTransition::Mint,
             burn_reason: None,
+            after_block: Some(after_block),
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id, transfer_info)]);
         let PrepareTransferPsbtResult::Success(psbt_string) = self
@@ -4851,8 +5569,10 @@ mod tests {
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Burn,
             burn_reason: Some(BurnReason::from(Bytes32::from([2u8; 32]))),
+            after_block: Some(7),
         };
         assert_eq!(without(&asset_info, "burn_reason").burn_reason, None);
+        assert_eq!(without(&asset_info, "after_block").after_block, None);
         let artifacts = TransferArtifacts {
             fascia: Some(vec![3]),
             ..Default::default()
@@ -4921,6 +5641,107 @@ mod tests {
             block_on(wallet.burn(online, s!("rgb:ifa"), 10, None, 1, 1)),
             Err(Error::WatchOnly)
         ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mint_begin_refuses_invalid_input() {
+        use crate::api::evm::tests::block_on;
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+
+        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Bfa];
+        let url = "http://127.0.0.1:1";
+        wallet.online_data = Some(OnlineData::for_test(url));
+        let online = Online {
+            id: 1,
+            indexer_url: url.to_string(),
+        };
+        for (id, schema) in [("rgb:bfa", AssetSchema::Bfa), ("rgb:nia", AssetSchema::Nia)] {
+            wallet
+                .database
+                .set_asset(DbAssetActMod {
+                    id: ActiveValue::Set(id.to_string()),
+                    schema: ActiveValue::Set(schema),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let endpoint = "rpc://127.0.0.1:3000/json-rpc";
+        let cases: [(&str, Assignment, &str, fn(&Error) -> bool); 4] = [
+            ("rgb:nia", Assignment::Fungible(10), endpoint, |e| {
+                *e == Error::UnsupportedMint {
+                    asset_schema: AssetSchema::Nia,
+                }
+            }),
+            ("rgb:bfa", Assignment::Fungible(0), endpoint, |e| {
+                *e == Error::InvalidAmountZero
+            }),
+            ("rgb:bfa", Assignment::InflationRight(10), endpoint, |e| {
+                *e == Error::InvalidAssignment
+            }),
+            (
+                "rgb:bfa",
+                Assignment::Fungible(10),
+                "not an endpoint",
+                |e| matches!(e, Error::InvalidTransportEndpoint { .. }),
+            ),
+        ];
+        for (id, assignment, sender_endpoint, expected) in cases {
+            let recipient = Recipient {
+                recipient_id: s!("recipient"),
+                witness_data: None,
+                assignment,
+                transport_endpoints: vec![endpoint.to_string()],
+                expiration_timestamp: None,
+            };
+            let err = block_on(wallet.mint_begin(
+                online.clone(),
+                id.to_string(),
+                recipient,
+                1,
+                1,
+                sender_endpoint.to_string(),
+            ))
+            .unwrap_err();
+            assert!(expected(&err), "{err:?}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn go_online_refuses_node_without_mint_support() {
+        use crate::api::evm::tests::{block_on, mock_finalized_block, mock_rpc};
+
+        // the node serves the chain and the finalized block, but not the logs of old blocks
+        let mut server = mockito::Server::new();
+        let _mocks = [
+            mock_rpc(
+                &mut server,
+                r#"{"method":"eth_chainId"}"#,
+                r#""result":"0x7a69""#,
+            ),
+            mock_finalized_block(&mut server, 0x10),
+            mock_rpc(
+                &mut server,
+                r#"{"method":"eth_getLogs"}"#,
+                r#""error":{"code":-32602,"message":"Archive requests require a personal token"}"#,
+            ),
+        ];
+        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Bfa];
+        let result = block_on(wallet.go_online(
+            false,
+            s!("http://127.0.0.1:1"),
+            HashMap::from([(31337, server.url())]),
+        ));
+        assert!(
+            matches!(result, Err(Error::InvalidEvmRpcUrl { ref details })
+                if details.starts_with("cannot get the logs of the oldest blocks")
+                    && details.ends_with("Archive requests require a personal token")),
+            "{result:?}"
+        );
+        assert!(wallet.online_data.is_none());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
