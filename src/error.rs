@@ -42,6 +42,13 @@ pub enum Error {
     #[error("Batch transfer cannot be deleted")]
     CannotDeleteBatchTransfer,
 
+    /// The transfer has already failed or progressed, so it cannot be ended again
+    #[error("Transfer cannot be ended: {txid}")]
+    CannotEndTransfer {
+        /// Transfer TXID
+        txid: String,
+    },
+
     /// Cannot estimate fees
     #[error("Cannot estimate fees")]
     CannotEstimateFees,
@@ -54,9 +61,22 @@ pub enum Error {
     #[error("The given PSBT cannot be finalized")]
     CannotFinalizePsbt,
 
+    /// Cannot use BFA schema on mainnet
+    #[error("Cannot use BFA schema on mainnet")]
+    CannotUseBfaOnMainnet,
+
     /// Cannot use IFA schema on mainnet
     #[error("Cannot use IFA schema on mainnet")]
     CannotUseIfaOnMainnet,
+
+    /// The EVM RPC endpoint is on a chain other than the configured one
+    #[error("EVM chain ID mismatch: expected {expected}, the RPC endpoint is on {actual}")]
+    EvmChainIdMismatch {
+        /// Configured chain ID
+        expected: u64,
+        /// Chain ID reported by the EVM RPC endpoint
+        actual: u64,
+    },
 
     /// The provided file is empty
     #[error("Empty file: {file_path}")]
@@ -208,6 +228,13 @@ pub enum Error {
     #[error("Invalid consignment")]
     InvalidConsignment,
 
+    /// The provided burn reason is invalid
+    #[error("Invalid burn reason: {details}")]
+    InvalidBurnReason {
+        /// Error details
+        details: String,
+    },
+
     /// The provided asset details is invalid
     #[error("Invalid details: {details}")]
     InvalidDetails {
@@ -230,6 +257,22 @@ pub enum Error {
     /// Trying to request fee estimation for an invalid block number, it must be between 1 and 1008
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
+
+    /// The provided EVM contract address is invalid
+    #[error("Invalid EVM contract address: {details}")]
+    InvalidEvmContractAddress {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided EVM RPC URL is invalid, the endpoint cannot be reached or it does not serve
+    /// what confirming mint events needs (the latest finalized block and the logs of the whole
+    /// chain history)
+    #[error("Invalid EVM RPC URL: {details}")]
+    InvalidEvmRpcUrl {
+        /// Error details
+        details: String,
+    },
 
     /// The provided fee rate is invalid
     #[error("Invalid fee rate: {details}")]
@@ -370,6 +413,27 @@ pub enum Error {
         txid: String,
     },
 
+    /// No confirmed mint event for the mint operation was found on the EVM chain (yet): it may
+    /// still be, e.g. once the lock is made or finalized
+    #[error("Mint event for operation {opid} not found on the EVM chain")]
+    MintEventNotFound {
+        /// ID of the mint operation
+        opid: String,
+    },
+
+    /// No mint event for the mint operation was found within the blocks scanned for it after the
+    /// one the mint commits to, all of them finalized: the mint will never be confirmed
+    #[error(
+        "Mint event for operation {opid} not found within {max_scan_blocks} blocks from the one \
+         the mint commits to"
+    )]
+    MintEventOutOfScanWindow {
+        /// ID of the mint operation
+        opid: String,
+        /// Number of blocks scanned for the mint event
+        max_scan_blocks: u64,
+    },
+
     /// The signed PSBT of a transfer is missing, so the transfer has failed
     #[error("Signed PSBT not found for transfer with TXID: {txid}, the transfer has failed")]
     MissingTransferArtifacts {
@@ -384,9 +448,20 @@ pub enum Error {
         details: String,
     },
 
+    /// Cannot burn an asset with zero amount
+    #[error("Burn request with zero amount")]
+    NoBurnAmount,
+
     /// No consignment found
     #[error("No consignment found")]
     NoConsignment,
+
+    /// No EVM RPC URL is configured for the chain
+    #[error("No EVM RPC URL configured for chain ID {chain_id}")]
+    NoEvmRpcUrl {
+        /// EVM chain ID
+        chain_id: u64,
+    },
 
     /// Cannot inflate an asset with unknown o zero amounts
     #[error("Inflation request with no amounts or zero amounts")]
@@ -395,6 +470,10 @@ pub enum Error {
     /// Cannot issue an asset without knowing the amounts
     #[error("Issuance request with no provided amounts")]
     NoIssuanceAmounts,
+
+    /// Cannot issue an asset with zero mint rights
+    #[error("Issuance request with zero mint rights")]
+    NoMintRights,
 
     /// Cannot create a wallet with no supported schemas
     #[error("Cannot create a wallet with no supported schemas")]
@@ -474,6 +553,13 @@ pub enum Error {
         version: String,
     },
 
+    /// The schema doesn't support burn transitions
+    #[error("Burn not supported")]
+    UnsupportedBurn {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
     /// The schema doesn't support inflation
     #[error("Inflation not supported")]
     UnsupportedInflation {
@@ -534,6 +620,13 @@ pub enum Error {
     /// The requested operation cannot be processed by a watch-only wallet
     #[error("Operation not allowed on watch only wallet")]
     WatchOnly,
+
+    /// The PSBT belongs to a different kind of operation than the one being ended
+    #[error("PSBT belongs to a different operation: {txid}")]
+    WrongOperation {
+        /// TXID of the PSBT
+        txid: String,
+    },
 
     /// The provided password is incorrect
     #[error("The provided password is incorrect")]
@@ -614,9 +707,6 @@ pub(crate) enum InternalError {
     #[error("Serde JSON error: {0}")]
     SerdeJSON(#[from] serde_json::Error),
 
-    #[error("Stash error: {0}")]
-    StashError(String),
-
     #[error("Stock error: {0}")]
     StockError(String),
 
@@ -686,58 +776,10 @@ impl From<psrgbt::MpcPsbtError> for InternalError {
     }
 }
 
-impl From<rgbstd::persistence::StashProviderError<std::convert::Infallible>> for InternalError {
-    fn from(e: rgbstd::persistence::StashProviderError<std::convert::Infallible>) -> Self {
-        InternalError::StashError(e.to_string())
-    }
-}
-
-impl From<rgbstd::persistence::StockError> for InternalError {
-    fn from(e: rgbstd::persistence::StockError) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    > for InternalError
+impl<S: rgbstd::persistence::RgbStore, E: std::error::Error>
+    From<rgbstd::persistence::StockError<S, E>> for InternalError
 {
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    ) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    > for InternalError
-{
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    ) -> Self {
+    fn from(e: rgbstd::persistence::StockError<S, E>) -> Self {
         InternalError::StockError(e.to_string())
     }
 }

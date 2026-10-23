@@ -7,8 +7,8 @@
 //! ## Wallet
 //! The main component of the library is the [`Wallet`].
 //!
-//! It allows to create and operate an RGB wallet that can issue, send and receive NIA and IFA
-//! assets. The library also manages UTXOs and asset allocations.
+//! It allows to create and operate an RGB wallet that can issue, send and receive NIA, IFA and
+//! BFA assets. The library also manages UTXOs and asset allocations.
 //!
 //! ## Backend
 //! The library uses BDK for walleting operations and several components from the RGB ecosystem for
@@ -39,12 +39,18 @@ pub use bdk_wallet::bitcoin;
 pub use rgbinvoice::RgbTransport;
 pub use rgbstd::{
     ChainNet, ContractId, Txid as RgbTxid,
-    containers::{ConsignmentExt, Fascia, FileContent, PubWitness, Transfer as RgbTransfer},
+    containers::{ConsignmentExt, Fascia, FileContent, Transfer as RgbTransfer},
     indexers::AnyResolver,
     persistence::UpdateRes,
     schema::SchemaId,
     validation::{ValidationConfig, ValidationError},
     vm::{WitnessOrd, WitnessPos},
+};
+pub use rgbstd::{
+    Opout,
+    containers::{AnchorResolverError, ResolveAnchor},
+    stl::{BridgeLocation, EvmAddress, EvmContract},
+    validation::ExternalAnchor,
 };
 
 pub use crate::{
@@ -74,8 +80,8 @@ use std::{
     time::Duration,
 };
 
-use crate::database::memory_db::ActiveValue;
-use amplify::{Wrapper, bmap, confinement::Confined, s};
+use crate::database::{memory_db::ActiveValue, rgb_store::MemRgbStore};
+use amplify::{Bytes32, Wrapper, bmap, confinement::Confined, s};
 #[cfg(feature = "esplora")]
 use base64::{Engine as _, engine::general_purpose};
 #[cfg(feature = "esplora")]
@@ -118,35 +124,41 @@ use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rand::{Rng, distr::Alphanumeric};
 use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
-    Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, Opout, OutputSeal,
-    OwnedFraction, Precision, Schema, SecretSeal, Transition, TransitionType, TypeSystem,
-    containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
-    contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder},
+    Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, OutputSeal, OwnedFraction,
+    Precision, Schema, SecretSeal, Transition, TransitionType,
+    containers::{BuilderSeal, ValidConsignment, ValidContract, ValidTransfer},
+    contract::{
+        AllocatedState, ContractBuilder, ContractData, FilteredContractState, IssuerWrapper,
+        TransitionBuilder,
+    },
     info::{ContractInfo, SchemaInfo},
     invoice::{InvoiceState, Pay2Vout},
-    persistence::{MemContract, MemContractState, StashReadProvider, Stock, fs::FsBinStore},
+    persistence::{
+        ContractAssignments, ContractStateSnapshot, RetrievedSpvProofs, RgbStore, Stock,
+    },
     rgbcore::commit_verify::Conceal,
     stl::{
-        AssetSpec, Attachment, ContractTerms, Details, MediaType, Name, RejectListUrl,
-        RicardianContract, Ticker,
+        AssetSpec, Attachment, BurnReason, ContractTerms, Details, MediaType, Name,
+        RejectListLocation, RejectListUrl, RicardianContract, Ticker,
     },
     txout::{BlindSeal, CloseMethod, ExplicitSeal},
     validation::{
-        ResolveWitness, Scripts, Status, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
+        ResolveWitness, SchemaDefinition, SchemaRules, WitnessOrdProvider, WitnessResolverError,
+        WitnessStatus,
     },
 };
 #[cfg(feature = "esplora")]
 use rgbstd::{
-    Assign, KnownTransition,
-    containers::Consignment,
+    Assign, AssignmentType, KnownTransition, OpId,
+    containers::{Consignment, PendingConsignment},
     contract::SchemaWrapper,
     daggy::Walker,
     txout::TxPtr,
     validation::{OpoutsDagData, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
-use schemata::{IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION};
-use schemata::{InflatableFungibleAsset, NonInflatableAsset};
+use schemata::{BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN};
+use schemata::{BridgedFungibleAsset, InflatableFungibleAsset, NonInflatableAsset};
 use scrypt::{
     Params, Scrypt,
     password_hash::{PasswordHasher, Salt, SaltString, rand_core::OsRng},
@@ -154,7 +166,9 @@ use scrypt::{
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use slog::{Drain, Logger, debug, error, info, o, warn};
-use strict_encoding::{DecodeError, DeserializeError, FieldName};
+use strict_encoding::{
+    DecodeError, DeserializeError, FieldName, StrictDeserialize, StrictSerialize,
+};
 use time::OffsetDateTime;
 use typenum::consts::U32;
 
@@ -173,7 +187,11 @@ use crate::utils::INDEXER_PARALLEL_REQUESTS;
 use crate::utils::{OffchainResolverWasm, WasmResolver};
 #[cfg(feature = "esplora")]
 use crate::{
-    api::proxy::GetConsignmentResponse,
+    api::{
+        evm::{BoundedAnchorResolver, EvmClient, max_mint_scan_blocks},
+        proxy::GetConsignmentResponse,
+        reject_list::RejectListClient,
+    },
     database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
     error::IndexerError,
     utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},
@@ -191,5 +209,5 @@ use crate::{
         get_descriptors, get_descriptors_from_xpubs, load_rgb_runtime, now, parse_address_str,
         setup_logger, str_to_xpub,
     },
-    wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
+    wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_BFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
 };

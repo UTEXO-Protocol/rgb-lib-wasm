@@ -6,6 +6,8 @@ use super::*;
 use crate::api::proxy::WasmProxyClient;
 
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
+const SCHEMAS_SUPPORTING_BURN: [database::enums::AssetSchema; 2] =
+    [AssetSchema::Ifa, AssetSchema::Bfa];
 
 const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
@@ -42,6 +44,9 @@ pub struct AssignmentsCollection {
     pub non_fungible: bool,
     /// Inflation assignments
     pub inflation: u64,
+    /// Mint rights
+    #[serde(default)]
+    pub mint: u64,
 }
 
 impl AssignmentsCollection {
@@ -68,6 +73,12 @@ impl AssignmentsCollection {
             AllocatedState::Data(_) => {
                 self.add_non_fungible();
             }
+            AllocatedState::Void if opout.ty == OS_MINT => {
+                self.mint = self
+                    .mint
+                    .checked_add(1)
+                    .expect("total mint rights cannot exceed u64::MAX");
+            }
             _ => {}
         }
     }
@@ -81,6 +92,7 @@ impl AssignmentsCollection {
                 needed.inflation.saturating_sub(self.inflation) > 0
             }
             (AllocatedState::Data(_), _) => needed.non_fungible && !self.non_fungible,
+            (AllocatedState::Void, OS_MINT) => needed.mint > self.mint,
             _ => false,
         }
     }
@@ -90,6 +102,7 @@ impl AssignmentsCollection {
             fungible: self.fungible - needed.fungible,
             non_fungible: false,
             inflation: self.inflation - needed.inflation,
+            mint: self.mint - needed.mint,
         }
     }
 
@@ -101,6 +114,9 @@ impl AssignmentsCollection {
             return false;
         }
         if self.inflation < needed.inflation {
+            return false;
+        }
+        if self.mint < needed.mint {
             return false;
         }
         true
@@ -122,6 +138,34 @@ pub struct OperationResult {
     pub txid: String,
     /// Batch transfer idx
     pub batch_transfer_idx: i32,
+    /// Entropy used for the merkle tree construction operation
+    pub entropy: u64,
+}
+
+/// The result of a burn begin operation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct BurnBeginResult {
+    /// PSBT to inspect and sign
+    pub psbt: String,
+    /// Batch transfer idx, None when `dry_run: true`
+    pub batch_transfer_idx: Option<i32>,
+    /// Operation details
+    pub details: BurnDetails,
+}
+
+/// Details for burn operations.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct BurnDetails {
+    /// Hex-encoded strict-encoded fascia, for inspection
+    pub fascia: String,
+    /// Minimum confirmations for the operation
+    pub min_confirmations: u8,
+    /// Entropy used for the merkle tree construction operation
+    pub entropy: u64,
+    /// Hex-encoded 32-byte reason committed in the burn transition, if any
+    pub burn_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -140,12 +184,18 @@ pub(crate) struct InfoBatchTransfer {
     extra_allocations: HashMap<String, TxoAssignments>,
     donation: bool,
     min_confirmations: u8,
+    #[serde(default)]
+    entropy: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 enum TypeOfTransition {
     Inflate,
     Transfer,
+    Burn,
+    /// A BFA mint after the given EVM block, for tests only
+    #[cfg(test)]
+    Mint(u64),
 }
 
 impl TypeOfTransition {
@@ -153,6 +203,26 @@ impl TypeOfTransition {
         match self {
             Self::Inflate => "inflate",
             Self::Transfer => "transfer",
+            Self::Burn => "burn",
+            #[cfg(test)]
+            Self::Mint(_) => "mint",
+        }
+    }
+}
+
+/// Where the reject list of an asset is kept.
+pub(crate) enum RejectListSource {
+    /// A list of opouts served at a URL
+    Url(String),
+    /// A list kept by an `IRgbRejectList` EVM contract
+    Evm(EvmContract),
+}
+
+impl From<RejectListLocation> for RejectListSource {
+    fn from(location: RejectListLocation) -> Self {
+        match location {
+            RejectListLocation::Url(url) => Self::Url(url.to_string()),
+            RejectListLocation::Evm(contract) => Self::Evm(contract),
         }
     }
 }
@@ -173,6 +243,8 @@ pub(crate) struct InfoAssetTransfer {
     assignments_needed: AssignmentsCollection,
     assignments_spent: TxoAssignments,
     main_transition: TypeOfTransition,
+    #[serde(default)]
+    burn_reason: Option<BurnReason>,
 }
 
 /// In-memory storage for transfer artifacts (replaces filesystem directories).
@@ -182,6 +254,34 @@ pub(crate) struct TransferArtifacts {
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
     pub(crate) signed_psbt: Option<String>,
+    #[serde(default)]
+    pub(crate) fascia: Option<Vec<u8>>,
+}
+
+impl TransferArtifacts {
+    fn is_operation(&self, is_main_transition: impl Fn(&TypeOfTransition) -> bool) -> bool {
+        !self.asset_infos.is_empty()
+            && self
+                .asset_infos
+                .values()
+                .all(|t| is_main_transition(&t.main_transition))
+    }
+}
+
+/// The burn transitions of the contract in the fascia.
+fn burn_opids(fascia: &Fascia, contract_id: ContractId) -> Vec<OpId> {
+    fascia
+        .bundles()
+        .get(&contract_id)
+        .map(|bundle| {
+            bundle
+                .known_transitions
+                .iter()
+                .filter(|kt| kt.transition.transition_type == TS_BURN)
+                .map(|kt| kt.opid)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn pending_consignment_matches(
@@ -382,6 +482,8 @@ pub(crate) struct OnlineData {
     pub(crate) id: u64,
     pub(crate) indexer_url: String,
     indexer: Indexer,
+    // EVM RPC URLs by chain ID, checked when going online
+    evm_rpc_urls: HashMap<u64, String>,
 }
 
 #[cfg(test)]
@@ -392,6 +494,7 @@ impl OnlineData {
             id: 1,
             indexer_url: indexer_url.to_string(),
             indexer: crate::utils::build_indexer(indexer_url).unwrap(),
+            evm_rpc_urls: HashMap::new(),
         }
     }
 }
@@ -577,8 +680,9 @@ impl Wallet {
                     for (no, fungible_assignment) in typed_assigns.as_fungible().iter().enumerate()
                     {
                         let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let Assign::ConfidentialSeal { seal, state, .. } = fungible_assignment {
-                            if Some(*seal) == known_concealed {
+                        if let BuilderSeal::Concealed(seal) = fungible_assignment.seal {
+                            let state = &fungible_assignment.state;
+                            if Some(seal) == known_concealed {
                                 match *ass_type {
                                     OS_ASSET => {
                                         received
@@ -594,7 +698,8 @@ impl Wallet {
                                 }
                             }
                         };
-                        if let Assign::Revealed { seal, state, .. } = fungible_assignment {
+                        if let BuilderSeal::Revealed(seal) = fungible_assignment.seal {
+                            let state = &fungible_assignment.state;
                             if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
                                 match *ass_type {
                                     OS_ASSET => {
@@ -616,15 +721,16 @@ impl Wallet {
                         typed_assigns.as_structured().iter().enumerate()
                     {
                         let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let Assign::ConfidentialSeal { seal, .. } = structured_assignment {
-                            if Some(*seal) == known_concealed {
-                                received.insert(opout, Assignment::NonFungible);
-                            }
+                        if let BuilderSeal::Concealed(seal) = structured_assignment.seal
+                            && Some(seal) == known_concealed
+                        {
+                            received.insert(opout, Assignment::NonFungible);
                         }
-                        if let Assign::Revealed { seal, .. } = structured_assignment {
-                            if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
-                                received.insert(opout, Assignment::NonFungible);
-                            }
+                        if let BuilderSeal::Revealed(seal) = structured_assignment.seal
+                            && seal.txid == TxPtr::WitnessTx
+                            && Some(seal.vout.into_u32()) == vout
+                        {
+                            received.insert(opout, Assignment::NonFungible);
                         };
                     }
                 }
@@ -717,6 +823,13 @@ impl Wallet {
                 && asset_allocations
                     .iter()
                     .any(|a| matches!(a.assignment, Assignment::InflationRight(_)))
+            {
+                needed = true;
+            }
+            if assignments_collected.mint < assignments_needed.mint
+                && asset_allocations
+                    .iter()
+                    .any(|a| a.assignment == Assignment::MintRight)
             {
                 needed = true;
             }
@@ -931,7 +1044,7 @@ impl Wallet {
         Ok(graph_seal)
     }
 
-    fn _check_dag(
+    pub(crate) fn _check_dag(
         &self,
         dag_data: &OpoutsDagData,
         reject_opouts: &HashSet<Opout>,
@@ -983,7 +1096,14 @@ impl Wallet {
         min_confirmations: u8,
     ) -> Result<i32, Error> {
         let created_at = now().unix_timestamp();
-        let expiration = Some(created_at + DURATION_SEND_TRANSFER);
+        let expiration = if transfer_info_map
+            .values()
+            .all(|t| t.main_transition == TypeOfTransition::Burn)
+        {
+            None
+        } else {
+            Some(created_at + DURATION_SEND_TRANSFER)
+        };
 
         let batch_transfer = DbBatchTransferActMod {
             txid: ActiveValue::Set(Some(txid.clone())),
@@ -1067,7 +1187,23 @@ impl Wallet {
             }
 
             for recipient in transfer_info.recipients.clone() {
-                let recipient_type = if transfer_info.main_transition == TypeOfTransition::Inflate {
+                if transfer_info.main_transition == TypeOfTransition::Burn {
+                    let transfer = DbTransferActMod {
+                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                        requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(
+                            transfer_info.original_assignments_needed.fungible,
+                        ))),
+                        incoming: ActiveValue::Set(false),
+                        burn_reason: ActiveValue::Set(
+                            transfer_info.burn_reason.map(|r| r.to_string()),
+                        ),
+                        ..Default::default()
+                    };
+                    self.database.set_transfer(transfer)?;
+                    continue;
+                }
+                let recipient_type = if transfer_info.main_transition != TypeOfTransition::Transfer
+                {
                     let vout = if let LocalRecipientData::Witness(local_witness_data) =
                         recipient.local_recipient_data
                     {
@@ -1144,6 +1280,15 @@ impl Wallet {
         Ok(batch_transfer_idx)
     }
 
+    /// Refuse to end the PSBT of an RGB operation with a vanilla end method.
+    fn _check_vanilla_end(&self, psbt: &Psbt) -> Result<(), Error> {
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        if self.transfer_artifacts.contains_key(&txid) {
+            return Err(Error::WrongOperation { txid });
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_input_unspents(
         &self,
         unspents: &[LocalUnspent],
@@ -1159,10 +1304,9 @@ impl Wallet {
             !(u.rgb_allocations
                 .iter()
                 .any(|a| a.incoming && a.status.pending()))
-                && !(u
-                    .rgb_allocations
-                    .iter()
-                    .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                && !(u.rgb_allocations.iter().any(|a| {
+                    !a.incoming && (a.status.waiting_counterparty() || a.status.initiated())
+                }))
                 && !u.utxo.pending_witness
                 && u.pending_blinded == 0
                 && u.utxo.exists
@@ -1220,17 +1364,45 @@ impl Wallet {
             id: online.id,
             indexer_url,
             indexer,
+            evm_rpc_urls: HashMap::new(),
         };
         Ok((online, online_data))
     }
 
     /// Return the existing or freshly generated set of wallet [`Online`] data (wasm32 async).
+    ///
+    /// The `evm_rpc_urls` map an EVM chain ID to the RPC URL of a node on that chain. BFA
+    /// operations use them. When the wallet supports BFA, each URL is checked to be on its chain and
+    /// to serve the latest finalized block and the logs of the whole chain history. Else
+    /// [`Error::InvalidEvmRpcUrl`] is returned: nodes with only the logs of recent blocks are not
+    /// supported.
     pub async fn go_online(
         &mut self,
         _skip_consistency_check: bool,
         indexer_url: String,
+        mut evm_rpc_urls: HashMap<u64, String>,
     ) -> Result<Online, Error> {
         info!(self.logger, "Going online...");
+        if self.supports_schema(&AssetSchema::Bfa) {
+            for (chain_id, evm_rpc_url) in &evm_rpc_urls {
+                let evm_client = EvmClient::new(evm_rpc_url);
+                let actual = evm_client
+                    .chain_id()
+                    .await
+                    .map_err(|e| Error::InvalidEvmRpcUrl {
+                        details: e.to_string(),
+                    })?;
+                if actual != *chain_id {
+                    return Err(Error::EvmChainIdMismatch {
+                        expected: *chain_id,
+                        actual,
+                    });
+                }
+                evm_client.check_mint_support().await?;
+            }
+        } else {
+            evm_rpc_urls.clear();
+        }
         let online = if let Some(online_data) = &self.online_data {
             let online = Online {
                 id: online_data.id,
@@ -1249,6 +1421,7 @@ impl Wallet {
             self.online_data = Some(online_data);
             online
         };
+        self.online_data.as_mut().unwrap().evm_rpc_urls = evm_rpc_urls;
         info!(self.logger, "Go online completed");
         Ok(online)
     }
@@ -1526,6 +1699,7 @@ impl Wallet {
         self.check_online(online)?;
 
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
+        self._check_vanilla_end(&signed_psbt)?;
         let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
 
         self.database
@@ -1646,6 +1820,12 @@ impl Wallet {
 
             let mut beneficiaries = vec![];
             for recipient in &transfer_info.recipients {
+                if matches!(
+                    recipient.assignment,
+                    Assignment::Fungible(0) | Assignment::InflationRight(0)
+                ) {
+                    continue;
+                }
                 let seal: BuilderSeal<GraphSeal> = match &recipient.local_recipient_data {
                     LocalRecipientData::Blind(secret_seal) => BuilderSeal::Concealed(*secret_seal),
                     LocalRecipientData::Witness(witness_data) => {
@@ -1715,6 +1895,29 @@ impl Wallet {
                         RGB_METADATA_ALLOWED_INFLATION,
                         Amount::from(change.inflation),
                     )
+                    .unwrap();
+            }
+            if transfer_info.main_transition == TypeOfTransition::Burn {
+                let burn = transfer_info.original_assignments_needed.fungible;
+                asset_transition_builder = asset_transition_builder
+                    .add_global_state(RGB_GLOBAL_BURNED_ASSET, Amount::from(burn))
+                    .unwrap();
+                if let Some(burn_reason) = transfer_info.burn_reason {
+                    asset_transition_builder = asset_transition_builder
+                        .add_global_state(RGB_GLOBAL_BURN_REASON, burn_reason)?;
+                }
+            }
+            #[cfg(test)]
+            if let TypeOfTransition::Mint(after_block) = transfer_info.main_transition {
+                let minted: u64 = transfer_info
+                    .recipients
+                    .iter()
+                    .map(|r| r.assignment.main_amount())
+                    .sum();
+                asset_transition_builder = asset_transition_builder
+                    .add_global_state(RGB_GLOBAL_ISSUED_SUPPLY, Amount::from(minted))
+                    .unwrap()
+                    .add_metadata("afterBlock", rgbstd::stl::BlockNumber::from(after_block))
                     .unwrap();
             }
 
@@ -1792,10 +1995,15 @@ impl Wallet {
         let fascia = psbt.rgb_commit().map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
+        let entropy = psbt
+            .outputs
+            .iter()
+            .find_map(|o| o.mpc_entropy())
+            .expect("commit sets the entropy");
 
         let witness_txid = psbt.get_txid();
 
-        runtime.consume_fascia(fascia, None)?;
+        runtime.consume_fascia(fascia.clone(), None)?;
 
         for (asset_id, transfer_info) in transfer_info_map.iter_mut() {
             let beneficiaries = asset_beneficiaries[asset_id].clone();
@@ -1815,21 +2023,35 @@ impl Wallet {
                 },
             );
 
-            let should_build_dag = transfer_info.main_transition == TypeOfTransition::Transfer
-                && transfer_info.asset_info.reject_list_url.is_some();
+            let contract_id = transfer_info.asset_info.contract_id;
+            let reject_list_source = match transfer_info.asset_info.reject_list_url.clone() {
+                Some(url) => Some(RejectListSource::Url(url)),
+                None if AssetSchema::get_from_contract_id(contract_id, runtime)?
+                    == AssetSchema::Bfa =>
+                {
+                    runtime
+                        .contract_wrapper::<BridgedFungibleAsset>(contract_id)?
+                        .reject_list()
+                        .map(RejectListSource::from)
+                }
+                None => None,
+            };
+            let is_burn = transfer_info.main_transition == TypeOfTransition::Burn;
+            let should_build_dag = (transfer_info.main_transition == TypeOfTransition::Transfer
+                || is_burn)
+                && reject_list_source.is_some();
 
             let consignment = if should_build_dag {
                 let (consignment, dag_data) = runtime.transfer_with_dag(
                     transfer_info.asset_info.contract_id,
                     beneficiaries_witness,
                     beneficiaries_blinded,
+                    burn_opids(&fascia, contract_id),
                     Some(witness_txid),
                 )?;
 
                 let (reject_opouts, allow_opouts) = self
-                    ._get_reject_list_async(
-                        transfer_info.asset_info.reject_list_url.as_ref().unwrap(),
-                    )
+                    ._get_reject_list_async(reject_list_source.as_ref().unwrap())
                     .await?;
                 let asset_opouts = input_opouts
                     .get(&transfer_info.asset_info.contract_id)
@@ -1858,24 +2080,40 @@ impl Wallet {
                     return Ok(false);
                 }
 
-                consignment
+                Some(consignment)
+            } else if is_burn {
+                // a burn has no recipient: burn_end builds its consignment
+                None
             } else {
-                runtime.transfer(
+                Some(runtime.transfer(
                     transfer_info.asset_info.contract_id,
                     beneficiaries_witness,
                     beneficiaries_blinded,
                     Some(witness_txid),
-                )?
+                )?)
             };
 
-            // Store consignment bytes in memory instead of filesystem
-            let mut consignment_bytes = Vec::new();
-            consignment.save(&mut consignment_bytes)?;
-            self.transfer_artifacts
+            let artifacts = self
+                .transfer_artifacts
                 .entry(txid_key.to_string())
-                .or_default()
-                .consignment_bytes
-                .insert(asset_id.clone(), consignment_bytes);
+                .or_default();
+            if is_burn {
+                artifacts.fascia = Some(
+                    fascia
+                        .to_strict_serialized::<{ amplify::confinement::U32 }>()
+                        .map_err(|e| Error::Internal {
+                            details: e.to_string(),
+                        })?
+                        .release(),
+                );
+            } else if let Some(consignment) = consignment {
+                // Store consignment bytes in memory instead of filesystem
+                let mut consignment_bytes = Vec::new();
+                consignment.save(&mut consignment_bytes)?;
+                artifacts
+                    .consignment_bytes
+                    .insert(asset_id.clone(), consignment_bytes);
+            }
 
             // Store asset transfer info in memory
             self.transfer_artifacts
@@ -1894,6 +2132,7 @@ impl Wallet {
             extra_allocations,
             donation,
             min_confirmations,
+            entropy,
         };
         self.transfer_artifacts
             .entry(txid_key.to_string())
@@ -1967,35 +2206,103 @@ impl Wallet {
             .map_err(InternalError::from)?
             .compute_txid()
             .to_string();
-        if final_txid != txid {
-            if let Some(artifacts) = self.transfer_artifacts.remove(&txid) {
-                self.transfer_artifacts.insert(final_txid, artifacts);
-            }
+        if final_txid != txid
+            && let Some(artifacts) = self.transfer_artifacts.remove(&txid)
+        {
+            self.transfer_artifacts.insert(final_txid, artifacts);
         }
 
         Ok(PrepareTransferPsbtResult::Success(psbt.to_string()))
     }
 
-    async fn _get_reject_list_async(
+    fn _evm_client(&self, chain_id: u64) -> Option<EvmClient> {
+        self.online_data
+            .as_ref()
+            .unwrap()
+            .evm_rpc_urls
+            .get(&chain_id)
+            .map(|url| EvmClient::new(url))
+    }
+
+    /// Confirm the external anchors of a consignment on the EVM chain of its bridge.
+    ///
+    /// Return the ID of a mint that is not confirmed yet, if any. Without an EVM RPC URL for the
+    /// chain, no mint is confirmed. A mint with no event within [`max_mint_scan_blocks`] blocks
+    /// after the block it commits to gives [`Error::MintEventOutOfScanWindow`].
+    pub(crate) async fn _resolve_anchors(
         &self,
-        reject_list_url: &str,
-    ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
-        let list = self
-            .wasm_proxy_client
-            .get_reject_list(reject_list_url)
-            .await?;
-        let reject_list = list.trim();
-        let mut opout_map = HashMap::with_capacity(reject_list.lines().count());
-        for line in reject_list.lines() {
-            let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
-            let opout = match Opout::from_str(opout_str) {
-                Ok(o) => o,
-                Err(_) => {
-                    warn!(self.logger, "Ignoring invalid opout in reject list: {line}");
-                    continue;
+        pending: &mut PendingConsignment<true>,
+    ) -> Result<Option<OpId>, Error> {
+        let anchors: Vec<ExternalAnchor> =
+            pending.pending().unresolved_anchors().cloned().collect();
+        let Some(ExternalAnchor::MintEvent { opid, .. }) = anchors.first() else {
+            return Ok(None);
+        };
+        let BridgeLocation::Evm(EvmContract { chain_id, address }) =
+            BridgedFungibleAsset::bridge_location(&pending.consignment().genesis).map_err(|e| {
+                Error::Internal {
+                    details: format!("unexpected bridge location error: {e:?}"),
                 }
-            };
-            opout_map.insert(opout, is_allow);
+            })?;
+        let Some(evm_client) = self._evm_client(chain_id) else {
+            warn!(self.logger, "No EVM RPC URL for chain ID {chain_id}");
+            return Ok(Some(*opid));
+        };
+        let resolver = BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks());
+        for anchor in &anchors {
+            let ExternalAnchor::MintEvent { opid, .. } = anchor;
+            if !resolver.is_confirmed(&address, anchor).await? {
+                if resolver.is_exhausted(opid) {
+                    return Err(Error::MintEventOutOfScanWindow {
+                        opid: opid.to_string(),
+                        max_scan_blocks: max_mint_scan_blocks(),
+                    });
+                }
+                return Ok(Some(*opid));
+            }
+            pending
+                .pending()
+                .resolve_anchor(anchor)
+                .map_err(|e| Error::Internal {
+                    details: format!("unexpected anchor resolution error: {e}"),
+                })?;
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn _get_reject_list_async(
+        &self,
+        source: &RejectListSource,
+    ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
+        let reject_list_url = match source {
+            RejectListSource::Url(url) => url,
+            RejectListSource::Evm(EvmContract { chain_id, address }) => {
+                let evm_client = self._evm_client(*chain_id).ok_or(Error::NoEvmRpcUrl {
+                    chain_id: *chain_id,
+                })?;
+                return Ok(evm_client.reject_list_entries(address).await?.decisions());
+            }
+        };
+        let list = RejectListClient::new(reject_list_url)?
+            .get_reject_list()
+            .await?;
+        // trim each line and skip empty ones, count the invalid ones and warn once
+        let mut opout_map = HashMap::new();
+        let mut invalid = 0;
+        for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
+            match Opout::from_str(opout_str) {
+                Ok(opout) => {
+                    opout_map.insert(opout, is_allow);
+                }
+                Err(_) => invalid += 1,
+            }
+        }
+        if invalid > 0 {
+            warn!(
+                self.logger,
+                "Ignoring {invalid} invalid opout(s) in reject list"
+            );
         }
         let (allow_opouts, reject_opouts) = opout_map.into_iter().fold(
             (HashSet::new(), HashSet::new()),
@@ -2174,16 +2481,16 @@ impl Wallet {
         let asset_id = contract_id.to_string();
 
         // validate consignment
-        if let Some(aid) = asset_transfer.asset_id.clone() {
-            if aid != asset_id {
-                error!(
-                    self.logger,
-                    "Received a different asset than the expected one"
-                );
-                return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                    .await;
-            }
+        if let Some(aid) = asset_transfer.asset_id.clone()
+            && aid != asset_id
+        {
+            error!(
+                self.logger,
+                "Received a different asset than the expected one"
+            );
+            return self
+                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                .await;
         }
 
         let witness_id = match RgbTxid::from_str(&txid) {
@@ -2205,15 +2512,18 @@ impl Wallet {
 
         debug!(self.logger, "Validating consignment...");
         let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
+        let schema_rules = asset_schema.schema_rules();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            trusted_typesystem,
             build_opouts_dag: true,
             ..Default::default()
         };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
-            Ok(consignment) => consignment,
+        let mut pending = match consignment
+            .clone()
+            .validate_deterministic(&schema_rules, &validation_config)
+            .and_then(|mut p| p.pending().resolve_all(&resolver).map(|_| p))
+        {
+            Ok(pending) => pending,
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger, "Consignment is invalid: {}", e);
                 return self
@@ -2226,7 +2536,27 @@ impl Wallet {
                     details: e.to_string(),
                 });
             }
+            Err(e) => {
+                return Err(Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
+                });
+            }
         };
+        match self._resolve_anchors(&mut pending).await {
+            Ok(Some(opid)) => {
+                warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
+                return Ok(None);
+            }
+            Ok(None) => {}
+            Err(e @ Error::MintEventOutOfScanWindow { .. }) => {
+                error!(self.logger, "{e}");
+                return self
+                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    .await;
+            }
+            Err(e) => return Err(e),
+        }
+        let valid_consignment = pending.finalize();
         let validation_status = valid_consignment.validation_status();
         let validity = validation_status.validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
@@ -2239,25 +2569,15 @@ impl Wallet {
         {
             if let Some(RecipientTypeFull::Witness { .. }) = transfer.recipient_type {
                 if let Some(vout) = vout {
-                    if let PubWitness::Tx(tx) = &anchored_bundle.pub_witness {
-                        if let Some(output) = tx.output.get(vout as usize) {
-                            let script_pubkey =
-                                script_buf_from_recipient_id(recipient_id.clone())?.unwrap();
-                            if output.script_pubkey != script_pubkey {
-                                error!(
-                                    self.logger,
-                                    "The provided vout pays an incorrect script pubkey"
-                                );
-                                return self
-                                    ._refuse_consignment_async(
-                                        proxy_url,
-                                        recipient_id,
-                                        &mut updated_batch_transfer,
-                                    )
-                                    .await;
-                            }
-                        } else {
-                            error!(self.logger, "Cannot find the expected outpoint");
+                    let tx = &anchored_bundle.tx;
+                    if let Some(output) = tx.output.get(vout as usize) {
+                        let script_pubkey =
+                            script_buf_from_recipient_id(recipient_id.clone())?.unwrap();
+                        if output.script_pubkey != script_pubkey {
+                            error!(
+                                self.logger,
+                                "The provided vout pays an incorrect script pubkey"
+                            );
                             return self
                                 ._refuse_consignment_async(
                                     proxy_url,
@@ -2267,7 +2587,7 @@ impl Wallet {
                                 .await;
                         }
                     } else {
-                        error!(self.logger, "Consignment is missing the witness TX");
+                        error!(self.logger, "Cannot find the expected outpoint");
                         return self
                             ._refuse_consignment_async(
                                 proxy_url,
@@ -2330,45 +2650,48 @@ impl Wallet {
                 .await;
         };
 
-        if asset_schema == AssetSchema::Ifa {
-            let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.clone()) {
-                ass.reject_list_url
-            } else {
-                let contract = IfaWrapper::with(valid_consignment.contract_data());
-                contract.reject_list_url().map(|u| u.to_string())
-            };
-            if let Some(url) = &url {
-                let (reject_opouts, allow_opouts) = self._get_reject_list_async(url).await?;
-
-                let to_reject = self._check_dag(
-                    validation_status
-                        .dag_data_opt
-                        .as_ref()
-                        .expect("build_opouts_dag is true"),
-                    &reject_opouts,
-                    &allow_opouts,
-                    &received.clone().into_keys().collect(),
-                )?;
-
-                if !to_reject.is_empty() {
-                    error!(
-                        self.logger,
-                        "Found {} opout(s) that must be rejected",
-                        to_reject.len()
-                    );
-                    return self
-                        ._refuse_consignment_async(
-                            proxy_url,
-                            recipient_id,
-                            &mut updated_batch_transfer,
-                        )
-                        .await;
+        let reject_list_source = match asset_schema {
+            AssetSchema::Ifa => {
+                let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.clone()) {
+                    ass.reject_list_url
                 } else {
-                    info!(
-                        self.logger,
-                        "Didn't find any opout(s) that should be rejected"
-                    );
-                }
+                    let contract = IfaWrapper::with(runtime.consignment_data(&valid_consignment)?);
+                    contract.reject_list_url().map(|u| u.to_string())
+                };
+                url.map(RejectListSource::Url)
+            }
+            AssetSchema::Bfa => BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
+                .reject_list()
+                .map(RejectListSource::from),
+            AssetSchema::Nia => None,
+        };
+        if let Some(source) = &reject_list_source {
+            let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
+
+            let to_reject = self._check_dag(
+                validation_status
+                    .dag_data_opt
+                    .as_ref()
+                    .expect("build_opouts_dag is true"),
+                &reject_opouts,
+                &allow_opouts,
+                &received.clone().into_keys().collect(),
+            )?;
+
+            if !to_reject.is_empty() {
+                error!(
+                    self.logger,
+                    "Found {} opout(s) that must be rejected",
+                    to_reject.len()
+                );
+                return self
+                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    .await;
+            } else {
+                info!(
+                    self.logger,
+                    "Didn't find any opout(s) that should be rejected"
+                );
             }
         }
 
@@ -2383,15 +2706,22 @@ impl Wallet {
                 let mut attachments = vec![];
                 match asset_schema {
                     AssetSchema::Nia => {
-                        let contract_data = valid_contract.contract_data();
+                        let contract_data = runtime.consignment_data(&valid_contract)?;
                         let contract = NiaWrapper::with(contract_data);
                         if let Some(attachment) = contract.contract_terms().media {
                             attachments.push(attachment)
                         }
                     }
                     AssetSchema::Ifa => {
-                        let contract_data = valid_contract.contract_data();
+                        let contract_data = runtime.consignment_data(&valid_contract)?;
                         let contract = IfaWrapper::with(contract_data);
+                        if let Some(attachment) = contract.contract_terms().media {
+                            attachments.push(attachment)
+                        }
+                    }
+                    AssetSchema::Bfa => {
+                        let contract_data = runtime.consignment_data(&valid_contract)?;
+                        let contract = BfaWrapper::with(contract_data);
                         if let Some(attachment) = contract.contract_terms().media {
                             attachments.push(attachment)
                         }
@@ -2689,12 +3019,17 @@ impl Wallet {
             let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
             let validation_config = ValidationConfig {
                 chain_net: self.chain_net(),
-                trusted_typesystem: asset_schema.types(),
                 ..Default::default()
             };
-            let valid_consignment = consignment
-                .validate(&wasm_resolver, &validation_config)
+            let mut pending = consignment
+                .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
+                .and_then(|mut p| p.pending().resolve_all(&wasm_resolver).map(|_| p))
                 .map_err(|_| InternalError::Unexpected)?;
+            if let Some(opid) = self._resolve_anchors(&mut pending).await? {
+                warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
+                return Ok(None);
+            }
+            let valid_consignment = pending.finalize();
             let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
             runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
@@ -2745,10 +3080,10 @@ impl Wallet {
         if incoming {
             let batch_transfer_data =
                 batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
-            if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data) {
-                if let Some(recipient_id) = &transfer.recipient_id {
-                    self.received_consignments.remove(recipient_id);
-                }
+            if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data)
+                && let Some(recipient_id) = &transfer.recipient_id
+            {
+                self.received_consignments.remove(recipient_id);
             }
         }
 
@@ -2831,7 +3166,10 @@ impl Wallet {
                 .batch_transfers
                 .retain(|t| batch_transfers_ids.contains(&t.idx));
         };
-        db_data.batch_transfers.retain(|t| t.pending());
+        // an initiated transfer waits for its end method
+        db_data
+            .batch_transfers
+            .retain(|t| t.pending() && !t.status.initiated());
 
         let mut refresh_result = HashMap::new();
         for transfer in db_data.batch_transfers.clone().into_iter() {
@@ -2917,7 +3255,7 @@ impl Wallet {
                 .database
                 .get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
 
-            if !batch_transfer.waiting_counterparty() {
+            if !batch_transfer.waiting_counterparty() && !batch_transfer.status.initiated() {
                 return Err(Error::CannotFailBatchTransfer);
             }
 
@@ -2994,7 +3332,10 @@ impl Wallet {
             for recipient in recipients.clone() {
                 self.check_transport_endpoints(&recipient.transport_endpoints)?;
                 match (&recipient.assignment, schema) {
-                    (Assignment::Fungible(amt), AssetSchema::Nia | AssetSchema::Ifa) => {
+                    (
+                        Assignment::Fungible(amt),
+                        AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa,
+                    ) => {
                         if *amt == 0 {
                             return Err(Error::InvalidAmountZero);
                         }
@@ -3139,6 +3480,7 @@ impl Wallet {
                     assignments_needed,
                     assignments_spent: HashMap::new(),
                     main_transition,
+                    burn_reason: None,
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -3187,11 +3529,16 @@ impl Wallet {
             .compute_txid()
             .to_string();
 
-        // Clone data out of transfer_artifacts to avoid borrow conflicts
-        let artifacts = self
+        if !self
             .transfer_artifacts
-            .remove(&txid)
-            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+            .get(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?
+            .is_operation(|t| *t == TypeOfTransition::Transfer)
+        {
+            return Err(Error::WrongOperation { txid });
+        }
+        // Clone data out of transfer_artifacts to avoid borrow conflicts
+        let artifacts = self.transfer_artifacts.remove(&txid).unwrap();
         let info_contents = artifacts.batch_info.ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
         })?;
@@ -3306,6 +3653,7 @@ impl Wallet {
         Ok(OperationResult {
             txid,
             batch_transfer_idx,
+            entropy: info_contents.entropy,
         })
     }
 
@@ -3559,6 +3907,7 @@ impl Wallet {
         self.check_online(online)?;
 
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
+        self._check_vanilla_end(&signed_psbt)?;
         let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
 
         info!(self.logger, "Send BTC (end) completed");
@@ -3644,6 +3993,7 @@ impl Wallet {
         self.check_online(online)?;
 
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
+        self._check_vanilla_end(&signed_psbt)?;
         let tx = self._broadcast_psbt(signed_psbt, false).await?;
 
         self.database
@@ -3752,6 +4102,7 @@ impl Wallet {
             assignments_needed,
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Inflate,
+            burn_reason: None,
         };
         let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> =
             BTreeMap::from([(asset_id.clone(), transfer_info)]);
@@ -3799,10 +4150,20 @@ impl Wallet {
             .compute_txid()
             .to_string();
 
-        let artifacts = self
+        if !self
             .transfer_artifacts
-            .remove(&txid)
-            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+            .get(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?
+            .is_operation(|t| match t {
+                TypeOfTransition::Inflate => true,
+                #[cfg(test)]
+                TypeOfTransition::Mint(_) => true,
+                _ => false,
+            })
+        {
+            return Err(Error::WrongOperation { txid });
+        }
+        let artifacts = self.transfer_artifacts.remove(&txid).unwrap();
         let info_contents = artifacts.batch_info.ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
         })?;
@@ -3835,19 +4196,22 @@ impl Wallet {
         )?;
 
         let (asset_id, transfer_info) = transfer_info_map.into_iter().next().unwrap();
-        let inflation = transfer_info.original_assignments_needed.inflation;
-        let db_asset = self.database.get_asset(asset_id).unwrap().unwrap();
-        let updated_known_circulating_supply = db_asset
-            .known_circulating_supply
-            .as_ref()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap()
-            + inflation;
-        let mut updated_asset: DbAssetActMod = db_asset.into();
-        updated_asset.known_circulating_supply =
-            ActiveValue::Set(Some(updated_known_circulating_supply.to_string()));
-        self.database.update_asset(&mut updated_asset)?;
+        // a test BFA mint has no known circulating supply
+        if transfer_info.main_transition == TypeOfTransition::Inflate {
+            let inflation = transfer_info.original_assignments_needed.inflation;
+            let db_asset = self.database.get_asset(asset_id).unwrap().unwrap();
+            let updated_known_circulating_supply = db_asset
+                .known_circulating_supply
+                .as_ref()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                + inflation;
+            let mut updated_asset: DbAssetActMod = db_asset.into();
+            updated_asset.known_circulating_supply =
+                ActiveValue::Set(Some(updated_known_circulating_supply.to_string()));
+            self.database.update_asset(&mut updated_asset)?;
+        }
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
@@ -3856,7 +4220,415 @@ impl Wallet {
         Ok(OperationResult {
             txid,
             batch_transfer_idx,
+            entropy: info_contents.entropy,
         })
+    }
+
+    /// Burn RGB assets.
+    ///
+    /// This calls [`burn_begin`](Wallet::burn_begin), signs the resulting PSBT and finally
+    /// calls [`burn_end`](Wallet::burn_end).
+    ///
+    /// A wallet with private keys is required.
+    pub async fn burn(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Burning amount: {}...", amount);
+        self._check_xprv()?;
+        let begin = self
+            .burn_begin(
+                online.clone(),
+                asset_id,
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+                true,
+            )
+            .await?;
+        let signed_psbt = self.sign_psbt(begin.psbt, None)?;
+        let res = self.burn_end(online, signed_psbt).await?;
+        info!(self.logger, "Burn completed");
+        Ok(res)
+    }
+
+    /// Prepare the PSBT to burn `amount` of an RGB asset, with the provided `fee_rate` (in
+    /// sat/vB).
+    ///
+    /// The optional `burn_reason` is a hex-encoded 32-byte value committed in the burn
+    /// transition.
+    ///
+    /// If `dry_run` is false, the wallet saves the transfer in [`TransferStatus::Initiated`] and
+    /// returns its batch transfer idx.
+    ///
+    /// Sign the returned PSBT and give it to [`burn_end`](Wallet::burn_end).
+    ///
+    /// This doesn't require the wallet to have private keys.
+    pub async fn burn_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<BurnBeginResult, Error> {
+        info!(self.logger, "Burning (begin) amount: {}...", amount);
+        self.check_online(online.clone())?;
+
+        let asset = self.database.check_asset_exists(asset_id.clone())?;
+        let schema = asset.schema;
+        self.check_schema_support(&schema)?;
+        if !SCHEMAS_SUPPORTING_BURN.contains(&schema) {
+            return Err(Error::UnsupportedBurn {
+                asset_schema: schema,
+            });
+        }
+        if amount == 0 {
+            return Err(Error::NoBurnAmount);
+        }
+        let burn_reason = burn_reason
+            .map(|reason| self.check_burn_reason(reason))
+            .transpose()?;
+
+        let (fee_rate_checked, unspents, input_unspents, mut runtime) =
+            self._get_transfer_begin_data(online, fee_rate)?;
+
+        let assignments_needed = AssignmentsCollection {
+            fungible: amount,
+            ..Default::default()
+        };
+        let asset_spend = self._select_rgb_inputs(
+            asset_id.clone(),
+            &assignments_needed,
+            input_unspents.clone(),
+        )?;
+
+        let network: ChainNet = self.bitcoin_network().into();
+        let script_pubkey = self
+            ._get_new_address(KeychainKind::External)?
+            .script_pubkey();
+        let dust = self
+            .bdk_wallet
+            .public_descriptor(KeychainKind::External)
+            .dust_value()
+            .to_sat();
+        let witness_recipients = vec![(script_pubkey.clone(), dust)];
+        let beneficiary = beneficiary_from_script_buf(script_pubkey);
+        let local_recipient = LocalRecipient {
+            recipient_id: XChainNet::with(network, beneficiary).to_string(),
+            local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
+                amount_sat: dust,
+                blinding: None,
+                vout: 1,
+            }),
+            assignment: Assignment::Fungible(0),
+            transport_endpoints: vec![],
+        };
+
+        let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
+        let transfer_info = InfoAssetTransfer {
+            asset_info: AssetInfo {
+                contract_id,
+                reject_list_url: asset.reject_list_url,
+            },
+            recipients: vec![local_recipient],
+            asset_spend,
+            change: AssignmentsCollection::default(),
+            original_assignments_needed: assignments_needed.clone(),
+            assignments_needed,
+            assignments_spent: HashMap::new(),
+            main_transition: TypeOfTransition::Burn,
+            burn_reason,
+        };
+        let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
+        let mut rejected = HashSet::new();
+        let psbt_string = loop {
+            match self
+                ._prepare_transfer_psbt_wasm(
+                    &mut transfer_info_map,
+                    false,
+                    unspents.clone(),
+                    &input_unspents,
+                    &witness_recipients,
+                    fee_rate_checked,
+                    min_confirmations,
+                    None,
+                    &mut runtime,
+                    &mut rejected,
+                )
+                .await?
+            {
+                PrepareTransferPsbtResult::Retry => {
+                    // select inputs again, without the rejected ones
+                    let assignments_needed =
+                        transfer_info_map[&asset_id].assignments_needed.clone();
+                    let asset_spend = self._select_rgb_inputs(
+                        asset_id.clone(),
+                        &assignments_needed,
+                        input_unspents.clone(),
+                    )?;
+                    transfer_info_map = BTreeMap::from([(
+                        asset_id.clone(),
+                        InfoAssetTransfer {
+                            asset_spend,
+                            assignments_needed,
+                            ..transfer_info.clone()
+                        },
+                    )]);
+                }
+                PrepareTransferPsbtResult::Success(psbt_string) => break psbt_string,
+            }
+        };
+        drop(runtime);
+
+        let txid = Psbt::from_str(&psbt_string)?
+            .unsigned_tx
+            .compute_txid()
+            .to_string();
+        let artifacts = self.transfer_artifacts[&txid].clone();
+        let info_contents = artifacts.batch_info.unwrap();
+        let batch_transfer_idx = if dry_run {
+            None
+        } else {
+            let idx = self._save_transfers(
+                txid,
+                &artifacts.asset_infos,
+                info_contents.extra_allocations,
+                info_contents.change_utxo_idx,
+                info_contents.btc_change,
+                TransferStatus::Initiated,
+                min_confirmations,
+            )?;
+            self.update_backup_info(false)?;
+            self.trigger_auto_backup();
+            Some(idx)
+        };
+
+        info!(self.logger, "Burn (begin) completed");
+        Ok(BurnBeginResult {
+            psbt: psbt_string,
+            batch_transfer_idx,
+            details: BurnDetails {
+                fascia: hex::encode(artifacts.fascia.unwrap()),
+                min_confirmations,
+                entropy: info_contents.entropy,
+                burn_reason: burn_reason.map(|r| r.to_string()),
+            },
+        })
+    }
+
+    /// Complete the burn operation by broadcasting the provided PSBT and saving the transfer.
+    ///
+    /// The provided PSBT, prepared with the [`burn_begin`](Wallet::burn_begin) function, needs to
+    /// have already been signed.
+    ///
+    /// The wallet keeps a consignment that proves the burn, with its full history.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    pub async fn burn_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Burning (end)...");
+        self.check_online(online)?;
+
+        let psbt = Psbt::from_str(&signed_psbt)?;
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+        // only a burn begun without dry run, and not failed or ended, has a batch transfer
+        let db_data = self.database.get_db_data(false)?;
+        let batch_transfer = db_data
+            .batch_transfers
+            .iter()
+            .find(|bt| {
+                bt.txid.as_ref() == Some(&txid)
+                    && matches!(
+                        bt.incoming(&db_data.asset_transfers, &db_data.transfers),
+                        Ok(false)
+                    )
+            })
+            .cloned();
+        if batch_transfer
+            .as_ref()
+            .is_some_and(|bt| !bt.status.initiated())
+        {
+            return Err(Error::CannotEndTransfer { txid });
+        }
+
+        let artifacts = self
+            .transfer_artifacts
+            .get(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+        if !artifacts.is_operation(|t| *t == TypeOfTransition::Burn) {
+            return Err(Error::WrongOperation { txid });
+        }
+        let info_contents = artifacts.batch_info.clone().ok_or(Error::Internal {
+            details: s!("missing batch info in transfer artifacts"),
+        })?;
+        let transfer_info_map = artifacts.asset_infos.clone();
+        let fascia_bytes = artifacts.fascia.clone().ok_or(Error::Internal {
+            details: s!("missing fascia in transfer artifacts"),
+        })?;
+        let mut fascia = Fascia::from_strict_serialized::<{ amplify::confinement::U32 }>(
+            Confined::try_from(fascia_bytes).map_err(|e| Error::Internal {
+                details: e.to_string(),
+            })?,
+        )
+        .map_err(|e| Error::Internal {
+            details: e.to_string(),
+        })?;
+
+        // the consignment carries the signed transaction
+        fascia.update_witness_tx(psbt.clone().extract_tx().map_err(InternalError::from)?);
+        let mut runtime = self.rgb_runtime()?;
+        let mut consignment_bytes = HashMap::new();
+        for (asset_id, transfer_info) in &transfer_info_map {
+            let contract_id = transfer_info.asset_info.contract_id;
+            let consignment = runtime.transfer_from_fascia(
+                contract_id,
+                [],
+                [],
+                burn_opids(&fascia, contract_id),
+                &fascia,
+            )?;
+            let mut bytes = Vec::new();
+            consignment.save(&mut bytes)?;
+            consignment_bytes.insert(asset_id.clone(), bytes);
+        }
+
+        self._broadcast_psbt(psbt, false).await?;
+        runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
+
+        let batch_transfer_idx = match batch_transfer {
+            Some(batch_transfer) => {
+                let mut updated: DbBatchTransferActMod = batch_transfer.into();
+                updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+                self.database.update_batch_transfer(&mut updated)?.idx
+            }
+            None => self._save_transfers(
+                txid.clone(),
+                &transfer_info_map,
+                info_contents.extra_allocations,
+                info_contents.change_utxo_idx,
+                info_contents.btc_change,
+                TransferStatus::WaitingConfirmations,
+                info_contents.min_confirmations,
+            )?,
+        };
+        self.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(signed_psbt),
+                consignment_bytes,
+                ..Default::default()
+            },
+        );
+
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+
+        info!(self.logger, "Burn (end) completed");
+        Ok(OperationResult {
+            txid,
+            batch_transfer_idx,
+            entropy: info_contents.entropy,
+        })
+    }
+
+    /// Begin a BFA mint of `amounts` on new UTXOs, with one mint right as input, for tests only.
+    ///
+    /// Return the unsigned PSBT and the mint opid. Complete it with `inflate_end`.
+    #[cfg(test)]
+    pub(crate) async fn test_mint_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        amounts: Vec<u64>,
+        after_block: u64,
+    ) -> Result<(String, OpId), Error> {
+        let asset = self.database.check_asset_exists(asset_id.clone())?;
+        let (fee_rate_checked, unspents, input_unspents, mut runtime) =
+            self._get_transfer_begin_data(online, 1)?;
+        let assignments_needed = AssignmentsCollection {
+            mint: 1,
+            ..Default::default()
+        };
+        let asset_spend = self._select_rgb_inputs(
+            asset_id.clone(),
+            &assignments_needed,
+            input_unspents.clone(),
+        )?;
+        let network: ChainNet = self.bitcoin_network().into();
+        let mut local_recipients = vec![];
+        let mut witness_recipients: Vec<(ScriptBuf, u64)> = vec![];
+        for (idx, amt) in amounts.iter().enumerate() {
+            let script_pubkey = self
+                ._get_new_address(KeychainKind::External)?
+                .script_pubkey();
+            let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
+            witness_recipients.push((script_pubkey, 1000));
+            local_recipients.push(LocalRecipient {
+                recipient_id: XChainNet::with(network, beneficiary).to_string(),
+                local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
+                    amount_sat: 1000,
+                    blinding: None,
+                    vout: idx as u32 + 1,
+                }),
+                assignment: Assignment::Fungible(*amt),
+                transport_endpoints: vec![],
+            })
+        }
+        let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
+        let transfer_info = InfoAssetTransfer {
+            asset_info: AssetInfo {
+                contract_id,
+                reject_list_url: asset.reject_list_url,
+            },
+            recipients: local_recipients,
+            asset_spend,
+            change: AssignmentsCollection::default(),
+            original_assignments_needed: assignments_needed.clone(),
+            assignments_needed,
+            assignments_spent: HashMap::new(),
+            main_transition: TypeOfTransition::Mint(after_block),
+            burn_reason: None,
+        };
+        let mut transfer_info_map = BTreeMap::from([(asset_id, transfer_info)]);
+        let PrepareTransferPsbtResult::Success(psbt_string) = self
+            ._prepare_transfer_psbt_wasm(
+                &mut transfer_info_map,
+                false,
+                unspents,
+                &input_unspents,
+                &witness_recipients,
+                fee_rate_checked,
+                1,
+                None,
+                &mut runtime,
+                &mut HashSet::new(),
+            )
+            .await?
+        else {
+            unreachable!("a mint has no retry")
+        };
+        let opid = Psbt::from_str(&psbt_string)?
+            .rgb_contract_consumers(contract_id)
+            .unwrap()
+            .into_iter()
+            .find_map(|(opout, opid)| (opout.ty == OS_MINT).then_some(opid))
+            .unwrap();
+        Ok((psbt_string, opid))
     }
 
     /// List vanilla (non-colored) unspent outputs.
@@ -3882,10 +4654,10 @@ impl Wallet {
                     .indexer()
                     .get_tx_confirmations(&u.outpoint.txid.to_string())
                     .await?;
-                if let Some(confs) = confirmations {
-                    if confs >= min_confirmations as u64 {
-                        filtered.push(u);
-                    }
+                if let Some(confs) = confirmations
+                    && confs >= min_confirmations as u64
+                {
+                    filtered.push(u);
                 }
             }
             filtered
@@ -3895,5 +4667,284 @@ impl Wallet {
 
         info!(self.logger, "List unspents vanilla completed");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mint_right_is_not_an_input_of_a_fungible_send() {
+        let mint = Opout::new(OpId::from([1u8; 32]), OS_MINT, 0);
+        let needed = AssignmentsCollection {
+            fungible: 30,
+            ..Default::default()
+        };
+        // the send moves it as an extra allocation
+        assert!(!AssignmentsCollection::default().opout_contributes(
+            &mint,
+            &AllocatedState::Void,
+            &needed
+        ));
+        assert_eq!(
+            Assignment::from_opout_and_state(mint, &AllocatedState::Void),
+            Assignment::MintRight
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn evm_reject_list_rejects_descendants_of_rejected_opout() {
+        use crate::api::evm::tests::*;
+        use crate::api::evm::{REJECT_LIST_ENTRIES_SELECTOR, REJECT_LIST_LENGTH_SELECTOR};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        // entry 1 rejects, entry 2 allows, both finalized
+        let mut server = mockito::Server::new();
+        let length = format!("0x{:064x}", 2);
+        let zero = EvmAddress::default().to_string();
+        let _mocks = [
+            mock_rpc(
+                &mut server,
+                r#"{"method":"eth_blockNumber"}"#,
+                r#""result":"0x10""#,
+            ),
+            mock_finalized_block(&mut server, 8),
+            mock_eth_call(&mut server, &zero, 8, REJECT_LIST_LENGTH_SELECTOR, &length),
+            mock_eth_call(
+                &mut server,
+                &zero,
+                0x10,
+                REJECT_LIST_LENGTH_SELECTOR,
+                &length,
+            ),
+            mock_eth_call(
+                &mut server,
+                &zero,
+                0x10,
+                &format!("{REJECT_LIST_ENTRIES_SELECTOR}{:064x}{:064x}", 0, 2),
+                &encode_entries(&[(1, true), (2, false)]),
+            ),
+        ];
+        let mut wallet = make_test_wallet(false);
+        let mut online_data = OnlineData::for_test(&server.url());
+        online_data.evm_rpc_urls = HashMap::from([(31337, server.url())]);
+        wallet.online_data = Some(online_data);
+        let source = RejectListSource::Evm(EvmContract {
+            chain_id: 31337,
+            address: Default::default(),
+        });
+        let (reject, allow) = block_on(wallet._get_reject_list_async(&source)).unwrap();
+        assert_eq!(reject, HashSet::from([test_opout(1)]));
+        assert_eq!(allow, HashSet::from([test_opout(2)]));
+
+        // 1 -> 3 and 1 -> 2 -> 4: the allowed opout 2 shields 4 but not 3
+        let mut dag = rgbstd::validation::OpoutsDagInfo::new();
+        for b in 1..=4 {
+            let node = dag.register_output(test_opout(b));
+            dag.cache_outputs(&test_opout(b).op, vec![node]);
+        }
+        for (parent, child) in [(1, 3), (1, 2), (2, 4)] {
+            dag.connect_input_to_outputs_by_opid(test_opout(parent), &test_opout(child).op);
+        }
+        let to_reject = wallet
+            ._check_dag(
+                &dag.to_opouts_dag_data(),
+                &reject,
+                &allow,
+                &HashSet::from([test_opout(3), test_opout(4)]),
+            )
+            .unwrap();
+        assert_eq!(to_reject, HashSet::from([test_opout(3)]));
+
+        // a chain with no URL gives an error, not an empty list
+        wallet.online_data.as_mut().unwrap().evm_rpc_urls.clear();
+        assert!(matches!(
+            block_on(wallet._get_reject_list_async(&source)),
+            Err(Error::NoEvmRpcUrl { chain_id: 31337 })
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn url_reject_list_parse() {
+        use crate::api::evm::tests::{block_on, test_opout};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        // lines are trimmed, empty lines are skipped and invalid lines are ignored
+        let mut server = mockito::Server::new();
+        let body = format!(
+            "  {}\r\n\n\t!{} \nnot an opout\n# comment\n",
+            test_opout(1),
+            test_opout(2)
+        );
+        let _mock = server.mock("GET", "/").with_body(body).create();
+        let mut wallet = make_test_wallet(false);
+        wallet.online_data = Some(OnlineData::for_test(&server.url()));
+        let source = RejectListSource::Url(server.url());
+        let (reject, allow) = block_on(wallet._get_reject_list_async(&source)).unwrap();
+        assert_eq!(reject, HashSet::from([test_opout(1)]));
+        assert_eq!(allow, HashSet::from([test_opout(2)]));
+    }
+
+    #[test]
+    fn many_rights_on_utxo() {
+        // a UTXO can receive more mint rights than an issuance can create (u8::MAX)
+        let num_rights = u8::MAX as u64 + 2;
+        let opid = OpId::from([0u8; 32]);
+        let mut from_opouts = AssignmentsCollection::default();
+        let mut from_allocations = AssignmentsCollection::default();
+        for no in 0..num_rights {
+            let opout = Opout::new(opid, OS_MINT, no as u16);
+            from_opouts.add_opout_state(&opout, &AllocatedState::Void);
+            Assignment::MintRight.add_to_assignments(&mut from_allocations);
+        }
+        assert_eq!(from_opouts.mint, num_rights);
+        assert_eq!(from_allocations.mint, num_rights);
+
+        let needed = AssignmentsCollection {
+            mint: 1,
+            ..Default::default()
+        };
+        assert!(from_opouts.enough(&needed));
+        assert_eq!(from_opouts.change(&needed).mint, num_rights - 1);
+    }
+
+    #[test]
+    fn assignments_collection_without_mint_deserializes() {
+        let collection: AssignmentsCollection =
+            serde_json::from_str(r#"{"fungible":5,"non_fungible":false,"inflation":0}"#).unwrap();
+        assert_eq!(collection.mint, 0);
+    }
+
+    #[test]
+    fn data_without_burn_fields_deserializes() {
+        fn without<T: Serialize + serde::de::DeserializeOwned>(value: &T, field: &str) -> T {
+            let mut json = serde_json::to_value(value).unwrap();
+            json.as_object_mut().unwrap().remove(field).unwrap();
+            serde_json::from_value(json).unwrap()
+        }
+        let batch_info = InfoBatchTransfer {
+            btc_change: None,
+            change_utxo_idx: None,
+            extra_allocations: HashMap::new(),
+            donation: false,
+            min_confirmations: 1,
+            entropy: 7,
+        };
+        assert_eq!(without(&batch_info, "entropy").entropy, 0);
+        let asset_info = InfoAssetTransfer {
+            asset_info: AssetInfo {
+                contract_id: ContractId::from([1u8; 32]),
+                reject_list_url: None,
+            },
+            recipients: vec![],
+            asset_spend: AssetSpend {
+                txo_map: HashMap::new(),
+                assignments_collected: AssignmentsCollection::default(),
+                input_btc_amt: 0,
+            },
+            change: AssignmentsCollection::default(),
+            original_assignments_needed: AssignmentsCollection::default(),
+            assignments_needed: AssignmentsCollection::default(),
+            assignments_spent: HashMap::new(),
+            main_transition: TypeOfTransition::Burn,
+            burn_reason: Some(BurnReason::from(Bytes32::from([2u8; 32]))),
+        };
+        assert_eq!(without(&asset_info, "burn_reason").burn_reason, None);
+        let artifacts = TransferArtifacts {
+            fascia: Some(vec![3]),
+            ..Default::default()
+        };
+        assert_eq!(without(&artifacts, "fascia").fascia, None);
+        let transfer = DbTransfer {
+            idx: 1,
+            asset_transfer_idx: 1,
+            requested_assignment: None,
+            incoming: false,
+            recipient_type: None,
+            recipient_id: None,
+            ack: None,
+            invoice_string: None,
+            burn_reason: Some(s!("ab")),
+        };
+        assert_eq!(without(&transfer, "burn_reason").burn_reason, None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn burn_refuses_invalid_input() {
+        use crate::api::evm::tests::block_on;
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+
+        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Ifa];
+        let url = "http://127.0.0.1:1";
+        wallet.online_data = Some(OnlineData::for_test(url));
+        let online = Online {
+            id: 1,
+            indexer_url: url.to_string(),
+        };
+        for (id, schema) in [("rgb:ifa", AssetSchema::Ifa), ("rgb:nia", AssetSchema::Nia)] {
+            wallet
+                .database
+                .set_asset(DbAssetActMod {
+                    id: ActiveValue::Set(id.to_string()),
+                    schema: ActiveValue::Set(schema),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let cases: [(&str, u64, Option<String>, fn(&Error) -> bool); 4] = [
+            ("rgb:ifa", 0, None, |e| *e == Error::NoBurnAmount),
+            ("rgb:ifa", 10, Some(s!("zz")), |e| {
+                matches!(e, Error::InvalidBurnReason { .. })
+            }),
+            ("rgb:unknown", 10, None, |e| {
+                matches!(e, Error::AssetNotFound { .. })
+            }),
+            ("rgb:nia", 10, None, |e| {
+                *e == Error::UnsupportedBurn {
+                    asset_schema: AssetSchema::Nia,
+                }
+            }),
+        ];
+        for (id, amount, reason, expected) in cases {
+            let err = block_on(wallet.burn(online.clone(), id.to_string(), amount, reason, 1, 1))
+                .unwrap_err();
+            assert!(expected(&err), "{err:?}");
+        }
+
+        wallet.watch_only = true;
+        assert!(matches!(
+            block_on(wallet.burn(online, s!("rgb:ifa"), 10, None, 1, 1)),
+            Err(Error::WatchOnly)
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn check_burn_reason_wants_32_hex_bytes() {
+        let wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let reason = "ab".repeat(32);
+        assert_eq!(
+            wallet
+                .check_burn_reason(reason.clone())
+                .unwrap()
+                .to_string(),
+            reason
+        );
+        assert!(matches!(
+            wallet.check_burn_reason(s!("zz")),
+            Err(Error::InvalidBurnReason { details }) if details.starts_with("not a hex string")
+        ));
+        for len in [31, 33] {
+            assert!(matches!(
+                wallet.check_burn_reason("ab".repeat(len)),
+                Err(Error::InvalidBurnReason { details })
+                    if details == format!("expected 32 bytes, got {len}")
+            ));
+        }
     }
 }
