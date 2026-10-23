@@ -74,7 +74,10 @@ impl AssignmentsCollection {
                 self.add_non_fungible();
             }
             AllocatedState::Void if opout.ty == OS_MINT => {
-                self.mint += 1;
+                self.mint = self
+                    .mint
+                    .checked_add(1)
+                    .expect("total mint rights cannot exceed u64::MAX");
             }
             _ => {}
         }
@@ -1368,7 +1371,10 @@ impl Wallet {
     /// Return the existing or freshly generated set of wallet [`Online`] data (wasm32 async).
     ///
     /// The `evm_rpc_urls` map an EVM chain ID to the RPC URL of a node on that chain. BFA
-    /// operations use them. When the wallet supports BFA, each URL is checked to be on its chain.
+    /// operations use them. When the wallet supports BFA, each URL is checked to be on its chain and
+    /// to serve the latest finalized block and the logs of the whole chain history. Else
+    /// [`Error::InvalidEvmRpcUrl`] is returned: nodes with only the logs of recent blocks are not
+    /// supported.
     pub async fn go_online(
         &mut self,
         _skip_consistency_check: bool,
@@ -1378,17 +1384,20 @@ impl Wallet {
         info!(self.logger, "Going online...");
         if self.supports_schema(&AssetSchema::Bfa) {
             for (chain_id, evm_rpc_url) in &evm_rpc_urls {
-                let actual = EvmClient::new(evm_rpc_url).chain_id().await.map_err(|e| {
-                    Error::InvalidEvmRpcUrl {
+                let evm_client = EvmClient::new(evm_rpc_url);
+                let actual = evm_client
+                    .chain_id()
+                    .await
+                    .map_err(|e| Error::InvalidEvmRpcUrl {
                         details: e.to_string(),
-                    }
-                })?;
+                    })?;
                 if actual != *chain_id {
                     return Err(Error::EvmChainIdMismatch {
                         expected: *chain_id,
                         actual,
                     });
                 }
+                evm_client.check_mint_support().await?;
             }
         } else {
             evm_rpc_urls.clear();
@@ -2217,7 +2226,8 @@ impl Wallet {
     /// Confirm the external anchors of a consignment on the EVM chain of its bridge.
     ///
     /// Return the ID of a mint that is not confirmed yet, if any. Without an EVM RPC URL for the
-    /// chain, no mint is confirmed.
+    /// chain, no mint is confirmed. A mint with no event within [`max_mint_scan_blocks`] blocks
+    /// after the block it commits to gives [`Error::MintEventOutOfScanWindow`].
     pub(crate) async fn _resolve_anchors(
         &self,
         pending: &mut PendingConsignment<true>,
@@ -2237,16 +2247,16 @@ impl Wallet {
             warn!(self.logger, "No EVM RPC URL for chain ID {chain_id}");
             return Ok(Some(*opid));
         };
+        let resolver = BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks());
         for anchor in &anchors {
-            let ExternalAnchor::MintEvent {
-                opid,
-                amount,
-                after_block,
-            } = anchor;
-            if !evm_client
-                .find_funds_in(&address, opid, *amount, *after_block)
-                .await?
-            {
+            let ExternalAnchor::MintEvent { opid, .. } = anchor;
+            if !resolver.is_confirmed(&address, anchor).await? {
+                if resolver.is_exhausted(opid) {
+                    return Err(Error::MintEventOutOfScanWindow {
+                        opid: opid.to_string(),
+                        max_scan_blocks: max_mint_scan_blocks(),
+                    });
+                }
                 return Ok(Some(*opid));
             }
             pending
@@ -2272,22 +2282,26 @@ impl Wallet {
                 return Ok(evm_client.reject_list_entries(address).await?.decisions());
             }
         };
-        let list = self
-            .wasm_proxy_client
-            .get_reject_list(reject_list_url)
+        let list = RejectListClient::new(reject_list_url)?
+            .get_reject_list()
             .await?;
-        let reject_list = list.trim();
-        let mut opout_map = HashMap::with_capacity(reject_list.lines().count());
-        for line in reject_list.lines() {
+        // trim each line and skip empty ones, count the invalid ones and warn once
+        let mut opout_map = HashMap::new();
+        let mut invalid = 0;
+        for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
             let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
-            let opout = match Opout::from_str(opout_str) {
-                Ok(o) => o,
-                Err(_) => {
-                    warn!(self.logger, "Ignoring invalid opout in reject list: {line}");
-                    continue;
+            match Opout::from_str(opout_str) {
+                Ok(opout) => {
+                    opout_map.insert(opout, is_allow);
                 }
-            };
-            opout_map.insert(opout, is_allow);
+                Err(_) => invalid += 1,
+            }
+        }
+        if invalid > 0 {
+            warn!(
+                self.logger,
+                "Ignoring {invalid} invalid opout(s) in reject list"
+            );
         }
         let (allow_opouts, reject_opouts) = opout_map.into_iter().fold(
             (HashSet::new(), HashSet::new()),
@@ -2527,9 +2541,19 @@ impl Wallet {
                 });
             }
         };
-        if let Some(opid) = self._resolve_anchors(&mut pending).await? {
-            warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
-            return Ok(None);
+        match self._resolve_anchors(&mut pending).await {
+            Ok(Some(opid)) => {
+                warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
+                return Ok(None);
+            }
+            Ok(None) => {}
+            Err(e @ Error::MintEventOutOfScanWindow { .. }) => {
+                error!(self.logger, "{e}");
+                return self
+                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    .await;
+            }
+            Err(e) => return Err(e),
         }
         let valid_consignment = pending.finalize();
         let validation_status = valid_consignment.validation_status();
@@ -4739,6 +4763,51 @@ mod tests {
             block_on(wallet._get_reject_list_async(&source)),
             Err(Error::NoEvmRpcUrl { chain_id: 31337 })
         ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn url_reject_list_parse() {
+        use crate::api::evm::tests::{block_on, test_opout};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        // lines are trimmed, empty lines are skipped and invalid lines are ignored
+        let mut server = mockito::Server::new();
+        let body = format!(
+            "  {}\r\n\n\t!{} \nnot an opout\n# comment\n",
+            test_opout(1),
+            test_opout(2)
+        );
+        let _mock = server.mock("GET", "/").with_body(body).create();
+        let mut wallet = make_test_wallet(false);
+        wallet.online_data = Some(OnlineData::for_test(&server.url()));
+        let source = RejectListSource::Url(server.url());
+        let (reject, allow) = block_on(wallet._get_reject_list_async(&source)).unwrap();
+        assert_eq!(reject, HashSet::from([test_opout(1)]));
+        assert_eq!(allow, HashSet::from([test_opout(2)]));
+    }
+
+    #[test]
+    fn many_rights_on_utxo() {
+        // a UTXO can receive more mint rights than an issuance can create (u8::MAX)
+        let num_rights = u8::MAX as u64 + 2;
+        let opid = OpId::from([0u8; 32]);
+        let mut from_opouts = AssignmentsCollection::default();
+        let mut from_allocations = AssignmentsCollection::default();
+        for no in 0..num_rights {
+            let opout = Opout::new(opid, OS_MINT, no as u16);
+            from_opouts.add_opout_state(&opout, &AllocatedState::Void);
+            Assignment::MintRight.add_to_assignments(&mut from_allocations);
+        }
+        assert_eq!(from_opouts.mint, num_rights);
+        assert_eq!(from_allocations.mint, num_rights);
+
+        let needed = AssignmentsCollection {
+            mint: 1,
+            ..Default::default()
+        };
+        assert!(from_opouts.enough(&needed));
+        assert_eq!(from_opouts.change(&needed).mint, num_rights - 1);
     }
 
     #[test]

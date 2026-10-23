@@ -206,7 +206,12 @@ impl Assignment {
             Self::Fungible(amt) => assignments.fungible += amt,
             Self::NonFungible => assignments.non_fungible = true,
             Self::InflationRight(amt) => assignments.inflation += amt,
-            Self::MintRight => assignments.mint += 1,
+            Self::MintRight => {
+                assignments.mint = assignments
+                    .mint
+                    .checked_add(1)
+                    .expect("total mint rights cannot exceed u64::MAX")
+            }
             _ => unreachable!("when using this method we should know the assignment type"),
         }
     }

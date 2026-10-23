@@ -44,6 +44,8 @@ fn transport_endpoint() -> String {
 }
 
 pub(super) async fn funded_wallet(wd: WalletData, utxos: u8) -> (Wallet, Online) {
+    // a failed test can leave the mock set
+    crate::api::evm::MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
     let mut wallet = Wallet::new(wd).unwrap();
     let online = wallet
         .go_online(false, ESPLORA_URL.to_string(), evm_rpc_urls())
@@ -467,6 +469,160 @@ async fn bfa_receive_refuses_rejected_allocation() {
     let statuses = settle(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses, vec![TransferStatus::Failed]);
     assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
+}
+
+/// The ways a `MaliciousRejectList` contract breaks the reject list read model. This mirrors the
+/// `Mode` enum of `tests/contracts/MaliciousRejectList.sol`.
+#[derive(Clone, Copy, Debug)]
+enum MaliciousRejectListMode {
+    LengthReverts,
+    EntriesReverts,
+    ShortPage,
+    BadBool,
+    LengthOverflow,
+    Shrinking,
+    HugeLength,
+}
+
+/// Deploy a `MaliciousRejectList` behaving as `mode` and put its code at `address`.
+async fn deploy_malicious_reject_list(address: &str, mode: MaliciousRejectListMode) {
+    // regenerate with `forge inspect --use 0.8.35 MaliciousRejectList.sol:MaliciousRejectList bytecode`
+    let creation_code = include_str!("../../tests/contracts/MaliciousRejectList.bin").trim();
+    let data = format!("{creation_code}{:064x}", mode as u8);
+    let tx = evm_rpc(
+        "eth_sendTransaction",
+        json!([{"from": ANVIL_ACCOUNT, "data": data}]),
+    )
+    .await;
+    let receipt = evm_rpc("eth_getTransactionReceipt", json!([tx])).await;
+    let code = evm_rpc("eth_getCode", json!([receipt["contractAddress"], "latest"])).await;
+    evm_rpc("anvil_setCode", json!([address, code])).await;
+}
+
+#[wasm_bindgen_test]
+async fn bfa_receive_refuses_malicious_reject_list() {
+    use MaliciousRejectListMode::*;
+
+    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
+    let bridge = new_evm_address();
+    let reject_list = new_evm_address();
+    deploy_bridge(&bridge).await;
+    deploy_reject_list(&reject_list, &[]).await;
+    let (asset_id, opid) =
+        bfa_with_units(&mut a, &a_online, &bridge, Some(reject_list.clone())).await;
+    emit_funds_in(&bridge, opid, 100).await;
+    finalize_evm().await;
+    send(&mut a, &a_online, &mut b, &asset_id, 30).await;
+
+    // the receiver cannot read the list: the transfer stays pending and the asset is not imported
+    let cases = [
+        (None, "no contract at the reject list address"),
+        (Some(LengthReverts), "eth_call error"),
+        (Some(EntriesReverts), "eth_call error"),
+        (Some(ShortPage), "unexpected reject list page size"),
+        (Some(BadBool), "bad bool"),
+        (
+            Some(LengthOverflow),
+            "reject list length doesn't fit in a u64",
+        ),
+        (
+            Some(Shrinking),
+            "shorter at the latest block than at the finalized one",
+        ),
+        (Some(HugeLength), "reject list too long"),
+    ];
+    for (mode, expected) in cases {
+        match mode {
+            Some(mode) => deploy_malicious_reject_list(&reject_list, mode).await,
+            None => {
+                evm_rpc("anvil_setCode", json!([reject_list, "0x"])).await;
+            }
+        }
+        finalize_evm().await;
+        let refreshed = b
+            .refresh(b_online.clone(), None, vec![], false)
+            .await
+            .unwrap();
+        let refreshed = refreshed.values().next().unwrap();
+        assert!(
+            refreshed.updated_status.is_none(),
+            "{mode:?}: {refreshed:?}"
+        );
+        assert!(
+            matches!(refreshed.failure, Some(Error::Network { ref details }) if details.contains(expected)),
+            "{mode:?}: {refreshed:?}"
+        );
+        let transfers = b
+            .list_transfers(crate::wallet::AssetFilter::Any, None)
+            .unwrap();
+        assert_eq!(
+            transfers.last().unwrap().status,
+            TransferStatus::WaitingCounterparty,
+            "{mode:?}"
+        );
+        assert!(
+            b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty(),
+            "{mode:?}"
+        );
+    }
+
+    // a benign list again: the transfer settles
+    deploy_reject_list(&reject_list, &[]).await;
+    finalize_evm().await;
+    let statuses = settle(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+}
+
+#[wasm_bindgen_test]
+async fn bfa_receive_refuses_mint_out_of_scan_window() {
+    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
+    let bridge = new_evm_address();
+    deploy_bridge(&bridge).await;
+    let (asset_id, opid) = bfa_with_units(&mut a, &a_online, &bridge, None).await;
+    emit_funds_in(&bridge, opid, 100).await;
+    finalize_evm().await;
+    send(&mut a, &a_online, &mut b, &asset_id, 30).await;
+
+    // the event follows the block the mint commits to, so no scan of 0 blocks finds it
+    crate::api::evm::MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
+    let res = b.refresh(b_online.clone(), None, vec![], false).await;
+    crate::api::evm::MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
+    let refreshed = res.unwrap();
+    let refreshed = refreshed.values().next().unwrap();
+    assert_eq!(
+        refreshed.updated_status,
+        Some(TransferStatus::Failed),
+        "{refreshed:?}"
+    );
+    assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn bfa_reject_list_url() {
+    use crate::api::reject_list::RejectListClient;
+
+    let get = |path: &str| {
+        let url = format!("{REGTEST_HELPER_URL}/reject-list/{path}");
+        async move { RejectListClient::new(&url).unwrap().get_reject_list().await }
+    };
+    let list = (0..10_000)
+        .map(|i| format!("{i:064x}/1/0\n"))
+        .collect::<String>();
+    assert_eq!(get("valid").await.unwrap(), list);
+    assert!(matches!(
+        get("redirect").await,
+        Err(Error::RejectListService { .. })
+    ));
+    assert!(matches!(
+        get("missing").await,
+        Err(Error::RejectListService { ref details }) if details.contains("404")
+    ));
+    assert!(matches!(
+        get("oversized").await,
+        Err(Error::RejectListService { ref details }) if details.contains("reject list too large")
+    ));
 }
 
 pub(super) fn s(value: &str) -> String {

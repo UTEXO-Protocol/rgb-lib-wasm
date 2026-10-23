@@ -181,7 +181,11 @@ use crate::utils::INDEXER_PARALLEL_REQUESTS;
 use crate::utils::{OffchainResolverWasm, WasmResolver};
 #[cfg(feature = "esplora")]
 use crate::{
-    api::{evm::EvmClient, proxy::GetConsignmentResponse},
+    api::{
+        evm::{BoundedAnchorResolver, EvmClient, max_mint_scan_blocks},
+        proxy::GetConsignmentResponse,
+        reject_list::RejectListClient,
+    },
     database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
     error::IndexerError,
     utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},

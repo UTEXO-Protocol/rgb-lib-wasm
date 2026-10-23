@@ -265,7 +265,9 @@ pub enum Error {
         details: String,
     },
 
-    /// The provided EVM RPC URL is invalid or the endpoint cannot be reached
+    /// The provided EVM RPC URL is invalid, the endpoint cannot be reached or it does not serve
+    /// what confirming mint events needs (the latest finalized block and the logs of the whole
+    /// chain history)
     #[error("Invalid EVM RPC URL: {details}")]
     InvalidEvmRpcUrl {
         /// Error details
@@ -411,11 +413,25 @@ pub enum Error {
         txid: String,
     },
 
-    /// No confirmed mint event for the mint operation was found on the EVM chain
+    /// No confirmed mint event for the mint operation was found on the EVM chain (yet): it may
+    /// still be, e.g. once the lock is made or finalized
     #[error("Mint event for operation {opid} not found on the EVM chain")]
     MintEventNotFound {
         /// ID of the mint operation
         opid: String,
+    },
+
+    /// No mint event for the mint operation was found within the blocks scanned for it after the
+    /// one the mint commits to, all of them finalized: the mint will never be confirmed
+    #[error(
+        "Mint event for operation {opid} not found within {max_scan_blocks} blocks from the one \
+         the mint commits to"
+    )]
+    MintEventOutOfScanWindow {
+        /// ID of the mint operation
+        opid: String,
+        /// Number of blocks scanned for the mint event
+        max_scan_blocks: u64,
     },
 
     /// The signed PSBT of a transfer is missing, so the transfer has failed
