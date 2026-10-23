@@ -413,6 +413,14 @@ pub enum Error {
         txid: String,
     },
 
+    /// The invoice expires too soon (a mint needs the invoice to leave time for the lock)
+    #[error("Invoice expired")]
+    InvoiceExpired,
+
+    /// A mint cannot spend the last mint right of the wallet, which would be left unable to mint
+    #[error("Cannot mint with the last mint right")]
+    LastMintRight,
+
     /// No confirmed mint event for the mint operation was found on the EVM chain (yet): it may
     /// still be, e.g. once the lock is made or finalized
     #[error("Mint event for operation {opid} not found on the EVM chain")]
@@ -539,6 +547,10 @@ pub enum Error {
         schema_id: String,
     },
 
+    /// The transfer has expired
+    #[error("Transfer expired")]
+    TransferExpired,
+
     /// The detected transfer is unknown
     #[error("Unknown transfer: {txid}")]
     UnknownTransfer {
@@ -556,6 +568,13 @@ pub enum Error {
     /// The schema doesn't support burn transitions
     #[error("Burn not supported")]
     UnsupportedBurn {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
+    /// The schema doesn't support mint transitions
+    #[error("Mint not supported")]
+    UnsupportedMint {
         /// Asset schema
         asset_schema: AssetSchema,
     },

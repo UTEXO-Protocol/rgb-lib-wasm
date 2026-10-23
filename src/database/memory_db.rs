@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::database::enums::{
     AssetSchema, Assignment, ColoringType, RecipientTypeFull, TransferStatus, TransportType,
-    WalletTransactionType,
+    TypeOfTransition, WalletTransactionType,
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
@@ -96,6 +96,8 @@ pub struct DbAssetTransfer {
     pub user_driven: bool,
     pub batch_transfer_idx: i32,
     pub asset_id: Option<String>,
+    #[serde(default)]
+    pub transition_type: Option<TypeOfTransition>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -104,6 +106,7 @@ pub struct DbAssetTransferActMod {
     pub user_driven: ActiveValue<bool>,
     pub batch_transfer_idx: ActiveValue<i32>,
     pub asset_id: ActiveValue<Option<String>>,
+    pub transition_type: ActiveValue<Option<TypeOfTransition>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +384,7 @@ impl From<DbAssetTransfer> for DbAssetTransferActMod {
             user_driven: ActiveValue::Unchanged(m.user_driven),
             batch_transfer_idx: ActiveValue::Unchanged(m.batch_transfer_idx),
             asset_id: ActiveValue::Unchanged(m.asset_id),
+            transition_type: ActiveValue::Unchanged(m.transition_type),
         }
     }
 }
@@ -534,6 +538,7 @@ impl InMemoryDb {
             user_driven: av(a.user_driven),
             batch_transfer_idx: av(a.batch_transfer_idx),
             asset_id: av(a.asset_id),
+            transition_type: av(a.transition_type),
         };
         self.asset_transfers.borrow_mut().push(row);
         Ok(idx)

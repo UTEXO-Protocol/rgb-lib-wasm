@@ -157,7 +157,9 @@ use rgbstd::{
     validation::{OpoutsDagData, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
-use schemata::{BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN};
+use schemata::{
+    BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN, TS_MINT,
+};
 use schemata::{BridgedFungibleAsset, InflatableFungibleAsset, NonInflatableAsset};
 use scrypt::{
     Params, Scrypt,
@@ -188,7 +190,7 @@ use crate::utils::{OffchainResolverWasm, WasmResolver};
 #[cfg(feature = "esplora")]
 use crate::{
     api::{
-        evm::{BoundedAnchorResolver, EvmClient, max_mint_scan_blocks},
+        evm::{EvmClient, MintAnchorResolver, max_mint_scan_blocks},
         proxy::GetConsignmentResponse,
         reject_list::RejectListClient,
     },
@@ -200,7 +202,7 @@ use crate::{
 use crate::{
     database::{
         LocalRgbAllocation, LocalTransportEndpoint, LocalUnspent, TransferData,
-        enums::{ColoringType, RecipientTypeFull, WalletTransactionType},
+        enums::{ColoringType, RecipientTypeFull, TypeOfTransition, WalletTransactionType},
     },
     error::InternalError,
     utils::{

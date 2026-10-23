@@ -759,6 +759,26 @@ pub struct Recipient {
     pub assignment: Assignment,
     /// Transport endpoints
     pub transport_endpoints: Vec<String>,
+    /// The invoice expiration (UNIX timestamp, seconds), taken from the invoice. A mint needs it.
+    #[serde(default)]
+    pub expiration_timestamp: Option<u64>,
+}
+
+/// A mint received by the wallet, as checked by it: what its sender has to lock on the external
+/// chain for the mint to complete.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct ReceivedMint {
+    /// ID of the mint operation, which the lock has to commit to
+    pub opid: String,
+    /// Amount minted, which the lock has to match
+    pub amount: u64,
+    /// External chain block the lock has to follow
+    pub after_block: u64,
+    /// EIP-155 chain ID of the EVM chain the asset's bridge contract lives on
+    pub evm_chain_id: u64,
+    /// Address of the asset's bridge contract, where the lock has to be made
+    pub bridge_contract: String,
 }
 
 /// The information needed to receive RGB assets in witness mode.
@@ -959,6 +979,8 @@ pub enum TransferKind {
     Inflation,
     /// A burn transfer
     Burn,
+    /// A mint transfer
+    Mint,
 }
 
 /// A wallet unspent.
@@ -1103,6 +1125,10 @@ pub struct Wallet {
     /// Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
+    /// Received mints, as checked, keyed by recipient_id
+    pub(crate) received_mints: HashMap<String, ReceivedMint>,
+    /// Last finalized EVM block scanned for each terminal mint, keyed by recipient_id and opid
+    pub(crate) mint_scanned_blocks: HashMap<String, HashMap<String, u64>>,
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent in-memory RGB stock.
@@ -1257,6 +1283,8 @@ impl Wallet {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            received_mints: HashMap::new(),
+            mint_scanned_blocks: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: {
@@ -2365,6 +2393,35 @@ impl Wallet {
         Ok(transfers_changed)
     }
 
+    /// Get the details of the mint received on the provided `recipient_id`, once the wallet has
+    /// checked it: what the lock on the external chain has to match for the mint to complete.
+    ///
+    /// Returns `None` if no mint checked by the wallet pays `recipient_id`, or if it failed.
+    pub fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, Error> {
+        info!(self.logger, "Getting received mint...");
+        // a failed receive has nothing left to lock for
+        let db_data = self.database.get_db_data(false)?;
+        let failed = db_data.transfers.iter().any(|t| {
+            t.recipient_id.as_deref() == Some(&recipient_id)
+                && db_data
+                    .asset_transfers
+                    .iter()
+                    .find(|at| at.idx == t.asset_transfer_idx)
+                    .and_then(|at| {
+                        db_data
+                            .batch_transfers
+                            .iter()
+                            .find(|bt| bt.idx == at.batch_transfer_idx)
+                    })
+                    .is_some_and(|bt| t.incoming && bt.status == TransferStatus::Failed)
+        });
+        info!(self.logger, "Get received mint completed");
+        if failed {
+            return Ok(None);
+        }
+        Ok(self.received_mints.get(&recipient_id).cloned())
+    }
+
     /// Return the [`Metadata`] of the RGB asset with the given ID.
     pub fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, Error> {
         info!(self.logger, "Getting metadata for asset '{}'...", asset_id);
@@ -2646,6 +2703,8 @@ impl Wallet {
                     RecipientTypeFull::Witness { .. } => TransferKind::ReceiveWitness,
                 }
             }
+        } else if asset_transfer.transition_type == Some(TypeOfTransition::Mint) {
+            TransferKind::Mint
         } else if transfer.recipient_id.is_none() {
             // a burn is the only outgoing transfer without a recipient
             TransferKind::Burn
@@ -2688,7 +2747,10 @@ impl Wallet {
         };
         let change_utxo = match kind {
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => None,
-            TransferKind::Send | TransferKind::Inflation | TransferKind::Burn => {
+            TransferKind::Send
+            | TransferKind::Inflation
+            | TransferKind::Burn
+            | TransferKind::Mint => {
                 let change_txo_idx: Vec<i32> = filtered_coloring
                     .filter(|c| c.r#type == ColoringType::Change)
                     .map(|c| c.txo_idx)
@@ -2705,12 +2767,16 @@ impl Wallet {
         };
 
         let consignment_path = match (&kind, batch_transfer.status) {
-            (TransferKind::Send | TransferKind::Inflation | TransferKind::Burn, _) => {
-                Some(self.get_send_consignment_path(
-                    &asset_transfer.asset_id.clone().unwrap(),
-                    &batch_transfer.txid.clone().unwrap(),
-                ))
-            }
+            (
+                TransferKind::Send
+                | TransferKind::Inflation
+                | TransferKind::Burn
+                | TransferKind::Mint,
+                _,
+            ) => Some(self.get_send_consignment_path(
+                &asset_transfer.asset_id.clone().unwrap(),
+                &batch_transfer.txid.clone().unwrap(),
+            )),
             (
                 TransferKind::ReceiveBlind | TransferKind::ReceiveWitness,
                 TransferStatus::WaitingCounterparty,
@@ -3336,6 +3402,8 @@ impl Wallet {
             bdk_changeset: self.bdk_database.get_data().clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
+            received_mints: self.received_mints.clone(),
+            mint_scanned_blocks: self.mint_scanned_blocks.clone(),
             rgb_store: Some(rgb_store),
             reuse_address_index: self.reuse_address_index.clone(),
         })
@@ -3457,6 +3525,8 @@ impl Wallet {
 
         // Restore received consignments
         self.received_consignments = snapshot.received_consignments;
+        self.received_mints = snapshot.received_mints;
+        self.mint_scanned_blocks = snapshot.mint_scanned_blocks;
 
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
@@ -3539,6 +3609,8 @@ pub(crate) mod address_reuse_tests {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            received_mints: HashMap::new(),
+            mint_scanned_blocks: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
