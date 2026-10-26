@@ -1,4 +1,5 @@
 pub(crate) mod memory_db;
+pub(crate) mod rgb_store;
 
 use super::*;
 
@@ -210,6 +211,8 @@ pub(crate) struct LocalRecipient {
     pub local_recipient_data: LocalRecipientData,
     pub assignment: Assignment,
     pub transport_endpoints: Vec<LocalTransportEndpoint>,
+    #[serde(default)]
+    pub invoice_expiration: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

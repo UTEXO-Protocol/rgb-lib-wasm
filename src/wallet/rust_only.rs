@@ -157,7 +157,7 @@ impl Wallet {
                 beneficiaries.push(seal);
 
                 match schema {
-                    AssetSchema::Nia | AssetSchema::Ifa => {
+                    AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa => {
                         asset_transition_builder = asset_transition_builder.add_fungible_state(
                             assignment_name.clone(),
                             seal,
@@ -384,9 +384,10 @@ impl Wallet {
                 };
                 let initial_supply = contract.total_issued_supply().into();
                 let max_supply = contract.max_supply().into();
-                let known_circulating_supply = IfaWrapper::with(valid_transfer.contract_data())
-                    .total_issued_supply()
-                    .into();
+                let known_circulating_supply =
+                    IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
+                        .total_issued_supply()
+                        .into();
                 let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
                 LocalAssetData {
                     name,
@@ -397,6 +398,34 @@ impl Wallet {
                     initial_supply,
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
+                    reject_list_url,
+                }
+            }
+            AssetSchema::Bfa => {
+                let contract = runtime.contract_wrapper::<BridgedFungibleAsset>(contract_id)?;
+                let spec = contract.spec();
+                let media_idx = if let Some(attachment) = contract.contract_terms().media {
+                    Some(self.get_or_insert_media(
+                        hex::encode(attachment.digest),
+                        attachment.ty.to_string(),
+                    )?)
+                } else {
+                    None
+                };
+                // the DB keeps only a reject list URL
+                let reject_list_url = match contract.reject_list() {
+                    Some(RejectListLocation::Url(url)) => Some(url.to_string()),
+                    _ => None,
+                };
+                LocalAssetData {
+                    name: spec.name().to_string(),
+                    precision: spec.precision.into(),
+                    ticker: Some(spec.ticker().to_string()),
+                    details: spec.details().map(|d| d.to_string()),
+                    media_idx,
+                    initial_supply: 0,
+                    max_supply: None,
+                    known_circulating_supply: None,
                     reject_list_url,
                 }
             }
@@ -533,14 +562,18 @@ impl Wallet {
 
         debug!(self.logger, "Validating consignment...");
         let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
+        let schema_rules = asset_schema.schema_rules();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            trusted_typesystem,
+            build_opouts_dag: asset_schema == AssetSchema::Bfa,
             ..Default::default()
         };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
-            Ok(consignment) => consignment,
+        let mut pending = match consignment
+            .clone()
+            .validate_deterministic(&schema_rules, &validation_config)
+            .and_then(|mut p| p.pending().resolve_all(&resolver).map(|_| p))
+        {
+            Ok(pending) => pending,
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger, "Consignment is invalid: {}", e);
                 return Err(Error::InvalidConsignment);
@@ -551,17 +584,58 @@ impl Wallet {
                     details: e.to_string(),
                 });
             }
+            Err(e) => {
+                return Err(Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
+                });
+            }
         };
+        if let Some(opid) = self
+            ._resolve_anchors(&mut pending, &HashSet::new(), &mut HashMap::new())
+            .await?
+        {
+            return Err(Error::MintEventNotFound {
+                opid: opid.to_string(),
+            });
+        }
+        let valid_consignment = pending.finalize();
         let validity = valid_consignment.validation_status().validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
+
+        let received_rgb_assignments =
+            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
+
+        if asset_schema == AssetSchema::Bfa {
+            let source = BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
+                .reject_list()
+                .map(RejectListSource::from);
+            if let Some(source) = &source {
+                let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
+                let to_reject = self._check_dag(
+                    valid_consignment
+                        .validation_status()
+                        .dag_data_opt
+                        .as_ref()
+                        .expect("build_opouts_dag is true for BFA"),
+                    &reject_opouts,
+                    &allow_opouts,
+                    &received_rgb_assignments.keys().cloned().collect(),
+                )?;
+                if !to_reject.is_empty() {
+                    error!(
+                        self.logger,
+                        "Found {} opout(s) that must be rejected",
+                        to_reject.len()
+                    );
+                    return Err(Error::InvalidConsignment);
+                }
+            }
+        }
 
         let valid_contract = valid_consignment.clone().into_valid_contract();
         runtime
             .import_contract(valid_contract, &resolver)
             .expect("failure importing validated contract");
-
-        let received_rgb_assignments =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
 
         runtime.accept_transfer(valid_consignment, &resolver)?;
         drop(runtime);
@@ -641,6 +715,9 @@ pub async fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
 /// transaction ID. The fallback resolver uses witness data from the consignment itself.
 ///
 /// Returns a `ValidateConsignmentResult` with validity status, warnings, and error details.
+///
+/// The mints in a BFA history are checked only online: a consignment that holds one gives the
+/// `external_anchors` error.
 #[cfg(feature = "esplora")]
 pub fn validate_consignment_offchain(
     consignment_bytes: &[u8],
@@ -654,7 +731,7 @@ pub fn validate_consignment_offchain(
     let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
     let chain_net: ChainNet = bitcoin_network.into();
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-    let trusted_typesystem = asset_schema.types();
+    let schema_rules = asset_schema.schema_rules();
 
     let wasm_resolver = crate::utils::WasmResolver::from_consignment(&consignment, chain_net);
     let resolver = crate::utils::OffchainResolverWasm {
@@ -665,11 +742,13 @@ pub fn validate_consignment_offchain(
 
     let validation_config = ValidationConfig {
         chain_net,
-        trusted_typesystem,
         ..Default::default()
     };
 
-    match consignment.clone().validate(&resolver, &validation_config) {
+    match consignment
+        .clone()
+        .validate(&schema_rules, &resolver, &validation_config)
+    {
         Ok(valid_consignment) => {
             let status = valid_consignment.validation_status();
             Ok(ValidateConsignmentResult {
@@ -695,6 +774,18 @@ pub fn validate_consignment_offchain(
             valid: false,
             warnings: None,
             error: Some("resolver".to_string()),
+            details: Some(e.to_string()),
+        }),
+        Err(ValidationError::ExternalAnchorsPending(count)) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("external_anchors".to_string()),
+            details: Some(format!("{count} mint event(s) to check online")),
+        }),
+        Err(e) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("unexpected".to_string()),
             details: Some(e.to_string()),
         }),
     }

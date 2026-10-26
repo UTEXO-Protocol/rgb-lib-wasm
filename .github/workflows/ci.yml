@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [dev, stage, master]
+    branches: [dev, stage, master, bfa]
   pull_request:
-    branches: [dev, stage, master]
+    branches: [dev, stage, master, bfa]
 
 env:
   CARGO_TERM_COLOR: always
@@ -158,6 +158,19 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test integration_wasm
+
+      # The lib browser tests run in two sessions: the eight BFA mint tests each
+      # drive anvil and a full regtest flow, and one Firefox session holding them
+      # next to the rest of the suite runs out of memory
+      - name: Run BFA tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 900
+        run: wasm-pack test --headless --firefox --release --lib -- --skip bfa_mint_
+
+      - name: Run BFA mint tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 900
+        run: wasm-pack test --headless --firefox --release --lib -- bfa_mint_
 
       - name: Stop regtest services
         if: always()

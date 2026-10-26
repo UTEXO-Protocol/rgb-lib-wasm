@@ -279,18 +279,4 @@ impl WasmProxyClient {
             .await
             .map_err(InternalError::from)?)
     }
-
-    pub(crate) async fn get_reject_list(&self, url: &str) -> Result<String, Error> {
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::RejectListService {
-                details: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(InternalError::from)?)
-    }
 }

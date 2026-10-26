@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::database::enums::{
     AssetSchema, Assignment, ColoringType, RecipientTypeFull, TransferStatus, TransportType,
-    WalletTransactionType,
+    TypeOfTransition, WalletTransactionType,
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
@@ -96,6 +96,8 @@ pub struct DbAssetTransfer {
     pub user_driven: bool,
     pub batch_transfer_idx: i32,
     pub asset_id: Option<String>,
+    #[serde(default)]
+    pub transition_type: Option<TypeOfTransition>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -104,6 +106,7 @@ pub struct DbAssetTransferActMod {
     pub user_driven: ActiveValue<bool>,
     pub batch_transfer_idx: ActiveValue<i32>,
     pub asset_id: ActiveValue<Option<String>>,
+    pub transition_type: ActiveValue<Option<TypeOfTransition>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +199,8 @@ pub struct DbTransfer {
     pub recipient_id: Option<String>,
     pub ack: Option<bool>,
     pub invoice_string: Option<String>,
+    #[serde(default)]
+    pub burn_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -208,6 +213,7 @@ pub struct DbTransferActMod {
     pub recipient_id: ActiveValue<Option<String>>,
     pub ack: ActiveValue<Option<bool>>,
     pub invoice_string: ActiveValue<Option<String>>,
+    pub burn_reason: ActiveValue<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +384,7 @@ impl From<DbAssetTransfer> for DbAssetTransferActMod {
             user_driven: ActiveValue::Unchanged(m.user_driven),
             batch_transfer_idx: ActiveValue::Unchanged(m.batch_transfer_idx),
             asset_id: ActiveValue::Unchanged(m.asset_id),
+            transition_type: ActiveValue::Unchanged(m.transition_type),
         }
     }
 }
@@ -393,6 +400,7 @@ impl From<DbTransfer> for DbTransferActMod {
             recipient_id: ActiveValue::Unchanged(m.recipient_id),
             ack: ActiveValue::Unchanged(m.ack),
             invoice_string: ActiveValue::Unchanged(m.invoice_string),
+            burn_reason: ActiveValue::Unchanged(m.burn_reason),
         }
     }
 }
@@ -530,6 +538,7 @@ impl InMemoryDb {
             user_driven: av(a.user_driven),
             batch_transfer_idx: av(a.batch_transfer_idx),
             asset_id: av(a.asset_id),
+            transition_type: av(a.transition_type),
         };
         self.asset_transfers.borrow_mut().push(row);
         Ok(idx)
@@ -634,6 +643,7 @@ impl InMemoryDb {
             recipient_id: av(t.recipient_id),
             ack: av(t.ack),
             invoice_string: av(t.invoice_string),
+            burn_reason: av(t.burn_reason),
         };
         self.transfers.borrow_mut().push(row);
         Ok(idx)
@@ -736,6 +746,9 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &t.invoice_string {
             row.invoice_string = v.clone();
+        }
+        if let ActiveValue::Set(v) = &t.burn_reason {
+            row.burn_reason = v.clone();
         }
         Ok(row.clone())
     }
