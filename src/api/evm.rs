@@ -281,6 +281,8 @@ struct CallObject {
 #[derive(Debug, Deserialize)]
 struct BlockHeader {
     number: String,
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 /// Filter object for `eth_getLogs`.
@@ -491,7 +493,6 @@ impl EvmClient {
 
     /// Whether `contract` emitted a `FundsIn` event for `opid` with the exact `amount`, after
     /// `after_block` and up to `last_block`.
-    /// A log range that the node refuses is halved and requested again.
     pub(crate) async fn find_funds_in(
         &self,
         contract: &EvmAddress,
@@ -500,8 +501,26 @@ impl EvmClient {
         after_block: u64,
         last_block: u64,
     ) -> Result<bool, Error> {
+        Ok(self
+            .find_funds_in_block(contract, opid, amount, after_block, after_block, last_block)
+            .await?
+            .is_some())
+    }
+
+    /// The block of the first `FundsIn` event for `opid` with the exact `amount` after
+    /// `scanned_block` and up to `last_block` that follows `after_block`, if any.
+    /// A log range that the node refuses is halved and requested again.
+    async fn find_funds_in_block(
+        &self,
+        contract: &EvmAddress,
+        opid: &OpId,
+        amount: u64,
+        after_block: u64,
+        scanned_block: u64,
+        last_block: u64,
+    ) -> Result<Option<u64>, Error> {
         let mut block_range = LOGS_BLOCK_RANGE;
-        let mut from_block = after_block.saturating_add(1);
+        let mut from_block = scanned_block.saturating_add(1);
         while from_block <= last_block {
             let to_block = min(from_block.saturating_add(block_range - 1), last_block);
             let logs = match self.get_logs(contract, opid, from_block, to_block).await? {
@@ -520,7 +539,7 @@ impl EvmClient {
                 if let Some(event) = log.as_funds_in()?
                     && event.confirms(opid, amount, after_block)
                 {
-                    return Ok(true);
+                    return Ok(event.block_number);
                 }
             }
             let Some(next_block) = to_block.checked_add(1) else {
@@ -528,7 +547,44 @@ impl EvmClient {
             };
             from_block = next_block;
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Timestamp of the block including a `FundsIn` event for `opid` with the exact `amount`
+    /// after `after_block`, finalized or not, if any.
+    pub(crate) async fn funds_in_inclusion(
+        &self,
+        contract: &EvmAddress,
+        opid: &OpId,
+        amount: u64,
+        after_block: u64,
+    ) -> Result<Option<u64>, Error> {
+        let latest_block = self.block_number().await?;
+        let Some(block) = self
+            .find_funds_in_block(
+                contract,
+                opid,
+                amount,
+                after_block,
+                after_block,
+                latest_block,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.block_timestamp(block).await?))
+    }
+
+    /// Timestamp of the block with the given number.
+    pub(crate) async fn block_timestamp(&self, block: u64) -> Result<u64, Error> {
+        let header: BlockHeader = self
+            .rpc("eth_getBlockByNumber", (format!("0x{block:x}"), false))
+            .await?;
+        let timestamp = header.timestamp.ok_or_else(|| Error::Network {
+            details: format!("the node reports no timestamp for block {block}"),
+        })?;
+        parse_quantity(&timestamp, "block timestamp")
     }
 
     async fn eth_call(
@@ -660,6 +716,100 @@ impl<'a> BoundedAnchorResolver<'a> {
     /// mint is never confirmed.
     pub(crate) fn is_exhausted(&self, opid: &OpId) -> bool {
         self.exhausted.borrow().contains(opid)
+    }
+}
+
+/// A resolver of the mint events paying a recipient. Each scan resumes after the last finalized
+/// block of the previous scan. A [`BoundedAnchorResolver`] resolves the mints in the history.
+/// Both scan only `max_scan_blocks` blocks.
+pub(crate) struct MintAnchorResolver<'a> {
+    client: &'a EvmClient,
+    history: BoundedAnchorResolver<'a>,
+    terminal_opids: &'a HashSet<OpId>,
+    /// Last finalized block scanned without the event, by terminal mint
+    scanned_blocks: RefCell<HashMap<OpId, u64>>,
+    max_scan_blocks: u64,
+    exhausted: RefCell<HashSet<OpId>>,
+}
+
+impl<'a> MintAnchorResolver<'a> {
+    pub(crate) fn new(
+        client: &'a EvmClient,
+        terminal_opids: &'a HashSet<OpId>,
+        scanned_blocks: HashMap<OpId, u64>,
+        max_scan_blocks: u64,
+    ) -> Self {
+        Self {
+            client,
+            history: BoundedAnchorResolver::new(client, max_scan_blocks),
+            terminal_opids,
+            scanned_blocks: RefCell::new(scanned_blocks),
+            max_scan_blocks,
+            exhausted: RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// The last finalized block scanned without the event, by terminal mint.
+    pub(crate) fn scanned_blocks(&self) -> HashMap<OpId, u64> {
+        self.scanned_blocks.borrow().clone()
+    }
+
+    /// Whether a finalized `FundsIn` event confirms the mint within the limit.
+    pub(crate) async fn is_confirmed(
+        &self,
+        contract: &EvmAddress,
+        anchor: &ExternalAnchor,
+    ) -> Result<bool, Error> {
+        let ExternalAnchor::MintEvent {
+            opid,
+            amount,
+            after_block,
+        } = anchor;
+        if !self.terminal_opids.contains(opid) {
+            return self.history.is_confirmed(contract, anchor).await;
+        }
+        // finalized blocks cannot be reorged, so a scanned block is not scanned again
+        let scanned_block = self
+            .scanned_blocks
+            .borrow()
+            .get(opid)
+            .copied()
+            .unwrap_or(*after_block)
+            .max(*after_block);
+        let finalized_block = self.client.finalized_block_number().await?;
+        let limit_block = after_block.saturating_add(self.max_scan_blocks);
+        let last_block = min(finalized_block, limit_block);
+        if self
+            .client
+            .find_funds_in_block(
+                contract,
+                opid,
+                *amount,
+                *after_block,
+                scanned_block,
+                last_block,
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        self.scanned_blocks
+            .borrow_mut()
+            .insert(*opid, scanned_block.max(last_block));
+        if last_block == limit_block {
+            self.exhausted.borrow_mut().insert(*opid);
+        }
+        Ok(false)
+    }
+
+    /// Whether the mint has no event in any block within the limit, all of them finalized.
+    pub(crate) fn is_exhausted(&self, opid: &OpId) -> bool {
+        if self.terminal_opids.contains(opid) {
+            self.exhausted.borrow().contains(opid)
+        } else {
+            self.history.is_exhausted(opid)
+        }
     }
 }
 
@@ -1310,6 +1460,58 @@ pub(crate) mod tests {
             .create();
         assert_eq!(resolve(&server, u64::MAX), (false, false));
         get_logs.assert();
+    }
+
+    #[test]
+    fn mint_anchor_resolver_resumes_scan() {
+        let opid = OpId::from([0u8; 32]);
+        let terminal_opids = HashSet::from([opid]);
+        let anchor = ExternalAnchor::MintEvent {
+            opid,
+            amount: 7,
+            after_block: 16,
+        };
+        let resolve = |server: &mockito::Server, scanned_block: u64| {
+            let client = EvmClient::new(&server.url());
+            let resolver = MintAnchorResolver::new(
+                &client,
+                &terminal_opids,
+                HashMap::from([(opid, scanned_block)]),
+                10,
+            );
+            let confirmed = block_on(resolver.is_confirmed(&contract(), &anchor)).unwrap();
+            (
+                confirmed,
+                resolver.scanned_blocks()[&opid],
+                resolver.is_exhausted(&opid),
+            )
+        };
+
+        // the scan resumes after the scanned block and stops at the finalized one
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 22);
+        let range = mock_get_logs(&mut server, 21, 22, NO_LOGS);
+        assert_eq!(resolve(&server, 20), (false, 22, false));
+        range.assert();
+
+        // the next scan resumes from there and stops at the limit: the mint is exhausted
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 1020);
+        let range = mock_get_logs(&mut server, 23, 26, NO_LOGS);
+        assert_eq!(resolve(&server, 22), (false, 26, true));
+        range.assert();
+
+        // an event in the last block within the limit confirms the mint
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 1020);
+        let range = mock_get_logs(
+            &mut server,
+            23,
+            26,
+            &format!(r#""result":[{}]"#, funds_in_log(7, 26)),
+        );
+        assert_eq!(resolve(&server, 22), (true, 22, false));
+        range.assert();
     }
 
     #[test]
