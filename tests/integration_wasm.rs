@@ -55,7 +55,7 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
 #[wasm_bindgen_test]
 async fn test_full_wallet_flow() {
     let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
-    let mut wallet = Wallet::new(wd).unwrap();
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
     let online = wallet
         .go_online(false, ESPLORA_URL.to_string())
         .await
@@ -530,6 +530,15 @@ async fn test_full_wallet_flow() {
     // Wallet has state, so backup should be required
     assert!(needs_backup, "backup_info should indicate backup needed");
 
+    let ifa_before_backup = wallet
+        .list_assets(vec![AssetSchema::Ifa])
+        .unwrap()
+        .ifa
+        .unwrap()
+        .into_iter()
+        .find(|a| a.asset_id == ifa.asset_id)
+        .unwrap();
+
     let password = "test_password_123";
     let backup_bytes = wallet.backup(password).unwrap();
     assert!(!backup_bytes.is_empty(), "Backup should produce bytes");
@@ -564,6 +573,45 @@ async fn test_full_wallet_flow() {
     assert!(
         total_after_restore > 0,
         "BTC balance should survive backup/restore"
+    );
+
+    // Restore into a fresh wallet: IFA units and inflation rights must survive
+    let mut restored = Wallet::new(wd).unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    let restored_ifa = restored
+        .list_assets(vec![AssetSchema::Ifa])
+        .unwrap()
+        .ifa
+        .unwrap()
+        .into_iter()
+        .find(|a| a.asset_id == ifa.asset_id)
+        .expect("IFA asset should survive backup/restore");
+    assert_eq!(restored_ifa.balance, ifa_before_backup.balance);
+    assert_eq!(restored_ifa.max_supply, ifa_before_backup.max_supply);
+    assert_eq!(
+        restored_ifa.known_circulating_supply,
+        ifa_before_backup.known_circulating_supply
+    );
+
+    // The restored RGB state must allow a new inflation
+    let online_r = restored
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    restored.sync(online_r.clone()).await.unwrap();
+    let unsigned_inflate = restored
+        .inflate_begin(online_r.clone(), ifa.asset_id.clone(), vec![200], 1, 1)
+        .await
+        .unwrap();
+    let signed_inflate = restored.sign_psbt(unsigned_inflate, None).unwrap();
+    restored
+        .inflate_end(online_r.clone(), signed_inflate)
+        .await
+        .unwrap();
+    let restored_ifa_balance = restored.get_asset_balance(ifa.asset_id.clone()).unwrap();
+    assert_eq!(
+        restored_ifa_balance.future,
+        ifa_before_backup.balance.future + 200
     );
 
     // VSS Cloud Backup: full round-trip against real server
