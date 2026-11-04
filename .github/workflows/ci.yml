@@ -78,6 +78,8 @@ jobs:
         run: wasm-pack test --headless --firefox --release -- --test keys_wasm
       - name: Run wallet tests
         run: wasm-pack test --headless --firefox --release -- --test wallet_wasm
+      - name: Run binding tests
+        run: wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 
   integration-tests:
     name: Integration tests (Firefox + regtest)

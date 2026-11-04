@@ -117,6 +117,7 @@ Runs 94 native unit tests (database, crypto, backup, VSS encryption).
 ```yaml
 wasm-pack test --headless --firefox --release -- --test keys_wasm
 wasm-pack test --headless --firefox --release -- --test wallet_wasm
+wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 ```
 
 11 tests covering key generation/restoration and wallet creation. No Docker needed.
