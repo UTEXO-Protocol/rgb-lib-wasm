@@ -379,6 +379,7 @@ wasm-pack test --headless --firefox --release -- --test wallet_wasm
 # Integration tests (requires regtest Docker services)
 cd tests && bash regtest.sh start
 cd .. && wasm-pack test --headless --firefox --release -- --test integration_wasm
+wasm-pack test --headless --firefox --release -- --test receive_wasm
 cd tests && bash regtest.sh stop
 ```
 

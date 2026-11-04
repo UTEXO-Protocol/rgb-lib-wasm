@@ -12,6 +12,7 @@ The WASM tests (running in headless Firefox) communicate with all services over 
 - **bitcoind** (:18443) — Primary Bitcoin Core node. Connected to esplora's bitcoind via p2p (:18444) so both see the same chain.
 - **regtest-helper** (:8080) — Lightweight HTTP server that wraps bitcoind RPC for mining, funding, and status checks.
 - **RGB proxy** (:3000) — Consignment relay for RGB transfers between wallets.
+- **RGB proxy B** (:3010): second relay used by the receive tests.
 - **vss-cors-proxy** (:8082) — Nginx reverse proxy that adds CORS headers, forwarding to the VSS server.
 - **vss-server** (:8080 internal) — Versioned Storage Service for cloud backups. Not browser-accessible directly (no CORS).
 - **vss-postgres** (:5432 internal) — PostgreSQL database backing the VSS server.
@@ -32,6 +33,7 @@ Esplora bundles its own bitcoind for block indexing. Our primary bitcoind handle
 | esplora | 8094 | `http://127.0.0.1:8094/regtest/api` | Block explorer / indexer API |
 | esplora (electrum) | 50004 | — | Not used (WASM can't do TCP) |
 | RGB proxy | 3000 | `http://127.0.0.1:3000/json-rpc` | RGB consignment relay |
+| RGB proxy B | 3010 | `http://127.0.0.1:3010/json-rpc` | Second relay for the receive tests |
 | regtest-helper | 8080 | `http://127.0.0.1:8080` | Mining / funding helper |
 | VSS server | 8081 | `http://127.0.0.1:8081` | VSS direct (not browser-accessible) |
 | VSS CORS proxy | 8082 | `http://127.0.0.1:8082/vss` | VSS via nginx CORS proxy |
