@@ -121,7 +121,7 @@ success.
 ### Going online
 
 ```javascript
-const online = await wallet.goOnline(true, 'http://localhost:8094/regtest/api');
+const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
 await wallet.sync(online);
 ```
 
@@ -326,7 +326,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `listTransfers(assetId?)` | no | List RGB transfers |
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions |
-| `goOnline(skipCheck, indexerUrl)` | yes | Connect to an Esplora indexer |
+| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer |
 | `sync(online)` | yes | Sync wallet with indexer |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
