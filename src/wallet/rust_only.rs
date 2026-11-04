@@ -526,12 +526,16 @@ impl Wallet {
         let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
         runtime.store_secret_seal(graph_seal)?;
 
-        let wasm_resolver =
-            crate::utils::WasmResolver::from_consignment(&consignment, self.chain_net());
+        let chain_resolver = self
+            .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
+            .await
+            .map_err(|e| Error::Network {
+                details: e.to_string(),
+            })?;
         let resolver = crate::utils::OffchainResolverWasm {
             witness_id,
             consignment: &consignment,
-            fallback: &wasm_resolver,
+            fallback: &chain_resolver,
         };
 
         debug!(self.logger, "Validating consignment...");
@@ -593,32 +597,7 @@ impl Wallet {
         info!(self.logger, "Updating witnesses...");
         self.check_online(online)?;
 
-        let mut cache = HashMap::new();
-        for witness_id in &force_witnesses {
-            let txid_str = witness_id.to_string();
-            let txid = Txid::from_str(&txid_str).map_err(|_| Error::InvalidTxid)?;
-            if let Some((tx, block_height, block_time)) =
-                self.indexer().get_tx_with_status(&txid).await?
-            {
-                let witness_ord = match block_height.zip(block_time) {
-                    Some((h, t)) => {
-                        if let Some(height) = NonZeroU32::new(h) {
-                            if let Some(pos) = WitnessPos::bitcoin(height, t as i64) {
-                                WitnessOrd::Mined(pos)
-                            } else {
-                                WitnessOrd::Tentative
-                            }
-                        } else {
-                            WitnessOrd::Tentative
-                        }
-                    }
-                    None => WitnessOrd::Tentative,
-                };
-                cache.insert(*witness_id, WitnessStatus::Resolved(tx, witness_ord));
-            }
-        }
-
-        let resolver = crate::utils::PreFetchResolver::new(cache, self.chain_net());
+        let resolver = self.prefetch_witnesses(force_witnesses.clone()).await?;
         let update_res =
             self.rgb_runtime()?
                 .update_witnesses(&resolver, after_height, force_witnesses)?;
@@ -659,7 +638,16 @@ pub fn validate_consignment_offchain(
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
     let trusted_typesystem = asset_schema.types();
 
-    let wasm_resolver = crate::utils::WasmResolver::from_consignment(&consignment, chain_net);
+    let mut cache = HashMap::new();
+    for bw in consignment.bundled_witnesses() {
+        if let Some(tx) = bw.pub_witness.tx().cloned() {
+            cache.insert(
+                bw.witness_id(),
+                WitnessStatus::Resolved(tx, WitnessOrd::Tentative),
+            );
+        }
+    }
+    let wasm_resolver = crate::utils::PreFetchResolver::new(cache, chain_net);
     let resolver = crate::utils::OffchainResolverWasm {
         witness_id,
         consignment: &consignment,

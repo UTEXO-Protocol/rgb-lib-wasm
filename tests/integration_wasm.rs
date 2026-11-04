@@ -11,7 +11,8 @@ use rgb_lib_wasm::wallet::{
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, Error, FileContent, PubWitness,
-    RgbTransfer, RgbTransport, RgbTxid, TransferStatus, bitcoin::Amount, bitcoin::Psbt,
+    RgbTransfer, RgbTransport, RgbTxid, TransferStatus,
+    bitcoin::{Amount, Psbt},
     generate_keys,
 };
 use utils::*;
@@ -791,6 +792,125 @@ async fn test_full_wallet_flow() {
         b_ifa_balance.settled + b_ifa_balance.future + b_ifa_balance.spendable >= 5,
         "Receiver IFA balance should include the received amount, got: {:?}",
         b_ifa_balance,
+    );
+
+    // Refresh path: C gets an IFA consignment from B whose history witness is not on chain.
+    for _ in 0..30 {
+        mine_blocks(1).await;
+        wait_for_esplora_sync().await;
+        wallet_b
+            .refresh(online_b.clone(), None, vec![], false)
+            .await
+            .unwrap();
+        if wallet_b
+            .get_asset_balance(ifa.asset_id.clone())
+            .unwrap()
+            .settled
+            == 5
+        {
+            break;
+        }
+        sleep_ms(1000).await;
+    }
+    let b_ifa_settled = wallet_b.get_asset_balance(ifa.asset_id.clone()).unwrap();
+    assert_eq!(
+        b_ifa_settled.settled, 5,
+        "B must settle the IFA transfer, got: {:?}",
+        b_ifa_settled
+    );
+    let mut wallet_c = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let online_c = wallet_c
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    let recv_c = wallet_c
+        .witness_receive(
+            None,
+            Assignment::Fungible(3),
+            None,
+            vec![transport.clone()],
+            1,
+        )
+        .unwrap();
+    let c_recipient = Recipient {
+        recipient_id: recv_c.recipient_id.clone(),
+        witness_data: Some(WitnessData {
+            amount_sat: 2000,
+            blinding: None,
+        }),
+        assignment: Assignment::Fungible(3),
+        transport_endpoints: vec![transport.clone()],
+    };
+    let unsigned_c = wallet_b
+        .send_begin(
+            online_b.clone(),
+            HashMap::from([(ifa.asset_id.clone(), vec![c_recipient])]),
+            false,
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    let signed_c = wallet_b.sign_psbt(unsigned_c, None).unwrap();
+    let w2_tx = Psbt::from_str(&signed_c).unwrap().extract_tx().unwrap();
+    let w2 = w2_tx.compute_txid().to_string();
+    // Post under the txid only. C's recipient ID stays free for the forged file.
+    wallet_b.post_consignment_by_txid(w2.clone()).await.unwrap();
+    let (bytes, _) = get_consignment_from_proxy(&w2).await;
+    let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
+    // Same commitment and inputs, new txid: the history witness is not on chain.
+    assert!(
+        consignment.modify_bundle(RgbTxid::from_str(&ifa_send.txid).unwrap(), |bw| {
+            let PubWitness::Tx(tx) = &mut bw.pub_witness else {
+                panic!("history witness must be a full tx");
+            };
+            let out = tx.output.iter_mut().max_by_key(|o| o.value).unwrap();
+            out.value = Amount::from_sat(out.value.to_sat() - 1);
+        })
+    );
+    let mut forged = Vec::new();
+    consignment.save(&mut forged).unwrap();
+    let c_script = rgb_lib_wasm::utils::script_buf_from_recipient_id(recv_c.recipient_id.clone())
+        .unwrap()
+        .unwrap();
+    let c_vout = w2_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey == c_script)
+        .unwrap() as u32;
+    wallet_b
+        .post_consignment(
+            PROXY_URL,
+            recv_c.recipient_id.clone(),
+            &forged,
+            w2,
+            Some(c_vout),
+        )
+        .await
+        .unwrap();
+    let c_refresh = wallet_c
+        .refresh(online_c, None, vec![], false)
+        .await
+        .unwrap();
+    assert!(
+        c_refresh
+            .values()
+            .any(|r| r.updated_status == Some(TransferStatus::Failed)),
+        "C must fail the transfer, got: {:?}",
+        c_refresh
+            .values()
+            .map(|r| &r.updated_status)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        wallet_c
+            .list_assets(vec![AssetSchema::Ifa])
+            .unwrap()
+            .ifa
+            .unwrap_or_default()
+            .is_empty(),
+        "C must not import the asset"
     );
 
     // List unspents vanilla
