@@ -18,6 +18,15 @@ fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Read a u64 from a JS number, BigInt or decimal string.
+fn js_to_u64(value: JsValue) -> Result<u64, JsValue> {
+    match value.as_string() {
+        Some(s) => s.parse::<u64>().map_err(|e| e.to_string()),
+        None => serde_wasm_bindgen::from_value::<u64>(value).map_err(|e| e.to_string()),
+    }
+    .map_err(|e| JsValue::from_str(&format!("Invalid expiration timestamp: {e}")))
+}
+
 #[wasm_bindgen(js_namespace = console)]
 extern "C" {
     #[wasm_bindgen(js_name = error)]
@@ -276,16 +285,18 @@ impl WasmWallet {
     /// Blind an UTXO to receive RGB assets. Returns ReceiveData as a JS object.
     ///
     /// `assignment_js` is a JS object like `{ "Fungible": 100 }` or `"NonFungible"` or `"Any"`.
+    /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `transport_endpoints_js` is a JS array of endpoint strings.
     #[wasm_bindgen(js_name = "blindReceive")]
     pub fn blind_receive(
         &self,
         asset_id: Option<String>,
         assignment_js: JsValue,
-        duration_seconds: Option<u32>,
+        expiration_timestamp_js: JsValue,
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
     ) -> Result<JsValue, JsValue> {
+        let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let assignment: rgb_lib_wasm::Assignment = serde_wasm_bindgen::from_value(assignment_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid assignment: {e}")))?;
         let transport_endpoints: Vec<String> =
@@ -297,7 +308,7 @@ impl WasmWallet {
             .blind_receive(
                 asset_id,
                 assignment,
-                duration_seconds,
+                expiration_timestamp,
                 transport_endpoints,
                 min_confirmations,
             )
@@ -306,15 +317,18 @@ impl WasmWallet {
     }
 
     /// Create an address to receive RGB assets via witness TX. Returns ReceiveData as a JS object.
+    ///
+    /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     #[wasm_bindgen(js_name = "witnessReceive")]
     pub fn witness_receive(
         &self,
         asset_id: Option<String>,
         assignment_js: JsValue,
-        duration_seconds: Option<u32>,
+        expiration_timestamp_js: JsValue,
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
     ) -> Result<JsValue, JsValue> {
+        let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let assignment: rgb_lib_wasm::Assignment = serde_wasm_bindgen::from_value(assignment_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid assignment: {e}")))?;
         let transport_endpoints: Vec<String> =
@@ -326,7 +340,7 @@ impl WasmWallet {
             .witness_receive(
                 asset_id,
                 assignment,
-                duration_seconds,
+                expiration_timestamp,
                 transport_endpoints,
                 min_confirmations,
             )
@@ -461,7 +475,9 @@ impl WasmWallet {
     /// Send RGB assets (begin): prepare a PSBT. Returns the unsigned PSBT string.
     ///
     /// `recipient_map_js` is a JS object mapping asset IDs to arrays of Recipient objects.
+    /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     #[wasm_bindgen(js_name = "sendBegin")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_begin(
         &self,
         online_js: JsValue,
@@ -469,8 +485,10 @@ impl WasmWallet {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
+        expiration_timestamp_js: JsValue,
         lock_time: Option<u32>,
     ) -> Result<String, JsValue> {
+        let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let recipient_map: HashMap<String, Vec<Recipient>> =
@@ -484,6 +502,7 @@ impl WasmWallet {
                 donation,
                 fee_rate,
                 min_confirmations,
+                expiration_timestamp,
                 lock_time,
             )
             .await

@@ -231,6 +231,10 @@ pub enum Error {
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
 
+    /// The provided expiration is invalid
+    #[error("Invalid expiration")]
+    InvalidExpiration,
+
     /// The provided fee rate is invalid
     #[error("Invalid fee rate: {details}")]
     InvalidFeeRate {
