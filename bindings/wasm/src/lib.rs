@@ -8,7 +8,7 @@ use std::panic;
 use wasm_bindgen::prelude::*;
 
 use rgb_lib_wasm::Wallet;
-use rgb_lib_wasm::wallet::{Online, Recipient, RefreshFilter, WalletData};
+use rgb_lib_wasm::wallet::{Online, OnlineOptions, Recipient, RefreshFilter, WalletData};
 
 /// Serialize to JsValue using BigInt for u64/i64 values that exceed Number.MAX_SAFE_INTEGER.
 fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
@@ -389,16 +389,15 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Go online: connect to an indexer. Returns Online data as a JS object.
+    /// Go online: connect to an indexer. Takes the online options as a JS object and returns
+    /// Online data as a JS object.
     #[wasm_bindgen(js_name = "goOnline")]
-    pub async fn go_online(
-        &self,
-        skip_consistency_check: bool,
-        indexer_url: &str,
-    ) -> Result<JsValue, JsValue> {
+    pub async fn go_online(&self, online_options: JsValue) -> Result<JsValue, JsValue> {
+        let online_options: OnlineOptions = serde_wasm_bindgen::from_value(online_options)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let mut wallet = self.inner.borrow_mut();
         let online = wallet
-            .go_online(skip_consistency_check, indexer_url.to_string())
+            .go_online(online_options)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&online)

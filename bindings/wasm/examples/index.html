@@ -143,7 +143,7 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-number">3</span>
       <span class="step-title">Go Online</span>
       <p>Connect the wallet to an Esplora indexer. Returns an Online object used by subsequent operations.</p>
-      <code class="snippet">const online = await wallet.goOnline(true, "http://127.0.0.1:8094/regtest/api");</code>
+      <code class="snippet">const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: "http://127.0.0.1:8094/regtest/api" } }, skipConsistencyCheck: true, proxyAuthKeys: {} });</code>
     </div>
 
     <div class="step">
@@ -302,7 +302,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 4: Go online
         log('[4/12] Going online...', 'log-info');
-        const online = await wallet.goOnline(true, ESPLORA_API);
+        const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: ESPLORA_API } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
         state.online = online;
         append('[4/12] Wallet online (Esplora connected)');
         log('[4/12] Online', 'log-ok');

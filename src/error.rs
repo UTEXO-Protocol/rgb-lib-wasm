@@ -58,6 +58,13 @@ pub enum Error {
     #[error("Cannot use IFA schema on mainnet")]
     CannotUseIfaOnMainnet,
 
+    /// Two proxy authentication key entries resolve to the same proxy URL
+    #[error("Duplicate proxy authentication key: {details}")]
+    DuplicateProxyAuthKey {
+        /// Error details
+        details: String,
+    },
+
     /// The provided file is empty
     #[error("Empty file: {file_path}")]
     EmptyFile {
@@ -284,6 +291,13 @@ pub enum Error {
     /// The provided asset precision is invalid
     #[error("Invalid precision: {details}")]
     InvalidPrecision {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided proxy authentication key is invalid
+    #[error("Invalid proxy authentication key: {details}")]
+    InvalidProxyAuthKey {
         /// Error details
         details: String,
     },

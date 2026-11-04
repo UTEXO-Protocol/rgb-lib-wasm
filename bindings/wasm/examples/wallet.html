@@ -469,7 +469,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.goOnline(skip, url);
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: skip, proxyAuthKeys: {} });
         showResult('online-output', 'online-result',
           'Online! Stored for subsequent operations.\n\n' + json(state.online));
         enableBtns(onlineBtns);

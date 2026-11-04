@@ -408,10 +408,73 @@ impl Indexer {
     }
 }
 
+/// Options for the [`Wallet::go_online`] method.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct OnlineOptions {
+    /// Indexer the wallet should use
+    pub indexer_config: IndexerConfig,
+    /// Whether to skip the consistency check when going online. This wallet runs no consistency
+    /// check yet, so the value has no effect.
+    pub skip_consistency_check: bool,
+    /// Keys that sign calls to proxies that require authentication.
+    ///
+    /// Maps a transport endpoint (e.g. `rpc://host/json-rpc`) to a hex-encoded 32-byte Ed25519 seed.
+    /// The keys stay in memory. Going online again replaces them.
+    /// `refresh` uses these keys, so keep a correct key for every endpoint a pending transfer needs.
+    pub proxy_auth_keys: HashMap<String, String>,
+}
+
+/// Indexer the wallet connects to, see [`OnlineOptions::indexer_config`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum IndexerConfig {
+    /// An indexer implementing the esplora protocol.
+    Esplora {
+        /// URL of the esplora server
+        url: String,
+    },
+}
+
+impl IndexerConfig {
+    /// URL of the indexer.
+    pub fn url(&self) -> &str {
+        match self {
+            Self::Esplora { url } => url,
+        }
+    }
+}
+
+/// Parse and validate the [`OnlineOptions::proxy_auth_keys`], keying them by proxy URL.
+fn parse_proxy_auth_keys(
+    proxy_auth_keys: &HashMap<String, String>,
+) -> Result<HashMap<String, [u8; 32]>, Error> {
+    let mut keys = HashMap::new();
+    for (endpoint, seed) in proxy_auth_keys {
+        let proxy_url = TransportEndpoint::new(endpoint.clone())?.endpoint;
+        let seed: [u8; 32] = hex::decode(seed)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| Error::InvalidProxyAuthKey {
+                details: format!(
+                    "expected a hex-encoded 32-byte Ed25519 seed for endpoint {endpoint}"
+                ),
+            })?;
+        if keys.insert(proxy_url.clone(), seed).is_some() {
+            return Err(Error::DuplicateProxyAuthKey {
+                details: format!(
+                    "endpoint {endpoint} resolves to a proxy URL ({proxy_url}) already covered by another entry"
+                ),
+            });
+        }
+    }
+    Ok(keys)
+}
+
 pub(crate) struct OnlineData {
     pub(crate) id: u64,
     pub(crate) indexer_url: String,
     indexer: Indexer,
+    pub(crate) proxy_auth_keys: HashMap<String, [u8; 32]>,
 }
 
 #[cfg(test)]
@@ -422,6 +485,7 @@ impl OnlineData {
             id: 1,
             indexer_url: indexer_url.to_string(),
             indexer: crate::utils::build_indexer(indexer_url).unwrap(),
+            proxy_auth_keys: HashMap::new(),
         }
     }
 }
@@ -1299,7 +1363,12 @@ impl Wallet {
 }
 
 impl Wallet {
-    async fn _go_online_wasm(&self, indexer_url: String) -> Result<(Online, OnlineData), Error> {
+    async fn _go_online_wasm(
+        &self,
+        online_options: &OnlineOptions,
+    ) -> Result<(Online, OnlineData), Error> {
+        let proxy_auth_keys = parse_proxy_auth_keys(&online_options.proxy_auth_keys)?;
+        let indexer_url = online_options.indexer_config.url().to_string();
         let online_id = now().unix_timestamp_nanos() as u64;
         let online = Online {
             id: online_id,
@@ -1320,32 +1389,40 @@ impl Wallet {
             id: online.id,
             indexer_url,
             indexer,
+            proxy_auth_keys,
         };
         Ok((online, online_data))
     }
 
     /// Return the existing or freshly generated set of wallet [`Online`] data (wasm32 async).
-    pub async fn go_online(
-        &mut self,
-        _skip_consistency_check: bool,
-        indexer_url: String,
-    ) -> Result<Online, Error> {
+    ///
+    /// See [`OnlineOptions`] for details on the available options.
+    pub async fn go_online(&mut self, online_options: OnlineOptions) -> Result<Online, Error> {
         info!(self.logger, "Going online...");
         let online = if let Some(online_data) = &self.online_data {
             let online = Online {
                 id: online_data.id,
-                indexer_url,
+                indexer_url: online_options.indexer_config.url().to_string(),
             };
             if online_data.indexer_url != online.indexer_url {
-                let (online, online_data) = self._go_online_wasm(online.indexer_url).await?;
+                let (online, online_data) = self._go_online_wasm(&online_options).await?;
                 self.online_data = Some(online_data);
+                info!(self.logger, "Went online with new indexer");
                 online
             } else {
                 self.check_online(online.clone())?;
+                // No `..`: a new option must be handled here to compile.
+                let OnlineOptions {
+                    indexer_config: _,         // unchanged here
+                    skip_consistency_check: _, // no effect
+                    proxy_auth_keys,
+                } = &online_options;
+                let proxy_auth_keys = parse_proxy_auth_keys(proxy_auth_keys)?;
+                self.online_data.as_mut().unwrap().proxy_auth_keys = proxy_auth_keys;
                 online
             }
         } else {
-            let (online, online_data) = self._go_online_wasm(indexer_url).await?;
+            let (online, online_data) = self._go_online_wasm(&online_options).await?;
             self.online_data = Some(online_data);
             online
         };
@@ -3948,5 +4025,159 @@ impl Wallet {
 
         info!(self.logger, "List unspents vanilla completed");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod go_online_tests {
+    use super::*;
+    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+    const INDEXER_URL: &str = "http://127.0.0.1:1";
+    const PROXY_ENDPOINT: &str = "rpc://127.0.0.1:3000/json-rpc";
+    const PROXY_URL: &str = "http://127.0.0.1:3000/json-rpc";
+
+    fn options(url: &str, keys: &[(&str, &str)]) -> OnlineOptions {
+        OnlineOptions {
+            indexer_config: IndexerConfig::Esplora {
+                url: url.to_string(),
+            },
+            skip_consistency_check: true,
+            proxy_auth_keys: keys
+                .iter()
+                .map(|(e, k)| (e.to_string(), k.to_string()))
+                .collect(),
+        }
+    }
+
+    fn go_online(wallet: &mut Wallet, options: OnlineOptions) -> Result<Online, Error> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(wallet.go_online(options))
+    }
+
+    // Serves one block hash for every request, like an esplora server.
+    fn fake_esplora() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = "00".repeat(32);
+                let res = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, res.as_bytes());
+            }
+        });
+        url
+    }
+
+    fn stored_keys(wallet: &Wallet) -> HashMap<String, [u8; 32]> {
+        wallet.online_data.as_ref().unwrap().proxy_auth_keys.clone()
+    }
+
+    #[test]
+    fn go_online_replaces_proxy_auth_keys() {
+        let mut wallet = make_test_wallet(false);
+        wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
+        let online = Online {
+            id: 1,
+            indexer_url: INDEXER_URL.to_string(),
+        };
+        let seed1 = "11".repeat(32);
+        let seed2 = "22".repeat(32);
+
+        let res = go_online(
+            &mut wallet,
+            options(INDEXER_URL, &[(PROXY_ENDPOINT, &seed1)]),
+        );
+        assert_eq!(res, Ok(online.clone()));
+        assert_eq!(
+            stored_keys(&wallet),
+            HashMap::from([(PROXY_URL.to_string(), [0x11; 32])])
+        );
+
+        let res = go_online(
+            &mut wallet,
+            options(INDEXER_URL, &[(PROXY_ENDPOINT, &seed2)]),
+        );
+        assert_eq!(res, Ok(online.clone()));
+        assert_eq!(
+            stored_keys(&wallet),
+            HashMap::from([(PROXY_URL.to_string(), [0x22; 32])])
+        );
+
+        let res = go_online(&mut wallet, options(INDEXER_URL, &[]));
+        assert_eq!(res, Ok(online));
+        assert!(stored_keys(&wallet).is_empty());
+    }
+
+    #[test]
+    fn go_online_stores_proxy_auth_keys() {
+        let mut wallet = make_test_wallet(false);
+        let url = fake_esplora();
+        let other_url = fake_esplora();
+        let seed1 = "11".repeat(32);
+        let seed2 = "22".repeat(32);
+
+        let res = go_online(&mut wallet, options(&url, &[(PROXY_ENDPOINT, &seed1)]));
+        assert!(res.is_ok());
+        assert_eq!(
+            stored_keys(&wallet),
+            HashMap::from([(PROXY_URL.to_string(), [0x11; 32])])
+        );
+
+        let res = go_online(
+            &mut wallet,
+            options(&other_url, &[(PROXY_ENDPOINT, &seed2)]),
+        );
+        assert!(res.is_ok());
+        assert_eq!(
+            stored_keys(&wallet),
+            HashMap::from([(PROXY_URL.to_string(), [0x22; 32])])
+        );
+    }
+
+    #[test]
+    fn go_online_rejects_invalid_proxy_auth_keys() {
+        let mut wallet = make_test_wallet(false);
+        let seed1 = "11".repeat(32);
+
+        let res = go_online(
+            &mut wallet,
+            options(INDEXER_URL, &[("127.0.0.1:3000/json-rpc", &seed1)]),
+        );
+        assert!(matches!(res, Err(Error::InvalidTransportEndpoint { .. })));
+        let res = go_online(
+            &mut wallet,
+            options(INDEXER_URL, &[("ws://127.0.0.1:3000/json-rpc", &seed1)]),
+        );
+        assert_eq!(res, Err(Error::UnsupportedTransportType));
+        for seed in ["not hex", &seed1[..62], &format!("{seed1}00")] {
+            let res = go_online(&mut wallet, options(INDEXER_URL, &[(PROXY_ENDPOINT, seed)]));
+            assert!(matches!(res, Err(Error::InvalidProxyAuthKey { .. })));
+        }
+        assert!(wallet.online_data.is_none());
+
+        wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
+        let res = go_online(
+            &mut wallet,
+            options(INDEXER_URL, &[(PROXY_ENDPOINT, &seed1)]),
+        );
+        assert!(res.is_ok());
+        let keys = HashMap::from([(PROXY_URL.to_string(), [0x11; 32])]);
+        for url in [INDEXER_URL, "http://127.0.0.1:2"] {
+            let res = go_online(&mut wallet, options(url, &[(PROXY_ENDPOINT, "not hex")]));
+            assert!(matches!(res, Err(Error::InvalidProxyAuthKey { .. })));
+            let online_data = wallet.online_data.as_ref().unwrap();
+            assert_eq!(online_data.id, 1);
+            assert_eq!(online_data.indexer_url, INDEXER_URL);
+            assert_eq!(online_data.proxy_auth_keys, keys);
+        }
     }
 }

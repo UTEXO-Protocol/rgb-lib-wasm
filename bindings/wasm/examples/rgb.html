@@ -560,7 +560,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
         const url = document.getElementById('setup-indexer-url').value.trim();
         log('Auto setup: going online (' + url + ')...', 'log-warn');
-        state.online = await state.wallet.goOnline(true, url);
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
         log('Online', 'log-ok');
 
         enableBtns(walletBtns);
@@ -622,7 +622,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('setup-indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.goOnline(true, url);
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
         enableBtns(onlineBtns);
         showResult('setup-output', 'setup-result', 'Online!\n\n' + json(state.online));
         log('Online: ' + url, 'log-ok');
