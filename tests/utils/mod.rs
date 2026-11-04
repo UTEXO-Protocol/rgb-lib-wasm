@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub const REGTEST_HELPER_URL: &str = "http://127.0.0.1:8080";
 pub const ESPLORA_URL: &str = "http://127.0.0.1:8094/regtest/api";
 pub const PROXY_URL: &str = "http://127.0.0.1:3000/json-rpc";
+#[allow(dead_code)]
+pub const PROXY_B_URL: &str = "http://127.0.0.1:3010/json-rpc";
 pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
 
 #[derive(Serialize)]
@@ -116,6 +118,11 @@ pub async fn sleep_ms(ms: u32) {
 /// Returns the decoded consignment bytes and the txid from the proxy response.
 #[allow(dead_code)]
 pub async fn get_consignment_from_proxy(recipient_id: &str) -> (Vec<u8>, String) {
+    get_consignment_from(PROXY_URL, recipient_id).await
+}
+
+#[allow(dead_code)]
+pub async fn get_consignment_from(proxy_url: &str, recipient_id: &str) -> (Vec<u8>, String) {
     #[derive(Serialize)]
     struct JsonRpcRequest<T: Serialize> {
         method: String,
@@ -150,7 +157,7 @@ pub async fn get_consignment_from_proxy(recipient_id: &str) -> (Vec<u8>, String)
         }),
     };
     let resp: JsonRpcResponse<GetConsignmentResponse> = client
-        .post(PROXY_URL)
+        .post(proxy_url)
         .json(&body)
         .send()
         .await

@@ -17,7 +17,7 @@ sed -e "s|context: ./regtest-helper|context: $SCRIPT_DIR/regtest-helper|" \
 trap "rm -f $GENERATED_OVERRIDE" EXIT
 
 COMPOSE="docker compose -f $UPSTREAM_COMPOSE -f $GENERATED_OVERRIDE"
-SERVICES="bitcoind esplora proxy regtest-helper vss-postgres vss-server vss-cors-proxy"
+SERVICES="bitcoind esplora proxy proxy-b regtest-helper vss-postgres vss-server vss-cors-proxy"
 
 case "$1" in
     start)
@@ -80,6 +80,7 @@ case "$1" in
         echo "  bitcoind RPC:    http://127.0.0.1:18443"
         echo "  esplora:         http://127.0.0.1:8094/regtest/api"
         echo "  RGB proxy:       http://127.0.0.1:3000/json-rpc"
+        echo "  RGB proxy B:     http://127.0.0.1:3010/json-rpc"
         echo "  regtest-helper:  http://127.0.0.1:8080"
         echo "  VSS server:      http://127.0.0.1:8081 (direct), http://127.0.0.1:8082 (CORS proxy)"
         ;;

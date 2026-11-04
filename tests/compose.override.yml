@@ -11,6 +11,12 @@ services:
     depends_on:
       - bitcoind
 
+  # Second proxy for the receive tests. Port 3010 avoids 3001 to 3003.
+  proxy-b:
+    image: ghcr.io/rgb-tools/rgb-proxy-server:0.3.0
+    ports:
+      - "3010:3000"
+
   # Override esplora to always start (upstream has it in 'tests' profile)
   esplora:
     profiles: []
