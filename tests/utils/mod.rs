@@ -8,6 +8,17 @@ pub const PROXY_URL: &str = "http://127.0.0.1:3000/json-rpc";
 pub const PROXY_B_URL: &str = "http://127.0.0.1:3010/json-rpc";
 pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
 
+const DURATION_RCV_TRANSFER: u64 = 86400;
+const DURATION_SEND_TRANSFER: u64 = 3600;
+
+pub fn default_rcv_expiration() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64 + DURATION_RCV_TRANSFER
+}
+
+pub fn default_send_expiration() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64 + DURATION_SEND_TRANSFER
+}
+
 #[derive(Serialize)]
 struct MineRequest {
     blocks: u32,

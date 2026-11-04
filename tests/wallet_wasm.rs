@@ -132,6 +132,10 @@ fn test_wallet_queries_fresh() {
     let _info = wallet.backup_info().unwrap();
 }
 
+fn rcv_expiration() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64 + 86400
+}
+
 /// Tests receive operations: witness_receive (works offline), list_transfers
 /// after receive, and error cases for invalid asset IDs.
 /// Note: blind_receive requires funded UTXOs so it's tested in integration_wasm.
@@ -140,18 +144,19 @@ fn test_receive_and_transfers() {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
 
     // witness_receive: success
+    let expiration = rcv_expiration();
     let recv = wallet
         .witness_receive(
             None,
             Assignment::Any,
-            None,
+            expiration,
             vec!["rpc://127.0.0.1".into()],
             1,
         )
         .unwrap();
     assert!(!recv.invoice.is_empty());
     assert!(!recv.recipient_id.is_empty());
-    assert!(recv.expiration_timestamp.is_some());
+    assert_eq!(recv.expiration_timestamp, expiration);
 
     // list_transfers: should have a pending transfer from witness_receive
     let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
@@ -165,13 +170,18 @@ fn test_receive_and_transfers() {
             .any(|t| t.status == TransferStatus::WaitingCounterparty),
         "Should have WaitingCounterparty transfer"
     );
+    let transfer = transfers
+        .iter()
+        .find(|t| t.recipient_id == Some(recv.recipient_id.clone()))
+        .unwrap();
+    assert_eq!(transfer.expiration_timestamp, Some(expiration));
 
     // witness_receive: invalid asset
     let err = wallet
         .witness_receive(
             Some("nonexistent_asset_id".into()),
             Assignment::Fungible(100),
-            None,
+            rcv_expiration(),
             vec!["rpc://127.0.0.1".into()],
             1,
         )
@@ -189,7 +199,7 @@ fn test_receive_and_transfers() {
     assert_eq!(data.network, BitcoinNetwork::Regtest);
     assert_eq!(data.assignment, Assignment::Any);
     assert!(!data.transport_endpoints.is_empty());
-    assert_eq!(data.expiration_timestamp, recv.expiration_timestamp);
+    assert_eq!(data.expiration_timestamp, Some(expiration as i64));
 
     // Invoice: invalid string should fail
     assert!(Invoice::new("not-a-valid-invoice".to_string()).is_err());
@@ -230,7 +240,7 @@ fn test_errors_and_backup() {
         .witness_receive(
             None,
             Assignment::Any,
-            None,
+            rcv_expiration(),
             vec!["rpc://127.0.0.1".into()],
             1,
         )
