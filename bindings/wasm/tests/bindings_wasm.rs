@@ -65,3 +65,15 @@ fn receive_rejects_malformed_expiration() {
         .unwrap_err());
     assert!(e.starts_with("Invalid expiration timestamp:"), "{e}");
 }
+
+#[wasm_bindgen_test]
+async fn go_online_reads_options_object() {
+    let wallet = wallet();
+    let options = js_sys::JSON::parse(
+        r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:1"}},"skipConsistencyCheck":true,
+        "proxyAuthKeys":{"rpc://127.0.0.1:3000/json-rpc":"not hex"}}"#,
+    )
+    .unwrap();
+    let e = err(wallet.go_online(options).await.unwrap_err());
+    assert!(e.starts_with("Invalid proxy authentication key"), "{e}");
+}

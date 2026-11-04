@@ -190,10 +190,7 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
         &format!("/tmp/fullscan-funded-{unique}"),
     );
     let mut funded = Wallet::new(wd1.clone()).unwrap();
-    let online = funded
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online = funded.go_online(go_online_options(false)).await.unwrap();
     let addr = funded.get_address().unwrap();
     fund_address(&addr, "1.0").await;
     mine_blocks(1).await;
@@ -209,10 +206,7 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
         &format!("/tmp/fullscan-thin-{unique}"),
     );
     let mut thin = Wallet::new(wd2).unwrap();
-    let online = thin
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online = thin.go_online(go_online_options(false)).await.unwrap();
 
     thin.sync(online.clone()).await.unwrap();
     let after_incremental = thin.get_btc_balance(None, true).unwrap();
@@ -241,10 +235,7 @@ async fn test_persistence_across_reload() {
     let keys_b = generate_keys(BitcoinNetwork::Regtest);
     let wd_a = test_wallet_data(&keys_a, vec![AssetSchema::Nia], "/tmp/persist_a");
     let mut wallet = Wallet::new(wd_a.clone()).unwrap();
-    let online = wallet
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
 
     // Fund, create UTXOs, and issue asset — all in one session
     fund_and_sync(&mut wallet, &online, "1.0").await;
@@ -263,10 +254,7 @@ async fn test_persistence_across_reload() {
 
     // Reload
     let mut wallet = simulate_reload(wallet, &wd_a).await;
-    let online = wallet
-        .go_online(true, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
     wallet.sync(online.clone()).await.unwrap();
 
     // list_assets: asset should exist
@@ -289,10 +277,7 @@ async fn test_persistence_across_reload() {
     // send_begin: Stock should have the contract (this was Bug 2)
     let wd_b = test_wallet_data(&keys_b, vec![AssetSchema::Nia], "/tmp/persist_b");
     let mut wallet_b = Wallet::new(wd_b).unwrap();
-    let online_b = wallet_b
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
     create_utxos(&mut wallet_b, &online_b, 5).await;
 
@@ -348,10 +333,7 @@ async fn test_persistence_across_reload() {
     // === Section 3: Signed PSBT survives reload during send ===
     // Reload wallet A after send_end but before refresh
     let mut wallet = simulate_reload(wallet, &wd_a).await;
-    let online = wallet
-        .go_online(true, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
     wallet.sync(online.clone()).await.unwrap();
 
     mine_blocks(1).await;
@@ -409,7 +391,7 @@ async fn test_persistence_across_reload() {
     // Restore into a fresh wallet with same keys
     let mut fresh_wallet = Wallet::new(wd_a.clone()).unwrap();
     fresh_wallet
-        .go_online(true, ESPLORA_URL.to_string())
+        .go_online(go_online_options(true))
         .await
         .unwrap();
     fresh_wallet
@@ -427,10 +409,7 @@ async fn test_persistence_across_reload() {
 
     // Reload again: state should survive (Bug 3 regression)
     let mut reloaded = simulate_reload(fresh_wallet, &wd_a).await;
-    reloaded
-        .go_online(true, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    reloaded.go_online(go_online_options(true)).await.unwrap();
 
     let transfers_after_reload = reloaded.list_transfers(AssetFilter::NoAsset, None).unwrap();
     assert!(
@@ -459,14 +438,8 @@ async fn test_accept_transfer_is_durable_before_success() {
     let wd_b = test_wallet_data(&keys_b, vec![AssetSchema::Nia], "/tmp/persist_accept_b");
     let mut wallet_a = Wallet::new(wd_a).unwrap();
     let mut wallet_b = Wallet::new(wd_b.clone()).unwrap();
-    let online_a = wallet_a
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
-    let online_b = wallet_b
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online_a = wallet_a.go_online(go_online_options(false)).await.unwrap();
+    let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
@@ -578,10 +551,7 @@ async fn test_pending_funding_transfer_completes_after_reload() {
     );
     let mut wallet_a = Wallet::new(wd_a.clone()).unwrap();
     let mut wallet_b = Wallet::new(wd_b).unwrap();
-    let online_a = wallet_a
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online_a = wallet_a.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
     create_utxos(&mut wallet_a, &online_a, 5).await;
@@ -646,10 +616,7 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         .await
         .unwrap();
     let mut wallet_a = simulate_reload(wallet_a, &wd_a).await;
-    let restored_online = wallet_a
-        .go_online(true, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let restored_online = wallet_a.go_online(go_online_options(true)).await.unwrap();
     let completed = wallet_a
         .send_end(restored_online, signed, false)
         .await

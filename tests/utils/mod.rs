@@ -1,5 +1,7 @@
 use base64::{Engine, engine::general_purpose};
+use rgb_lib_wasm::wallet::{IndexerConfig, OnlineOptions};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const REGTEST_HELPER_URL: &str = "http://127.0.0.1:8080";
 pub const ESPLORA_URL: &str = "http://127.0.0.1:8094/regtest/api";
@@ -10,6 +12,16 @@ pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
 
 const DURATION_RCV_TRANSFER: u64 = 86400;
 const DURATION_SEND_TRANSFER: u64 = 3600;
+
+pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
+    OnlineOptions {
+        indexer_config: IndexerConfig::Esplora {
+            url: ESPLORA_URL.to_string(),
+        },
+        skip_consistency_check,
+        proxy_auth_keys: HashMap::new(),
+    }
+}
 
 pub fn default_rcv_expiration() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64 + DURATION_RCV_TRANSFER

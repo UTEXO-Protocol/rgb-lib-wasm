@@ -58,10 +58,7 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
 async fn test_full_wallet_flow() {
     let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let mut wallet = Wallet::new(wd.clone()).unwrap();
-    let online = wallet
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet, &online, "1.0").await;
 
@@ -129,10 +126,7 @@ async fn test_full_wallet_flow() {
     // Must happen before blind_receive which locks the NIA UTXO via pending_blinded
     let wd_b = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let mut wallet_b = Wallet::new(wd_b).unwrap();
-    let online_b = wallet_b
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
     create_utxos(&mut wallet_b, &online_b, 5).await;
@@ -624,10 +618,7 @@ async fn test_full_wallet_flow() {
     );
 
     // The restored RGB state must allow a new inflation
-    let online_r = restored
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online_r = restored.go_online(go_online_options(false)).await.unwrap();
     restored.sync(online_r.clone()).await.unwrap();
     let unsigned_inflate = restored
         .inflate_begin(online_r.clone(), ifa.asset_id.clone(), vec![200], 1, 1)

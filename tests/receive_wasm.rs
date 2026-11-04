@@ -74,10 +74,7 @@ fn recipient(id: &str, amount: u64, sat: Option<u64>, url: &str) -> Recipient {
 
 async fn new_wallet() -> (Wallet, Online) {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
-    let online = wallet
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
     (wallet, online)
 }
 
