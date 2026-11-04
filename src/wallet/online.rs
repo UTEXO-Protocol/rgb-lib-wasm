@@ -184,13 +184,44 @@ pub(crate) struct TransferArtifacts {
     pub(crate) signed_psbt: Option<String>,
 }
 
+pub(crate) enum ReceiveMatcher {
+    Blind(SecretSeal),
+    Witness(ScriptBuf),
+}
+
+impl DbTransfer {
+    pub(crate) fn receive_matcher(&self) -> Result<ReceiveMatcher, Error> {
+        let recipient_id = self
+            .recipient_id
+            .clone()
+            .expect("transfer should have a recipient ID");
+        match self
+            .recipient_type
+            .as_ref()
+            .expect("transfer should have a recipient type")
+        {
+            RecipientTypeFull::Blind { .. } => {
+                let beneficiary = XChainNet::<Beneficiary>::from_str(&recipient_id)
+                    .expect("saved recipient ID is invalid");
+                match beneficiary.into_inner() {
+                    Beneficiary::BlindedSeal(secret_seal) => Ok(ReceiveMatcher::Blind(secret_seal)),
+                    _ => unreachable!("beneficiary is blinded"),
+                }
+            }
+            RecipientTypeFull::Witness { .. } => {
+                let script_pubkey = script_buf_from_recipient_id(recipient_id)?
+                    .expect("witness recipient ID should yield a script");
+                Ok(ReceiveMatcher::Witness(script_pubkey))
+            }
+        }
+    }
+}
+
 async fn pending_consignment_matches(
     proxy_client: &WasmProxyClient,
     endpoint: &str,
     recipient_id: &str,
     consignment_bytes: &[u8],
-    txid: &str,
-    vout: Option<u32>,
 ) -> bool {
     let Ok(response) = proxy_client
         .get_consignment(endpoint, recipient_id.to_owned())
@@ -204,7 +235,7 @@ async fn pending_consignment_matches(
     let Ok(existing_bytes) = general_purpose::STANDARD.decode(existing.consignment) else {
         return false;
     };
-    existing.txid == txid && existing.vout == vout && existing_bytes == consignment_bytes
+    existing_bytes == consignment_bytes
 }
 
 pub(crate) enum Indexer {
@@ -566,69 +597,137 @@ impl Wallet {
         vout: Option<u32>,
         known_concealed: Option<SecretSeal>,
     ) -> HashMap<Opout, Assignment> {
-        let mut received = HashMap::new();
-        if let Some(bundle) = consignment
+        consignment
             .bundles
             .iter()
-            .find(|ab| ab.witness_id() == witness_id)
-        {
-            for KnownTransition { transition, opid } in bundle.bundle.known_transitions.iter() {
-                for (ass_type, typed_assigns) in transition.assignments.iter() {
-                    for (no, fungible_assignment) in typed_assigns.as_fungible().iter().enumerate()
+            .find(|bundle| bundle.witness_id() == witness_id)
+            .map(|bundle| self.assignments_for_bundle(bundle, vout, known_concealed))
+            .unwrap_or_default()
+    }
+
+    /// Find the consignment terminal that pays this recipient. Return its bundle and, for a
+    /// witness receive, the paid vout. Return None when no terminal or more than one destination
+    /// pays it.
+    fn find_terminal_bundle<'c>(
+        &self,
+        consignment: &'c RgbTransfer,
+        matcher: &ReceiveMatcher,
+    ) -> Option<(&'c WitnessBundle, Option<u32>)> {
+        let mut matches: Vec<(&'c WitnessBundle, Option<u32>)> = vec![];
+        let mut push_match = |witness_bundle: &'c WitnessBundle, vout: Option<u32>| {
+            if !matches.iter().any(|(wb, v)| {
+                wb.bundle.bundle_id() == witness_bundle.bundle.bundle_id() && *v == vout
+            }) {
+                matches.push((witness_bundle, vout));
+            }
+        };
+
+        for (bundle_id, seals) in consignment.terminals.iter() {
+            let Some(witness_bundle) = consignment
+                .bundles
+                .iter()
+                .find(|wb| wb.bundle.bundle_id() == *bundle_id)
+            else {
+                continue;
+            };
+            match matcher {
+                ReceiveMatcher::Blind(secret_seal) => {
+                    if seals
+                        .into_iter()
+                        .any(|seal| seal == BuilderSeal::Concealed(*secret_seal))
                     {
-                        let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let BuilderSeal::Concealed(seal) = fungible_assignment.seal {
-                            let state = &fungible_assignment.state;
-                            if Some(seal) == known_concealed {
-                                match *ass_type {
-                                    OS_ASSET => {
-                                        received
-                                            .insert(opout, Assignment::Fungible(state.as_u64()));
-                                    }
-                                    OS_INFLATION => {
-                                        received.insert(
-                                            opout,
-                                            Assignment::InflationRight(state.as_u64()),
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        };
-                        if let BuilderSeal::Revealed(seal) = fungible_assignment.seal {
-                            let state = &fungible_assignment.state;
-                            if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
-                                match *ass_type {
-                                    OS_ASSET => {
-                                        received
-                                            .insert(opout, Assignment::Fungible(state.as_u64()));
-                                    }
-                                    OS_INFLATION => {
-                                        received.insert(
-                                            opout,
-                                            Assignment::InflationRight(state.as_u64()),
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        };
+                        push_match(witness_bundle, None);
                     }
-                    for (no, structured_assignment) in
-                        typed_assigns.as_structured().iter().enumerate()
-                    {
-                        let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let BuilderSeal::Concealed(seal) = structured_assignment.seal {
-                            if Some(seal) == known_concealed {
-                                received.insert(opout, Assignment::NonFungible);
+                }
+                ReceiveMatcher::Witness(script_pubkey) => {
+                    let tx = &witness_bundle.tx;
+                    for seal in seals {
+                        let BuilderSeal::Revealed(seal) = seal else {
+                            continue;
+                        };
+                        if seal.txid != TxPtr::WitnessTx {
+                            continue;
+                        }
+                        let vout = seal.vout.into_u32();
+                        if tx
+                            .output
+                            .get(vout as usize)
+                            .is_some_and(|out| out.script_pubkey == *script_pubkey)
+                        {
+                            push_match(witness_bundle, Some(vout));
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.len() > 1 {
+            error!(
+                self.logger,
+                "Consignment declares {} terminal payments to this recipient, refusing it as \
+                 ambiguous",
+                matches.len()
+            );
+            return None;
+        }
+        matches.into_iter().next()
+    }
+
+    fn assignments_for_bundle(
+        &self,
+        bundle: &WitnessBundle,
+        vout: Option<u32>,
+        known_concealed: Option<SecretSeal>,
+    ) -> HashMap<Opout, Assignment> {
+        let mut received = HashMap::new();
+        for KnownTransition { transition, opid } in bundle.bundle.known_transitions.iter() {
+            for (ass_type, typed_assigns) in transition.assignments.iter() {
+                for (no, fungible_assignment) in typed_assigns.as_fungible().iter().enumerate() {
+                    let opout = Opout::new(*opid, *ass_type, no as u16);
+                    if let BuilderSeal::Concealed(seal) = fungible_assignment.seal {
+                        let state = &fungible_assignment.state;
+                        if Some(seal) == known_concealed {
+                            match *ass_type {
+                                OS_ASSET => {
+                                    received.insert(opout, Assignment::Fungible(state.as_u64()));
+                                }
+                                OS_INFLATION => {
+                                    received
+                                        .insert(opout, Assignment::InflationRight(state.as_u64()));
+                                }
+                                _ => {}
                             }
                         }
-                        if let BuilderSeal::Revealed(seal) = structured_assignment.seal {
-                            if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
-                                received.insert(opout, Assignment::NonFungible);
+                    };
+                    if let BuilderSeal::Revealed(seal) = fungible_assignment.seal {
+                        let state = &fungible_assignment.state;
+                        if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
+                            match *ass_type {
+                                OS_ASSET => {
+                                    received.insert(opout, Assignment::Fungible(state.as_u64()));
+                                }
+                                OS_INFLATION => {
+                                    received
+                                        .insert(opout, Assignment::InflationRight(state.as_u64()));
+                                }
+                                _ => {}
                             }
-                        };
+                        }
+                    };
+                }
+                for (no, structured_assignment) in typed_assigns.as_structured().iter().enumerate()
+                {
+                    let opout = Opout::new(*opid, *ass_type, no as u16);
+                    if let BuilderSeal::Concealed(seal) = structured_assignment.seal {
+                        if Some(seal) == known_concealed {
+                            received.insert(opout, Assignment::NonFungible);
+                        }
                     }
+                    if let BuilderSeal::Revealed(seal) = structured_assignment.seal {
+                        if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
+                            received.insert(opout, Assignment::NonFungible);
+                        }
+                    };
                 }
             }
         }
@@ -2125,12 +2224,7 @@ impl Wallet {
                 Ok(r) => r,
             };
 
-            proxy_res = Some((
-                result.consignment,
-                transport_endpoint.endpoint,
-                result.txid,
-                result.vout,
-            ));
+            proxy_res = Some((result.consignment, transport_endpoint.endpoint));
             let mut updated_transfer_transport_endpoint: DbTransferTransportEndpointActMod =
                 transfer_transport_endpoint.into();
             updated_transfer_transport_endpoint.used = ActiveValue::Set(true);
@@ -2139,9 +2233,7 @@ impl Wallet {
             break;
         }
 
-        let (consignment, proxy_url, txid, vout) = if let Some(res) = proxy_res {
-            (res.0, res.1, res.2, res.3)
-        } else {
+        let Some((consignment, proxy_url)) = proxy_res else {
             return Ok(None);
         };
 
@@ -2188,14 +2280,29 @@ impl Wallet {
             }
         }
 
-        let witness_id = match RgbTxid::from_str(&txid) {
-            Ok(txid) => txid,
-            Err(_) => {
-                error!(self.logger, "Received an invalid TXID from the proxy");
-                return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                    .await;
-            }
+        if consignment.terminals.is_empty() {
+            error!(self.logger, "Consignment declares no terminals");
+            return self
+                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                .await;
+        }
+
+        let matcher = transfer.receive_matcher()?;
+        let Some((terminal_bundle, vout)) = self.find_terminal_bundle(&consignment, &matcher)
+        else {
+            error!(
+                self.logger,
+                "Cannot find a consignment terminal paying this recipient"
+            );
+            return self
+                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                .await;
+        };
+        let witness_id = terminal_bundle.witness_id();
+        let txid = witness_id.to_string();
+        let known_concealed = match matcher {
+            ReceiveMatcher::Blind(secret_seal) => Some(secret_seal),
+            ReceiveMatcher::Witness(_) => None,
         };
 
         let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
@@ -2245,65 +2352,6 @@ impl Wallet {
         let validity = validation_status.validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
 
-        // check the info provided via the proxy is correct
-        if let Some(anchored_bundle) = consignment
-            .bundles
-            .iter()
-            .find(|ab| ab.witness_id() == witness_id)
-        {
-            if let Some(RecipientTypeFull::Witness { .. }) = transfer.recipient_type {
-                if let Some(vout) = vout {
-                    let tx = &anchored_bundle.tx;
-                    if let Some(output) = tx.output.get(vout as usize) {
-                        let script_pubkey =
-                            script_buf_from_recipient_id(recipient_id.clone())?.unwrap();
-                        if output.script_pubkey != script_pubkey {
-                            error!(
-                                self.logger,
-                                "The provided vout pays an incorrect script pubkey"
-                            );
-                            return self
-                                ._refuse_consignment_async(
-                                    proxy_url,
-                                    recipient_id,
-                                    &mut updated_batch_transfer,
-                                )
-                                .await;
-                        }
-                    } else {
-                        error!(self.logger, "Cannot find the expected outpoint");
-                        return self
-                            ._refuse_consignment_async(
-                                proxy_url,
-                                recipient_id,
-                                &mut updated_batch_transfer,
-                            )
-                            .await;
-                    }
-                } else {
-                    error!(
-                        self.logger,
-                        "The vout should be provided when receiving via witness"
-                    );
-                    return self
-                        ._refuse_consignment_async(
-                            proxy_url,
-                            recipient_id,
-                            &mut updated_batch_transfer,
-                        )
-                        .await;
-                }
-            }
-        } else {
-            error!(
-                self.logger,
-                "Cannot find the provided TXID in the consignment"
-            );
-            return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                .await;
-        }
-
         if !self.supports_schema(&asset_schema) {
             error!(
                 self.logger,
@@ -2314,19 +2362,7 @@ impl Wallet {
                 .await;
         }
 
-        let known_concealed = if let Some(RecipientTypeFull::Blind { .. }) = transfer.recipient_type
-        {
-            let beneficiary = XChainNet::<Beneficiary>::from_str(&recipient_id)
-                .expect("saved recipient ID is invalid");
-            match beneficiary.into_inner() {
-                Beneficiary::BlindedSeal(secret_seal) => Some(secret_seal),
-                _ => unreachable!("beneficiary is blinded"),
-            }
-        } else {
-            None
-        };
-        let received =
-            self.extract_received_assignments(&consignment, witness_id, vout, known_concealed);
+        let received = self.assignments_for_bundle(terminal_bundle, vout, known_concealed);
         if received.is_empty() {
             error!(self.logger, "Cannot find any receiving assignment");
             return self
@@ -3374,8 +3410,6 @@ impl Wallet {
                             &transport_endpoint.endpoint,
                             &recipient.recipient_id,
                             consignment_bytes,
-                            &txid,
-                            vout,
                         )
                         .await
                         {
@@ -3462,8 +3496,6 @@ impl Wallet {
                             &transport_endpoint.endpoint,
                             &txid,
                             consignment_bytes,
-                            &txid,
-                            vout,
                         )
                         .await
                         {

@@ -36,8 +36,6 @@ pub(crate) struct ServerInfoResponse {
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct GetConsignmentResponse {
     pub(crate) consignment: String,
-    pub(crate) txid: String,
-    pub(crate) vout: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -292,5 +290,18 @@ impl WasmProxyClient {
             .text()
             .await
             .map_err(InternalError::from)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_consignment_response_needs_only_the_consignment() {
+        let res: JsonRpcResponse<GetConsignmentResponse> =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":"1","result":{"consignment":"Y29u"}}"#)
+                .unwrap();
+        assert_eq!(res.result.unwrap().consignment, "Y29u");
     }
 }

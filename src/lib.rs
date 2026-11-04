@@ -144,7 +144,7 @@ use rgbstd::{
 #[cfg(feature = "esplora")]
 use rgbstd::{
     Assign, KnownTransition,
-    containers::Consignment,
+    containers::{Consignment, WitnessBundle},
     contract::SchemaWrapper,
     daggy::Walker,
     txout::TxPtr,
