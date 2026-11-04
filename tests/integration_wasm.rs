@@ -1,12 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
-use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
+use rgb_lib_wasm::wallet::{
+    AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
+};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, bitcoin::Psbt, generate_keys,
+};
 use utils::*;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
@@ -50,6 +54,101 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_no_receive_on_pending_send_input() {
+    let transport = transport_endpoint();
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    let mut rcv_wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+
+    // issue an NIA asset on a UTXO with not enough bitcoins for a send
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let asset = wallet
+        .issue_asset_nia(
+            "PSI".to_string(),
+            "Pending send input".to_string(),
+            0,
+            vec![1000],
+        )
+        .unwrap();
+
+    // create 1 UTXO with no allocations, to be used as additional bitcoin input
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    let colored: HashSet<Outpoint> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert_eq!(colored.len(), 2);
+
+    // begin a witness send, without ending it
+    let receive_data = rcv_wallet
+        .witness_receive(None, Assignment::Any, None, vec![transport.clone()], 1)
+        .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            recipient_id: receive_data.recipient_id,
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            assignment: Assignment::Fungible(1),
+            transport_endpoints: vec![transport.clone()],
+        }],
+    )]);
+    let psbt = wallet
+        .send_begin(online.clone(), recipient_map, false, 1, 1, None)
+        .await
+        .unwrap()
+        .parse::<Psbt>()
+        .unwrap();
+    let inputs: HashSet<Outpoint> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect();
+    assert_eq!(inputs, colored);
+
+    // the UTXO with no allocations is being spent by the pending send, so it can't be used to receive
+    let result = wallet.blind_receive(None, Assignment::Any, None, vec![transport.clone()], 1);
+    assert!(
+        matches!(result, Err(Error::InsufficientAllocationSlots)),
+        "a receive must not use an input of a pending send, got: {:?}",
+        result.map(|r| r.recipient_id)
+    );
 }
 
 #[wasm_bindgen_test]
