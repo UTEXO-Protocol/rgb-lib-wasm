@@ -171,14 +171,11 @@ impl super::Wallet {
         Ok(())
     }
 
-    /// Decode a serialized backup payload and restore wallet + RGB stock state.
-    /// Shared by `restore_backup` and `vss_restore_backup` so a fix in one cannot miss the other.
+    /// Restore the wallet and the RGB stock from a backup payload. Both restore paths use it.
     fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
-        // 1. Deserialize payload
         let payload: WalletBackupPayload =
             serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
 
-        // 2. Restore InMemoryDb + BDK via existing snapshot mechanism
         let snapshot = super::idb_store::WalletSnapshot {
             sequence: 0,
             db: payload.db,
@@ -192,7 +189,6 @@ impl super::Wallet {
         };
         self.restore_from_snapshot(snapshot)?;
 
-        // 3. Restore RGB stock from strict-encoded components
         let stash_bytes = general_purpose::STANDARD
             .decode(&payload.stock_stash_b64)
             .map_err(InternalError::from)?;
@@ -502,7 +498,6 @@ mod tests {
         batch_idx
     }
 
-    // asset_id: None for a vanilla (sats-only) transfer, Some for an RGB asset send.
     fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
         use crate::keys::generate_keys;
         use crate::wallet::Online;
@@ -518,7 +513,7 @@ mod tests {
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
         *sender.rgb_stock.borrow_mut() = Some(Stock::in_memory());
         let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id);
-        // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
+        // The PSBT is invalid on purpose: refresh fails with InvalidPsbt only if it reads it back.
         sender.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
@@ -569,7 +564,6 @@ mod tests {
         refresh_after_restore_backup_reads_signed_psbt_impl(Some("rgb:test-asset"));
     }
 
-    // asset_id: None for a vanilla (sats-only) transfer, Some for an RGB asset send.
     fn refresh_fails_transfer_without_signed_psbt_impl(asset_id: Option<&str>) {
         use crate::database::enums::TransferStatus;
         use crate::wallet::Online;
@@ -640,9 +634,93 @@ mod tests {
     }
 
     #[test]
+    fn refresh_skips_and_fail_transfers_fails_expired_initiated_sends() {
+        use crate::database::enums::TransferStatus;
+        use crate::database::memory_db::{ActiveValue, DbBatchTransferActMod};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::online::{
+            OnlineData, RefreshFilter, RefreshTransferStatus, TransferArtifacts,
+        };
+        use crate::wallet::{Online, Outpoint};
+
+        let indexer_url = "http://127.0.0.1:1";
+        let mut wallet = make_test_wallet(false);
+        let mut seeded = vec![];
+        for (txid, expiration) in [("1".repeat(64), 1), ("2".repeat(64), i64::MAX)] {
+            let asset_id = format!("rgb:{}", &txid[..1]);
+            let batch_idx = seed_acknowledged_transfer(&mut wallet, &txid, Some(&asset_id));
+            let batch_transfer = wallet
+                .database
+                .get_db_data(false)
+                .unwrap()
+                .batch_transfers
+                .into_iter()
+                .find(|t| t.idx == batch_idx)
+                .unwrap();
+            let mut updated: DbBatchTransferActMod = batch_transfer.into();
+            updated.status = ActiveValue::Set(TransferStatus::Initiated);
+            updated.expiration = ActiveValue::Set(Some(expiration));
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+            let input = Outpoint {
+                txid: txid.clone(),
+                vout: 0,
+            };
+            wallet.transfer_artifacts.insert(
+                txid,
+                TransferArtifacts {
+                    inputs: vec![input.clone()],
+                    ..Default::default()
+                },
+            );
+            seeded.push((batch_idx, input));
+        }
+        let [(expired_idx, _), (pending_idx, pending_input)] = <[_; 2]>::try_from(seeded).unwrap();
+
+        wallet.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let filter = vec![RefreshFilter {
+            status: RefreshTransferStatus::WaitingCounterparty,
+            incoming: false,
+        }];
+        let result = rt
+            .block_on(wallet.refresh(online.clone(), None, filter, true))
+            .unwrap();
+        assert!(result.is_empty());
+
+        assert!(
+            rt.block_on(wallet.fail_transfers(online, None, false, true))
+                .unwrap()
+        );
+        let statuses: Vec<(i32, TransferStatus)> = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .iter()
+            .map(|t| (t.idx, t.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (expired_idx, TransferStatus::Failed),
+                (pending_idx, TransferStatus::Initiated)
+            ]
+        );
+        assert_eq!(
+            wallet.get_reserved_outpoints().unwrap(),
+            vec![pending_input]
+        );
+    }
+
+    #[test]
     fn vss_restore_payload_keeps_transfer_artifacts() {
-        // vss_restore_backup shares restore_payload with restore_backup, so this
-        // exercises the exact code the VSS path runs on the downloaded backup.
+        // vss_restore_backup uses restore_payload, so this covers the VSS path.
         use crate::keys::generate_keys;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
         use crate::wallet::online::TransferArtifacts;

@@ -309,15 +309,18 @@ impl Wallet {
         Ok(())
     }
 
-    /// Return `true` if a batch transfer with the given `txid` exists in the wallet database
-    /// and is not in `Failed` status. Used to detect idempotent replay of `send_end` after a
-    /// crash-inject reload: if the transfer is already present with a non-failed status, the
-    /// broadcast already happened and the caller may treat the operation as succeeded.
+    /// Return `true` if the batch transfer with this `txid` was ended by `send_end`.
+    /// Its status is then neither `Initiated` nor `Failed`, so the broadcast already happened.
+    /// Use it to detect a replay of `send_end` after a reload.
     pub fn is_batch_transfer_sent(&self, txid: &str) -> Result<bool, Error> {
         let batch_transfers = self.database.iter_batch_transfers()?;
-        Ok(batch_transfers
-            .iter()
-            .any(|bt| bt.txid.as_deref() == Some(txid) && bt.status != TransferStatus::Failed))
+        Ok(batch_transfers.iter().any(|bt| {
+            bt.txid.as_deref() == Some(txid)
+                && !matches!(
+                    bt.status,
+                    TransferStatus::Initiated | TransferStatus::Failed
+                )
+        }))
     }
 
     /// Return the current `Online` handle if the wallet has gone online, or `None` otherwise.
@@ -754,6 +757,35 @@ mod tests {
         let deserialized: ValidateConsignmentResult = serde_json::from_str(&json).unwrap();
         assert!(!deserialized.valid);
         assert_eq!(deserialized.error.unwrap(), "invalid");
+    }
+
+    #[test]
+    fn batch_transfer_sent_only_after_send_end() {
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+        // send_begin saves the send as Initiated
+        let idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::Initiated),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!wallet.is_batch_transfer_sent(txid).unwrap());
+
+        // send_end moves it to WaitingCounterparty
+        wallet
+            .database
+            .update_batch_transfer(&mut DbBatchTransferActMod {
+                idx: ActiveValue::Set(idx),
+                status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(wallet.is_batch_transfer_sent(txid).unwrap());
     }
 
     #[test]

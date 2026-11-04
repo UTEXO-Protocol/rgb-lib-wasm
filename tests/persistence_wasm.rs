@@ -17,7 +17,9 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, RgbTransport, generate_keys};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, Error, RgbTransport, TransferStatus, generate_keys,
+};
 use utils::*;
 
 fn test_wallet_data(
@@ -621,9 +623,24 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         .await
         .unwrap();
     let completed = wallet_a
-        .send_end(restored_online, signed, false)
+        .send_end(restored_online.clone(), signed.clone(), false)
         .await
         .unwrap();
     assert_eq!(completed.txid, funding_txid);
+    let transfers = wallet_a
+        .list_transfers(AssetFilter::Any, Some(funding_txid))
+        .unwrap();
+    assert!(!transfers.is_empty());
+    assert!(
+        transfers
+            .iter()
+            .all(|t| t.status == TransferStatus::WaitingConfirmations)
+    );
+    let result = wallet_a.send_end(restored_online, signed, false).await;
+    assert!(
+        matches!(result, Err(Error::CannotEndTransfer { .. })),
+        "a donation must not be ended twice, got: {:?}",
+        result.map(|r| r.txid)
+    );
     wallet_a.flush().await.unwrap();
 }
