@@ -34,7 +34,7 @@ pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_IFA: &str =
-    "rgb:sch:IpjJhFLz3oywYKQxO3KmFgR0Aa415nlTNrNyEFqMZCE#shoe-colombo-mango";
+    "rgb:sch:Y2a6SW4rY3gRwLE40OxILhwOyL2FR9ppte790oLbIe0#athena-paul-horizon";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct LocalAssetData {
@@ -1003,7 +1003,7 @@ pub struct Wallet {
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent in-memory RGB stock.
-    pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<rgbstd::persistence::Stock>>>,
+    pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<crate::utils::MemStock>>>,
     pub(crate) vss_client: Option<super::vss::VssBackupClient>,
     pub(crate) last_vss_backup_error: std::cell::RefCell<Option<String>>,
 }
@@ -1019,14 +1019,6 @@ impl Wallet {
             .await
             .map_err(|details| Error::Persistence { details })?;
         if let Some(snapshot) = snapshot {
-            if snapshot.stock_stash_b64.is_none()
-                || snapshot.stock_state_b64.is_none()
-                || snapshot.stock_index_b64.is_none()
-            {
-                return Err(Error::Persistence {
-                    details: s!("persisted wallet snapshot is missing RGB stock state"),
-                });
-            }
             wallet
                 .idb_sequence
                 .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
@@ -1125,7 +1117,7 @@ impl Wallet {
             let known: HashSet<_> = known_schemas.iter().map(|s| s.id).collect();
             for schema in supported_schemas {
                 if !known.contains(&SchemaId::from(schema)) {
-                    schema.import_kit(&mut runtime)?;
+                    schema.import_schema_definition(&mut runtime)?;
                 }
             }
         }
@@ -1157,8 +1149,7 @@ impl Wallet {
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: {
-                let stock =
-                    std::mem::replace(&mut runtime.stock, rgbstd::persistence::Stock::in_memory());
+                let stock = std::mem::take(&mut runtime.stock);
                 std::rc::Rc::new(std::cell::RefCell::new(Some(stock)))
             },
             vss_client: None,
@@ -1182,7 +1173,7 @@ impl Wallet {
                 details: s!("RGB runtime already in use"),
             })?
             .take()
-            .unwrap_or_else(rgbstd::persistence::Stock::in_memory);
+            .unwrap_or_default();
         Ok(RgbRuntime::with_shared_stock(
             stock,
             self.wallet_dir.clone(),
@@ -1622,9 +1613,7 @@ impl Wallet {
         let mut runtime = self.rgb_runtime()?;
         let mut builder = ContractBuilder::with(
             Identity::default(),
-            NonInflatableAsset::schema(),
-            NonInflatableAsset::types(),
-            NonInflatableAsset::scripts(),
+            NonInflatableAsset::schema_rules(),
             self.chain_net(),
         )
         .add_global_state("spec", spec.clone())
@@ -1784,9 +1773,7 @@ impl Wallet {
         let mut runtime = self.rgb_runtime()?;
         let mut builder = ContractBuilder::with(
             Identity::default(),
-            InflatableFungibleAsset::schema(),
-            InflatableFungibleAsset::types(),
-            InflatableFungibleAsset::scripts(),
+            InflatableFungibleAsset::schema_rules(),
             self.chain_net(),
         )
         .add_global_state("spec", spec.clone())
@@ -2998,7 +2985,7 @@ impl Wallet {
         let stock = stock.as_ref().ok_or_else(|| Error::Persistence {
             details: s!("RGB runtime is active; wallet state cannot be snapshotted"),
         })?;
-        let (stock_stash_b64, stock_state_b64, stock_index_b64) =
+        let rgb_store =
             super::idb_store::serialize_stock(stock).ok_or_else(|| Error::Persistence {
                 details: s!("failed to serialize RGB stock"),
             })?;
@@ -3012,9 +2999,7 @@ impl Wallet {
             bdk_changeset: self.bdk_database.get_data().clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
-            stock_stash_b64: Some(stock_stash_b64),
-            stock_state_b64: Some(stock_state_b64),
-            stock_index_b64: Some(stock_index_b64),
+            rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
         })
     }
@@ -3139,16 +3124,9 @@ impl Wallet {
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
 
-        // Restore RGB Stock from strict-encoded components
-        if let (Some(stash_b64), Some(state_b64), Some(index_b64)) = (
-            snapshot.stock_stash_b64,
-            snapshot.stock_state_b64,
-            snapshot.stock_index_b64,
-        ) {
-            let stock = super::idb_store::deserialize_stock(&stash_b64, &state_b64, &index_b64)
-                .map_err(InternalError::StockError)?;
-            *self.rgb_stock.borrow_mut() = Some(stock);
-        }
+        let stock = super::idb_store::deserialize_stock(&snapshot.rgb_store)
+            .map_err(|details| Error::Internal { details })?;
+        *self.rgb_stock.borrow_mut() = Some(stock);
 
         Ok(())
     }

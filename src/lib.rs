@@ -39,7 +39,7 @@ pub use bdk_wallet::bitcoin;
 pub use rgbinvoice::RgbTransport;
 pub use rgbstd::{
     ChainNet, ContractId, Txid as RgbTxid,
-    containers::{ConsignmentExt, Fascia, FileContent, PubWitness, Transfer as RgbTransfer},
+    containers::{ConsignmentExt, Fascia, FileContent, Transfer as RgbTransfer},
     indexers::AnyResolver,
     persistence::UpdateRes,
     schema::SchemaId,
@@ -74,7 +74,7 @@ use std::{
     time::Duration,
 };
 
-use crate::database::memory_db::ActiveValue;
+use crate::database::{memory_db::ActiveValue, rgb_store::MemRgbStore};
 use amplify::{Wrapper, bmap, confinement::Confined, s};
 #[cfg(feature = "esplora")]
 use base64::{Engine as _, engine::general_purpose};
@@ -119,12 +119,17 @@ use rand::{Rng, distr::Alphanumeric};
 use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
     Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, Opout, OutputSeal,
-    OwnedFraction, Precision, Schema, SecretSeal, Transition, TransitionType, TypeSystem,
-    containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
-    contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder},
+    OwnedFraction, Precision, Schema, SecretSeal, Transition, TransitionType,
+    containers::{BuilderSeal, ValidConsignment, ValidContract, ValidTransfer},
+    contract::{
+        AllocatedState, ContractBuilder, ContractData, FilteredContractState, IssuerWrapper,
+        TransitionBuilder,
+    },
     info::{ContractInfo, SchemaInfo},
     invoice::{InvoiceState, Pay2Vout},
-    persistence::{MemContract, MemContractState, StashReadProvider, Stock, fs::FsBinStore},
+    persistence::{
+        ContractAssignments, ContractStateSnapshot, RetrievedSpvProofs, RgbStore, Stock,
+    },
     rgbcore::commit_verify::Conceal,
     stl::{
         AssetSpec, Attachment, ContractTerms, Details, MediaType, Name, RejectListUrl,
@@ -132,7 +137,8 @@ use rgbstd::{
     },
     txout::{BlindSeal, CloseMethod, ExplicitSeal},
     validation::{
-        ResolveWitness, Scripts, Status, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
+        ResolveWitness, SchemaDefinition, SchemaRules, WitnessOrdProvider, WitnessResolverError,
+        WitnessStatus,
     },
 };
 #[cfg(feature = "esplora")]

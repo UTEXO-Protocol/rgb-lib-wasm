@@ -70,16 +70,16 @@ web-sys = { version = "0.3", features = ["FormData", "Blob", "BlobPropertyBag", 
 
 # RGB-related deps
 amplify = { version = "=4.8.1", default-features = false }
-rgb-invoicing = { version = "=0.11.1-rc.10", default-features = false }
-rgb-psbt-utils = { version = "=0.11.1-rc.10", default-features = false }
-rgb-schemas = { version = "=0.11.1-rc.10", default-features = false }
-rgb-ops = { version = "=0.11.1-rc.10", default-features = false, features = [
+rgb-invoicing = { version = "=0.11.2-rc.1", default-features = false }
+rgb-psbt-utils = { version = "=0.11.2-rc.1", default-features = false }
+rgb-schemas = { version = "=0.11.2-rc.1", default-features = false }
+rgb-ops = { version = "=0.11.2-rc.1", default-features = false, features = [
     "serde",
 ] }
-rgb-strict-encoding = { version = "=1.0.1", default-features = false, features = [
+rgb-strict-encoding = { version = "=1.0.5", default-features = false, features = [
     "bitcoin",
 ] }
-rgb-strict-types = { version = "=1.0.1", default-features = false }
+rgb-strict-types = { version = "=1.0.5", default-features = false }
 
 [features]
 default = ["esplora"]

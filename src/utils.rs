@@ -538,22 +538,24 @@ impl ResolveWitness for DumbResolver {
     }
 }
 
+pub(crate) type MemStock = Stock<MemRgbStore>;
+
 /// Wrapper for the RGB stock.
 /// On drop, the stock is saved back to the shared RefCell for persistence across calls.
 pub(crate) struct RgbRuntime {
     /// The RGB stock
-    pub(crate) stock: Stock,
+    pub(crate) stock: MemStock,
     /// The wallet directory
     wallet_dir: PathBuf,
     /// Shared storage for persisting the stock back on drop (WASM in-memory persistence)
-    shared_stock: Option<std::rc::Rc<std::cell::RefCell<Option<Stock>>>>,
+    shared_stock: Option<std::rc::Rc<std::cell::RefCell<Option<MemStock>>>>,
 }
 
 impl RgbRuntime {
     pub(crate) fn with_shared_stock(
-        stock: Stock,
+        stock: MemStock,
         wallet_dir: PathBuf,
-        shared: std::rc::Rc<std::cell::RefCell<Option<Stock>>>,
+        shared: std::rc::Rc<std::cell::RefCell<Option<MemStock>>>,
     ) -> Self {
         Self {
             stock,
@@ -567,10 +569,10 @@ impl RgbRuntime {
         &mut self,
         contract: ValidTransfer,
         resolver: &R,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         self.stock
             .accept_transfer(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -578,7 +580,7 @@ impl RgbRuntime {
         &mut self,
         fascia: Fascia,
         witness_ord: Option<WitnessOrd>,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         struct FasciaResolver {
             witness_id: RgbTxid,
             witness_ord: WitnessOrd,
@@ -597,45 +599,46 @@ impl RgbRuntime {
 
         self.stock
             .consume_fascia(fascia, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn contracts(&self) -> Result<Vec<ContractInfo>, InternalError> {
-        Ok(self
-            .stock
+    pub(crate) fn contracts(&self) -> Result<Vec<ContractInfo>, Error> {
+        self.stock
             .contracts()
-            .map_err(InternalError::from)?
-            .collect())
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
     pub(crate) fn contract_wrapper<C: IssuerWrapper>(
         &self,
         contract_id: ContractId,
-    ) -> Result<C::Wrapper<MemContract<&MemContractState>>, InternalError> {
+    ) -> Result<C::Wrapper<ContractStateSnapshot>, Error> {
         self.stock
             .contract_wrapper::<C>(contract_id)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn contracts_assigning(
         &self,
         outputs: impl IntoIterator<Item = impl Into<OutPoint>>,
-    ) -> Result<BTreeSet<ContractId>, InternalError> {
+    ) -> Result<BTreeSet<ContractId>, Error> {
         Ok(FromIterator::from_iter(
             self.stock
                 .contracts_assigning(outputs)
-                .map_err(InternalError::from)?,
+                .map_err(Error::from)?,
         ))
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn genesis(&self, contract_id: ContractId) -> Result<&Genesis, InternalError> {
+    pub(crate) fn genesis(&self, contract_id: ContractId) -> Result<Genesis, Error> {
         self.stock
-            .as_stash_provider()
-            .genesis(contract_id)
-            .map_err(InternalError::from)
+            .as_store()
+            .genesis(contract_id)?
+            .ok_or_else(|| Error::Internal {
+                details: format!("genesis {contract_id} not found"),
+            })
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -643,14 +646,29 @@ impl RgbRuntime {
         &mut self,
         contract: ValidContract,
         resolver: &R,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         self.stock
             .import_contract(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
-    pub(crate) fn import_kit(&mut self, kit: ValidKit) -> Result<Status, InternalError> {
-        self.stock.import_kit(kit).map_err(InternalError::from)
+    pub(crate) fn import_schema_definition(
+        &mut self,
+        schema_def: SchemaDefinition,
+    ) -> Result<(), Error> {
+        self.stock
+            .import_schema_definition(schema_def)
+            .map_err(Error::from)
+    }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn consignment_data<const TRANSFER: bool>(
+        &self,
+        consignment: &ValidConsignment<TRANSFER>,
+    ) -> Result<ContractData<FilteredContractState>, Error> {
+        self.stock
+            .consignment_data(consignment)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -658,35 +676,31 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         outpoints: impl IntoIterator<Item = impl Into<OutPoint>>,
-    ) -> Result<HashMap<OutputSeal, HashMap<Opout, AllocatedState>>, InternalError> {
+    ) -> Result<ContractAssignments, Error> {
         self.stock
             .contract_assignments_for(contract_id, outpoints)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn contract_schema(
-        &self,
-        contract_id: ContractId,
-    ) -> Result<&Schema, InternalError> {
+    pub(crate) fn contract_schema(&self, contract_id: ContractId) -> Result<Schema, Error> {
         self.stock
-            .as_stash_provider()
-            .contract_schema(contract_id)
-            .map_err(InternalError::from)
+            .as_store()
+            .contract_schema(contract_id)?
+            .ok_or_else(|| Error::Internal {
+                details: format!("schema for contract {contract_id} not found"),
+            })
     }
 
-    pub(crate) fn schemata(&self) -> Result<Vec<SchemaInfo>, InternalError> {
-        Ok(self
-            .stock
+    pub(crate) fn schemata(&self) -> Result<Vec<SchemaInfo>, Error> {
+        self.stock
             .schemata()
-            .map_err(InternalError::from)?
-            .collect())
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
-    pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<bool, InternalError> {
-        self.stock
-            .store_secret_seal(seal)
-            .map_err(InternalError::from)
+    pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<(), Error> {
+        self.stock.store_secret_seal(seal).map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -696,10 +710,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         witness_id: Option<RgbTxid>,
-    ) -> Result<RgbTransfer, InternalError> {
+    ) -> Result<RgbTransfer, Error> {
         self.stock
-            .transfer(contract_id, outputs, secret_seals, [], witness_id)
-            .map_err(InternalError::from)
+            .transfer(contract_id, outputs, secret_seals, [], witness_id, None)
+            .map(|(consignment, _)| consignment)
+            .map_err(Error::from)
     }
 
     #[cfg(feature = "esplora")]
@@ -709,10 +724,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         witness_id: Option<RgbTxid>,
-    ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
+    ) -> Result<(RgbTransfer, OpoutsDagData), Error> {
         self.stock
-            .transfer_with_dag(contract_id, outputs, secret_seals, [], witness_id)
-            .map_err(InternalError::from)
+            .transfer_with_dag(contract_id, outputs, secret_seals, [], witness_id, None)
+            .map(|(consignment, dag, _)| (consignment, dag))
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -722,10 +738,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         fascia: &Fascia,
-    ) -> Result<RgbTransfer, InternalError> {
+    ) -> Result<RgbTransfer, Error> {
         self.stock
-            .transfer_from_fascia(contract_id, outputs, secret_seals, [], fascia)
-            .map_err(InternalError::from)
+            .transfer_from_fascia(contract_id, outputs, secret_seals, [], fascia, None)
+            .map(|(consignment, _)| consignment)
+            .map_err(Error::from)
     }
 
     #[cfg(feature = "esplora")]
@@ -735,10 +752,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         fascia: &Fascia,
-    ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
+    ) -> Result<(RgbTransfer, OpoutsDagData), Error> {
         self.stock
-            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, [], fascia)
-            .map_err(InternalError::from)
+            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, [], fascia, None)
+            .map(|(consignment, dag, _)| (consignment, dag))
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -746,10 +764,10 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         transition_name: impl Into<FieldName>,
-    ) -> Result<TransitionBuilder, InternalError> {
+    ) -> Result<TransitionBuilder, Error> {
         self.stock
             .transition_builder(contract_id, transition_name)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -757,10 +775,10 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         transition_type: TransitionType,
-    ) -> Result<TransitionBuilder, InternalError> {
+    ) -> Result<TransitionBuilder, Error> {
         self.stock
             .transition_builder_raw(contract_id, transition_type)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -769,10 +787,10 @@ impl RgbRuntime {
         resolver: &R,
         after_height: u32,
         force_witnesses: Vec<RgbTxid>,
-    ) -> Result<UpdateRes, InternalError> {
+    ) -> Result<UpdateRes, Error> {
         self.stock
             .update_witnesses(resolver, after_height, force_witnesses)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -780,7 +798,7 @@ impl RgbRuntime {
         &mut self,
         witness_id: RgbTxid,
         witness_ord: WitnessOrd,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         self.stock.upsert_witness(witness_id, witness_ord)?;
         Ok(())
     }
@@ -789,14 +807,14 @@ impl RgbRuntime {
 impl Drop for RgbRuntime {
     fn drop(&mut self) {
         if let Some(shared) = self.shared_stock.take() {
-            let stock = std::mem::replace(&mut self.stock, Stock::in_memory());
+            let stock = std::mem::take(&mut self.stock);
             *shared.borrow_mut() = Some(stock);
         }
     }
 }
 
 pub(crate) fn load_rgb_runtime(_wallet_dir: PathBuf) -> Result<RgbRuntime, Error> {
-    let stock = Stock::in_memory();
+    let stock = MemStock::default();
     Ok(RgbRuntime {
         stock,
         wallet_dir: PathBuf::new(),
@@ -851,9 +869,10 @@ impl WasmResolver {
         let mut cache = HashMap::new();
         for bw in consignment.bundled_witnesses() {
             let wid = bw.witness_id();
-            if let Some(tx) = bw.pub_witness.tx().cloned() {
-                cache.insert(wid, WitnessStatus::Resolved(tx, WitnessOrd::Tentative));
-            }
+            cache.insert(
+                wid,
+                WitnessStatus::Resolved(bw.tx.clone(), WitnessOrd::Tentative),
+            );
         }
         Self {
             witness_cache: cache,
@@ -940,7 +959,7 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolverWasm<'_, '_, TRANS
         self.consignment
             .bundled_witnesses()
             .find(|bw| bw.witness_id() == witness_id)
-            .and_then(|p| p.pub_witness.tx().cloned())
+            .map(|p| p.tx.clone())
             .map_or_else(
                 || self.fallback.resolve_witness(witness_id),
                 |tx| Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),

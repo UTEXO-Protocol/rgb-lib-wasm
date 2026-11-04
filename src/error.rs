@@ -6,7 +6,7 @@
 use super::*;
 
 /// The error variants returned by functions.
-#[derive(Debug, Clone, PartialEq, thiserror::Error, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Deserialize, Serialize)]
 pub enum Error {
     /// Address rotation called when reuse_addresses is false
     #[error("Address reuse is not enabled")]
@@ -614,12 +614,6 @@ pub(crate) enum InternalError {
     #[error("Serde JSON error: {0}")]
     SerdeJSON(#[from] serde_json::Error),
 
-    #[error("Stash error: {0}")]
-    StashError(String),
-
-    #[error("Stock error: {0}")]
-    StockError(String),
-
     #[error("Strip prefix error: {0}")]
     StripPrefix(#[from] std::path::StripPrefixError),
 
@@ -686,59 +680,17 @@ impl From<psrgbt::MpcPsbtError> for InternalError {
     }
 }
 
-impl From<rgbstd::persistence::StashProviderError<std::convert::Infallible>> for InternalError {
-    fn from(e: rgbstd::persistence::StashProviderError<std::convert::Infallible>) -> Self {
-        InternalError::StashError(e.to_string())
-    }
-}
-
-impl From<rgbstd::persistence::StockError> for InternalError {
-    fn from(e: rgbstd::persistence::StockError) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    > for InternalError
-{
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    ) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    > for InternalError
-{
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    ) -> Self {
-        InternalError::StockError(e.to_string())
+impl<E: std::error::Error> From<rgbstd::persistence::StockError<MemRgbStore, E>> for Error {
+    fn from(e: rgbstd::persistence::StockError<MemRgbStore, E>) -> Self {
+        match e {
+            rgbstd::persistence::StockError::Resolver(details) => Error::Indexer { details },
+            rgbstd::persistence::StockError::WitnessUnresolved(txid, e) => Error::Indexer {
+                details: format!("cannot resolve witness {txid}: {e}"),
+            },
+            e => Error::Internal {
+                details: format!("Stock err: {e}"),
+            },
+        }
     }
 }
 
@@ -798,5 +750,43 @@ impl From<rgbstd::contract::BuilderError> for Error {
         Error::Internal {
             details: e.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stock_errors_map_to_rgb_lib_errors() {
+        type StockErr = rgbstd::persistence::StockError<MemRgbStore, std::convert::Infallible>;
+
+        let e: Error = StockErr::Resolver(s!("down")).into();
+        assert_eq!(
+            e,
+            Error::Indexer {
+                details: s!("down")
+            }
+        );
+
+        let id = format!("{}1", "0".repeat(63));
+        let txid = RgbTxid::from_str(&id).unwrap();
+        let e: Error = StockErr::WitnessUnresolved(txid, WitnessResolverError::NotSupported).into();
+        assert_eq!(
+            e,
+            Error::Indexer {
+                details: format!(
+                    "cannot resolve witness {id}: operation is not supported by this resolver"
+                )
+            }
+        );
+
+        let e: Error = StockErr::AbsentValidWitness.into();
+        assert_eq!(
+            e,
+            Error::Internal {
+                details: s!("Stock err: AbsentValidWitness")
+            }
+        );
     }
 }

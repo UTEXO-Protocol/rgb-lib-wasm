@@ -577,8 +577,9 @@ impl Wallet {
                     for (no, fungible_assignment) in typed_assigns.as_fungible().iter().enumerate()
                     {
                         let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let Assign::ConfidentialSeal { seal, state, .. } = fungible_assignment {
-                            if Some(*seal) == known_concealed {
+                        if let BuilderSeal::Concealed(seal) = fungible_assignment.seal {
+                            let state = &fungible_assignment.state;
+                            if Some(seal) == known_concealed {
                                 match *ass_type {
                                     OS_ASSET => {
                                         received
@@ -594,7 +595,8 @@ impl Wallet {
                                 }
                             }
                         };
-                        if let Assign::Revealed { seal, state, .. } = fungible_assignment {
+                        if let BuilderSeal::Revealed(seal) = fungible_assignment.seal {
+                            let state = &fungible_assignment.state;
                             if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
                                 match *ass_type {
                                     OS_ASSET => {
@@ -616,12 +618,12 @@ impl Wallet {
                         typed_assigns.as_structured().iter().enumerate()
                     {
                         let opout = Opout::new(*opid, *ass_type, no as u16);
-                        if let Assign::ConfidentialSeal { seal, .. } = structured_assignment {
-                            if Some(*seal) == known_concealed {
+                        if let BuilderSeal::Concealed(seal) = structured_assignment.seal {
+                            if Some(seal) == known_concealed {
                                 received.insert(opout, Assignment::NonFungible);
                             }
                         }
-                        if let Assign::Revealed { seal, .. } = structured_assignment {
+                        if let BuilderSeal::Revealed(seal) = structured_assignment.seal {
                             if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
                                 received.insert(opout, Assignment::NonFungible);
                             }
@@ -2205,28 +2207,40 @@ impl Wallet {
 
         debug!(self.logger, "Validating consignment...");
         let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
+        let schema_rules = asset_schema.schema_rules();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            trusted_typesystem,
             build_opouts_dag: true,
             ..Default::default()
         };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger, "Consignment is invalid: {}", e);
-                return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                    .await;
-            }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger, "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-        };
+        let valid_consignment =
+            match consignment
+                .clone()
+                .validate(&schema_rules, &resolver, &validation_config)
+            {
+                Ok(consignment) => consignment,
+                Err(ValidationError::InvalidConsignment(e)) => {
+                    error!(self.logger, "Consignment is invalid: {}", e);
+                    return self
+                        ._refuse_consignment_async(
+                            proxy_url,
+                            recipient_id,
+                            &mut updated_batch_transfer,
+                        )
+                        .await;
+                }
+                Err(ValidationError::ResolverError(e)) => {
+                    warn!(self.logger, "Network error during consignment validation");
+                    return Err(Error::Network {
+                        details: e.to_string(),
+                    });
+                }
+                Err(e) => {
+                    return Err(Error::Internal {
+                        details: format!("unexpected consignment validation error: {e}"),
+                    });
+                }
+            };
         let validation_status = valid_consignment.validation_status();
         let validity = validation_status.validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
@@ -2239,25 +2253,15 @@ impl Wallet {
         {
             if let Some(RecipientTypeFull::Witness { .. }) = transfer.recipient_type {
                 if let Some(vout) = vout {
-                    if let PubWitness::Tx(tx) = &anchored_bundle.pub_witness {
-                        if let Some(output) = tx.output.get(vout as usize) {
-                            let script_pubkey =
-                                script_buf_from_recipient_id(recipient_id.clone())?.unwrap();
-                            if output.script_pubkey != script_pubkey {
-                                error!(
-                                    self.logger,
-                                    "The provided vout pays an incorrect script pubkey"
-                                );
-                                return self
-                                    ._refuse_consignment_async(
-                                        proxy_url,
-                                        recipient_id,
-                                        &mut updated_batch_transfer,
-                                    )
-                                    .await;
-                            }
-                        } else {
-                            error!(self.logger, "Cannot find the expected outpoint");
+                    let tx = &anchored_bundle.tx;
+                    if let Some(output) = tx.output.get(vout as usize) {
+                        let script_pubkey =
+                            script_buf_from_recipient_id(recipient_id.clone())?.unwrap();
+                        if output.script_pubkey != script_pubkey {
+                            error!(
+                                self.logger,
+                                "The provided vout pays an incorrect script pubkey"
+                            );
                             return self
                                 ._refuse_consignment_async(
                                     proxy_url,
@@ -2267,7 +2271,7 @@ impl Wallet {
                                 .await;
                         }
                     } else {
-                        error!(self.logger, "Consignment is missing the witness TX");
+                        error!(self.logger, "Cannot find the expected outpoint");
                         return self
                             ._refuse_consignment_async(
                                 proxy_url,
@@ -2334,7 +2338,7 @@ impl Wallet {
             let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.clone()) {
                 ass.reject_list_url
             } else {
-                let contract = IfaWrapper::with(valid_consignment.contract_data());
+                let contract = IfaWrapper::with(runtime.consignment_data(&valid_consignment)?);
                 contract.reject_list_url().map(|u| u.to_string())
             };
             if let Some(url) = &url {
@@ -2383,14 +2387,14 @@ impl Wallet {
                 let mut attachments = vec![];
                 match asset_schema {
                     AssetSchema::Nia => {
-                        let contract_data = valid_contract.contract_data();
+                        let contract_data = runtime.consignment_data(&valid_contract)?;
                         let contract = NiaWrapper::with(contract_data);
                         if let Some(attachment) = contract.contract_terms().media {
                             attachments.push(attachment)
                         }
                     }
                     AssetSchema::Ifa => {
-                        let contract_data = valid_contract.contract_data();
+                        let contract_data = runtime.consignment_data(&valid_contract)?;
                         let contract = IfaWrapper::with(contract_data);
                         if let Some(attachment) = contract.contract_terms().media {
                             attachments.push(attachment)
@@ -2689,11 +2693,14 @@ impl Wallet {
             let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
             let validation_config = ValidationConfig {
                 chain_net: self.chain_net(),
-                trusted_typesystem: asset_schema.types(),
                 ..Default::default()
             };
             let valid_consignment = consignment
-                .validate(&wasm_resolver, &validation_config)
+                .validate(
+                    &asset_schema.schema_rules(),
+                    &wasm_resolver,
+                    &validation_config,
+                )
                 .map_err(|_| InternalError::Unexpected)?;
             let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;

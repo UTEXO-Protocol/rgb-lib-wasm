@@ -59,38 +59,22 @@ impl AssetSchema {
         Self::from_schema_id(schema_id)
     }
 
-    fn schema(&self) -> Schema {
+    pub(crate) fn schema_rules(&self) -> SchemaRules {
         match self {
-            Self::Nia => NonInflatableAsset::schema(),
-            Self::Ifa => InflatableFungibleAsset::schema(),
+            Self::Nia => NonInflatableAsset::schema_rules(),
+            Self::Ifa => InflatableFungibleAsset::schema_rules(),
         }
     }
 
-    fn scripts(&self) -> Scripts {
+    pub(crate) fn schema_definition(&self) -> SchemaDefinition {
         match self {
-            Self::Nia => NonInflatableAsset::scripts(),
-            Self::Ifa => InflatableFungibleAsset::scripts(),
+            Self::Nia => NonInflatableAsset::schema_definition(),
+            Self::Ifa => InflatableFungibleAsset::schema_definition(),
         }
     }
 
-    /// Returns the type system for this asset schema.
-    pub fn types(&self) -> TypeSystem {
-        match self {
-            Self::Nia => NonInflatableAsset::types(),
-            Self::Ifa => InflatableFungibleAsset::types(),
-        }
-    }
-
-    pub(crate) fn import_kit(&self, runtime: &mut RgbRuntime) -> Result<(), Error> {
-        let schema = self.schema();
-        let lib = self.scripts();
-        let types = self.types();
-        let mut kit = Kit::default();
-        kit.schemata.push(schema).unwrap();
-        kit.scripts.extend(lib.into_values()).unwrap();
-        kit.types = types;
-        let valid_kit = kit.validate().map_err(|_| InternalError::Unexpected)?;
-        runtime.import_kit(valid_kit)?;
+    pub(crate) fn import_schema_definition(&self, runtime: &mut RgbRuntime) -> Result<(), Error> {
+        runtime.import_schema_definition(self.schema_definition())?;
         Ok(())
     }
 }
@@ -249,7 +233,7 @@ mod tests {
         for asset_schema in AssetSchema::VALUES {
             assert_eq!(
                 SchemaId::from(asset_schema),
-                asset_schema.schema().schema_id(),
+                asset_schema.schema_definition().schema.schema_id(),
                 "SCHEMA_ID constant for {asset_schema} is stale"
             );
         }
