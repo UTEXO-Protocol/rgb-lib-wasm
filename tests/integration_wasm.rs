@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -9,7 +10,9 @@ use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
 };
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, bitcoin::Psbt, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, Error, FileContent, PubWitness,
+    RgbTransfer, RgbTransport, RgbTxid, TransferStatus, bitcoin::Amount, bitcoin::Psbt,
+    generate_keys,
 };
 use utils::*;
 
@@ -1033,6 +1036,182 @@ async fn test_full_wallet_flow() {
     assert!(
         !deleted,
         "No failed transfers to delete should return false"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_history_witness_not_on_chain_refused() {
+    let transport = transport_endpoint();
+
+    let mut wallet_a = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online_a = wallet_a
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
+    create_utxos(&mut wallet_a, &online_a, 5).await;
+    let nia = wallet_a
+        .issue_asset_nia(
+            "HWT".to_string(),
+            "History witness".to_string(),
+            0,
+            vec![1000],
+        )
+        .unwrap();
+
+    let mut wallet_b = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online_b = wallet_b
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
+    create_utxos(&mut wallet_b, &online_b, 5).await;
+    let recv_b = wallet_b
+        .blind_receive(
+            None,
+            Assignment::Fungible(200),
+            Some(3600),
+            vec![transport.clone()],
+            0,
+        )
+        .unwrap();
+
+    // Hop 1: A sends to B, B settles.
+    let recipient = Recipient {
+        recipient_id: recv_b.recipient_id.clone(),
+        witness_data: None,
+        assignment: Assignment::Fungible(200),
+        transport_endpoints: vec![transport.clone()],
+    };
+    let unsigned = wallet_a
+        .send_begin(
+            online_a.clone(),
+            HashMap::from([(nia.asset_id.clone(), vec![recipient])]),
+            false,
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
+    let w1 = wallet_a
+        .send_end(online_a.clone(), signed, false)
+        .await
+        .unwrap()
+        .txid;
+    wallet_b
+        .refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    wallet_a
+        .refresh(online_a.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for _ in 0..60 {
+        wallet_b
+            .refresh(online_b.clone(), None, vec![], false)
+            .await
+            .unwrap();
+        if wallet_b
+            .get_asset_balance(nia.asset_id.clone())
+            .unwrap()
+            .settled
+            == 200
+        {
+            break;
+        }
+        sleep_ms(500).await;
+    }
+    assert_eq!(
+        wallet_b
+            .get_asset_balance(nia.asset_id.clone())
+            .unwrap()
+            .settled,
+        200,
+        "B must settle the first transfer"
+    );
+
+    let mut wallet_c = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online_c = wallet_c
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    let recv_c = wallet_c
+        .witness_receive(
+            None,
+            Assignment::Fungible(100),
+            None,
+            vec![transport.clone()],
+            1,
+        )
+        .unwrap();
+
+    // Hop 2: B sends to C, W2 is not broadcast.
+    let recipient = Recipient {
+        recipient_id: recv_c.recipient_id.clone(),
+        witness_data: Some(WitnessData {
+            amount_sat: 2000,
+            blinding: None,
+        }),
+        assignment: Assignment::Fungible(100),
+        transport_endpoints: vec![transport.clone()],
+    };
+    let unsigned = wallet_b
+        .send_begin(
+            online_b.clone(),
+            HashMap::from([(nia.asset_id.clone(), vec![recipient])]),
+            false,
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    let signed = wallet_b.sign_psbt(unsigned, None).unwrap();
+    let w2 = wallet_b
+        .send_end(online_b.clone(), signed, false)
+        .await
+        .unwrap()
+        .txid;
+
+    let (bytes, proxy_txid) = get_consignment_from_proxy(&recv_c.recipient_id).await;
+    assert_eq!(proxy_txid, w2);
+    let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
+    let w1_id = RgbTxid::from_str(&w1).unwrap();
+    assert!(
+        consignment
+            .bundled_witnesses()
+            .any(|bw| bw.witness_id() == w1_id && bw.pub_witness.tx().is_some())
+    );
+
+    // Same commitment and inputs, new txid: the history witness is not on chain.
+    assert!(consignment.modify_bundle(w1_id, |bw| {
+        if let PubWitness::Tx(tx) = &mut bw.pub_witness {
+            let out = tx.output.iter_mut().max_by_key(|o| o.value).unwrap();
+            out.value = Amount::from_sat(out.value.to_sat() - 1);
+        }
+    }));
+    let mut forged = Vec::new();
+    consignment.save(&mut forged).unwrap();
+    wallet_b
+        .post_consignment(PROXY_URL, w2.clone(), &forged, w2.clone(), None)
+        .await
+        .unwrap();
+
+    let res = wallet_c
+        .accept_transfer(
+            online_c,
+            w2.clone(),
+            0,
+            RgbTransport::from_str(&transport).unwrap(),
+            0,
+        )
+        .await;
+    assert!(
+        matches!(res, Err(Error::InvalidConsignment)),
+        "a consignment with a history witness that is not on chain must be refused, got: {:?}",
+        res.map(|(_, a)| a)
     );
 }
 
