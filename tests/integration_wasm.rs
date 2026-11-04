@@ -6,7 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 mod utils;
 
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
+use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
 use utils::*;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
@@ -710,5 +710,19 @@ async fn test_full_wallet_flow() {
     assert!(
         !deleted,
         "No failed transfers to delete should return false"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_go_online_other_network() {
+    let mut wallet = Wallet::new(WalletData {
+        bitcoin_network: BitcoinNetwork::Testnet,
+        ..test_wallet_data(vec![AssetSchema::Nia])
+    })
+    .unwrap();
+    let result = wallet.go_online(false, ESPLORA_URL.to_string()).await;
+    assert!(
+        matches!(&result, Err(Error::InvalidIndexer { details }) if details == "resolver is for another chain-network pair"),
+        "a testnet wallet must be refused by a regtest indexer, got: {result:?}"
     );
 }
