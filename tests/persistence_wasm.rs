@@ -314,9 +314,11 @@ async fn test_persistence_across_reload() {
             1,
             default_send_expiration(),
             None,
+            false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     assert!(
         !unsigned_psbt.is_empty(),
         "send_begin should succeed after reload (Stock has contract)"
@@ -490,9 +492,11 @@ async fn test_accept_transfer_is_durable_before_success() {
             1,
             default_send_expiration(),
             None,
+            false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
     let psbt = Psbt::from_str(&signed).unwrap();
     let recipient_vout = psbt
@@ -589,9 +593,11 @@ async fn test_pending_funding_transfer_completes_after_reload() {
             1,
             default_send_expiration(),
             None,
+            false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
     let funding_txid = Psbt::from_str(&signed)
         .unwrap()

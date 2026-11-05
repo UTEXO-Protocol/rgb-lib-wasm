@@ -156,9 +156,19 @@ async fn test_full_wallet_flow() {
 
     let send_exp = default_send_expiration() + 1800;
     let unsigned_psbt = wallet
-        .send_begin(online.clone(), recipient_map, false, 1, 1, send_exp, None)
+        .send_begin(
+            online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            send_exp,
+            None,
+            false,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
     let send_result = wallet
         .send_end(online.clone(), signed_psbt, false)
@@ -416,9 +426,11 @@ async fn test_full_wallet_flow() {
             1,
             default_send_expiration(),
             None,
+            false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed_ifa = wallet.sign_psbt(unsigned_ifa, None).unwrap();
     let ifa_send = wallet
         .send_end(online.clone(), signed_ifa, false)

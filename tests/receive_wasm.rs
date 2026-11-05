@@ -8,9 +8,7 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::{consensus::encode::serialize_hex, psbt::Psbt};
 use rgb_lib_wasm::utils::script_buf_from_recipient_id;
-use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, Recipient, Transfer, Wallet, WalletData, WitnessData,
-};
+use rgb_lib_wasm::wallet::{DatabaseType, Online, Recipient, Wallet, WalletData};
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, TransferKind,
     TransferStatus, generate_keys,
@@ -34,13 +32,6 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     }
 }
 
-async fn fund_and_sync(wallet: &mut Wallet, online: &Online, amount: &str) {
-    let addr = wallet.get_address().unwrap();
-    fund_address(&addr, amount).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-}
-
 async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8) {
     let unsigned = wallet
         .create_utxos_begin(online.clone(), true, Some(num), None, 1, true)
@@ -54,22 +45,6 @@ async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8) {
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
-}
-
-fn transport_endpoint(url: &str) -> String {
-    format!("rpc://{}", url.trim_start_matches("http://"))
-}
-
-fn recipient(id: &str, amount: u64, sat: Option<u64>, url: &str) -> Recipient {
-    Recipient {
-        recipient_id: id.to_string(),
-        witness_data: sat.map(|amount_sat| WitnessData {
-            amount_sat,
-            blinding: None,
-        }),
-        assignment: Assignment::Fungible(amount),
-        transport_endpoints: vec![transport_endpoint(url)],
-    }
 }
 
 async fn new_wallet() -> (Wallet, Online) {
@@ -106,9 +81,11 @@ async fn begin_send(
             1,
             default_send_expiration(),
             None,
+            true,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let txid = Psbt::from_str(&signed)
         .unwrap()
@@ -140,43 +117,6 @@ async fn broadcast(signed: &str) {
         .send()
         .await
         .expect("broadcast request failed");
-}
-
-fn transfer_of(wallet: &Wallet, recipient_id: &str) -> Transfer {
-    wallet
-        .list_transfers(AssetFilter::Any, None)
-        .unwrap()
-        .into_iter()
-        .find(|t| t.recipient_id.as_deref() == Some(recipient_id))
-        .unwrap()
-}
-
-async fn refresh(wallet: &mut Wallet, online: &Online) {
-    wallet
-        .refresh(online.clone(), None, vec![], false)
-        .await
-        .unwrap();
-}
-
-async fn settle(wallet: &mut Wallet, online: &Online, recipient_ids: &[String]) {
-    for _ in 0..5 {
-        mine_blocks(1).await;
-        wait_for_esplora_sync().await;
-        wallet.sync(online.clone()).await.unwrap();
-        refresh(wallet, online).await;
-        if recipient_ids
-            .iter()
-            .all(|r| transfer_of(wallet, r).status == TransferStatus::Settled)
-        {
-            return;
-        }
-        sleep_ms(1000).await;
-    }
-    let statuses: Vec<_> = recipient_ids
-        .iter()
-        .map(|r| transfer_of(wallet, r).status)
-        .collect();
-    panic!("transfers did not settle: {statuses:?}");
 }
 
 fn save(consignment: &RgbTransfer) -> Vec<u8> {
