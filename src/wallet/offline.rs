@@ -17,8 +17,6 @@ pub(crate) const NUM_KNOWN_SCHEMAS: usize = 2;
 
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
-pub(crate) const DURATION_RCV_TRANSFER: u32 = 86400;
-
 pub(crate) const ASSET_ID_PREFIX: &str = "rgb:";
 pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
 
@@ -339,7 +337,7 @@ pub struct ReceiveData {
     /// ID of the receive operation (blinded UTXO or Bitcoin script)
     pub recipient_id: String,
     /// Expiration of the receive operation
-    pub expiration_timestamp: Option<i64>,
+    pub expiration_timestamp: u64,
     /// Batch transfer idx
     pub batch_transfer_idx: i32,
 }
@@ -782,7 +780,7 @@ pub struct Transfer {
     /// Change UTXO of an outgoing transfer
     pub change_utxo: Option<Outpoint>,
     /// Expiration of the transfer
-    pub expiration: Option<i64>,
+    pub expiration_timestamp: Option<u64>,
     /// Transport endpoints for the transfer
     pub transport_endpoints: Vec<TransferTransportEndpoint>,
     /// Invoice string of the incoming transfer
@@ -810,7 +808,7 @@ impl Transfer {
             recipient_id: x.recipient_id.clone(),
             receive_utxo: td.receive_utxo,
             change_utxo: td.change_utxo,
-            expiration: td.expiration,
+            expiration_timestamp: td.expiration.map(|t| t as u64),
             transport_endpoints,
             invoice_string: x.invoice_string.clone(),
             consignment_path: td.consignment_path,
@@ -2567,12 +2565,12 @@ impl Wallet {
         &self,
         asset_id: Option<String>,
         assignment: Assignment,
-        duration_seconds: Option<u32>,
+        expiration_timestamp: i64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         beneficiary: Beneficiary,
         recipient_type: RecipientTypeFull,
-    ) -> Result<(String, String, Option<i64>, i32), Error> {
+    ) -> Result<(String, String, i32), Error> {
         let network: ChainNet = self.bitcoin_network().into();
 
         let beneficiary = XChainNet::with(network, beneficiary);
@@ -2642,21 +2640,16 @@ impl Wallet {
             _ => return Err(Error::InvalidAssignment),
         };
         let created_at = now().unix_timestamp();
-        let expiry = if duration_seconds == Some(0) {
-            None
-        } else {
-            let duration_seconds = duration_seconds.unwrap_or(DURATION_RCV_TRANSFER) as i64;
-            let expiry = created_at + duration_seconds;
-            invoice_builder = invoice_builder.set_expiry_timestamp(expiry);
-            Some(expiry)
-        };
-
+        if expiration_timestamp < created_at {
+            return Err(Error::InvalidExpiration);
+        }
+        invoice_builder = invoice_builder.set_expiry_timestamp(expiration_timestamp);
         let invoice = invoice_builder.finish();
         let invoice_string = invoice.to_string();
 
         let batch_transfer = DbBatchTransferActMod {
             status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
-            expiration: ActiveValue::Set(expiry),
+            expiration: ActiveValue::Set(Some(expiration_timestamp)),
             created_at: ActiveValue::Set(created_at),
             min_confirmations: ActiveValue::Set(min_confirmations),
             ..Default::default()
@@ -2691,7 +2684,7 @@ impl Wallet {
             )?;
         }
 
-        Ok((recipient_id, invoice_string, expiry, batch_transfer_idx))
+        Ok((recipient_id, invoice_string, batch_transfer_idx))
     }
 
     /// Blind an UTXO to receive RGB assets and return the resulting [`ReceiveData`].
@@ -2702,8 +2695,8 @@ impl Wallet {
     /// An optional amount can be specified, which will be embedded in the invoice. It will not be
     /// checked when accepting the transfer.
     ///
-    /// An optional duration (in seconds) can be specified, which will set the expiration of the
-    /// invoice. A duration of 0 seconds means no expiration.
+    /// An expiration UTC timestamp must be specified, which will set the expiration of the
+    /// invoice and the transfer.
     ///
     /// Each endpoint in the provided `transport_endpoints` list will be used as RGB data exchange
     /// medium. The list needs to contain at least 1 endpoint and a maximum of 3. Strings
@@ -2720,15 +2713,15 @@ impl Wallet {
         &self,
         asset_id: Option<String>,
         assignment: Assignment,
-        duration_seconds: Option<u32>,
+        expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
-            "Receiving via blinded UTXO for asset '{:?}' with duration '{:?}'...",
+            "Receiving via blinded UTXO for asset '{:?}' with expiration '{}'...",
             asset_id,
-            duration_seconds
+            expiration_timestamp
         );
 
         let mut unspents: Vec<LocalUnspent> = self.database.get_rgb_allocations(
@@ -2753,10 +2746,10 @@ impl Wallet {
         let blind_seal = self.get_blind_seal(utxo.clone()).transmutate();
         let beneficiary = Beneficiary::BlindedSeal(blind_seal.conceal());
 
-        let (recipient_id, invoice, expiration_timestamp, batch_transfer_idx) = self._receive(
+        let (recipient_id, invoice, batch_transfer_idx) = self._receive(
             asset_id,
             assignment,
-            duration_seconds,
+            expiration_timestamp as i64,
             transport_endpoints,
             min_confirmations,
             beneficiary,
@@ -2788,8 +2781,8 @@ impl Wallet {
     /// An optional amount can be specified, which will be embedded in the invoice. It will not be
     /// checked when accepting the transfer.
     ///
-    /// An optional duration (in seconds) can be specified, which will set the expiration of the
-    /// invoice. A duration of 0 seconds means no expiration.
+    /// An expiration UTC timestamp must be specified, which will set the expiration of the
+    /// invoice and the transfer.
     ///
     /// Each endpoint in the provided `transport_endpoints` list will be used as RGB data exchange
     /// medium. The list needs to contain at least 1 endpoint and a maximum of 3. Strings
@@ -2806,24 +2799,24 @@ impl Wallet {
         &mut self,
         asset_id: Option<String>,
         assignment: Assignment,
-        duration_seconds: Option<u32>,
+        expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
-            "Receiving via witness TX for asset '{:?}' with duration '{:?}'...",
+            "Receiving via witness TX for asset '{:?}' with expiration '{}'...",
             asset_id,
-            duration_seconds
+            expiration_timestamp
         );
 
         let script_pubkey = self.get_new_address()?.script_pubkey();
         let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
 
-        let (recipient_id, invoice, expiration_timestamp, batch_transfer_idx) = self._receive(
+        let (recipient_id, invoice, batch_transfer_idx) = self._receive(
             asset_id,
             assignment,
-            duration_seconds,
+            expiration_timestamp as i64,
             transport_endpoints,
             min_confirmations,
             beneficiary,
@@ -3258,5 +3251,50 @@ pub(crate) mod address_reuse_tests {
             internal_after.to_string(),
             "Internal unchanged after External index bump"
         );
+    }
+}
+
+#[cfg(test)]
+mod receive_expiration_tests {
+    use super::address_reuse_tests::make_test_wallet;
+    use super::*;
+
+    #[test]
+    fn receive_past_expiration_fails() {
+        let mut wallet = make_test_wallet(false);
+        let result = wallet.witness_receive(
+            None,
+            Assignment::Any,
+            now().unix_timestamp() as u64 - 1,
+            vec![s!("rpc://127.0.0.1")],
+            1,
+        );
+        assert!(matches!(result, Err(Error::InvalidExpiration)));
+        let db_data = wallet.database.get_db_data(false).unwrap();
+        assert!(db_data.batch_transfers.is_empty());
+    }
+
+    #[test]
+    fn receive_keeps_given_expiration() {
+        let mut wallet = make_test_wallet(false);
+        let exp = now().unix_timestamp() + 100_000;
+        let beneficiary =
+            beneficiary_from_script_buf(wallet.get_new_address().unwrap().script_pubkey());
+        let (_, invoice, _) = wallet
+            ._receive(
+                None,
+                Assignment::Any,
+                exp,
+                vec![s!("rpc://127.0.0.1")],
+                1,
+                beneficiary,
+                RecipientTypeFull::Witness { vout: None },
+            )
+            .unwrap();
+        let db_data = wallet.database.get_db_data(false).unwrap();
+        assert_eq!(db_data.batch_transfers.len(), 1);
+        assert_eq!(db_data.batch_transfers[0].expiration, Some(exp));
+        let invoice_data = Invoice::new(invoice).unwrap().invoice_data();
+        assert_eq!(invoice_data.expiration_timestamp, Some(exp));
     }
 }

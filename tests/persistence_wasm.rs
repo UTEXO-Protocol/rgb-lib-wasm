@@ -301,7 +301,7 @@ async fn test_persistence_across_reload() {
         .witness_receive(
             None,
             Assignment::Fungible(100),
-            None,
+            default_rcv_expiration(),
             vec![transport.clone()],
             1,
         )
@@ -321,7 +321,15 @@ async fn test_persistence_across_reload() {
 
     // send_begin must succeed — proves Stock has the contract after reload
     let unsigned_psbt = wallet
-        .send_begin(online.clone(), recipient_map, false, 1, 1, None)
+        .send_begin(
+            online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            None,
+        )
         .await
         .unwrap();
     assert!(
@@ -384,7 +392,13 @@ async fn test_persistence_across_reload() {
     // === Section 4: Backup restore persists to IndexedDB ===
     // Create a witness receive to add more state
     let _recv = wallet
-        .witness_receive(None, Assignment::Any, None, vec![transport.clone()], 1)
+        .witness_receive(
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![transport.clone()],
+            1,
+        )
         .unwrap();
 
     // Backup
@@ -472,7 +486,7 @@ async fn test_accept_transfer_is_durable_before_success() {
         .witness_receive(
             None,
             Assignment::Fungible(100),
-            None,
+            default_rcv_expiration(),
             vec![transport.clone()],
             1,
         )
@@ -495,7 +509,15 @@ async fn test_accept_transfer_is_durable_before_success() {
     recipient_map.insert(asset.asset_id, vec![recipient]);
 
     let unsigned = wallet_a
-        .send_begin(online_a.clone(), recipient_map, false, 1, 1, None)
+        .send_begin(
+            online_a.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            None,
+        )
         .await
         .unwrap();
     let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
@@ -572,7 +594,7 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         .witness_receive(
             None,
             Assignment::Fungible(100),
-            None,
+            default_rcv_expiration(),
             vec![transport.clone()],
             1,
         )
@@ -589,7 +611,15 @@ async fn test_pending_funding_transfer_completes_after_reload() {
     let recipient_map = HashMap::from([(asset.asset_id, vec![recipient])]);
 
     let unsigned = wallet_a
-        .send_begin(online_a.clone(), recipient_map, true, 1, 1, None)
+        .send_begin(
+            online_a.clone(),
+            recipient_map,
+            true,
+            1,
+            1,
+            default_send_expiration(),
+            None,
+        )
         .await
         .unwrap();
     let signed = wallet_a.sign_psbt(unsigned, None).unwrap();

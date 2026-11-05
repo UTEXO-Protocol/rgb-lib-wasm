@@ -6,7 +6,9 @@ wasm_bindgen_test_configure!(run_in_browser);
 mod utils;
 
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, TransferKind, TransferStatus, generate_keys,
+};
 use utils::*;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
@@ -139,7 +141,7 @@ async fn test_full_wallet_flow() {
         .witness_receive(
             None,
             Assignment::Fungible(200),
-            None,
+            default_rcv_expiration(),
             vec![transport.clone()],
             1,
         )
@@ -158,8 +160,9 @@ async fn test_full_wallet_flow() {
     let mut recipient_map = HashMap::new();
     recipient_map.insert(nia.asset_id.clone(), vec![recipient]);
 
+    let send_exp = default_send_expiration() + 1800;
     let unsigned_psbt = wallet
-        .send_begin(online.clone(), recipient_map, false, 1, 1, None)
+        .send_begin(online.clone(), recipient_map, false, 1, 1, send_exp, None)
         .await
         .unwrap();
     let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
@@ -168,6 +171,14 @@ async fn test_full_wallet_flow() {
         .await
         .unwrap();
     assert!(!send_result.txid.is_empty());
+    let sent = wallet
+        .list_transfers(
+            AssetFilter::Id(nia.asset_id.clone()),
+            Some(send_result.txid.clone()),
+        )
+        .unwrap();
+    let sent = sent.iter().find(|t| t.kind == TransferKind::Send).unwrap();
+    assert_eq!(sent.expiration_timestamp, Some(send_exp));
 
     // validate_consignment_offchain: fetch from proxy and validate before broadcast
     let (consignment_bytes, proxy_txid) = get_consignment_from_proxy(&recv_b.recipient_id).await;
@@ -349,6 +360,17 @@ async fn test_full_wallet_flow() {
         .await
         .unwrap();
     assert!(!inflate_result.txid.is_empty());
+    let inflation = wallet
+        .list_transfers(
+            AssetFilter::Id(ifa.asset_id.clone()),
+            Some(inflate_result.txid.clone()),
+        )
+        .unwrap();
+    let inflation = inflation
+        .iter()
+        .find(|t| t.kind == TransferKind::Inflation)
+        .unwrap();
+    assert_eq!(inflation.expiration_timestamp, None);
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
@@ -376,7 +398,7 @@ async fn test_full_wallet_flow() {
         .blind_receive(
             None,
             Assignment::Any,
-            Some(3600),
+            default_rcv_expiration(),
             vec![transport.clone()],
             1,
         )
@@ -392,7 +414,15 @@ async fn test_full_wallet_flow() {
     ifa_recipient_map.insert(ifa.asset_id.clone(), vec![ifa_recipient]);
 
     let unsigned_ifa = wallet
-        .send_begin(online.clone(), ifa_recipient_map, false, 1, 1, None)
+        .send_begin(
+            online.clone(),
+            ifa_recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            None,
+        )
         .await
         .unwrap();
     let signed_ifa = wallet.sign_psbt(unsigned_ifa, None).unwrap();
@@ -727,24 +757,32 @@ async fn test_full_wallet_flow() {
     wallet.disable_vss_backup();
 
     // Receive API tests (after send, since blind_receive locks NIA UTXO)
+    let blind_exp = default_rcv_expiration();
     let blind_recv = wallet
         .blind_receive(
             Some(nia.asset_id.clone()),
             Assignment::Fungible(100),
-            Some(3600),
+            blind_exp,
             vec![transport.clone()],
             1,
         )
         .unwrap();
     assert!(!blind_recv.invoice.is_empty());
     assert!(!blind_recv.recipient_id.is_empty());
-    assert!(blind_recv.expiration_timestamp.is_some());
+    assert_eq!(blind_recv.expiration_timestamp, blind_exp);
 
+    let witness_exp = default_rcv_expiration();
     let witness_recv = wallet
-        .witness_receive(None, Assignment::Any, Some(0), vec![transport.clone()], 1)
+        .witness_receive(
+            None,
+            Assignment::Any,
+            witness_exp,
+            vec![transport.clone()],
+            1,
+        )
         .unwrap();
     assert!(!witness_recv.invoice.is_empty());
-    assert!(witness_recv.expiration_timestamp.is_none());
+    assert_eq!(witness_recv.expiration_timestamp, witness_exp);
 
     // fail_transfers: no pending transfers to fail — should succeed with false
     let failed = wallet

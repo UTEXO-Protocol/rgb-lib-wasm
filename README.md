@@ -158,7 +158,7 @@ const recipientMap = {
     transportEndpoints: ['rpc://localhost:3000/json-rpc'],
   }]
 };
-const psbt = await wallet.sendBegin(online, recipientMap, false, 1n, 1);
+const psbt = await wallet.sendBegin(online, recipientMap, false, 1n, 1, Math.floor(Date.now() / 1000) + 3600);
 const signed = wallet.signPsbt(psbt);
 const result = await wallet.sendEnd(online, signed, false);
 // result: { txid, batchTransferIdx }
@@ -176,11 +176,11 @@ const txid = await wallet.sendBtcEnd(online, signed, false);
 
 ```javascript
 // Blind receive (UTXO-based)
-const blind = wallet.blindReceive(null, 'Any', null, ['rpc://localhost:3000/json-rpc'], 1);
+const blind = wallet.blindReceive(null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1);
 // blind: { invoice, recipientId, expirationTimestamp, ... }
 
 // Witness receive (address-based)
-const witness = wallet.witnessReceive(null, { Fungible: 100 }, null, ['rpc://localhost:3000/json-rpc'], 1);
+const witness = wallet.witnessReceive(null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1);
 ```
 
 ### Parsing invoices
@@ -375,6 +375,7 @@ cargo test --lib
 # WASM unit tests (headless Firefox)
 wasm-pack test --headless --firefox --release -- --test keys_wasm
 wasm-pack test --headless --firefox --release -- --test wallet_wasm
+wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 
 # Integration tests (requires regtest Docker services)
 cd tests && bash regtest.sh start

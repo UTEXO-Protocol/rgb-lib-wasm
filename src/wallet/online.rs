@@ -15,8 +15,6 @@ pub(crate) const UTXO_NUM: u8 = 5;
 
 pub(crate) const MIN_FEE_RATE: u64 = 1;
 
-pub(crate) const DURATION_SEND_TRANSFER: i64 = 3600;
-
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
@@ -140,6 +138,7 @@ pub(crate) struct InfoBatchTransfer {
     extra_allocations: HashMap<String, TxoAssignments>,
     donation: bool,
     min_confirmations: u8,
+    expiration_timestamp: Option<i64>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1082,14 +1081,14 @@ impl Wallet {
         btc_change: Option<BtcChange>,
         status: TransferStatus,
         min_confirmations: u8,
+        expiration_timestamp: Option<i64>,
     ) -> Result<i32, Error> {
         let created_at = now().unix_timestamp();
-        let expiration = Some(created_at + DURATION_SEND_TRANSFER);
 
         let batch_transfer = DbBatchTransferActMod {
             txid: ActiveValue::Set(Some(txid.clone())),
             status: ActiveValue::Set(status),
-            expiration: ActiveValue::Set(expiration),
+            expiration: ActiveValue::Set(expiration_timestamp),
             created_at: ActiveValue::Set(created_at),
             min_confirmations: ActiveValue::Set(min_confirmations),
             ..Default::default()
@@ -1668,6 +1667,7 @@ impl Wallet {
         unspents: Vec<LocalUnspent>,
         runtime: &mut RgbRuntime,
         min_confirmations: u8,
+        expiration_timestamp: Option<i64>,
         btc_change: Option<BtcChange>,
         rejected: &mut HashSet<Opout>,
     ) -> Result<bool, Error> {
@@ -1995,6 +1995,7 @@ impl Wallet {
             extra_allocations,
             donation,
             min_confirmations,
+            expiration_timestamp,
         };
         self.transfer_artifacts
             .entry(txid_key.to_string())
@@ -2013,6 +2014,7 @@ impl Wallet {
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate_checked: FeeRate,
         min_confirmations: u8,
+        expiration_timestamp: Option<i64>,
         lock_time: Option<u32>,
         runtime: &mut RgbRuntime,
         rejected: &mut HashSet<Opout>,
@@ -2050,6 +2052,7 @@ impl Wallet {
                 unspents,
                 runtime,
                 min_confirmations,
+                expiration_timestamp,
                 btc_change,
                 rejected,
             )
@@ -3008,6 +3011,11 @@ impl Wallet {
     /// Prepare the PSBT to send RGB assets (wasm32 async).
     ///
     /// See native [`send_begin`](Wallet::send_begin) for full documentation.
+    ///
+    /// An expiration UTC timestamp must be specified, which will set the expiration of the
+    /// transfer. This should be set to the same value specified by the recipient's invoice. In case
+    /// of a batch transfer, set it to the minimum (earliest) expiration across the recipients'
+    /// invoices.
     pub async fn send_begin(
         &mut self,
         online: Online,
@@ -3015,6 +3023,7 @@ impl Wallet {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
+        expiration_timestamp: u64,
         lock_time: Option<u32>,
     ) -> Result<String, Error> {
         info!(self.logger, "Sending (begin) to: {:?}...", recipient_map);
@@ -3195,6 +3204,7 @@ impl Wallet {
                     &witness_recipients,
                     fee_rate_checked,
                     min_confirmations,
+                    Some(expiration_timestamp as i64),
                     lock_time,
                     &mut runtime,
                     &mut rejected,
@@ -3329,6 +3339,7 @@ impl Wallet {
                 info_contents.btc_change,
                 TransferStatus::WaitingConfirmations,
                 info_contents.min_confirmations,
+                info_contents.expiration_timestamp,
             )?
         } else {
             self._save_transfers(
@@ -3339,6 +3350,7 @@ impl Wallet {
                 info_contents.btc_change,
                 TransferStatus::WaitingCounterparty,
                 info_contents.min_confirmations,
+                info_contents.expiration_timestamp,
             )?
         };
 
@@ -3806,6 +3818,7 @@ impl Wallet {
                 fee_rate_checked,
                 min_confirmations,
                 None,
+                None,
                 &mut runtime,
                 &mut rejected,
             )
@@ -3871,6 +3884,7 @@ impl Wallet {
             info_contents.btc_change,
             TransferStatus::WaitingConfirmations,
             info_contents.min_confirmations,
+            info_contents.expiration_timestamp,
         )?;
 
         let (asset_id, transfer_info) = transfer_info_map.into_iter().next().unwrap();

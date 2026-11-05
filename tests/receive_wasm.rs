@@ -101,7 +101,15 @@ async fn begin_send(
     map: HashMap<String, Vec<Recipient>>,
 ) -> (String, String) {
     let unsigned = wallet
-        .send_begin(online.clone(), map, false, 1, 1, None)
+        .send_begin(
+            online.clone(),
+            map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            None,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -193,7 +201,7 @@ async fn witness_receive_settles_without_proxy_txid_and_vout() {
             .witness_receive(
                 None,
                 Assignment::Fungible(amount),
-                None,
+                default_rcv_expiration(),
                 vec![transport_endpoint(PROXY_URL)],
                 1,
             )
@@ -259,7 +267,7 @@ async fn blind_receive_settles_without_proxy_txid() {
         .blind_receive(
             None,
             Assignment::Fungible(66),
-            None,
+            default_rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
         )
@@ -298,7 +306,7 @@ async fn receive_refuses_consignment_without_terminals() {
         .blind_receive(
             None,
             Assignment::Fungible(66),
-            None,
+            default_rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
         )
@@ -338,7 +346,7 @@ async fn witness_receive_multiple_assets_success() {
             .witness_receive(
                 None,
                 Assignment::Fungible(amount),
-                None,
+                default_rcv_expiration(),
                 vec![transport_endpoint(url)],
                 1,
             )
@@ -411,7 +419,7 @@ async fn witness_receive_accepts_repeated_terminal_seal() {
         .witness_receive(
             None,
             Assignment::Fungible(66),
-            None,
+            default_rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
         )
