@@ -155,12 +155,15 @@ use schemata::{IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION};
 use schemata::{InflatableFungibleAsset, NonInflatableAsset};
 use scrypt::{
     Params, Scrypt,
-    password_hash::{PasswordHasher, Salt, SaltString, rand_core::OsRng},
+    password_hash::{
+        PasswordHasher, Salt, SaltString,
+        rand_core::{OsRng, RngCore},
+    },
 };
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use slog::{Drain, Logger, debug, error, info, o, warn};
-use strict_encoding::{DecodeError, DeserializeError, FieldName};
+use strict_encoding::{DecodeError, DeserializeError, FieldName, StrictSerialize};
 use time::OffsetDateTime;
 use typenum::consts::U32;
 

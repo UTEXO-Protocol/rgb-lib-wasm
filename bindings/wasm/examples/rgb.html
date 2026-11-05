@@ -839,10 +839,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const minConf = parseInt(document.getElementById('send-rgb-min-conf').value, 10) || 1;
       try {
         log('sendBegin (RGB)...', 'log-warn');
-        const unsignedPsbt = await state.wallet.sendBegin(
+        const unsignedPsbt = (await state.wallet.sendBegin(
           state.online, recipientMap, donation, BigInt(feeRate), minConf,
-          Math.floor(Date.now() / 1000) + 3600
-        );
+          Math.floor(Date.now() / 1000) + 3600, null, false
+        )).psbt;
         document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
         showResult('send-rgb-output', 'send-rgb-result', 'Unsigned PSBT created. Proceed to Sign.');
         log('sendBegin OK', 'log-ok');
@@ -907,10 +907,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
         log('send RGB (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.sendBegin(
+        const unsignedPsbt = (await state.wallet.sendBegin(
           state.online, recipientMap, donation, BigInt(feeRate), minConf,
-          Math.floor(Date.now() / 1000) + 3600
-        );
+          Math.floor(Date.now() / 1000) + 3600, null, false
+        )).psbt;
         document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
 
         log('send RGB (auto) sign...', 'log-warn');

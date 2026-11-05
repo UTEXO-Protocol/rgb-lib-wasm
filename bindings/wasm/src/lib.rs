@@ -471,10 +471,12 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Send RGB assets (begin): prepare a PSBT. Returns the unsigned PSBT string.
+    /// Send RGB assets (begin): prepare a PSBT. Returns a SendBeginResult JS object
+    /// `{ psbt, batchTransferIdx, details }`.
     ///
     /// `recipient_map_js` is a JS object mapping asset IDs to arrays of Recipient objects.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
+    /// If `dry_run` is true, the wallet does not save the transfer as Initiated.
     #[wasm_bindgen(js_name = "sendBegin")]
     #[allow(clippy::too_many_arguments)]
     pub async fn send_begin(
@@ -486,7 +488,8 @@ impl WasmWallet {
         min_confirmations: u8,
         expiration_timestamp_js: JsValue,
         lock_time: Option<u32>,
-    ) -> Result<String, JsValue> {
+        dry_run: bool,
+    ) -> Result<JsValue, JsValue> {
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
@@ -494,7 +497,7 @@ impl WasmWallet {
             serde_wasm_bindgen::from_value(recipient_map_js)
                 .map_err(|e| JsValue::from_str(&format!("Invalid recipient map: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
-        wallet
+        let result = wallet
             .send_begin(
                 online,
                 recipient_map,
@@ -503,9 +506,11 @@ impl WasmWallet {
                 min_confirmations,
                 expiration_timestamp,
                 lock_time,
+                dry_run,
             )
             .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
     }
 
     /// Send RGB assets (end): broadcast a signed PSBT. Returns an OperationResult JS object.

@@ -309,15 +309,17 @@ impl Wallet {
         Ok(())
     }
 
-    /// Return `true` if a batch transfer with the given `txid` exists in the wallet database
-    /// and is not in `Failed` status. Used to detect idempotent replay of `send_end` after a
-    /// crash-inject reload: if the transfer is already present with a non-failed status, the
-    /// broadcast already happened and the caller may treat the operation as succeeded.
+    /// Return `true` if a batch transfer with the given `txid` exists and is not `Initiated` or `Failed`.
+    /// This means the broadcast already happened.
     pub fn is_batch_transfer_sent(&self, txid: &str) -> Result<bool, Error> {
         let batch_transfers = self.database.iter_batch_transfers()?;
-        Ok(batch_transfers
-            .iter()
-            .any(|bt| bt.txid.as_deref() == Some(txid) && bt.status != TransferStatus::Failed))
+        Ok(batch_transfers.iter().any(|bt| {
+            bt.txid.as_deref() == Some(txid)
+                && !matches!(
+                    bt.status,
+                    TransferStatus::Failed | TransferStatus::Initiated
+                )
+        }))
     }
 
     /// Return the current `Online` handle if the wallet has gone online, or `None` otherwise.

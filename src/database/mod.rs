@@ -76,8 +76,13 @@ impl DbBatchTransfer {
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn pending(&self) -> bool {
-        self.status.pending()
+    pub(crate) fn initiated(&self) -> bool {
+        self.status.initiated()
+    }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn waiting(&self) -> bool {
+        self.status.waiting()
     }
 
     pub(crate) fn waiting_confirmations(&self) -> bool {

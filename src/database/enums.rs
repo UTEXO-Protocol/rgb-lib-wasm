@@ -156,6 +156,11 @@ impl TransferStatus {
     pub(crate) fn waiting_counterparty(&self) -> bool {
         self == &TransferStatus::WaitingCounterparty
     }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn waiting(&self) -> bool {
+        self.waiting_counterparty() || self.waiting_confirmations()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
