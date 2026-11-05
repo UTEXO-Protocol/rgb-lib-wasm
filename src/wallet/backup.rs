@@ -43,6 +43,9 @@ pub(crate) struct WalletBackupPayload {
     #[serde(default)]
     pub(crate) transfer_artifacts:
         std::collections::HashMap<String, super::online::TransferArtifacts>,
+    /// Consignments of incoming transfers waiting to settle, base64, keyed by recipient ID.
+    #[serde(default)]
+    pub(crate) received_consignments: std::collections::HashMap<String, String>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -184,7 +187,16 @@ impl super::Wallet {
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
-            received_consignments: Default::default(),
+            received_consignments: payload
+                .received_consignments
+                .into_iter()
+                .map(|(recipient_id, b64)| {
+                    general_purpose::STANDARD
+                        .decode(b64)
+                        .map(|bytes| (recipient_id, bytes))
+                        .map_err(|_| Error::InvalidBackup)
+                })
+                .collect::<Result<_, _>>()?,
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
@@ -325,6 +337,41 @@ impl super::Wallet {
         })
     }
 
+    /// The received consignments still needed to settle an incoming transfer, base64.
+    fn settling_consignments_b64(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, Error> {
+        use crate::database::enums::TransferStatus;
+
+        let db_data = self.database.get_db_data(false)?;
+        let settling: std::collections::HashSet<i32> = db_data
+            .batch_transfers
+            .iter()
+            .filter(|bt| bt.status == TransferStatus::WaitingConfirmations)
+            .flat_map(|bt| {
+                db_data
+                    .asset_transfers
+                    .iter()
+                    .filter(move |at| at.batch_transfer_idx == bt.idx)
+                    .map(|at| at.idx)
+            })
+            .collect();
+        Ok(db_data
+            .transfers
+            .iter()
+            .filter(|t| t.incoming && settling.contains(&t.asset_transfer_idx))
+            .filter_map(|t| t.recipient_id.as_ref())
+            .filter_map(|recipient_id| {
+                self.received_consignments.get(recipient_id).map(|bytes| {
+                    (
+                        recipient_id.clone(),
+                        general_purpose::STANDARD.encode(bytes),
+                    )
+                })
+            })
+            .collect())
+    }
+
     /// Serialize the wallet state to JSON bytes (shared by local backup and VSS).
     fn serialize_backup_payload(&self) -> Result<Vec<u8>, Error> {
         let stock_ref = self.rgb_stock.borrow();
@@ -355,6 +402,7 @@ impl super::Wallet {
             stock_index_b64: general_purpose::STANDARD.encode(index_bytes.as_unconfined()),
             reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
+            received_consignments: self.settling_consignments_b64()?,
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -639,10 +687,46 @@ mod tests {
         refresh_fails_transfer_without_signed_psbt_impl(Some("rgb:test-asset"));
     }
 
+    // An incoming transfer received on `recipient_id`, its batch in `status`.
+    fn seed_incoming_transfer(
+        wallet: &mut crate::wallet::Wallet,
+        recipient_id: &str,
+        status: crate::database::enums::TransferStatus,
+    ) {
+        use crate::database::memory_db::{
+            ActiveValue, DbAssetTransferActMod, DbBatchTransferActMod, DbTransferActMod,
+        };
+
+        let batch_idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                status: ActiveValue::Set(status),
+                ..Default::default()
+            })
+            .unwrap();
+        let asset_transfer_idx = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                incoming: ActiveValue::Set(true),
+                recipient_id: ActiveValue::Set(Some(recipient_id.to_string())),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn vss_restore_payload_keeps_transfer_artifacts() {
+    fn restore_payload_keeps_artifacts_and_settling_consignments() {
         // vss_restore_backup shares restore_payload with restore_backup, so this
         // exercises the exact code the VSS path runs on the downloaded backup.
+        use crate::database::enums::TransferStatus;
         use crate::keys::generate_keys;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
         use crate::wallet::online::TransferArtifacts;
@@ -651,16 +735,27 @@ mod tests {
         let txid = "2".repeat(64);
         let keys = generate_keys(crate::BitcoinNetwork::Regtest);
 
-        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
-        *sender.rgb_stock.borrow_mut() = Some(Stock::in_memory());
-        sender.transfer_artifacts.insert(
+        let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
                 signed_psbt: Some(s!("psbt")),
                 ..Default::default()
             },
         );
-        let payload_json = sender.serialize_backup_payload().unwrap();
+        seed_incoming_transfer(
+            &mut wallet,
+            "settling",
+            TransferStatus::WaitingConfirmations,
+        );
+        seed_incoming_transfer(&mut wallet, "failed", TransferStatus::Failed);
+        for recipient_id in ["settling", "failed", "unknown"] {
+            wallet
+                .received_consignments
+                .insert(recipient_id.to_string(), recipient_id.as_bytes().to_vec());
+        }
+        let payload_json = wallet.serialize_backup_payload().unwrap();
 
         let mut restored = make_test_wallet_with_keys(keys, false);
         restored.restore_payload(&payload_json).unwrap();
@@ -672,5 +767,37 @@ mod tests {
                 .and_then(|a| a.signed_psbt.clone()),
             Some(s!("psbt"))
         );
+        assert_eq!(
+            restored.received_consignments,
+            std::collections::HashMap::from([(s!("settling"), b"settling".to_vec())])
+        );
+    }
+
+    #[test]
+    fn restore_payload_without_received_consignments() {
+        use crate::keys::generate_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use rgbstd::persistence::Stock;
+
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+        let wallet = make_test_wallet_with_keys(keys.clone(), false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&wallet.serialize_backup_payload().unwrap()).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("received_consignments")
+            .unwrap();
+
+        let mut restored = make_test_wallet_with_keys(keys, false);
+        restored
+            .received_consignments
+            .insert(s!("stale"), b"stale".to_vec());
+        restored
+            .restore_payload(&serde_json::to_vec(&payload).unwrap())
+            .unwrap();
+
+        assert!(restored.received_consignments.is_empty());
     }
 }

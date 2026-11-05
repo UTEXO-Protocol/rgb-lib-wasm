@@ -132,6 +132,7 @@ impl WasmProxyClient {
         &self,
         url: &str,
         recipient_id: String,
+        timeout: Option<std::time::Duration>,
     ) -> Result<JsonRpcResponse<GetConsignmentResponse>, Error> {
         let body = JsonRpcRequest {
             method: s!("consignment.get"),
@@ -139,10 +140,11 @@ impl WasmProxyClient {
             id: None,
             params: Some(RecipientIDParam { recipient_id }),
         };
-        Ok(self
-            .client
-            .post(url)
-            .json(&body)
+        let mut request = self.client.post(url).json(&body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        Ok(request
             .send()
             .await
             .map_err(|e| Error::Proxy {
