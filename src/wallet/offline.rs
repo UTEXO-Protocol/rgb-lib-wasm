@@ -364,6 +364,26 @@ pub struct ReceiveData {
     pub expiration_timestamp: u64,
     /// Batch transfer idx
     pub batch_transfer_idx: i32,
+    /// Recipient's Ed25519 public key (hex-encoded), as embedded in the invoice
+    pub public_key: String,
+}
+
+/// Data of a receive operation, ready to be stored.
+pub(crate) struct ReceiveDataInternal {
+    asset_id: Option<String>,
+    detected_assignment: Assignment,
+    invoice_string: String,
+    recipient_id: String,
+    endpoints: Vec<String>,
+    created_at: i64,
+    expiration_timestamp: i64,
+    recipient_type_full: RecipientTypeFull,
+    blind_seal: Option<GraphSeal>,
+    script_pubkey: Option<ScriptBuf>,
+    operation_secret_key: Vec<u8>,
+    recipient_pubkey: Vec<u8>,
+    encryption: Encryption,
+    retention_deadline: Option<i64>,
 }
 
 /// The type of an RGB recipient
@@ -573,6 +593,8 @@ impl Invoice {
             expiration_timestamp: decoded.expiry,
             transport_endpoints,
             network,
+            public_key: decoded.public_key,
+            encryption: Encryption::from(decoded.encryption),
         };
 
         Ok(Invoice {
@@ -612,6 +634,10 @@ pub struct InvoiceData {
     pub expiration_timestamp: Option<i64>,
     /// Transport endpoints
     pub transport_endpoints: Vec<String>,
+    /// Recipient's Ed25519 public key (hex-encoded), from the invoice `pk` field (if present)
+    pub public_key: Option<String>,
+    /// Consignment/media encryption preference, from the invoice `enc` field
+    pub encryption: Encryption,
 }
 
 /// Data for operations that require the wallet to be online.
@@ -683,6 +709,16 @@ pub struct Recipient {
     pub assignment: Assignment,
     /// Transport endpoints
     pub transport_endpoints: Vec<String>,
+    /// Recipient's Ed25519 public key (hex-encoded), taken from the invoice `pk` field.
+    pub public_key: Option<String>,
+    /// The recipient's consignment/media encryption preference, taken from the invoice `enc`
+    /// field. This is not a choice of the sender, who must honor it.
+    pub encryption: Encryption,
+    /// The invoice expiration (UNIX timestamp, seconds), taken from the invoice.
+    ///
+    /// The transfer cannot be created after it and the operation expiration needs to leave the
+    /// time to detect the ACK and broadcast the TX before it.
+    pub expiration_timestamp: Option<u64>,
 }
 
 /// The information needed to receive RGB assets in witness mode.
@@ -775,6 +811,17 @@ pub enum AssetFilter {
     Id(String),
 }
 
+/// Proxy data of a received consignment, saved until the transfer ends.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct ReceivedConsignmentMeta {
+    pub(crate) proxy_url: Option<String>,
+    pub(crate) transfer_id: Option<String>,
+    pub(crate) sender_transport_endpoint: String,
+    pub(crate) sender_pubkey: String,
+    pub(crate) consignment_hash: String,
+    pub(crate) batch: bool,
+}
+
 /// An RGB transfer.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -807,6 +854,8 @@ pub struct Transfer {
     pub expiration_timestamp: Option<u64>,
     /// Transport endpoints for the transfer
     pub transport_endpoints: Vec<TransferTransportEndpoint>,
+    /// Sender proxy endpoint of the transfer, where the ACK is posted and the signed TX released
+    pub sender_transport_endpoint: Option<String>,
     /// Invoice string of the incoming transfer
     pub invoice_string: Option<String>,
     /// Consignment path
@@ -818,6 +867,7 @@ impl Transfer {
         x: &DbTransfer,
         td: TransferData,
         transport_endpoints: Vec<TransferTransportEndpoint>,
+        sender_transport_endpoint: Option<String>,
     ) -> Transfer {
         Transfer {
             idx: x.idx,
@@ -834,6 +884,7 @@ impl Transfer {
             change_utxo: td.change_utxo,
             expiration_timestamp: td.expiration.map(|t| t as u64),
             transport_endpoints,
+            sender_transport_endpoint,
             invoice_string: x.invoice_string.clone(),
             consignment_path: td.consignment_path,
         }
@@ -1022,6 +1073,12 @@ pub struct Wallet {
     /// Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
+    /// Proxy data of each received consignment. Key: recipient_id
+    #[cfg(feature = "esplora")]
+    pub(crate) received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
+    /// Signed TX released by the sender proxy. Key: recipient_id
+    #[cfg(feature = "esplora")]
+    pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent in-memory RGB stock.
@@ -1168,6 +1225,10 @@ impl Wallet {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            received_consignment_meta: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            received_signed_txs: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: {
@@ -1411,6 +1472,51 @@ impl Wallet {
             })?;
 
         Ok(())
+    }
+
+    /// Persist the sender's own proxy endpoint for a transfer (the target for the recipient's ACK
+    /// and the signed-TX release), tagged with the [`TransportEndpointKind::SenderProxy`] role.
+    #[cfg(feature = "esplora")]
+    pub(crate) fn save_sender_transport_endpoint(
+        &self,
+        transfer_idx: i32,
+        endpoint: &str,
+    ) -> Result<(), Error> {
+        let transport_endpoint_idx =
+            match self.database.get_transport_endpoint(endpoint.to_string())? {
+                Some(ce) => ce.idx,
+                None => self
+                    .database
+                    .set_transport_endpoint(DbTransportEndpointActMod {
+                        transport_type: ActiveValue::Set(TransportType::JsonRpc),
+                        endpoint: ActiveValue::Set(endpoint.to_string()),
+                        ..Default::default()
+                    })?,
+            };
+        // `used` is false, so the row never shows up as a used endpoint
+        self.database
+            .set_transfer_transport_endpoint(DbTransferTransportEndpointActMod {
+                transfer_idx: ActiveValue::Set(transfer_idx),
+                transport_endpoint_idx: ActiveValue::Set(transport_endpoint_idx),
+                used: ActiveValue::Set(false),
+                kind: ActiveValue::Set(TransportEndpointKind::SenderProxy),
+                ..Default::default()
+            })?;
+        Ok(())
+    }
+
+    /// Convert a single `RgbTransport`-format endpoint (e.g. `rpc://host`) to its HTTP(S) URL.
+    #[cfg(feature = "esplora")]
+    pub(crate) fn convert_transport_endpoint_url(&self, endpoint: &str) -> Result<String, Error> {
+        let rgb_transport = RgbTransport::from_str(endpoint)?;
+        match &rgb_transport {
+            RgbTransport::JsonRpc { .. } => Ok(TransportEndpoint::try_from(rgb_transport)
+                .map_err(|e| Error::InvalidTransportEndpoint {
+                    details: e.to_string(),
+                })?
+                .endpoint),
+            _ => Err(Error::UnsupportedTransportType),
+        }
     }
 
     pub(crate) fn check_details(&self, details: String) -> Result<Details, Error> {
@@ -2486,10 +2592,15 @@ impl Wallet {
                     )?,
                     tte_data
                         .iter()
+                        .filter(|(tte, _)| tte.kind == TransportEndpointKind::RecipientProxy)
                         .map(|(tte, ce)| {
                             TransferTransportEndpoint::from_db_transfer_transport_endpoint(tte, ce)
                         })
                         .collect(),
+                    tte_data
+                        .iter()
+                        .find(|(tte, _)| tte.kind == TransportEndpointKind::SenderProxy)
+                        .map(|(_, ce)| ce.endpoint.clone()),
                 ))
             })
             .collect::<Result<Vec<Transfer>, Error>>()?;
@@ -2584,122 +2695,272 @@ impl Wallet {
         Ok(unspents)
     }
 
-    fn _receive(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    async fn create_receive_data(
+        &mut self,
+        online: Option<Online>,
         asset_id: Option<String>,
         assignment: Assignment,
         expiration_timestamp: i64,
         transport_endpoints: Vec<String>,
-        min_confirmations: u8,
-        beneficiary: Beneficiary,
-        recipient_type: RecipientTypeFull,
-    ) -> Result<(String, String, i32), Error> {
-        let network: ChainNet = self.bitcoin_network().into();
+        recipient_type: RecipientType,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveDataInternal, Error> {
+        let encryption = encryption.unwrap_or(Encryption::Required);
 
-        let beneficiary = XChainNet::with(network, beneficiary);
-        let recipient_id = beneficiary.to_string();
-        debug!(self.logger, "Recipient ID: {recipient_id}");
-        let (schema, contract_id) = if let Some(aid) = asset_id.clone() {
-            let asset = self.database.check_asset_exists(aid.clone())?;
-            let contract_id = ContractId::from_str(&aid).expect("invalid contract ID");
-            (Some(asset.schema), Some(contract_id))
-        } else {
-            (None, None)
-        };
-
-        self.check_transport_endpoints(&transport_endpoints)?;
-        let mut transport_endpoints_dedup = transport_endpoints.clone();
-        transport_endpoints_dedup.sort();
-        transport_endpoints_dedup.dedup();
-        if transport_endpoints_dedup.len() != transport_endpoints.len() {
-            return Err(Error::InvalidTransportEndpoints {
-                details: s!("no duplicate transport endpoints allowed"),
-            });
+        #[cfg(not(feature = "esplora"))]
+        {
+            let _ = online;
+            return Err(Error::Offline);
         }
-        let mut endpoints: Vec<String> = vec![];
-        for endpoint_str in &transport_endpoints {
-            let rgb_transport = RgbTransport::from_str(endpoint_str)?;
-            match &rgb_transport {
-                RgbTransport::JsonRpc { .. } => {
-                    endpoints.push(
-                        TransportEndpoint::try_from(rgb_transport)
-                            .unwrap()
-                            .endpoint
-                            .clone(),
+        #[cfg(feature = "esplora")]
+        {
+            let online = online.ok_or(Error::OnlineNeeded)?;
+            self.check_online(online)?;
+
+            let (beneficiary, recipient_type_full, blind_seal, script_pubkey) = match recipient_type
+            {
+                RecipientType::Blind => {
+                    let mut unspents: Vec<LocalUnspent> = self.database.get_rgb_allocations(
+                        self.database.get_unspent_txos(vec![])?,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    unspents.retain(|u| {
+                        !(u.rgb_allocations
+                            .iter()
+                            .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                    });
+                    let utxo = self.get_utxo(&[], Some(&unspents), true, None)?;
+                    let unblinded_utxo = utxo.outpoint();
+                    debug!(
+                        self.logger,
+                        "Blinding outpoint '{}'",
+                        unblinded_utxo.to_string()
                     );
+                    let blind_seal = self.get_blind_seal(utxo.clone()).transmutate();
+                    let beneficiary = Beneficiary::BlindedSeal(blind_seal.conceal());
+                    let recipient_type_full = RecipientTypeFull::Blind { unblinded_utxo };
+                    (beneficiary, recipient_type_full, Some(blind_seal), None)
                 }
-                _ => {
-                    return Err(Error::UnsupportedTransportType);
+                RecipientType::Witness => {
+                    let script_pubkey = self.get_new_address()?.script_pubkey();
+                    let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
+                    let recipient_type_full = RecipientTypeFull::Witness { vout: None };
+                    (beneficiary, recipient_type_full, None, Some(script_pubkey))
+                }
+            };
+
+            let network: ChainNet = self.bitcoin_network().into();
+            let beneficiary = XChainNet::with(network, beneficiary);
+            let recipient_id = beneficiary.to_string();
+            debug!(self.logger, "Recipient ID: {recipient_id}");
+            let (schema, contract_id) = if let Some(aid) = asset_id.clone() {
+                let asset = self.database.check_asset_exists(aid.clone())?;
+                let contract_id = ContractId::from_str(&aid).expect("invalid contract ID");
+                (Some(asset.schema), Some(contract_id))
+            } else {
+                (None, None)
+            };
+
+            self.check_transport_endpoints(&transport_endpoints)?;
+            let mut transport_endpoints_dedup = transport_endpoints.clone();
+            transport_endpoints_dedup.sort();
+            transport_endpoints_dedup.dedup();
+            if transport_endpoints_dedup.len() != transport_endpoints.len() {
+                return Err(Error::InvalidTransportEndpoints {
+                    details: s!("no duplicate transport endpoints allowed"),
+                });
+            }
+            let mut endpoints: Vec<String> = vec![];
+            for endpoint_str in &transport_endpoints {
+                let rgb_transport = RgbTransport::from_str(endpoint_str)?;
+                match &rgb_transport {
+                    RgbTransport::JsonRpc { .. } => {
+                        endpoints.push(
+                            TransportEndpoint::try_from(rgb_transport)
+                                .unwrap()
+                                .endpoint
+                                .clone(),
+                        );
+                    }
+                    _ => {
+                        return Err(Error::UnsupportedTransportType);
+                    }
                 }
             }
-        }
 
-        let mut invoice_builder = RgbInvoiceBuilder::new(beneficiary);
-        if let Some(schema) = schema {
-            invoice_builder = invoice_builder.set_schema(schema.into());
-        }
-        if let Some(contract_id) = contract_id {
-            invoice_builder = invoice_builder.set_contract(contract_id);
-        }
-        let transports: Vec<&str> = transport_endpoints.iter().map(AsRef::as_ref).collect();
-        invoice_builder = invoice_builder.add_transports(transports).unwrap();
-        let detected_assignment = match (&assignment, schema) {
-            (Assignment::Fungible(amt), Some(AssetSchema::Nia) | Some(AssetSchema::Ifa) | None) => {
-                invoice_builder = invoice_builder.set_amount_raw(*amt);
-                invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
-                assignment
+            let mut invoice_builder = RgbInvoiceBuilder::new(beneficiary);
+            if let Some(schema) = schema {
+                invoice_builder = invoice_builder.set_schema(schema.into());
             }
-            (Assignment::Any, Some(AssetSchema::Nia)) => {
-                invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
-                Assignment::Fungible(0)
+            if let Some(contract_id) = contract_id {
+                invoice_builder = invoice_builder.set_contract(contract_id);
             }
-            (Assignment::InflationRight(amt), Some(AssetSchema::Ifa)) => {
-                invoice_builder = invoice_builder.set_amount_raw(*amt);
-                invoice_builder =
-                    invoice_builder.set_assignment_name(RGB_STATE_INFLATION_ALLOWANCE);
-                assignment
+            let transports: Vec<&str> = transport_endpoints.iter().map(AsRef::as_ref).collect();
+            invoice_builder = invoice_builder.add_transports(transports).unwrap();
+            let detected_assignment = match (&assignment, schema) {
+                (
+                    Assignment::Fungible(amt),
+                    Some(AssetSchema::Nia) | Some(AssetSchema::Ifa) | None,
+                ) => {
+                    invoice_builder = invoice_builder.set_amount_raw(*amt);
+                    invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
+                    assignment
+                }
+                (Assignment::Any, Some(AssetSchema::Nia)) => {
+                    invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
+                    Assignment::Fungible(0)
+                }
+                (Assignment::InflationRight(amt), Some(AssetSchema::Ifa)) => {
+                    invoice_builder = invoice_builder.set_amount_raw(*amt);
+                    invoice_builder =
+                        invoice_builder.set_assignment_name(RGB_STATE_INFLATION_ALLOWANCE);
+                    assignment
+                }
+                (Assignment::Any, _) => Assignment::Any,
+                _ => return Err(Error::InvalidAssignment),
+            };
+            let created_at = now().unix_timestamp();
+            if expiration_timestamp < created_at {
+                return Err(Error::InvalidExpiration);
             }
-            (Assignment::Any, _) => Assignment::Any,
-            _ => return Err(Error::InvalidAssignment),
-        };
-        let created_at = now().unix_timestamp();
-        if expiration_timestamp < created_at {
-            return Err(Error::InvalidExpiration);
-        }
-        invoice_builder = invoice_builder.set_expiry_timestamp(expiration_timestamp);
-        let invoice = invoice_builder.finish();
-        let invoice_string = invoice.to_string();
+            invoice_builder = invoice_builder.set_expiry_timestamp(expiration_timestamp);
 
+            // the per-operation Ed25519 key: the invoice carries its public key and the
+            // encryption preference
+            let recipient_sk = crate::encryption::gen_ed25519();
+            let recipient_vk = recipient_sk.verifying_key();
+            invoice_builder = invoice_builder.set_public_key(recipient_vk.to_bytes());
+            invoice_builder = invoice_builder.set_encryption(encryption.into());
+
+            let invoice_string = invoice_builder.finish().to_string();
+
+            // for a blind receive, the invoice expiration plus the longest retention grace among
+            // the proxies, until which a transfer to the invoice can still be downloaded
+            let mut retention_deadline: Option<i64> = None;
+
+            // reserve the invoice on the proxies
+            let recipient_pk = hex::encode(recipient_vk.to_bytes());
+            let invoice_id = invoice_id(&recipient_id, &recipient_pk);
+            let reservation_expiration = expiration_timestamp.to_string();
+            let mut reserved = false;
+            // whether a proxy refused the reservation as it is draining
+            let mut draining = false;
+            for endpoint in &endpoints {
+                // skip endpoints that are unreachable or run an unsupported protocol version
+                let Ok(info) = crate::utils::check_proxy(endpoint).await else {
+                    continue;
+                };
+                let proxy_client = ProxyClient::new(endpoint)?;
+                // only needed by proxies with proxy-level authentication enabled
+                let signature = self.online_data.as_ref().and_then(|online_data| {
+                    online_data.proxy_auth_signature(
+                        endpoint,
+                        &prepare_invoice_auth_message(
+                            &invoice_id,
+                            &reservation_expiration,
+                            &recipient_pk,
+                        ),
+                    )
+                });
+                match proxy_client
+                    .prepare_invoice(
+                        &invoice_id,
+                        &reservation_expiration,
+                        &recipient_pk,
+                        signature,
+                    )
+                    .await
+                {
+                    Ok(res) if res.error.is_none() => {
+                        reserved = true;
+                        if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
+                            let deadline = expiration_timestamp
+                                + i64::from(crate::utils::proxy_retention_grace(&info));
+                            retention_deadline = Some(std::cmp::max(
+                                retention_deadline.unwrap_or(deadline),
+                                deadline,
+                            ));
+                        }
+                    }
+                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
+                        // a draining proxy, the invoice can be reserved on the other ones
+                        Error::ProxyDraining => draining = true,
+                        // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
+                        e => return Err(e),
+                    },
+                    Err(_) => continue,
+                }
+            }
+            if !reserved {
+                return Err(if draining {
+                    Error::ProxyDraining
+                } else {
+                    Error::NoValidTransportEndpoint
+                });
+            }
+
+            Ok(ReceiveDataInternal {
+                asset_id,
+                detected_assignment,
+                invoice_string,
+                recipient_id,
+                endpoints,
+                created_at,
+                expiration_timestamp,
+                recipient_type_full,
+                blind_seal,
+                script_pubkey,
+                operation_secret_key: recipient_sk.to_bytes().to_vec(),
+                recipient_pubkey: recipient_vk.to_bytes().to_vec(),
+                encryption,
+                retention_deadline,
+            })
+        }
+    }
+
+    fn store_receive_transfer(
+        &self,
+        data: &ReceiveDataInternal,
+        min_confirmations: u8,
+    ) -> Result<i32, Error> {
         let batch_transfer = DbBatchTransferActMod {
             status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
-            expiration: ActiveValue::Set(Some(expiration_timestamp)),
-            created_at: ActiveValue::Set(created_at),
+            expiration: ActiveValue::Set(Some(data.expiration_timestamp)),
+            created_at: ActiveValue::Set(data.created_at),
             min_confirmations: ActiveValue::Set(min_confirmations),
+            operation_secret_key: ActiveValue::Set(Some(data.operation_secret_key.clone())),
+            retention_deadline: ActiveValue::Set(data.retention_deadline),
             ..Default::default()
         };
         let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
         let asset_transfer = DbAssetTransferActMod {
             user_driven: ActiveValue::Set(true),
             batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
-            asset_id: ActiveValue::Set(asset_id),
+            asset_id: ActiveValue::Set(data.asset_id.clone()),
             ..Default::default()
         };
         let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
         let transfer = DbTransferActMod {
             asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-            requested_assignment: ActiveValue::Set(Some(detected_assignment)),
+            requested_assignment: ActiveValue::Set(Some(data.detected_assignment.clone())),
             incoming: ActiveValue::Set(true),
-            recipient_id: ActiveValue::Set(Some(recipient_id.clone())),
-            recipient_type: ActiveValue::Set(Some(recipient_type)),
-            invoice_string: ActiveValue::Set(Some(invoice_string.clone())),
+            recipient_id: ActiveValue::Set(Some(data.recipient_id.clone())),
+            recipient_type: ActiveValue::Set(Some(data.recipient_type_full.clone())),
+            invoice_string: ActiveValue::Set(Some(data.invoice_string.clone())),
+            recipient_pubkey: ActiveValue::Set(Some(data.recipient_pubkey.clone())),
+            recipient_encryption: ActiveValue::Set(data.encryption),
             ..Default::default()
         };
         let transfer_idx = self.database.set_transfer(transfer)?;
-        for endpoint in endpoints {
+        for endpoint in &data.endpoints {
             self.save_transfer_transport_endpoint(
                 transfer_idx,
                 &LocalTransportEndpoint {
-                    endpoint,
+                    endpoint: endpoint.clone(),
                     transport_type: TransportType::JsonRpc,
                     used: false,
                     usable: true,
@@ -2707,7 +2968,22 @@ impl Wallet {
             )?;
         }
 
-        Ok((recipient_id, invoice_string, batch_transfer_idx))
+        if let Some(blind_seal) = data.blind_seal {
+            let mut runtime = self.rgb_runtime()?;
+            runtime.store_secret_seal(blind_seal)?;
+            // Drop runtime so Stock returns to RefCell before auto-save
+            drop(runtime);
+        }
+
+        if let Some(script_pubkey) = &data.script_pubkey {
+            self.database
+                .set_pending_witness_script(DbPendingWitnessScriptActMod {
+                    script: ActiveValue::Set(script_pubkey.to_hex_string()),
+                    ..Default::default()
+                })?;
+        }
+
+        Ok(batch_transfer_idx)
     }
 
     /// Blind an UTXO to receive RGB assets and return the resulting [`ReceiveData`].
@@ -2729,16 +3005,24 @@ impl Wallet {
     /// At the moment the only supported variant is JsonRpc (e.g. `rpc://127.0.0.1` or
     /// `rpcs://example.com`).
     ///
+    /// The wallet reserves the invoice on each endpoint, so it needs to be online.
+    ///
     /// The `min_confirmations` number determines the minimum number of confirmations needed for
     /// the transaction anchoring the transfer for it to be considered final and move (while
     /// refreshing) to the [`TransferStatus::Settled`] status.
-    pub fn blind_receive(
-        &self,
+    ///
+    /// The `encryption` preference is embedded in the invoice and is [`Encryption::Required`] when
+    /// not specified.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blind_receive(
+        &mut self,
+        online: Option<Online>,
         asset_id: Option<String>,
         assignment: Assignment,
         expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
+        encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
@@ -2747,52 +3031,29 @@ impl Wallet {
             expiration_timestamp
         );
 
-        let mut unspents: Vec<LocalUnspent> = self.database.get_rgb_allocations(
-            self.database.get_unspent_txos(vec![])?,
-            None,
-            None,
-            None,
-            None,
-        )?;
-        unspents.retain(|u| {
-            !(u.rgb_allocations
-                .iter()
-                .any(|a| !a.incoming && a.status.waiting_counterparty()))
-        });
-        let utxo = self.get_utxo(&[], Some(&unspents), true, None)?;
-        let unblinded_utxo = utxo.outpoint();
-        debug!(
-            self.logger,
-            "Blinding outpoint '{}'",
-            unblinded_utxo.to_string()
-        );
-        let blind_seal = self.get_blind_seal(utxo.clone()).transmutate();
-        let beneficiary = Beneficiary::BlindedSeal(blind_seal.conceal());
-
-        let (recipient_id, invoice, batch_transfer_idx) = self._receive(
-            asset_id,
-            assignment,
-            expiration_timestamp as i64,
-            transport_endpoints,
-            min_confirmations,
-            beneficiary,
-            RecipientTypeFull::Blind { unblinded_utxo },
-        )?;
-
-        let mut runtime = self.rgb_runtime()?;
-        runtime.store_secret_seal(blind_seal)?;
-        // Drop runtime so Stock returns to RefCell before auto-save
-        drop(runtime);
+        let data = self
+            .create_receive_data(
+                online,
+                asset_id,
+                assignment,
+                expiration_timestamp as i64,
+                transport_endpoints,
+                RecipientType::Blind,
+                encryption,
+            )
+            .await?;
+        let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
 
         info!(self.logger, "Blind receive completed");
         Ok(ReceiveData {
-            invoice,
-            recipient_id,
+            invoice: data.invoice_string,
+            recipient_id: data.recipient_id,
             expiration_timestamp,
             batch_transfer_idx,
+            public_key: hex::encode(&data.recipient_pubkey),
         })
     }
 
@@ -2815,16 +3076,24 @@ impl Wallet {
     /// At the moment the only supported variant is JsonRpc (e.g. `rpc://127.0.0.1` or
     /// `rpcs://example.com`).
     ///
+    /// The wallet reserves the invoice on each endpoint, so it needs to be online.
+    ///
     /// The `min_confirmations` number determines the minimum number of confirmations needed for
     /// the transaction anchoring the transfer for it to be considered final and move (while
     /// refreshing) to the [`TransferStatus::Settled`] status.
-    pub fn witness_receive(
+    ///
+    /// The `encryption` preference is embedded in the invoice and is [`Encryption::Required`] when
+    /// not specified.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn witness_receive(
         &mut self,
+        online: Option<Online>,
         asset_id: Option<String>,
         assignment: Assignment,
         expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
+        encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
@@ -2833,34 +3102,29 @@ impl Wallet {
             expiration_timestamp
         );
 
-        let script_pubkey = self.get_new_address()?.script_pubkey();
-        let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
-
-        let (recipient_id, invoice, batch_transfer_idx) = self._receive(
-            asset_id,
-            assignment,
-            expiration_timestamp as i64,
-            transport_endpoints,
-            min_confirmations,
-            beneficiary,
-            RecipientTypeFull::Witness { vout: None },
-        )?;
-
-        self.database
-            .set_pending_witness_script(DbPendingWitnessScriptActMod {
-                script: ActiveValue::Set(script_pubkey.to_hex_string()),
-                ..Default::default()
-            })?;
+        let data = self
+            .create_receive_data(
+                online,
+                asset_id,
+                assignment,
+                expiration_timestamp as i64,
+                transport_endpoints,
+                RecipientType::Witness,
+                encryption,
+            )
+            .await?;
+        let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
 
         info!(self.logger, "Witness receive completed");
         Ok(ReceiveData {
-            invoice,
-            recipient_id,
+            invoice: data.invoice_string,
+            recipient_id: data.recipient_id,
             expiration_timestamp,
             batch_transfer_idx,
+            public_key: hex::encode(&data.recipient_pubkey),
         })
     }
 
@@ -2991,7 +3255,7 @@ impl Wallet {
         self.save_to_idb();
     }
 
-    fn snapshot(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
+    pub(crate) fn snapshot(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
         let stock = self
             .rgb_stock
             .try_borrow()
@@ -3015,6 +3279,8 @@ impl Wallet {
             bdk_changeset: self.bdk_database.get_data().clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
+            received_consignment_meta: self.received_consignment_meta.clone(),
+            received_signed_txs: self.received_signed_txs.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
         })
@@ -3136,6 +3402,8 @@ impl Wallet {
 
         // Restore received consignments
         self.received_consignments = snapshot.received_consignments;
+        self.received_consignment_meta = snapshot.received_consignment_meta;
+        self.received_signed_txs = snapshot.received_signed_txs;
 
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
@@ -3216,6 +3484,10 @@ pub(crate) mod address_reuse_tests {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            received_consignment_meta: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            received_signed_txs: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
@@ -3277,47 +3549,123 @@ pub(crate) mod address_reuse_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod receive_expiration_tests {
     use super::address_reuse_tests::make_test_wallet;
     use super::*;
 
+    const INDEXER_URL: &str = "http://127.0.0.1:1";
+
+    fn online(wallet: &mut Wallet) -> Online {
+        wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
+        Online {
+            id: 1,
+            indexer_url: INDEXER_URL.to_string(),
+        }
+    }
+
+    // A proxy answering `server.info` and `invoice.prepare`.
+    fn proxy() -> (mockito::ServerGuard, Vec<mockito::Mock>) {
+        let mut server = mockito::Server::new();
+        let info = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!("server.info")))
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"0.4.0","uptime":1,"retention_grace_secs":"100"}}"#,
+            )
+            .create();
+        let prepare = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!("invoice.prepare")))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
+            .create();
+        (server, vec![info, prepare])
+    }
+
     #[test]
     fn receive_past_expiration_fails() {
         let mut wallet = make_test_wallet(false);
-        let result = wallet.witness_receive(
+        let online = online(&mut wallet);
+        let result = crate::block_on(wallet.witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             now().unix_timestamp() as u64 - 1,
             vec![s!("rpc://127.0.0.1")],
             1,
-        );
+            None,
+        ));
         assert!(matches!(result, Err(Error::InvalidExpiration)));
         let db_data = wallet.database.get_db_data(false).unwrap();
         assert!(db_data.batch_transfers.is_empty());
     }
 
     #[test]
-    fn receive_keeps_given_expiration() {
+    fn receive_needs_online() {
         let mut wallet = make_test_wallet(false);
-        let exp = now().unix_timestamp() + 100_000;
-        let beneficiary =
-            beneficiary_from_script_buf(wallet.get_new_address().unwrap().script_pubkey());
-        let (_, invoice, _) = wallet
-            ._receive(
+        let exp = now().unix_timestamp() as u64 + 100_000;
+        for result in [
+            crate::block_on(wallet.witness_receive(
+                None,
                 None,
                 Assignment::Any,
                 exp,
                 vec![s!("rpc://127.0.0.1")],
                 1,
-                beneficiary,
-                RecipientTypeFull::Witness { vout: None },
-            )
-            .unwrap();
+                None,
+            )),
+            crate::block_on(wallet.blind_receive(
+                None,
+                None,
+                Assignment::Any,
+                exp,
+                vec![s!("rpc://127.0.0.1")],
+                1,
+                None,
+            )),
+        ] {
+            assert!(matches!(result, Err(Error::OnlineNeeded)));
+        }
+        let db_data = wallet.database.get_db_data(false).unwrap();
+        assert!(db_data.batch_transfers.is_empty());
+    }
+
+    #[test]
+    fn receive_keeps_given_expiration_and_stores_v1_data() {
+        let mut wallet = make_test_wallet(false);
+        let online = online(&mut wallet);
+        let (server, _mocks) = proxy();
+        let exp = now().unix_timestamp() + 100_000;
+        let data = crate::block_on(wallet.create_receive_data(
+            Some(online),
+            None,
+            Assignment::Any,
+            exp,
+            vec![format!("rpc://{}", server.host_with_port())],
+            RecipientType::Witness,
+            Some(Encryption::Optional),
+        ))
+        .unwrap();
+        wallet.store_receive_transfer(&data, 1).unwrap();
+        let public_key = hex::encode(&data.recipient_pubkey);
         let db_data = wallet.database.get_db_data(false).unwrap();
         assert_eq!(db_data.batch_transfers.len(), 1);
-        assert_eq!(db_data.batch_transfers[0].expiration, Some(exp));
-        let invoice_data = Invoice::new(invoice).unwrap().invoice_data();
+        let batch = &db_data.batch_transfers[0];
+        assert_eq!(batch.expiration, Some(exp));
+        assert!(batch.operation_secret_key.is_some());
+        // the retention deadline is only for a blind receive
+        assert_eq!(batch.retention_deadline, None);
+        let transfer = &db_data.transfers[0];
+        assert_eq!(
+            hex::encode(transfer.recipient_pubkey.as_ref().unwrap()),
+            public_key
+        );
+        assert_eq!(transfer.recipient_encryption, Encryption::Optional);
+        let invoice_data = Invoice::new(data.invoice_string).unwrap().invoice_data();
         assert_eq!(invoice_data.expiration_timestamp, Some(exp));
+        assert_eq!(invoice_data.public_key, Some(public_key));
+        assert_eq!(invoice_data.encryption, Encryption::Optional);
     }
 }

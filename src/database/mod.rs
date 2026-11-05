@@ -75,6 +75,20 @@ impl DbBatchTransfer {
         self.status.failed()
     }
 
+    /// Whether the transfer expiration has passed at `now`.
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn is_expired(&self, now: i64) -> bool {
+        self.expiration.is_some_and(|expiration| expiration < now)
+    }
+
+    /// Whether the transfer expiration has passed at `now` by more than `margin` seconds, so it
+    /// has passed for a counterparty whose clock is up to `margin` seconds behind this wallet's too.
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn is_expired_with_margin(&self, now: i64, margin: u32) -> bool {
+        self.expiration
+            .is_some_and(|expiration| expiration.saturating_add(i64::from(margin)) < now)
+    }
+
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn waiting(&self) -> bool {
         self.status.waiting()
@@ -211,6 +225,22 @@ pub(crate) struct LocalRecipient {
     pub local_recipient_data: LocalRecipientData,
     pub assignment: Assignment,
     pub transport_endpoints: Vec<LocalTransportEndpoint>,
+    /// Recipient's Ed25519 public key, empty when the recipient has no proxy
+    pub public_key: Vec<u8>,
+    pub encryption: Encryption,
+    /// Invoice expiration (UTC unix seconds), `None` when the recipient has no proxy
+    pub invoice_expiration: Option<i64>,
+}
+
+#[cfg(feature = "esplora")]
+impl LocalRecipient {
+    /// The IDs of the invoice and of the transfer to it on the proxy, given the hex-encoded pubkey
+    /// of the sender operation.
+    pub(crate) fn proxy_ids(&self, sender_pk_hex: &str) -> (String, String) {
+        let invoice_id = invoice_id(&self.recipient_id, &hex::encode(&self.public_key));
+        let transfer_id = transfer_id(&invoice_id, sender_pk_hex);
+        (invoice_id, transfer_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

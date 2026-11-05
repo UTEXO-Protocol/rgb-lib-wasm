@@ -3,7 +3,6 @@
 //! This module defines the online methods of the [`Wallet`] structure and all its related data.
 
 use super::*;
-use crate::api::proxy::WasmProxyClient;
 
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
@@ -175,6 +174,10 @@ pub(crate) struct InfoBatchTransfer {
     min_confirmations: u8,
     expiration_timestamp: Option<i64>,
     entropy: u64,
+    /// the key of the operation, one per operation and shared across all recipients
+    operation_secret_key: Option<Vec<u8>>,
+    /// the sender's own proxy endpoint, where the recipients post their ACK
+    sender_transport_endpoint: Option<String>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -230,13 +233,207 @@ impl TransferArtifacts {
     }
 }
 
+/// Request the ACKs of the operation of `transfer_ids` from the sender proxy (`ack.get`), signing
+/// the request with the operation (sender) key.
+async fn get_ack_signed(
+    proxy_client: &ProxyClient,
+    transfer_ids: &[String],
+    sender_sk: &SigningKey,
+) -> Result<JsonRpcResponse<GetAckResponse>, Error> {
+    let timestamp = now().unix_timestamp().to_string();
+    let digest = sha256_digest(get_ack_message(transfer_ids, &timestamp).as_bytes());
+    let signature = hex::encode(sign_ed25519(sender_sk, &digest));
+    proxy_client
+        .get_ack(transfer_ids, &signature, &timestamp)
+        .await
+}
+
+/// List the transfers to an invoice on a recipient proxy (`transfer.list`), signing the request
+/// with the recipient key.
+async fn list_invoice_transfers(
+    proxy_url: &str,
+    invoice_id: &str,
+    recipient_seed: &[u8],
+) -> Result<JsonRpcResponse<HashMap<String, ProxyTransferState>>, Error> {
+    let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
+        details: s!("invalid recipient secret key"),
+    })?;
+    let sk = ed25519_from_seed(&seed);
+    let timestamp = now().unix_timestamp().to_string();
+    let digest = sha256_digest(list_transfers_message(invoice_id, &timestamp).as_bytes());
+    let signature = hex::encode(sign_ed25519(&sk, &digest));
+    ProxyClient::new(proxy_url)?
+        .list_transfers(invoice_id, &signature, &timestamp)
+        .await
+}
+
+/// Whether the sender proxy knows the operation of `transfer_ids`, registered with the operation
+/// (sender) key, i.e. whether an earlier `ack.prepare` for it succeeded.
+async fn sender_proxy_knows_operation(
+    proxy_client: &ProxyClient,
+    transfer_ids: &[String],
+    sender_sk: &SigningKey,
+) -> Result<bool, Error> {
+    match get_ack_signed(proxy_client, transfer_ids, sender_sk)
+        .await?
+        .error
+    {
+        None => Ok(true),
+        Some(err) => match map_proxy_error(err) {
+            Error::OperationNotFound => Ok(false),
+            e => Err(e),
+        },
+    }
+}
+
+/// Interpret the sender proxy's response to `ack.clean`, requested before deliberately failing
+/// an outgoing operation.
+///
+/// Any proxy response other than the ones mapped to a [`CleanAckOutcome`] cannot be unambiguously
+/// interpreted safely and is surfaced as an error.
+fn clean_ack_outcome(error: Option<JsonRpcError>) -> Result<CleanAckOutcome, Error> {
+    match error {
+        None => Ok(CleanAckOutcome::Revoked),
+        Some(err) => match map_proxy_error(err) {
+            Error::ProxyTxAlreadyReleased => Ok(CleanAckOutcome::Released),
+            Error::OperationNotFound => Ok(CleanAckOutcome::Unknown),
+            e => Err(e),
+        },
+    }
+}
+
+/// Whether the expiration of an outgoing operation has passed on the local clock by more than the
+/// clock skew margin, so it has passed on the sender proxy's clock as well and the proxy can no
+/// longer release the signed TX, whatever it knows about the operation.
+fn expired_beyond_skew_margin(batch_transfer: &DbBatchTransfer) -> bool {
+    batch_transfer.is_expired_with_margin(now().unix_timestamp(), PROXY_CLOCK_SKEW_MARGIN_SECS)
+}
+
+/// Whether the broadcast deadline of an outgoing operation (its expiration plus the sender proxy
+/// retention grace, or just its expiration if unknown) has passed on the local clock by more than
+/// the clock skew margin, so the sender proxy can no longer hand out the signed TX, not even to
+/// recipients that already obtained it, and recipients stopped broadcasting it.
+fn broadcast_deadline_passed_beyond_skew_margin(batch_transfer: &DbBatchTransfer) -> bool {
+    batch_transfer
+        .broadcast_deadline
+        .or(batch_transfer.expiration)
+        .is_some_and(|deadline| {
+            deadline.saturating_add(i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS))
+                < now().unix_timestamp()
+        })
+}
+
+/// Whether the broadcast deadline of an incoming transfer plus the confirmation margin has passed,
+/// after which a transfer whose TX is not confirmed is failed. A transfer with no known broadcast
+/// deadline is never considered past it.
+fn confirmation_deadline_passed(batch_transfer: &DbBatchTransfer) -> bool {
+    batch_transfer.broadcast_deadline.is_some_and(|deadline| {
+        deadline.saturating_add(i64::from(CONFIRMATION_MARGIN_SECS)) < now().unix_timestamp()
+    })
+}
+
+/// Whether an incoming transfer is expired, so it can be failed: a transfer waiting for the
+/// broadcast of a TX the sender proxy may still release to it (it has a broadcast deadline) only
+/// once past the broadcast deadline plus the confirmation margin, a blind receive reserved on
+/// proxies (it has a retention deadline) still waiting for the counterparty only once the invoice
+/// expiration has passed on the proxies' clocks too, any other once past the invoice expiration.
+fn incoming_expired(batch_transfer: &DbBatchTransfer, now: i64) -> bool {
+    if batch_transfer.status == TransferStatus::WaitingBroadcast
+        && batch_transfer.broadcast_deadline.is_some()
+    {
+        return confirmation_deadline_passed(batch_transfer);
+    }
+    if batch_transfer.status == TransferStatus::WaitingCounterparty
+        && batch_transfer.retention_deadline.is_some()
+    {
+        return batch_transfer.is_expired_with_margin(now, PROXY_CLOCK_SKEW_MARGIN_SECS);
+    }
+    batch_transfer.is_expired(now)
+}
+
+/// The retention grace advertised by a sender proxy (`retention_grace_secs`), i.e. how long
+/// after an operation expiration it keeps a released signed TX available to the recipients. A
+/// proxy not advertising it is considered to grant none.
+async fn sender_proxy_retention_grace(proxy_url: &str) -> Result<u32, Error> {
+    let res = ProxyClient::new(proxy_url)?.get_info().await?;
+    if let Some(err) = res.error {
+        return Err(map_proxy_error(err));
+    }
+    let info = res.result.ok_or_else(|| Error::Proxy {
+        details: s!("missing server.info result"),
+    })?;
+    Ok(crate::utils::proxy_retention_grace(&info))
+}
+
+/// The broadcast deadline of an operation from the `expires_at` returned by `ack.post` and the
+/// sender proxy retention grace, `None` if the proxy didn't return a valid expiration.
+fn broadcast_deadline(expires_at: Option<&str>, retention_grace: u32) -> Option<i64> {
+    expires_at
+        .and_then(|exp| exp.parse::<i64>().ok())
+        .map(|exp| exp + i64::from(retention_grace))
+}
+
+/// Interpret an error returned by the sender proxy to `ack.get`, requested while waiting for the
+/// recipients' ACKs.
+///
+/// The only error with a safe interpretation is the proxy no longer knowing the operation (e.g.
+/// it dropped its data): the ACKs cannot be retrieved anymore, so the caller falls back to
+/// checking whether the TX was broadcast. That case returns `Ok(())`. Any other proxy response
+/// cannot be unambiguously interpreted safely and is surfaced as an error.
+fn check_get_ack_error(err: JsonRpcError) -> Result<(), Error> {
+    match map_proxy_error(err) {
+        Error::OperationNotFound => Ok(()),
+        e => Err(e),
+    }
+}
+
+/// The sender proxy's response to `ack.clean`, requested before failing an outgoing operation.
+#[derive(Debug)]
+pub(crate) enum CleanAckOutcome {
+    /// the signed TXs were revoked: nothing can be released anymore
+    Revoked,
+    /// the TX was already released to a recipient, who may still broadcast it
+    Released,
+    /// the proxy doesn't know the operation: it was never registered (send_end not completed),
+    /// or the proxy lost it, in which case whether the TX was released cannot be known
+    Unknown,
+}
+
+pub(crate) enum TryFailBatchTransferOutcome {
+    Failed,
+    Refreshed,
+    /// the transfer was not failed: the released signed TX could not be revoked (ack.clean
+    /// denied), or the sender proxy no longer knows the operation and it has not expired yet
+    Denied,
+}
+
+/// Proxy context needed to receive (and decrypt) a consignment via a proxy server.
+#[derive(Clone)]
+pub(crate) struct ProxyReceiveData {
+    /// endpoint the consignment was downloaded from
+    pub(crate) proxy_url: String,
+    /// ID of the transfer on the proxies
+    pub(crate) transfer_id: String,
+    /// sender's proxy endpoint (HTTP URL), where the ACK is posted
+    pub(crate) sender_proxy: String,
+    /// sender's Ed25519 public key (hex), used to derive the shared secret for decryption
+    pub(crate) sender_pubkey: String,
+    /// hash of the (plaintext) consignment, signed into the ACK and used for blob verification
+    pub(crate) consignment_hash: String,
+    /// recipient's encryption preference for this operation
+    pub(crate) recipient_encryption: Encryption,
+    /// whether the operation is a batch (multiple recipients)
+    pub(crate) batch: bool,
+}
+
 pub(crate) enum ReceiveMatcher {
     Blind(SecretSeal),
-    Witness(ScriptBuf),
+    /// the script paid and the blinding of the seal, derived from the keys of both parties
+    Witness(ScriptBuf, u64),
 }
 
 impl DbTransfer {
-    pub(crate) fn receive_matcher(&self) -> Result<ReceiveMatcher, Error> {
+    pub(crate) fn receive_matcher(&self, blinding: u64) -> Result<ReceiveMatcher, Error> {
         let recipient_id = self
             .recipient_id
             .clone()
@@ -257,31 +454,10 @@ impl DbTransfer {
             RecipientTypeFull::Witness { .. } => {
                 let script_pubkey = script_buf_from_recipient_id(recipient_id)?
                     .expect("witness recipient ID should yield a script");
-                Ok(ReceiveMatcher::Witness(script_pubkey))
+                Ok(ReceiveMatcher::Witness(script_pubkey, blinding))
             }
         }
     }
-}
-
-async fn pending_consignment_matches(
-    proxy_client: &WasmProxyClient,
-    endpoint: &str,
-    recipient_id: &str,
-    consignment_bytes: &[u8],
-) -> bool {
-    let Ok(response) = proxy_client
-        .get_consignment(endpoint, recipient_id.to_owned())
-        .await
-    else {
-        return false;
-    };
-    let Some(existing) = response.result else {
-        return false;
-    };
-    let Ok(existing_bytes) = general_purpose::STANDARD.decode(existing.consignment) else {
-        return false;
-    };
-    existing_bytes == consignment_bytes
 }
 
 pub(crate) enum Indexer {
@@ -524,6 +700,19 @@ pub(crate) struct OnlineData {
     pub(crate) proxy_auth_keys: HashMap<String, [u8; 32]>,
 }
 
+impl OnlineData {
+    /// Signature authenticating a call to the proxy at `proxy_url`, if a key has been configured
+    /// for it. The proxy verifies the Ed25519 signature of the SHA-256 digest of `message` against
+    /// its configured pubkeys.
+    pub(crate) fn proxy_auth_signature(&self, proxy_url: &str, message: &str) -> Option<String> {
+        self.proxy_auth_keys.get(proxy_url).map(|seed| {
+            let sk = ed25519_from_seed(seed);
+            let digest = sha256_digest(message.as_bytes());
+            hex::encode(sign_ed25519(&sk, &digest))
+        })
+    }
+}
+
 #[cfg(test)]
 impl OnlineData {
     /// Build online data for a native test. No connection is made.
@@ -762,13 +951,18 @@ impl Wallet {
                         push_match(witness_bundle, None);
                     }
                 }
-                ReceiveMatcher::Witness(script_pubkey) => {
+                ReceiveMatcher::Witness(script_pubkey, blinding) => {
                     let tx = &witness_bundle.tx;
                     for seal in seals {
                         let BuilderSeal::Revealed(seal) = seal else {
                             continue;
                         };
                         if seal.txid != TxPtr::WitnessTx {
+                            continue;
+                        }
+                        // the blinding is derived from the keys of both parties, so a seal with a
+                        // different one doesn't pay this transfer
+                        if *blinding != seal.blinding {
                             continue;
                         }
                         let vout = seal.vout.into_u32();
@@ -1206,6 +1400,9 @@ impl Wallet {
         status: TransferStatus,
         min_confirmations: u8,
         expiration_timestamp: Option<i64>,
+        operation_secret_key: Option<Vec<u8>>,
+        sender_transport_endpoint: Option<String>,
+        consignment_hashes: &HashMap<String, String>,
     ) -> Result<i32, Error> {
         let created_at = now().unix_timestamp();
 
@@ -1215,9 +1412,21 @@ impl Wallet {
             expiration: ActiveValue::Set(expiration_timestamp),
             created_at: ActiveValue::Set(created_at),
             min_confirmations: ActiveValue::Set(min_confirmations),
+            operation_secret_key: ActiveValue::Set(operation_secret_key.clone()),
             ..Default::default()
         };
         let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
+        let sender_pubkey_hex = match &operation_secret_key {
+            Some(seed) => {
+                let seed: [u8; 32] = seed.clone().try_into().map_err(|_| Error::Internal {
+                    details: s!("invalid operation secret key"),
+                })?;
+                Some(hex::encode(
+                    ed25519_from_seed(&seed).verifying_key().to_bytes(),
+                ))
+            }
+            None => None,
+        };
 
         let change_utxo_idx = if let Some(btc_change) = btc_change {
             Some(
@@ -1245,6 +1454,9 @@ impl Wallet {
         };
 
         for (asset_id, transfer_info) in transfer_info_map {
+            // hash of the plaintext consignment for this asset, if already generated: a begin
+            // saves the transfers before the consignments are final
+            let consignment_hash = consignment_hashes.get(asset_id).cloned();
             let asset_transfer = DbAssetTransferActMod {
                 user_driven: ActiveValue::Set(true),
                 batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
@@ -1291,6 +1503,18 @@ impl Wallet {
             }
 
             for recipient in transfer_info.recipients.clone() {
+                // the transfer ID on the proxies, only for a proxy recipient
+                let proxy_transfer_id = match &sender_pubkey_hex {
+                    Some(sender_pk) if !recipient.public_key.is_empty() => {
+                        Some(recipient.proxy_ids(sender_pk).1)
+                    }
+                    _ => None,
+                };
+                let recipient_pubkey = if recipient.public_key.is_empty() {
+                    None
+                } else {
+                    Some(recipient.public_key.clone())
+                };
                 let recipient_type = if transfer_info.main_transition == TypeOfTransition::Inflate {
                     let vout = if let LocalRecipientData::Witness(local_witness_data) =
                         recipient.local_recipient_data
@@ -1326,11 +1550,23 @@ impl Wallet {
                     incoming: ActiveValue::Set(false),
                     recipient_id: ActiveValue::Set(Some(recipient.recipient_id.clone())),
                     recipient_type: ActiveValue::Set(recipient_type),
+                    recipient_pubkey: ActiveValue::Set(recipient_pubkey),
+                    consignment_hash: ActiveValue::Set(consignment_hash.clone()),
+                    recipient_encryption: ActiveValue::Set(recipient.encryption),
+                    proxy_transfer_id: ActiveValue::Set(proxy_transfer_id),
+                    invoice_expiration: ActiveValue::Set(recipient.invoice_expiration),
                     ..Default::default()
                 };
                 let transfer_idx = self.database.set_transfer(transfer)?;
+                let has_endpoints = !recipient.transport_endpoints.is_empty();
                 for transport_endpoint in recipient.transport_endpoints {
                     self.save_transfer_transport_endpoint(transfer_idx, &transport_endpoint)?;
+                }
+                // the sender proxy endpoint (where the ACK is collected and the signed TX
+                // released) only concerns proxy recipients
+                if let (Some(endpoint), true) = (&sender_transport_endpoint, has_endpoints) {
+                    let url = self.convert_transport_endpoint_url(endpoint)?;
+                    self.save_sender_transport_endpoint(transfer_idx, &url)?;
                 }
             }
         }
@@ -1387,6 +1623,7 @@ impl Wallet {
         transfer_info_map: &BTreeMap<String, InfoAssetTransfer>,
         info: &InfoBatchTransfer,
         status: TransferStatus,
+        consignment_hashes: &HashMap<String, String>,
     ) -> Result<i32, Error> {
         let Some(existing) = self._get_outgoing_batch_transfer(&txid)? else {
             return self._save_transfers(
@@ -1398,11 +1635,30 @@ impl Wallet {
                 status,
                 info.min_confirmations,
                 info.expiration_timestamp,
+                info.operation_secret_key.clone(),
+                info.sender_transport_endpoint.clone(),
+                consignment_hashes,
             );
         };
         let mut updated: DbBatchTransferActMod = existing.clone().into();
         updated.status = ActiveValue::Set(status);
         self.database.update_batch_transfer(&mut updated)?;
+
+        // a begin saves the transfers before the consignments are final, so their
+        // consignment_hash is None: backfill it now
+        for (asset_id, consignment_hash) in consignment_hashes {
+            for transfer in self
+                .database
+                .get_transfers_for_asset(existing.idx, asset_id)?
+            {
+                if transfer.consignment_hash.is_none() {
+                    let mut updated_transfer: DbTransferActMod = transfer.into();
+                    updated_transfer.consignment_hash =
+                        ActiveValue::Set(Some(consignment_hash.clone()));
+                    self.database.update_transfer(&mut updated_transfer)?;
+                }
+            }
+        }
 
         // copy the used flags of the posts to the rows saved at begin; extra allocations have no
         // recipients
@@ -1421,6 +1677,8 @@ impl Wallet {
             for (tte, te) in self
                 .database
                 .get_transfer_transport_endpoints_data(db_transfer.idx)?
+                .into_iter()
+                .filter(|(tte, _)| tte.kind == TransportEndpointKind::RecipientProxy)
             {
                 let local_used = recipient
                     .transport_endpoints
@@ -2219,6 +2477,8 @@ impl Wallet {
             min_confirmations,
             expiration_timestamp,
             entropy,
+            operation_secret_key: None,
+            sender_transport_endpoint: None,
         };
         self.transfer_artifacts
             .entry(txid_key.to_string())
@@ -2239,6 +2499,8 @@ impl Wallet {
         min_confirmations: u8,
         expiration_timestamp: Option<i64>,
         lock_time: Option<u32>,
+        operation_secret_key: Option<Vec<u8>>,
+        sender_transport_endpoint: Option<String>,
         runtime: &mut RgbRuntime,
         rejected: &mut HashSet<Opout>,
         dry_run: bool,
@@ -2299,10 +2561,14 @@ impl Wallet {
                     .insert(final_txid.clone(), artifacts);
             }
         }
-        let info = self.transfer_artifacts[&final_txid]
-            .batch_info
-            .clone()
+        let batch_info = self
+            .transfer_artifacts
+            .get_mut(&final_txid)
+            .and_then(|a| a.batch_info.as_mut())
             .expect("set by _prepare_rgb_psbt_wasm");
+        batch_info.operation_secret_key = operation_secret_key;
+        batch_info.sender_transport_endpoint = sender_transport_endpoint;
+        let info = batch_info.clone();
 
         let batch_transfer_idx = if dry_run {
             None
@@ -2317,6 +2583,9 @@ impl Wallet {
                 TransferStatus::Initiated,
                 min_confirmations,
                 expiration_timestamp,
+                info.operation_secret_key,
+                info.sender_transport_endpoint,
+                &HashMap::new(),
             )?)
         };
 
@@ -2364,10 +2633,177 @@ impl Wallet {
         Ok((reject_opouts, allow_opouts))
     }
 
-    async fn _refuse_consignment_async(
+    /// The canonical ACK/NACK content message digest used both when signing (recipient) and
+    /// verifying (sender) an ACK (SHA-256 of `transfer_id || true|false || consignment_hash`).
+    fn ack_digest(transfer_id: &str, ack: bool, consignment_hash: &str) -> [u8; 32] {
+        let msg = format!(
+            "{transfer_id}{}{consignment_hash}",
+            if ack { "true" } else { "false" }
+        );
+        sha256_digest(msg.as_bytes())
+    }
+
+    /// Symmetric key shared with the counterparty (from the own operation seed and the
+    /// counterparty's hex-encoded Ed25519 pubkey) and the raw bytes of the expected plaintext hash.
+    fn shared_key_and_hash(
+        own_seed: &[u8],
+        counterparty_pubkey_hex: &str,
+        hash_hex: &str,
+    ) -> Result<([u8; 32], [u8; 32]), Error> {
+        let seed: [u8; 32] = own_seed.try_into().map_err(|_| Error::Internal {
+            details: s!("invalid own secret key"),
+        })?;
+        let own_sk = ed25519_from_seed(&seed);
+        let counterparty_vk =
+            verifying_key_from_bytes(&hex::decode(counterparty_pubkey_hex).map_err(|_| {
+                Error::Internal {
+                    details: s!("invalid counterparty pubkey"),
+                }
+            })?)?;
+        let derived = derive_shared(&own_sk, &counterparty_vk)?;
+        let hash_raw = decode_hash_hex(hash_hex)?;
+        Ok((derived.sym_key, hash_raw))
+    }
+
+    /// Verify a downloaded blob against its expected plaintext hash, first decrypting it with the
+    /// key shared with the counterparty as dictated by `encryption`, the mode the payload is
+    /// expected in: the recipient's invoice preference for consignments and media, always
+    /// `Required` for the signed TX. For `Optional` the encrypted form is tried first, falling back
+    /// to cleartext; for `Unsupported` the blob is taken as cleartext. Anything that doesn't match
+    /// the hash afterwards is rejected.
+    fn decrypt_blob_with_shared_key(
+        raw: Vec<u8>,
+        encryption: Encryption,
+        own_seed: &[u8],
+        counterparty_pubkey_hex: &str,
+        hash_hex: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let (sym_key, hash_raw) =
+            Self::shared_key_and_hash(own_seed, counterparty_pubkey_hex, hash_hex)?;
+        let plaintext = match encryption {
+            Encryption::Unsupported => raw,
+            Encryption::Required => decrypt_blob(&raw, &sym_key, &hash_raw)?,
+            Encryption::Optional => match decrypt_blob(&raw, &sym_key, &hash_raw) {
+                Ok(p) => p,
+                Err(_) => raw,
+            },
+        };
+        if hex::encode(sha256_digest(&plaintext)) != hash_hex {
+            return Err(Error::HashMismatch);
+        }
+        Ok(plaintext)
+    }
+
+    /// [`decrypt_blob_with_shared_key`](Self::decrypt_blob_with_shared_key) for a payload as the
+    /// proxy delivers it: base64-encoded in its JSON-RPC response.
+    fn decrypt_payload_with_shared_key(
+        payload_b64: &str,
+        encryption: Encryption,
+        own_seed: &[u8],
+        counterparty_pubkey_hex: &str,
+        hash_hex: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let raw = general_purpose::STANDARD.decode(payload_b64).map_err(|e| {
+            Error::InvalidEncryptedBlob {
+                details: e.to_string(),
+            }
+        })?;
+        Self::decrypt_blob_with_shared_key(
+            raw,
+            encryption,
+            own_seed,
+            counterparty_pubkey_hex,
+            hash_hex,
+        )
+    }
+
+    /// Sign an ACK/NACK with the recipient's operation key and post it to the sender's proxy.
+    async fn sign_and_post_ack(
         &self,
-        proxy_url: String,
-        recipient_id: String,
+        sender_proxy: &str,
+        transfer_id: &str,
+        ack: bool,
+        consignment_hash: &str,
+        recipient_seed: &[u8],
+    ) -> Result<PostAckResponse, Error> {
+        let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
+            details: s!("invalid recipient secret key"),
+        })?;
+        let sk = ed25519_from_seed(&seed);
+        let digest = Self::ack_digest(transfer_id, ack, consignment_hash);
+        let sig = hex::encode(sign_ed25519(&sk, &digest));
+        let proxy_client = ProxyClient::new(sender_proxy)?;
+        let res = proxy_client.post_ack(transfer_id, ack, &sig).await?;
+        if let Some(err) = res.error {
+            return Err(map_proxy_error(err));
+        }
+        res.result.ok_or_else(|| Error::Proxy {
+            details: s!("missing ack.post result"),
+        })
+    }
+
+    /// Decrypt the released signed TX, verify it, save it so it can be broadcast again until the
+    /// broadcast deadline and broadcast it.
+    async fn broadcast_received_tx(
+        &mut self,
+        recipient_id: &str,
+        signed_tx_b64: &str,
+        signed_tx_hash: &str,
+        sender_pubkey_hex: &str,
+        recipient_seed: &[u8],
+    ) -> Result<(), Error> {
+        let tx_bytes = Self::decrypt_payload_with_shared_key(
+            signed_tx_b64,
+            Encryption::Required,
+            recipient_seed,
+            sender_pubkey_hex,
+            signed_tx_hash,
+        )?;
+        let tx: BdkTransaction = bdk_wallet::bitcoin::consensus::encode::deserialize(&tx_bytes)
+            .map_err(|e| Error::Internal {
+                details: e.to_string(),
+            })?;
+        self.received_signed_txs
+            .insert(recipient_id.to_string(), tx_bytes);
+        self._broadcast_tx(tx).await?;
+        Ok(())
+    }
+
+    /// Broadcast again the signed TX released to a recipient, if saved, e.g. after it was evicted
+    /// from the mempool. Failures are only logged, as the TX may e.g. have been replaced.
+    async fn rebroadcast_received_tx(&self, recipient_id: &str) {
+        let Some(tx_bytes) = self.received_signed_txs.get(recipient_id) else {
+            return;
+        };
+        let tx: BdkTransaction = match bdk_wallet::bitcoin::consensus::encode::deserialize(tx_bytes)
+        {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!(self.logger, "Cannot load saved signed TX: {e}");
+                return;
+            }
+        };
+        debug!(self.logger, "Broadcasting the saved signed TX again");
+        if let Err(e) = self._broadcast_tx(tx).await {
+            warn!(
+                self.logger,
+                "Failed to broadcast the saved signed TX again: {e}"
+            );
+        }
+    }
+
+    /// Forget the data kept for a received consignment.
+    fn clear_received_data(&mut self, recipient_id: &str) {
+        self.received_consignments.remove(recipient_id);
+        self.received_consignment_meta.remove(recipient_id);
+        self.received_signed_txs.remove(recipient_id);
+    }
+
+    async fn _refuse_consignment_async(
+        &mut self,
+        data: &ProxyReceiveData,
+        recipient_id: &str,
+        recipient_seed: &[u8],
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(
@@ -2375,21 +2811,27 @@ impl Wallet {
             "Refusing invalid consignment for {recipient_id}"
         );
         match self
-            .wasm_proxy_client
-            .post_ack(&proxy_url, recipient_id, false)
+            .sign_and_post_ack(
+                &data.sender_proxy,
+                &data.transfer_id,
+                false,
+                &data.consignment_hash,
+                recipient_seed,
+            )
             .await
         {
-            Ok(r) => {
-                debug!(self.logger, "Consignment NACK response: {:?}", r);
-            }
-            Err(e) if e.to_string().contains("Cannot change ACK") => {
+            Ok(r) => debug!(self.logger, "Consignment NACK response: {:?}", r),
+            Err(Error::ProxyCannotChange { .. }) => {
                 warn!(self.logger, "Found an ACK when trying NACK");
             }
+            // the sender proxy may have no operation (e.g. donation): just fail locally
+            Err(Error::OperationNotFound) => {}
             Err(e) => {
                 error!(self.logger, "Failed to post NACK: {e}");
                 return Err(e);
             }
         };
+        self.clear_received_data(recipient_id);
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         Ok(Some(
             self.database
@@ -2397,39 +2839,284 @@ impl Wallet {
         ))
     }
 
-    pub(crate) async fn _get_consignment_async(
+    async fn _get_consignment_async(
         &self,
         proxy_url: &str,
-        recipient_id: String,
+        transfer_id: &str,
     ) -> Result<GetConsignmentResponse, Error> {
-        let consignment_res = self
-            .wasm_proxy_client
-            .get_consignment(proxy_url, recipient_id)
+        let consignment_res = ProxyClient::new(proxy_url)?
+            .get_consignment(transfer_id)
             .await;
-
-        if consignment_res.is_err() || consignment_res.as_ref().unwrap().result.as_ref().is_none() {
-            debug!(
-                self.logger,
-                "Consignment GET response error: {:?}", &consignment_res
-            );
-            return Err(Error::NoConsignment);
+        match consignment_res {
+            Ok(res) => match res.result {
+                Some(r) => Ok(r),
+                None => {
+                    debug!(
+                        self.logger,
+                        "Consignment GET response error: {:?}", res.error
+                    );
+                    Err(Error::NoConsignment)
+                }
+            },
+            Err(e) => {
+                debug!(self.logger, "Consignment GET response error: {e}");
+                Err(Error::NoConsignment)
+            }
         }
-
-        let consignment_res = consignment_res.unwrap().result.unwrap();
-
-        Ok(consignment_res)
     }
 
-    async fn _broadcast_and_update_rgb_async(
+    /// Find the transfer to an invoice on a recipient proxy and download its consignment.
+    ///
+    /// The proxy is asked for the pending transfers of the invoice, the first one whose transfer
+    /// ID matches the one derived from the invoice ID and the sender pubkey is returned. Proxy
+    /// errors (e.g. an unreachable proxy or an invoice it doesn't know) make it skip the proxy.
+    async fn find_invoice_transfer(
+        &self,
+        proxy_url: &str,
+        invoice_id: &str,
+        recipient_seed: &[u8],
+    ) -> Result<Option<(String, GetConsignmentResponse)>, Error> {
+        let transfers = match list_invoice_transfers(proxy_url, invoice_id, recipient_seed).await {
+            Ok(res) => match (res.result, res.error) {
+                (Some(transfers), None) => transfers,
+                (_, err) => {
+                    debug!(self.logger, "Transfer list error: {:?}", err);
+                    return Ok(None);
+                }
+            },
+            Err(e) => {
+                debug!(self.logger, "Transfer list error: {e}");
+                return Ok(None);
+            }
+        };
+        let mut pending: Vec<String> = transfers
+            .into_iter()
+            .filter(|(_, state)| *state == ProxyTransferState::Pending)
+            .map(|(tid, _)| tid)
+            .collect();
+        pending.sort();
+        for tid in pending {
+            let result = match self._get_consignment_async(proxy_url, &tid).await {
+                Err(Error::NoConsignment) => continue,
+                Err(e) => return Err(e),
+                Ok(r) => r,
+            };
+            // a transfer whose ID doesn't match the sender pubkey was not posted by its sender
+            if transfer_id(invoice_id, &result.sender_pk) != tid {
+                warn!(
+                    self.logger,
+                    "Ignoring transfer {tid}, which doesn't match its sender pubkey"
+                );
+                continue;
+            }
+            return Ok(Some((tid, result)));
+        }
+        Ok(None)
+    }
+
+    /// Whether a blind receive still waiting for the counterparty may be failed, which releases its
+    /// blinded UTXO. Before the invoice expiration the receive can be cancelled. After it, the
+    /// blinded UTXO stays reserved until the invoice expiration has passed on the proxies' clocks
+    /// too and then, on each recipient proxy, either a `transfer.list` shows no pending transfer
+    /// or the proxy retention grace has passed, since a transfer created before the expiration
+    /// can be downloaded until then and would otherwise assign its assets to a spent UTXO. An
+    /// "invoice not reserved" answer is taken as no pending transfer.
+    async fn blind_receive_may_be_failed(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+        db_data: &DbData,
+    ) -> Result<bool, Error> {
+        let Some(retention_deadline) = batch_transfer.retention_deadline else {
+            return Ok(true);
+        };
+        let now = now().unix_timestamp();
+        if !batch_transfer.is_expired(now) {
+            return Ok(true);
+        }
+        let skew_margin = i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS);
+        if !batch_transfer.is_expired_with_margin(now, PROXY_CLOCK_SKEW_MARGIN_SECS) {
+            return Ok(false);
+        }
+        if retention_deadline + skew_margin < now {
+            return Ok(true);
+        }
+        let batch_transfer_data =
+            batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+        let (_, transfer) = self.database.get_incoming_transfer(&batch_transfer_data)?;
+        let (Some(recipient_id), Some(recipient_pubkey), Some(recipient_seed)) = (
+            &transfer.recipient_id,
+            &transfer.recipient_pubkey,
+            &batch_transfer.operation_secret_key,
+        ) else {
+            return Ok(true);
+        };
+        let invoice_id = invoice_id(recipient_id, &hex::encode(recipient_pubkey));
+        for (tte, te) in self
+            .database
+            .get_transfer_transport_endpoints_data(transfer.idx)?
+        {
+            if tte.kind != TransportEndpointKind::RecipientProxy {
+                continue;
+            }
+            let res = list_invoice_transfers(&te.endpoint, &invoice_id, recipient_seed).await;
+            let nothing_pending = match res {
+                Ok(res) => match (res.result, res.error) {
+                    (Some(transfers), None) => transfers
+                        .values()
+                        .all(|state| *state != ProxyTransferState::Pending),
+                    (_, Some(err)) => matches!(map_proxy_error(err), Error::InvoiceNotReserved),
+                    (None, None) => false,
+                },
+                Err(_) => false,
+            };
+            if !nothing_pending {
+                debug!(
+                    self.logger,
+                    "Recipient proxy {} may still hold a transfer to the invoice", te.endpoint
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Let the recipient proxy delete the data of a transfer that has been handled. Failures are
+    /// only logged, as the proxy deletes the data anyway once the invoice expires.
+    async fn mark_transfer_retrieved(
+        &self,
+        proxy_url: &str,
+        transfer_id: &str,
+        recipient_seed: &[u8],
+    ) {
+        let Ok(seed) = <[u8; 32]>::try_from(recipient_seed) else {
+            return;
+        };
+        let sk = ed25519_from_seed(&seed);
+        let digest = sha256_digest(transfer_retrieved_message(transfer_id).as_bytes());
+        let signature = hex::encode(sign_ed25519(&sk, &digest));
+        let res = match ProxyClient::new(proxy_url) {
+            Ok(client) => client.transfer_retrieved(transfer_id, &signature).await,
+            Err(e) => Err(e),
+        };
+        match res {
+            Ok(r) if r.error.is_none() => {}
+            Ok(r) => warn!(
+                self.logger,
+                "Failed to mark transfer as retrieved: {:?}", r.error
+            ),
+            Err(e) => warn!(self.logger, "Failed to mark transfer as retrieved: {e}"),
+        }
+    }
+
+    async fn ack_consignment(
         &mut self,
-        runtime: &mut RgbRuntime,
-        witness_id: RgbTxid,
-        signed_psbt: Psbt,
-        skip_sync: bool,
-    ) -> Result<BdkTransaction, Error> {
-        let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
-        runtime.upsert_witness(witness_id, WitnessOrd::Tentative)?;
-        Ok(tx)
+        batch_transfer: &DbBatchTransfer,
+        transfer: &DbTransfer,
+        updated_batch_transfer: &mut DbBatchTransferActMod,
+        data: &ProxyReceiveData,
+        recipient_seed: &[u8],
+        // the sender proxy retention grace, for a transfer whose TX the sender proxy releases
+        retention_grace: Option<u32>,
+        // signed TX embedded in the consignment (donation flow), broadcast directly if present
+        donation_tx: Option<BdkTransaction>,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        debug!(self.logger, "ACKing consignment...");
+
+        let recipient_id = transfer
+            .recipient_id
+            .clone()
+            .expect("transfer should have a recipient ID");
+
+        // record our own ACK on the transfer
+        let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+        updated_transfer.ack = ActiveValue::Set(Some(true));
+
+        let res = match self
+            .sign_and_post_ack(
+                &data.sender_proxy,
+                &data.transfer_id,
+                true,
+                &data.consignment_hash,
+                recipient_seed,
+            )
+            .await
+        {
+            Ok(r) => r,
+            // the sender proxy may have no operation (e.g. donation): broadcast locally
+            Err(Error::OperationNotFound) if donation_tx.is_some() => {
+                self.database.update_transfer(&mut updated_transfer)?;
+                self._broadcast_tx(donation_tx.expect("checked to be some"))
+                    .await?;
+                updated_batch_transfer.status =
+                    ActiveValue::Set(TransferStatus::WaitingConfirmations);
+                return Ok(Some(
+                    self.database
+                        .update_batch_transfer(updated_batch_transfer)?,
+                ));
+            }
+            // a NACK is already recorded for this recipient (only this wallet could have posted
+            // it, as ACKs are signed with its operation key): the sender fails the operation on
+            // seeing it, so there is nothing left to wait for
+            Err(Error::ProxyCannotChange { .. }) => {
+                warn!(
+                    self.logger,
+                    "A NACK was already posted for this recipient, failing the transfer"
+                );
+                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+            }
+            Err(e) => return Err(e),
+        };
+        debug!(self.logger, "Consignment ACK response: {:?}", res);
+
+        self.database.update_transfer(&mut updated_transfer)?;
+
+        // the shared deadline for broadcasting the TX, after which (plus a confirmation margin)
+        // the transfer is failed if the TX is not confirmed
+        if let Some(grace) = retention_grace {
+            updated_batch_transfer.broadcast_deadline =
+                ActiveValue::Set(broadcast_deadline(res.expires_at.as_deref(), grace));
+        }
+
+        match (res.signed_tx, res.signed_tx_hash, res.sender_pk) {
+            (Some(signed_tx), Some(signed_tx_hash), Some(sender_pubkey)) => {
+                // the TX has been released: decrypt and broadcast it
+                self.broadcast_received_tx(
+                    &recipient_id,
+                    &signed_tx,
+                    &signed_tx_hash,
+                    &sender_pubkey,
+                    recipient_seed,
+                )
+                .await?;
+                updated_batch_transfer.status =
+                    ActiveValue::Set(TransferStatus::WaitingConfirmations);
+            }
+            _ if donation_tx.is_some() => {
+                // donation: the signed TX travels inside the consignment, broadcast it
+                self._broadcast_tx(donation_tx.expect("checked to be some"))
+                    .await?;
+                updated_batch_transfer.status =
+                    ActiveValue::Set(TransferStatus::WaitingConfirmations);
+            }
+            _ => {
+                // the TX has not been released (yet): for a batch operation not all recipients
+                // have ACKed yet, for a non-batch one the proxy is not compliant. Either way wait
+                // for the broadcast, posting the ACK again until the TX is returned or the
+                // operation expires
+                if !data.batch {
+                    warn!(
+                        self.logger,
+                        "No signed TX released for a non-batch operation"
+                    );
+                }
+                updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingBroadcast);
+            }
+        }
+
+        Ok(Some(
+            self.database
+                .update_batch_transfer(updated_batch_transfer)?,
+        ))
     }
 
     async fn _wait_consignment_async(
@@ -2449,61 +3136,216 @@ impl Wallet {
             .expect("transfer should have a recipient ID");
         debug!(self.logger, "Recipient ID: {recipient_id}");
 
-        // check if a consignment has been posted
         let tte_data = self
             .database
             .get_transfer_transport_endpoints_data(transfer.idx)?;
-        if let Some(updated_transfer) =
-            self._fail_batch_transfer_if_no_endpoints(batch_transfer, &tte_data)?
-        {
-            return Ok(Some(updated_transfer));
-        }
-        let mut proxy_res = None;
-        for (transfer_transport_endpoint, transport_endpoint) in tte_data {
-            let result = match self
-                ._get_consignment_async(&transport_endpoint.endpoint, recipient_id.clone())
-                .await
+
+        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
+
+        // the recipient's per-operation Ed25519 secret seed (used to derive the shared secret)
+        let recipient_seed =
+            batch_transfer
+                .operation_secret_key
+                .clone()
+                .ok_or_else(|| Error::Internal {
+                    details: s!("missing operation secret key"),
+                })?;
+
+        // if the consignment was downloaded in a previous attempt that failed for a transient
+        // reason, reuse it instead of hitting the proxy again
+        let cached = match (
+            self.received_consignments.contains_key(&recipient_id),
+            self.received_consignment_meta.get(&recipient_id),
+        ) {
+            (true, Some(meta)) => meta.transfer_id.clone().and_then(|cached_transfer_id| {
+                tte_data
+                    .iter()
+                    .find(|(tte, te)| {
+                        tte.kind == TransportEndpointKind::RecipientProxy
+                            && meta
+                                .proxy_url
+                                .as_ref()
+                                .map_or(tte.used, |url| url == &te.endpoint)
+                    })
+                    .map(|(tte, te)| {
+                        (
+                            tte.clone(),
+                            ProxyReceiveData {
+                                proxy_url: te.endpoint.clone(),
+                                transfer_id: cached_transfer_id,
+                                sender_proxy: meta.sender_transport_endpoint.clone(),
+                                sender_pubkey: meta.sender_pubkey.clone(),
+                                consignment_hash: meta.consignment_hash.clone(),
+                                recipient_encryption: transfer.recipient_encryption,
+                                batch: meta.batch,
+                            },
+                        )
+                    })
+            }),
+            _ => None,
+        };
+        let data = if let Some((cached_tte, data)) = cached {
+            debug!(
+                self.logger,
+                "Reusing previously-downloaded consignment for {recipient_id}"
+            );
+            if !cached_tte.used {
+                let mut updated_tte: DbTransferTransportEndpointActMod = cached_tte.into();
+                updated_tte.used = ActiveValue::Set(true);
+                self.database
+                    .update_transfer_transport_endpoint(&mut updated_tte)?;
+            }
+            if transfer.consignment_hash.is_none() || transfer.proxy_transfer_id.is_none() {
+                let mut ut: DbTransferActMod = transfer.clone().into();
+                ut.consignment_hash = ActiveValue::Set(Some(data.consignment_hash.clone()));
+                ut.proxy_transfer_id = ActiveValue::Set(Some(data.transfer_id.clone()));
+                self.database.update_transfer(&mut ut)?;
+            }
+            if !tte_data
+                .iter()
+                .any(|(tte, _)| tte.kind == TransportEndpointKind::SenderProxy)
             {
-                Err(Error::NoConsignment) => {
+                self.save_sender_transport_endpoint(transfer.idx, &data.sender_proxy)?;
+            }
+            data
+        } else {
+            // discover the transfer to the invoice and download its consignment
+            let recipient_pk = hex::encode(transfer.recipient_pubkey.as_ref().ok_or_else(
+                || Error::Internal {
+                    details: s!("missing recipient pubkey"),
+                },
+            )?);
+            let invoice_id = invoice_id(&recipient_id, &recipient_pk);
+            let mut proxy_res = None;
+            for (transfer_transport_endpoint, transport_endpoint) in tte_data {
+                if transfer_transport_endpoint.kind != TransportEndpointKind::RecipientProxy {
+                    continue;
+                }
+                let Some(found) = self
+                    .find_invoice_transfer(
+                        &transport_endpoint.endpoint,
+                        &invoice_id,
+                        &recipient_seed,
+                    )
+                    .await?
+                else {
                     info!(
                         self.logger,
                         "Skipping transport endpoint: {:?}", &transport_endpoint
                     );
                     continue;
-                }
-                Err(e) => return Err(e),
-                Ok(r) => r,
+                };
+
+                proxy_res = Some((transport_endpoint.endpoint, found));
+                let mut updated_tte: DbTransferTransportEndpointActMod =
+                    transfer_transport_endpoint.into();
+                updated_tte.used = ActiveValue::Set(true);
+                self.database
+                    .update_transfer_transport_endpoint(&mut updated_tte)?;
+                break;
+            }
+            let Some((proxy_url, (transfer_id, result))) = proxy_res else {
+                return Ok(None);
+            };
+            // the sender endpoint arrives in RgbTransport (rpc://) format; convert to an HTTP URL
+            let sender_proxy =
+                self.convert_transport_endpoint_url(&result.sender_transport_endpoint)?;
+            let data = ProxyReceiveData {
+                proxy_url,
+                transfer_id,
+                sender_proxy,
+                sender_pubkey: result.sender_pk.clone(),
+                consignment_hash: result.consignment_hash.clone(),
+                recipient_encryption: transfer.recipient_encryption,
+                batch: result.batch,
             };
 
-            proxy_res = Some((result.consignment, transport_endpoint.endpoint));
-            let mut updated_transfer_transport_endpoint: DbTransferTransportEndpointActMod =
-                transfer_transport_endpoint.into();
-            updated_transfer_transport_endpoint.used = ActiveValue::Set(true);
-            self.database
-                .update_transfer_transport_endpoint(&mut updated_transfer_transport_endpoint)?;
-            break;
-        }
-
-        let Some((consignment, proxy_url)) = proxy_res else {
-            return Ok(None);
-        };
-
-        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
-
-        // decode consignment bytes
-        let consignment_bytes = match general_purpose::STANDARD.decode(consignment) {
-            Ok(b) => b,
-            Err(e) => {
-                error!(self.logger, "Failed to decode consignment bytes: {e}");
-                return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                    .await;
+            // decode and (if needed) decrypt the consignment; a malformed payload is refused like
+            // one that fails decryption or verification
+            match Self::decrypt_payload_with_shared_key(
+                &result.consignment,
+                data.recipient_encryption,
+                &recipient_seed,
+                &data.sender_pubkey,
+                &data.consignment_hash,
+            ) {
+                Ok(bytes) => {
+                    self.received_consignments
+                        .insert(recipient_id.clone(), bytes);
+                }
+                Err(_) => {
+                    error!(self.logger, "Failed to decrypt/verify consignment");
+                    return self
+                        ._refuse_consignment_async(
+                            &data,
+                            &recipient_id,
+                            &recipient_seed,
+                            &mut updated_batch_transfer,
+                        )
+                        .await;
+                }
             }
+            self.received_consignment_meta.insert(
+                recipient_id.clone(),
+                ReceivedConsignmentMeta {
+                    proxy_url: Some(data.proxy_url.clone()),
+                    transfer_id: Some(data.transfer_id.clone()),
+                    sender_transport_endpoint: data.sender_proxy.clone(),
+                    sender_pubkey: data.sender_pubkey.clone(),
+                    consignment_hash: data.consignment_hash.clone(),
+                    batch: data.batch,
+                },
+            );
+
+            // persist the transfer ID, the consignment hash and the sender proxy endpoint (for the
+            // ACK)
+            let mut ut: DbTransferActMod = transfer.clone().into();
+            ut.consignment_hash = ActiveValue::Set(Some(data.consignment_hash.clone()));
+            ut.proxy_transfer_id = ActiveValue::Set(Some(data.transfer_id.clone()));
+            self.database.update_transfer(&mut ut)?;
+            self.save_sender_transport_endpoint(transfer.idx, &data.sender_proxy)?;
+
+            data
         };
 
-        // store consignment bytes in memory
-        self.received_consignments
-            .insert(recipient_id.clone(), consignment_bytes.clone());
+        let res = self
+            ._process_received_consignment_async(
+                batch_transfer,
+                &asset_transfer,
+                &transfer,
+                recipient_id,
+                &data,
+                &recipient_seed,
+                &mut updated_batch_transfer,
+            )
+            .await?;
+        // once the consignment has been handled (ACKed or refused), its data is saved locally and
+        // the proxy can delete it, while the transfer keeps counting towards the invoice quota
+        if res.is_some() {
+            self.mark_transfer_retrieved(&data.proxy_url, &data.transfer_id, &recipient_seed)
+                .await;
+        }
+        Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn _process_received_consignment_async(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        asset_transfer: &DbAssetTransfer,
+        transfer: &DbTransfer,
+        recipient_id: String,
+        data: &ProxyReceiveData,
+        recipient_seed: &[u8],
+        updated_batch_transfer: &mut DbBatchTransferActMod,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        let consignment_bytes = self
+            .received_consignments
+            .get(&recipient_id)
+            .ok_or_else(|| Error::Internal {
+                details: s!("consignment not found in memory"),
+            })?
+            .clone();
 
         let mut runtime = self.rgb_runtime()?;
         let consignment = match RgbTransfer::load(&consignment_bytes[..]) {
@@ -2511,12 +3353,33 @@ impl Wallet {
             Err(e) => {
                 error!(self.logger, "Failed to deserialize consignment: {e}");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        data,
+                        &recipient_id,
+                        recipient_seed,
+                        updated_batch_transfer,
+                    )
                     .await;
             }
         };
         let contract_id = consignment.contract_id();
         let asset_id = contract_id.to_string();
+        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+
+        if !self.supports_schema(&asset_schema) {
+            error!(
+                self.logger,
+                "The wallet doesn't support the provided schema: {}", asset_schema
+            );
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
+                .await;
+        }
 
         // validate consignment
         if let Some(aid) = asset_transfer.asset_id.clone() {
@@ -2526,7 +3389,12 @@ impl Wallet {
                     "Received a different asset than the expected one"
                 );
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        data,
+                        &recipient_id,
+                        recipient_seed,
+                        updated_batch_transfer,
+                    )
                     .await;
             }
         }
@@ -2534,11 +3402,35 @@ impl Wallet {
         if consignment.terminals.is_empty() {
             error!(self.logger, "Consignment declares no terminals");
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
                 .await;
         }
 
-        let matcher = transfer.receive_matcher()?;
+        // the seal blinding is derived from the keys of both parties
+        let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
+            details: s!("invalid recipient secret key"),
+        })?;
+        let sender_vk = hex::decode(&data.sender_pubkey)
+            .ok()
+            .and_then(|pk| verifying_key_from_bytes(&pk).ok());
+        let Some(sender_vk) = sender_vk else {
+            error!(self.logger, "Invalid sender pubkey");
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
+                .await;
+        };
+        let blinding = derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding;
+        let matcher = transfer.receive_matcher(blinding)?;
         let Some((terminal_bundle, vout)) = self.find_terminal_bundle(&consignment, &matcher)
         else {
             error!(
@@ -2546,7 +3438,12 @@ impl Wallet {
                 "Cannot find a consignment terminal paying this recipient"
             );
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
                 .await;
         };
         let witness_id = terminal_bundle.witness_id();
@@ -2554,7 +3451,7 @@ impl Wallet {
         let donation_tx = Self::donation_signed_tx(&terminal_bundle.tx);
         let known_concealed = match matcher {
             ReceiveMatcher::Blind(secret_seal) => Some(secret_seal),
-            ReceiveMatcher::Witness(_) => None,
+            ReceiveMatcher::Witness(..) => None,
         };
 
         let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
@@ -2565,7 +3462,6 @@ impl Wallet {
         };
 
         debug!(self.logger, "Validating consignment...");
-        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
         let schema_rules = asset_schema.schema_rules();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
@@ -2582,9 +3478,10 @@ impl Wallet {
                     error!(self.logger, "Consignment is invalid: {}", e);
                     return self
                         ._refuse_consignment_async(
-                            proxy_url,
-                            recipient_id,
-                            &mut updated_batch_transfer,
+                            data,
+                            &recipient_id,
+                            recipient_seed,
+                            updated_batch_transfer,
                         )
                         .await;
                 }
@@ -2604,21 +3501,16 @@ impl Wallet {
         let validity = validation_status.validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
 
-        if !self.supports_schema(&asset_schema) {
-            error!(
-                self.logger,
-                "The wallet doesn't support the provided schema: {}", asset_schema
-            );
-            return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
-                .await;
-        }
-
         let received = self.assignments_for_bundle(terminal_bundle, vout, known_concealed);
         if received.is_empty() {
             error!(self.logger, "Cannot find any receiving assignment");
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
                 .await;
         };
 
@@ -2650,9 +3542,10 @@ impl Wallet {
                     );
                     return self
                         ._refuse_consignment_async(
-                            proxy_url,
-                            recipient_id,
-                            &mut updated_batch_transfer,
+                            data,
+                            &recipient_id,
+                            recipient_seed,
+                            updated_batch_transfer,
                         )
                         .await;
                 } else {
@@ -2691,42 +3584,47 @@ impl Wallet {
                 };
                 for attachment in attachments {
                     let digest = hex::encode(attachment.digest);
-                    // on wasm32, skip media file download/storage (no filesystem)
-                    // media digest is recorded in DB but file is not stored locally
-                    let media_res = self
-                        .wasm_proxy_client
-                        .get_media(&proxy_url, digest.clone())
+                    // on wasm32, skip media file storage (no filesystem): the media is fetched
+                    // and checked against the digest in the contract
+                    let derived = derive_shared(&ed25519_from_seed(&seed), &sender_vk)?;
+                    let media_id = derived.media_id(&digest);
+                    let media_res = ProxyClient::new(&data.proxy_url)?
+                        .get_media(&data.transfer_id, &media_id)
                         .await?;
-                    if let Some(media_res) = media_res.result {
-                        let file_bytes = general_purpose::STANDARD
-                            .decode(media_res)
-                            .map_err(InternalError::from)?;
-                        let file_hash: sha256::Hash = Sha256Hash::hash(&file_bytes[..]);
-                        let actual_digest = file_hash.to_string();
-                        if digest != actual_digest {
-                            error!(
-                                self.logger,
-                                "Attached file has a different hash than the one in the contract"
-                            );
-                            return self
-                                ._refuse_consignment_async(
-                                    proxy_url,
-                                    recipient_id,
-                                    &mut updated_batch_transfer,
-                                )
-                                .await;
-                        }
-                        // on wasm32, we validate the media but don't write to filesystem
-                    } else {
+                    let Some(media_b64) = media_res.result else {
                         error!(
                             self.logger,
                             "Cannot find the media file but the contract defines one"
                         );
                         return self
                             ._refuse_consignment_async(
-                                proxy_url,
-                                recipient_id,
-                                &mut updated_batch_transfer,
+                                data,
+                                &recipient_id,
+                                recipient_seed,
+                                updated_batch_transfer,
+                            )
+                            .await;
+                    };
+                    // also checks the plaintext against the digest in the contract
+                    if Self::decrypt_payload_with_shared_key(
+                        &media_b64,
+                        data.recipient_encryption,
+                        recipient_seed,
+                        &data.sender_pubkey,
+                        &digest,
+                    )
+                    .is_err()
+                    {
+                        error!(
+                            self.logger,
+                            "Attached file has a different hash than the one in the contract"
+                        );
+                        return self
+                            ._refuse_consignment_async(
+                                data,
+                                &recipient_id,
+                                recipient_seed,
+                                updated_batch_transfer,
                             )
                             .await;
                     }
@@ -2758,41 +3656,33 @@ impl Wallet {
             "Consignment is valid. Received '{:?}' of contract '{}'", received, asset_id
         );
 
-        match self
-            .wasm_proxy_client
-            .post_ack(&proxy_url, recipient_id, true)
-            .await
-        {
-            Ok(r) => {
-                debug!(self.logger, "Consignment ACK response: {:?}", r);
-            }
-            Err(e) if e.to_string().contains("Cannot change ACK") => {
-                warn!(self.logger, "Found an NACK when trying ACK");
-            }
-            Err(e) => {
-                error!(self.logger, "Failed to post ACK: {e}");
-                return Err(e);
-            }
-        };
-
-        let new_status = match donation_tx {
-            Some(tx) => {
-                debug!(
+        // the sender proxy retention grace is how long after the operation expiration a released
+        // signed TX can still be retrieved: a non-donation transfer whose sender proxy grants
+        // less than the acceptable minimum is NACKed
+        let mut retention_grace = None;
+        if donation_tx.is_none() {
+            let grace = sender_proxy_retention_grace(&data.sender_proxy).await?;
+            if grace < MIN_SENDER_RETENTION_GRACE_SECS {
+                warn!(
                     self.logger,
-                    "Consignment contains the signed TX, broadcasting it"
+                    "Sender proxy retention grace ({grace}s) is below the acceptable minimum"
                 );
-                self._broadcast_tx(tx).await?;
-                TransferStatus::WaitingConfirmations
+                return self
+                    ._refuse_consignment_async(
+                        data,
+                        &recipient_id,
+                        recipient_seed,
+                        updated_batch_transfer,
+                    )
+                    .await;
             }
-            None => {
-                debug!(
-                    self.logger,
-                    "Consignment doesn't contain the signed TX, waiting for broadcast"
-                );
-                TransferStatus::WaitingBroadcast
-            }
-        };
+            retention_grace = Some(grace);
+        }
 
+        updated_batch_transfer.txid = ActiveValue::Set(Some(txid.clone()));
+
+        // a retry after a failed ACK saves the receive again: start from a clean state
+        self.database.del_coloring(asset_transfer.idx)?;
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
                 self.database
@@ -2805,16 +3695,25 @@ impl Wallet {
                 updated_transfer.recipient_type =
                     ActiveValue::Set(Some(RecipientTypeFull::Witness { vout }));
                 self.database.update_transfer(&mut updated_transfer)?;
-                let db_utxo = DbTxoActMod {
-                    txid: ActiveValue::Set(txid.clone()),
-                    vout: ActiveValue::Set(vout.unwrap()),
-                    btc_amount: ActiveValue::Set(s!("0")),
-                    spent: ActiveValue::Set(false),
-                    exists: ActiveValue::Set(false),
-                    pending_witness: ActiveValue::Set(true),
-                    ..Default::default()
+                let outpoint = Outpoint {
+                    txid: txid.clone(),
+                    vout: vout.unwrap(),
                 };
-                self.database.set_txo(db_utxo)?
+                match self.database.get_txo(&outpoint)? {
+                    Some(txo) => txo.idx,
+                    None => {
+                        let db_utxo = DbTxoActMod {
+                            txid: ActiveValue::Set(txid.clone()),
+                            vout: ActiveValue::Set(vout.unwrap()),
+                            btc_amount: ActiveValue::Set(s!("0")),
+                            spent: ActiveValue::Set(false),
+                            exists: ActiveValue::Set(false),
+                            pending_witness: ActiveValue::Set(true),
+                            ..Default::default()
+                        };
+                        self.database.set_txo(db_utxo)?
+                    }
+                }
             }
             _ => return Err(InternalError::Unexpected.into()),
         };
@@ -2829,13 +3728,31 @@ impl Wallet {
             self.database.set_coloring(db_coloring)?;
         }
 
-        updated_batch_transfer.txid = ActiveValue::Set(Some(txid));
-        updated_batch_transfer.status = ActiveValue::Set(new_status);
+        // release the stock before awaiting the proxy
+        drop(runtime);
 
-        Ok(Some(
-            self.database
-                .update_batch_transfer(&mut updated_batch_transfer)?,
-        ))
+        self.ack_consignment(
+            batch_transfer,
+            transfer,
+            updated_batch_transfer,
+            data,
+            recipient_seed,
+            retention_grace,
+            donation_tx,
+        )
+        .await
+    }
+
+    async fn _broadcast_and_update_rgb_async(
+        &mut self,
+        runtime: &mut RgbRuntime,
+        witness_id: RgbTxid,
+        signed_psbt: Psbt,
+        skip_sync: bool,
+    ) -> Result<BdkTransaction, Error> {
+        let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
+        runtime.upsert_witness(witness_id, WitnessOrd::Tentative)?;
+        Ok(tx)
     }
 
     async fn _wait_ack_async(
@@ -2848,6 +3765,76 @@ impl Wallet {
 
         let mut batch_transfer_data =
             batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+
+        // collect the (shared) sender proxy endpoint and the IDs of the transfers registered on it
+        let mut transfer_ids: Vec<String> = vec![];
+        let mut sender_proxy: Option<String> = None;
+        for asset_transfer_data in &batch_transfer_data.asset_transfers_data {
+            for transfer in &asset_transfer_data.transfers {
+                let transfer_sender_proxy = self
+                    .database
+                    .get_transfer_transport_endpoints_data(transfer.idx)?
+                    .into_iter()
+                    .find(|(tte, _)| tte.kind == TransportEndpointKind::SenderProxy)
+                    .map(|(_, ce)| ce.endpoint);
+                let Some(transfer_sender_proxy) = transfer_sender_proxy else {
+                    continue;
+                };
+                // a SenderProxy endpoint is only ever saved for a proxy recipient transfer, which
+                // always has a transfer ID: a missing one is corrupted data
+                let tid = transfer
+                    .proxy_transfer_id
+                    .clone()
+                    .ok_or_else(|| Error::Internal {
+                        details: format!(
+                            "transfer {} has a sender proxy endpoint but no transfer ID",
+                            transfer.idx
+                        ),
+                    })?;
+                transfer_ids.push(tid);
+                if sender_proxy.is_none() {
+                    sender_proxy = Some(transfer_sender_proxy);
+                }
+            }
+        }
+        let Some(sender_proxy) = sender_proxy else {
+            // no sender proxy registered (e.g. donation): nothing to wait for here
+            return Ok(None);
+        };
+
+        // ack.get is authenticated: sign the request with the operation (sender) key
+        let seed: [u8; 32] = batch_transfer
+            .operation_secret_key
+            .clone()
+            .unwrap_or_default()
+            .try_into()
+            .map_err(|_| Error::Internal {
+                details: s!("invalid operation secret key"),
+            })?;
+        let sk = ed25519_from_seed(&seed);
+        let proxy_client = ProxyClient::new(&sender_proxy)?;
+        let ack_res = get_ack_signed(&proxy_client, &transfer_ids, &sk).await?;
+        debug!(self.logger, "ACK get response: {:?}", ack_res);
+        if let Some(err) = ack_res.error {
+            // the sender proxy no longer knows the operation: the ACKs cannot be retrieved anymore
+            // and whether the TX was released cannot be known, so settle via the chain if a
+            // recipient broadcast it, otherwise keep waiting until the broadcast deadline has
+            // passed on the proxy's clock too
+            check_get_ack_error(err)?;
+            return self
+                .settle_untrusted_batch(
+                    batch_transfer,
+                    "the sender proxy no longer knows the operation",
+                    Error::OperationNotFound,
+                    skip_sync,
+                )
+                .await
+                .map(Some);
+        }
+        let ack_data = ack_res.result.ok_or_else(|| Error::Proxy {
+            details: s!("missing ack.get result"),
+        })?;
+
         for asset_transfer_data in batch_transfer_data.asset_transfers_data.iter_mut() {
             for transfer in asset_transfer_data.transfers.iter_mut() {
                 if transfer.ack.is_some() {
@@ -2856,88 +3843,263 @@ impl Wallet {
                 let tte_data = self
                     .database
                     .get_transfer_transport_endpoints_data(transfer.idx)?;
-                if let Some(updated_transfer) =
-                    self._fail_batch_transfer_if_no_endpoints(batch_transfer, &tte_data)?
-                {
-                    return Ok(Some(updated_transfer));
+                // a transfer with no transport endpoints at all has nothing to poll
+                if tte_data.is_empty() {
+                    continue;
                 }
-                let (_, transport_endpoint) = tte_data
-                    .clone()
-                    .into_iter()
-                    .find(|(tte, _ce)| tte.used)
-                    .expect("there should be 1 used TTE");
-                let proxy_url = transport_endpoint.endpoint.clone();
-                let recipient_id = transfer
-                    .recipient_id
-                    .clone()
-                    .expect("transfer should have a recipient ID");
-                debug!(self.logger, "Recipient ID: {recipient_id}");
-                let ack_res = self
-                    .wasm_proxy_client
-                    .get_ack(&proxy_url, recipient_id)
-                    .await?;
-                debug!(self.logger, "Consignment ACK/NACK response: {:?}", ack_res);
+                let transfer_id =
+                    transfer
+                        .proxy_transfer_id
+                        .clone()
+                        .ok_or_else(|| Error::Internal {
+                            details: format!(
+                                "transfer {} has transport endpoints but no transfer ID",
+                                transfer.idx
+                            ),
+                        })?;
+                debug!(self.logger, "Transfer ID: {transfer_id}");
+                // a transfer absent from the response has not been responded to yet
+                let ack = ack_data.acks.get(&transfer_id).copied();
+                let sig = ack_data.signatures.get(&transfer_id).cloned();
+                let (Some(ack), Some(sig_hex)) = (ack, sig) else {
+                    continue;
+                };
 
-                if ack_res.result.is_some() {
-                    let mut updated_transfer: DbTransferActMod = transfer.clone().into();
-                    updated_transfer.ack = ActiveValue::Set(ack_res.result);
-                    self.database.update_transfer(&mut updated_transfer)?;
-                    transfer.ack = ack_res.result;
+                // verify the recipient's ACK signature
+                let pubkey = transfer
+                    .recipient_pubkey
+                    .as_ref()
+                    .ok_or_else(|| Error::Internal {
+                        details: s!("missing recipient pubkey"),
+                    })?;
+                let vk = verifying_key_from_bytes(pubkey)?;
+                let consignment_hash =
+                    transfer
+                        .consignment_hash
+                        .clone()
+                        .ok_or_else(|| Error::Internal {
+                            details: s!("missing consignment hash"),
+                        })?;
+                let digest = Self::ack_digest(&transfer_id, ack, &consignment_hash);
+                let sig_bytes =
+                    hex::decode(&sig_hex).map_err(|_| Error::InvalidContentSignature)?;
+                if !verify_ed25519(&vk, &digest, &sig_bytes) {
+                    // the proxy served an ACK the recipient never signed, so it is corrupt or
+                    // forging ACKs and nothing it says can be trusted. The batch cannot be failed
+                    // right away either, as the proxy may have released the TX, so it is settled
+                    // like one the proxy lost, surfacing the error while waiting
+                    return self
+                        .settle_untrusted_batch(
+                            batch_transfer,
+                            "the sender proxy serves an invalid ACK signature",
+                            Error::InvalidContentSignature,
+                            skip_sync,
+                        )
+                        .await
+                        .map(Some);
                 }
+
+                let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+                updated_transfer.ack = ActiveValue::Set(Some(ack));
+                updated_transfer.ack_signature = ActiveValue::Set(Some(sig_bytes.clone()));
+                self.database.update_transfer(&mut updated_transfer)?;
+                transfer.ack = Some(ack);
+                transfer.ack_signature = Some(sig_bytes);
             }
         }
 
-        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         let mut batch_transfer_transfers: Vec<DbTransfer> = vec![];
         batch_transfer_data
             .asset_transfers_data
             .iter()
             .for_each(|atd| batch_transfer_transfers.extend(atd.transfers.clone()));
-        if batch_transfer_transfers
-            .iter()
-            .any(|t| t.ack == Some(false))
-        {
-            updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
-        } else if batch_transfer_transfers.iter().all(|t| t.ack == Some(true)) {
-            // do not broadcast an expired transfer: the recipient can fail it after expiration
-            let now = now().unix_timestamp();
-            if batch_transfer.expiration.unwrap_or(now) < now {
-                debug!(
-                    self.logger,
-                    "Transfer expired before the ACK was seen, failing it instead of broadcasting"
-                );
-                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
-            }
-            let txid = batch_transfer
-                .txid
-                .as_ref()
-                .expect("batch transfer should have a TXID");
-            // read signed PSBT from in-memory transfer artifacts
-            let Some(signed_psbt) = self
-                .transfer_artifacts
-                .get(txid)
-                .and_then(|a| a.signed_psbt.as_ref())
-            else {
-                let txid = txid.clone();
-                self._fail_batch_transfer(batch_transfer)?;
-                return Err(Error::MissingTransferArtifacts { txid });
-            };
-            let signed_psbt = Psbt::from_str(signed_psbt)?;
-            let mut runtime = self.rgb_runtime()?;
-            let witness_id = RgbTxid::from_str(&txid.to_string()).unwrap();
-            self._broadcast_and_update_rgb_async(&mut runtime, witness_id, signed_psbt, skip_sync)
-                .await?;
-            // Clean up: signed PSBT no longer needed after broadcast
-            self.transfer_artifacts.remove(txid);
-            updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
-        } else {
+        self.try_complete_batch(batch_transfer, &batch_transfer_transfers, skip_sync)
+            .await
+    }
+
+    async fn try_complete_batch(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        transfers: &[DbTransfer],
+        skip_sync: bool,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        if transfers.iter().any(|t| t.ack == Some(false)) {
+            return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+        }
+        if !transfers.iter().all(|t| t.ack == Some(true)) {
             return Ok(None);
         }
 
-        Ok(Some(
-            self.database
-                .update_batch_transfer(&mut updated_batch_transfer)?,
-        ))
+        // every recipient has ACKed: broadcast the transaction if transfer hasn't expired
+
+        // don't broadcast a transfer that has expired: past its expiration the recipient is
+        // allowed to fail it. When every ACK came (signed) from the sender proxy, the proxy
+        // released the TX to the recipients, so the transfer cannot simply be failed anymore: the
+        // TX is broadcast while no invoice has expired, while past that a recipient that didn't
+        // obtain the TX may have failed the transfer, so the transfer only progresses if the TX is
+        // found on-chain and can otherwise only be failed after spending one of its inputs
+        let released = transfers.iter().all(|t| t.ack_signature.is_some());
+        let now = now().unix_timestamp();
+        if !released && batch_transfer.is_expired(now) {
+            debug!(
+                self.logger,
+                "Transfer expired before broadcast, failing it instead of broadcasting"
+            );
+            return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+        }
+        if released && Self::any_invoice_expired(transfers, now) {
+            if let Some(updated) = self
+                .complete_batch_if_tx_on_chain(batch_transfer, skip_sync)
+                .await?
+            {
+                return Ok(Some(updated));
+            }
+            // the TX can never confirm once one of its inputs has been spent by another confirmed
+            // transaction, which is the only way such an operation can fail
+            if self.tx_inputs_spent_elsewhere(batch_transfer) {
+                info!(
+                    self.logger,
+                    "An input of the TX has been spent by another confirmed transaction, failing the transfer"
+                );
+                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+            }
+            warn!(
+                self.logger,
+                "Every recipient ACKed but an invoice has expired: not broadcasting the TX"
+            );
+            return Ok(None);
+        }
+        Ok(Some(self.broadcast_batch(batch_transfer, skip_sync).await?))
+    }
+
+    /// Whether the invoice expiration of any recipient has passed, accounting for the clock skew
+    /// with the recipient.
+    fn any_invoice_expired(transfers: &[DbTransfer], now: i64) -> bool {
+        transfers
+            .iter()
+            .filter_map(|t| t.invoice_expiration)
+            .any(|exp| now + PROXY_CLOCK_SKEW_MARGIN_SECS as i64 >= exp)
+    }
+
+    /// Whether one of the inputs of the TX of an outgoing transfer has been spent by another
+    /// confirmed transaction, so that the TX can never confirm.
+    fn tx_inputs_spent_elsewhere(&self, batch_transfer: &DbBatchTransfer) -> bool {
+        let Some(txid) = &batch_transfer.txid else {
+            return false;
+        };
+        let Some(signed_psbt) = self
+            .transfer_artifacts
+            .get(txid)
+            .and_then(|a| a.signed_psbt.as_ref())
+        else {
+            return false;
+        };
+        let Ok(psbt) = Psbt::from_str(signed_psbt) else {
+            return false;
+        };
+        let inputs: HashSet<BdkOutPoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect();
+        self.bdk_wallet.transactions().any(|wallet_tx| {
+            wallet_tx.chain_position.is_confirmed()
+                && wallet_tx.tx_node.txid.to_string() != *txid
+                && wallet_tx
+                    .tx_node
+                    .tx
+                    .input
+                    .iter()
+                    .any(|i| inputs.contains(&i.previous_output))
+        })
+    }
+
+    /// Broadcast the TX of an outgoing batch transfer (a no-op on the network if a recipient
+    /// already did), update the RGB state and move the transfer to `WaitingConfirmations`.
+    async fn broadcast_batch(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        skip_sync: bool,
+    ) -> Result<DbBatchTransfer, Error> {
+        let txid = batch_transfer
+            .txid
+            .as_ref()
+            .expect("batch transfer should have a TXID");
+        // read signed PSBT from in-memory transfer artifacts
+        let Some(signed_psbt) = self
+            .transfer_artifacts
+            .get(txid)
+            .and_then(|a| a.signed_psbt.as_ref())
+        else {
+            let txid = txid.clone();
+            self._fail_batch_transfer(batch_transfer)?;
+            return Err(Error::MissingTransferArtifacts { txid });
+        };
+        let signed_psbt = Psbt::from_str(signed_psbt)?;
+        let mut runtime = self.rgb_runtime()?;
+        let witness_id = RgbTxid::from_str(txid).unwrap();
+        self._broadcast_and_update_rgb_async(&mut runtime, witness_id, signed_psbt, skip_sync)
+            .await?;
+        // Clean up: signed PSBT no longer needed after broadcast
+        self.transfer_artifacts.remove(txid);
+        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
+        updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+        Ok(self
+            .database
+            .update_batch_transfer(&mut updated_batch_transfer)?)
+    }
+
+    /// Settle an outgoing batch transfer whose sender proxy can no longer be relied upon to tell
+    /// whether the signed TX was released (it lost the operation, or serves an ACK with an invalid
+    /// signature): complete it if its TX is on-chain, otherwise fail it once its broadcast
+    /// deadline (expiration plus the sender proxy retention grace) has passed on the proxy's clock
+    /// too, accepting the residual risk of a TX broadcast later anyway.
+    ///
+    /// While the transfer has to keep waiting, `waiting_error` is returned, so that the refresh
+    /// reports why the transfer cannot progress and a fail attempt is denied.
+    async fn settle_untrusted_batch(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        reason: &str,
+        waiting_error: Error,
+        skip_sync: bool,
+    ) -> Result<DbBatchTransfer, Error> {
+        if let Some(updated) = self
+            .complete_batch_if_tx_on_chain(batch_transfer, skip_sync)
+            .await?
+        {
+            return Ok(updated);
+        }
+        if !broadcast_deadline_passed_beyond_skew_margin(batch_transfer) {
+            return Err(waiting_error);
+        }
+        warn!(
+            self.logger,
+            "Failing a transfer past its broadcast deadline as {reason}: its TX can still be broadcast if it was released"
+        );
+        self._fail_batch_transfer(batch_transfer)
+    }
+
+    /// Complete an outgoing batch transfer waiting for its counterparty if its TX is on-chain
+    /// (mempool included), which happens when a recipient obtained the TX from the sender proxy
+    /// and broadcast it without the sender learning about the ACKs.
+    async fn complete_batch_if_tx_on_chain(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        skip_sync: bool,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        let Some(txid) = &batch_transfer.txid else {
+            return Ok(None);
+        };
+        if self.indexer().get_tx_confirmations(txid).await?.is_none() {
+            return Ok(None);
+        }
+        info!(
+            self.logger,
+            "TX of a transfer waiting for the counterparty found on-chain"
+        );
+        Ok(Some(self.broadcast_batch(batch_transfer, skip_sync).await?))
     }
 
     async fn _wait_confirmations_async(
@@ -2958,6 +4120,34 @@ impl Wallet {
         );
         let confirmations = self.indexer().get_tx_confirmations(&txid).await?;
         debug!(self.logger, "Confirmations: {:?}", confirmations);
+
+        // an incoming transfer with a broadcast deadline (released via the sender proxy) whose TX
+        // is not confirmed is failed once past the deadline plus the confirmation margin, while
+        // until the deadline its TX is broadcast again if missing
+        if incoming
+            && batch_transfer.broadcast_deadline.is_some()
+            && confirmations.unwrap_or(0) == 0
+        {
+            if confirmation_deadline_passed(batch_transfer) {
+                info!(
+                    self.logger,
+                    "TX not confirmed past the broadcast deadline, failing the transfer"
+                );
+                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+            }
+            if confirmations.is_none()
+                && batch_transfer
+                    .broadcast_deadline
+                    .is_some_and(|deadline| now().unix_timestamp() <= deadline)
+            {
+                let batch_transfer_data =
+                    batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+                let (_, transfer) = self.database.get_incoming_transfer(&batch_transfer_data)?;
+                if let Some(recipient_id) = &transfer.recipient_id {
+                    self.rebroadcast_received_tx(recipient_id).await;
+                }
+            }
+        }
 
         let Some(confirmations) = confirmations else {
             return Ok(None);
@@ -3073,13 +4263,13 @@ impl Wallet {
             .database
             .update_batch_transfer(&mut updated_batch_transfer)?;
 
-        // Clean up: received consignment no longer needed after settle
+        // Clean up: received data no longer needed after settle
         if incoming {
             let batch_transfer_data =
                 batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
             if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data) {
                 if let Some(recipient_id) = &transfer.recipient_id {
-                    self.received_consignments.remove(recipient_id);
+                    self.clear_received_data(recipient_id);
                 }
             }
         }
@@ -3099,6 +4289,148 @@ impl Wallet {
         } else {
             self._wait_ack_async(transfer, db_data, skip_sync).await
         }
+    }
+
+    /// A proxy recipient that has ACKed polls the sender proxy until the signed TX is released,
+    /// then decrypts and broadcasts it.
+    async fn _wait_broadcast_async(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        db_data: &DbData,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        debug!(self.logger, "Waiting broadcast...");
+
+        let batch_transfer_data =
+            batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+        let (_, transfer) = self.database.get_incoming_transfer(&batch_transfer_data)?;
+
+        // sender proxy endpoint (where the signed TX is released); without one there is nothing
+        // to ask for the TX, the sender broadcasts it and wait_confirmations detects it on-chain
+        let mut sender_proxy = None;
+        for (tte, ce) in self
+            .database
+            .get_transfer_transport_endpoints_data(transfer.idx)?
+        {
+            if tte.kind == TransportEndpointKind::SenderProxy {
+                sender_proxy = Some(ce.endpoint);
+                break;
+            }
+        }
+        let Some(sender_proxy) = sender_proxy else {
+            debug!(
+                self.logger,
+                "No sender proxy, waiting for the sender to broadcast"
+            );
+            return Ok(None);
+        };
+
+        let consignment_hash =
+            transfer
+                .consignment_hash
+                .clone()
+                .ok_or_else(|| Error::Internal {
+                    details: s!("missing consignment hash"),
+                })?;
+        let recipient_seed = batch_transfer
+            .operation_secret_key
+            .clone()
+            .unwrap_or_default();
+        let transfer_id = transfer
+            .proxy_transfer_id
+            .clone()
+            .ok_or_else(|| Error::Internal {
+                details: s!("missing transfer ID"),
+            })?;
+        let res = match self
+            .sign_and_post_ack(
+                &sender_proxy,
+                &transfer_id,
+                true,
+                &consignment_hash,
+                &recipient_seed,
+            )
+            .await
+        {
+            Ok(r) => r,
+            // the operation expired without releasing the TX, which never will be: fail the
+            // transfer
+            Err(Error::OperationExpired) => {
+                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+            }
+            // the sender proxy no longer knows the operation: a TX released before can still be
+            // broadcast (and detected on-chain) until the broadcast deadline
+            Err(Error::OperationNotFound) => return self.fail_if_past_deadline(batch_transfer),
+            // no definite answer: fail the transfer once past the broadcast deadline
+            Err(e) => {
+                if let Some(updated) = self.fail_if_past_deadline(batch_transfer)? {
+                    return Ok(Some(updated));
+                }
+                return Err(e);
+            }
+        };
+
+        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
+        // a transfer ACKed via a proxy not returning the operation expiration yet has no
+        // broadcast deadline, set it as soon as it's known
+        let mut deadline_changed = false;
+        if batch_transfer.broadcast_deadline.is_none()
+            && let Some(deadline) = broadcast_deadline(
+                res.expires_at.as_deref(),
+                sender_proxy_retention_grace(&sender_proxy).await?,
+            )
+        {
+            updated_batch_transfer.broadcast_deadline = ActiveValue::Set(Some(deadline));
+            deadline_changed = true;
+        }
+
+        match (res.signed_tx, res.signed_tx_hash, res.sender_pk) {
+            (Some(signed_tx), Some(signed_tx_hash), Some(sender_pubkey)) => {
+                let recipient_id = transfer
+                    .recipient_id
+                    .clone()
+                    .expect("transfer should have a recipient ID");
+                self.broadcast_received_tx(
+                    &recipient_id,
+                    &signed_tx,
+                    &signed_tx_hash,
+                    &sender_pubkey,
+                    &recipient_seed,
+                )
+                .await?;
+                updated_batch_transfer.status =
+                    ActiveValue::Set(TransferStatus::WaitingConfirmations);
+                Ok(Some(
+                    self.database
+                        .update_batch_transfer(&mut updated_batch_transfer)?,
+                ))
+            }
+            // still waiting on the other recipients (or a non-compliant proxy)
+            _ => {
+                if deadline_changed {
+                    // the status is unchanged, the deadline is checked on the next refresh
+                    self.database
+                        .update_batch_transfer(&mut updated_batch_transfer)?;
+                    return Ok(None);
+                }
+                self.fail_if_past_deadline(batch_transfer)
+            }
+        }
+    }
+
+    /// The TX is not on-chain (the confirmations are checked before this on every refresh): past
+    /// the broadcast deadline plus the confirmation margin the transfer is failed.
+    fn fail_if_past_deadline(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        if confirmation_deadline_passed(batch_transfer) {
+            info!(
+                self.logger,
+                "TX not confirmed past the broadcast deadline, failing the transfer"
+            );
+            return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+        }
+        Ok(None)
     }
 
     async fn _refresh_transfer_async(
@@ -3124,7 +4456,19 @@ impl Wallet {
                 self._wait_counterparty_async(transfer, db_data, incoming, skip_sync)
                     .await
             }
-            TransferStatus::WaitingBroadcast | TransferStatus::WaitingConfirmations => {
+            // a proxy recipient that ACKed polls the sender proxy for the TX (or expiration), if
+            // the TX is not on-chain already (broadcast by the sender when the batch completed,
+            // or by an earlier poll)
+            TransferStatus::WaitingBroadcast => {
+                match self
+                    ._wait_confirmations_async(transfer, db_data, incoming, skip_sync)
+                    .await?
+                {
+                    Some(updated) => Ok(Some(updated)),
+                    None => self._wait_broadcast_async(transfer, db_data).await,
+                }
+            }
+            TransferStatus::WaitingConfirmations => {
                 self._wait_confirmations_async(transfer, db_data, incoming, skip_sync)
                     .await
             }
@@ -3195,12 +4539,69 @@ impl Wallet {
         Ok(refresh_result)
     }
 
+    /// Revoke the stored signed TXs for an outgoing operation on the sender proxy (`ack.clean`).
+    /// An operation with nothing registered on a sender proxy has nothing to revoke and is
+    /// reported as [`CleanAckOutcome::Revoked`].
+    async fn clean_sender_ack(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+        db_data: &DbData,
+    ) -> Result<CleanAckOutcome, Error> {
+        let Some(seed) = &batch_transfer.operation_secret_key else {
+            return Ok(CleanAckOutcome::Revoked);
+        };
+        let bt_data = batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+        let mut transfer_ids: Vec<String> = vec![];
+        let mut sender_proxy = None;
+        for atd in &bt_data.asset_transfers_data {
+            for t in &atd.transfers {
+                let transfer_sender_proxy = self
+                    .database
+                    .get_transfer_transport_endpoints_data(t.idx)?
+                    .into_iter()
+                    .find(|(tte, _)| tte.kind == TransportEndpointKind::SenderProxy)
+                    .map(|(_, ce)| ce.endpoint);
+                let Some(transfer_sender_proxy) = transfer_sender_proxy else {
+                    continue;
+                };
+                if let Some(tid) = &t.proxy_transfer_id {
+                    transfer_ids.push(tid.clone());
+                }
+                if sender_proxy.is_none() {
+                    sender_proxy = Some(transfer_sender_proxy);
+                }
+            }
+        }
+        let Some(sender_proxy) = sender_proxy else {
+            // no sender proxy: nothing to clean
+            return Ok(CleanAckOutcome::Revoked);
+        };
+        transfer_ids.sort();
+        let seed: [u8; 32] = seed.clone().try_into().map_err(|_| Error::Internal {
+            details: s!("invalid operation secret key"),
+        })?;
+        let sk = ed25519_from_seed(&seed);
+        let digest = sha256_digest(transfer_ids.concat().as_bytes());
+        let sig = hex::encode(sign_ed25519(&sk, &digest));
+        let proxy_client = ProxyClient::new(&sender_proxy)?;
+        let res = proxy_client.clean_ack(&transfer_ids, &sig).await?;
+        clean_ack_outcome(res.error)
+    }
+
     async fn _try_fail_batch_transfer_async(
         &mut self,
         batch_transfer: &DbBatchTransfer,
-        throw_err: bool,
         db_data: &mut DbData,
-    ) -> Result<(), Error> {
+        revoke_released: bool,
+    ) -> Result<TryFailBatchTransferOutcome, Error> {
+        let incoming = batch_transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?;
+        // an outgoing transfer is expired once its expiration has passed on the sender proxy's
+        // clock too, as the proxy may release its TX until then
+        let expired = if incoming {
+            incoming_expired(batch_transfer, now().unix_timestamp())
+        } else {
+            expired_beyond_skew_margin(batch_transfer)
+        };
         let updated_batch_transfer = match self
             ._refresh_transfer_async(batch_transfer, db_data, &[], true)
             .await
@@ -3208,25 +4609,130 @@ impl Wallet {
             Err(Error::MinFeeNotMet { txid: _ }) | Err(Error::MaxFeeExceeded { txid: _ }) => {
                 Ok(None)
             }
+            // the sender proxy lost the operation or serves an invalid ACK signature: the
+            // refresh fails the transfer itself once its broadcast deadline has passed, until
+            // then the signed TX may still be broadcast by a recipient, so the fail is denied
+            Err(Error::OperationNotFound) | Err(Error::InvalidContentSignature) if !incoming => {
+                info!(
+                    self.logger,
+                    "Sender proxy cannot be relied upon, fail denied until the broadcast deadline"
+                );
+                return Ok(TryFailBatchTransferOutcome::Denied);
+            }
+            // a transfer that keeps failing to refresh would otherwise never be failed; once
+            // expired its TX should no longer be broadcast by the sender, so it is safe to fail
+            // it, while before that the error could be transient
+            Err(e) if expired => {
+                warn!(
+                    self.logger,
+                    "Failing expired transfer that failed to refresh: {e}"
+                );
+                Ok(None)
+            }
             Err(e) => Err(e),
             Ok(v) => Ok(v),
         }?;
-        // fail transfer if the status didn't change after a refresh
-        if updated_batch_transfer.is_none() {
-            self._fail_batch_transfer(batch_transfer)?;
-        } else if throw_err {
-            return Err(Error::CannotFailBatchTransfer);
+        // if the status changed after the refresh, the transfer progressed
+        if let Some(updated) = updated_batch_transfer {
+            // the refresh may have failed the batch itself: that is exactly the outcome a
+            // deliberate fail wanted
+            if updated.status == TransferStatus::Failed {
+                return Ok(TryFailBatchTransferOutcome::Failed);
+            }
+            return Ok(TryFailBatchTransferOutcome::Refreshed);
         }
-
-        Ok(())
+        // the status didn't change: before failing an outgoing transfer make sure its TX is not
+        // on-chain already (a recipient holding the TX may have broadcast it), in which case the
+        // transfer progresses instead
+        if !incoming
+            && batch_transfer.status == TransferStatus::WaitingCounterparty
+            && self
+                .complete_batch_if_tx_on_chain(batch_transfer, true)
+                .await?
+                .is_some()
+        {
+            return Ok(TryFailBatchTransferOutcome::Refreshed);
+        }
+        // an outgoing transfer every recipient ACKed has had its TX released: if it's still
+        // waiting for the counterparty it can only be failed once one of the TX inputs has been
+        // spent by another confirmed transaction, which the refresh above detects
+        if !incoming && batch_transfer.status == TransferStatus::WaitingCounterparty {
+            // read from the DB, as the refresh above may have just stored the ACKs
+            let batch_transfer_data = batch_transfer.get_transfers(
+                &self.database.iter_asset_transfers()?,
+                &self.database.iter_transfers()?,
+            )?;
+            let transfers: Vec<DbTransfer> = batch_transfer_data
+                .asset_transfers_data
+                .into_iter()
+                .flat_map(|atd| atd.transfers)
+                .collect();
+            if !transfers.is_empty() && transfers.iter().all(|t| t.ack == Some(true)) {
+                info!(
+                    self.logger,
+                    "Every recipient ACKed the transfer, fail denied"
+                );
+                return Ok(TryFailBatchTransferOutcome::Denied);
+            }
+        }
+        // for a deliberate fail of an outgoing operation, revoke the released signed TXs on the
+        // sender proxy first
+        if revoke_released && !incoming {
+            match self.clean_sender_ack(batch_transfer, db_data).await? {
+                CleanAckOutcome::Revoked => {}
+                // the TX was already released to a recipient, who may still broadcast it: deny
+                CleanAckOutcome::Released => return Ok(TryFailBatchTransferOutcome::Denied),
+                // the proxy no longer knows the operation, so whether the TX was released cannot
+                // be known. Only an operation that completed send_end had a signed TX registered:
+                // it is failed only once its broadcast deadline has passed on the proxy's clock
+                // too, since until then the proxy may recover the operation and hand out the TX,
+                // while recipients that obtained the TX have time to broadcast it, which the chain
+                // check above detects
+                CleanAckOutcome::Unknown
+                    if batch_transfer.status == TransferStatus::WaitingCounterparty =>
+                {
+                    if !broadcast_deadline_passed_beyond_skew_margin(batch_transfer) {
+                        info!(
+                            self.logger,
+                            "Operation unknown to the sender proxy, fail denied until its broadcast deadline"
+                        );
+                        return Ok(TryFailBatchTransferOutcome::Denied);
+                    }
+                    warn!(
+                        self.logger,
+                        "Failing an operation unknown to the sender proxy past its broadcast deadline: its TX can still be broadcast if it was released before the proxy lost the operation"
+                    );
+                }
+                // an operation that didn't complete send_end (still Initiated) never had a signed
+                // TX registered, so nothing can have been released
+                CleanAckOutcome::Unknown => {}
+            }
+        }
+        // a blind receive keeps its blinded UTXO reserved while a transfer to the invoice can
+        // still be downloaded
+        if incoming
+            && batch_transfer.status == TransferStatus::WaitingCounterparty
+            && !self
+                .blind_receive_may_be_failed(batch_transfer, db_data)
+                .await?
+        {
+            info!(
+                self.logger,
+                "A transfer to the blind invoice may still be downloaded, fail denied"
+            );
+            return Ok(TryFailBatchTransferOutcome::Denied);
+        }
+        self._fail_batch_transfer(batch_transfer)?;
+        Ok(TryFailBatchTransferOutcome::Failed)
     }
 
     /// Fail pending RGB transfers (wasm32 async).
     ///
     /// See native [`fail_transfers`](Wallet::fail_transfers) for full documentation.
     ///
-    /// A transfer in status [`TransferStatus::WaitingBroadcast`] can be failed only after it
-    /// expires, because its TX can still be broadcast before then.
+    /// A transfer in status [`TransferStatus::WaitingBroadcast`] can be failed only once past its
+    /// broadcast deadline plus the confirmation margin, because its TX can still be broadcast
+    /// before then.
     pub async fn fail_transfers(
         &mut self,
         online: Online,
@@ -3257,9 +4763,10 @@ impl Wallet {
                 return Err(Error::CannotFailBatchTransfer);
             }
 
-            // the TX can still be broadcast before expiration
+            // a transfer waiting for the counterparty's broadcast can only be failed once it has
+            // expired, since the TX may still be broadcast before then
             if batch_transfer.status == TransferStatus::WaitingBroadcast
-                && batch_transfer.expiration.unwrap_or(now) >= now
+                && !incoming_expired(batch_transfer, now)
             {
                 return Err(Error::CannotFailBatchTransfer);
             }
@@ -3274,16 +4781,29 @@ impl Wallet {
             }
 
             transfers_changed = true;
-            self._try_fail_batch_transfer_async(batch_transfer, true, &mut db_data)
-                .await?
+            // a deliberate fail (explicit batch idx) revokes any released signed TXs first
+            if !matches!(
+                self._try_fail_batch_transfer_async(batch_transfer, &mut db_data, true)
+                    .await?,
+                TryFailBatchTransferOutcome::Failed
+            ) {
+                return Err(Error::CannotFailBatchTransfer);
+            }
         } else {
-            // fail all expired transfers in a fallible status
-            let mut expired_batch_transfers: Vec<DbBatchTransfer> = db_data
-                .batch_transfers
-                .clone()
-                .into_iter()
-                .filter(|t| t.is_fallible() && t.expiration.unwrap_or(now) < now)
-                .collect();
+            // fail all expired transfers in a fallible status; an outgoing one is expired once
+            // its expiration has passed on the sender proxy's clock too, as the proxy may release
+            // its TX until then
+            let mut expired_batch_transfers: Vec<DbBatchTransfer> = vec![];
+            for t in db_data.batch_transfers.clone() {
+                let expired = if t.incoming(&db_data.asset_transfers, &db_data.transfers)? {
+                    incoming_expired(&t, now)
+                } else {
+                    expired_beyond_skew_margin(&t)
+                };
+                if expired && t.is_fallible() {
+                    expired_batch_transfers.push(t);
+                }
+            }
             for batch_transfer in expired_batch_transfers.iter_mut() {
                 if no_asset_only {
                     let connected_assets = batch_transfer
@@ -3294,9 +4814,14 @@ impl Wallet {
                         continue;
                     }
                 }
-                transfers_changed = true;
-                self._try_fail_batch_transfer_async(batch_transfer, false, &mut db_data)
-                    .await?
+                // expired transfers: the proxy operation has lapsed, no need to revoke released TXs
+                if !matches!(
+                    self._try_fail_batch_transfer_async(batch_transfer, &mut db_data, false)
+                        .await?,
+                    TryFailBatchTransferOutcome::Denied
+                ) {
+                    transfers_changed = true;
+                }
             }
         }
 
@@ -3325,10 +4850,27 @@ impl Wallet {
         fee_rate: u64,
         min_confirmations: u8,
         expiration_timestamp: u64,
+        sender_transport_endpoint: Option<String>,
         lock_time: Option<u32>,
         dry_run: bool,
     ) -> Result<SendBeginResult, Error> {
         info!(self.logger, "Sending (begin) to: {:?}...", recipient_map);
+
+        if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
+            return Err(Error::InvalidRecipientMap);
+        }
+        // the recipients post their ACK to (and get the signed TX from) the sender proxy
+        let Some(sender_transport_endpoint) = sender_transport_endpoint else {
+            return Err(Error::InvalidTransportEndpoint {
+                details: s!("missing sender transport endpoint"),
+            });
+        };
+        self.convert_transport_endpoint_url(&sender_transport_endpoint)?;
+        let operation_sk = crate::encryption::gen_ed25519();
+        let operation_secret_key = operation_sk.to_bytes().to_vec();
+        let now_ts = now().unix_timestamp();
+        // earliest invoice expiration among the recipients, bounding the operation one
+        let mut min_invoice_expiration: Option<i64> = None;
 
         let (fee_rate_checked, unspents, input_unspents, mut runtime) =
             self._get_transfer_begin_data(online, fee_rate)?;
@@ -3372,7 +4914,7 @@ impl Wallet {
                         used: false,
                         usable: false,
                     };
-                    if crate::utils::check_proxy_async(&transport_endpoint.endpoint)
+                    if crate::utils::check_proxy(&transport_endpoint.endpoint)
                         .await
                         .is_ok()
                     {
@@ -3396,6 +4938,35 @@ impl Wallet {
                     return Err(Error::InvalidRecipientNetwork);
                 }
 
+                // decode and validate the recipient's Ed25519 public key, needed to encrypt data
+                // for and verify the ACK from the recipient
+                let public_key_hex =
+                    recipient
+                        .public_key
+                        .as_deref()
+                        .ok_or_else(|| Error::InvalidPubkey {
+                            details: s!("missing recipient public key"),
+                        })?;
+                let public_key = hex::decode(public_key_hex).map_err(|_| Error::InvalidPubkey {
+                    details: s!("recipient public key is not valid hex"),
+                })?;
+                let recipient_vk = verifying_key_from_bytes(&public_key)?;
+
+                // a transfer cannot be created after the invoice expiration
+                let invoice_expiration =
+                    recipient
+                        .expiration_timestamp
+                        .ok_or_else(|| Error::InvalidRecipientData {
+                            details: s!("missing invoice expiration"),
+                        })? as i64;
+                if invoice_expiration <= now_ts {
+                    return Err(Error::InvoiceExpired);
+                }
+                min_invoice_expiration = Some(
+                    min_invoice_expiration
+                        .map_or(invoice_expiration, |m| std::cmp::min(m, invoice_expiration)),
+                );
+
                 let local_recipient_data = match xchainnet_beneficiary.into_inner() {
                     Beneficiary::BlindedSeal(secret_seal) => {
                         if recipient.witness_data.is_some() {
@@ -3409,9 +4980,20 @@ impl Wallet {
                         if let Some(ref witness_data) = recipient.witness_data {
                             let script_buf = pay_2_vout.to_script();
                             witness_recipients.push((script_buf.clone(), witness_data.amount_sat));
+                            // the blinding of the recipient seal is derived from the keys of both
+                            // parties, so the sender cannot choose it
+                            if witness_data.blinding.is_some() {
+                                return Err(Error::InvalidRecipientData {
+                                    details: s!(
+                                        "cannot provide a blinding for a witness recipient with transport endpoints"
+                                    ),
+                                });
+                            }
+                            let blinding =
+                                Some(derive_shared(&operation_sk, &recipient_vk)?.seal_blinding);
                             let local_witness_data = LocalWitnessData {
                                 amount_sat: witness_data.amount_sat,
-                                blinding: witness_data.blinding,
+                                blinding,
                                 vout: recipient_vout,
                             };
                             recipient_vout += 1;
@@ -3432,6 +5014,9 @@ impl Wallet {
                         local_recipient_data,
                         assignment: recipient.assignment.clone(),
                         transport_endpoints,
+                        public_key,
+                        encryption: recipient.encryption,
+                        invoice_expiration: Some(invoice_expiration),
                     });
 
                 recipient
@@ -3451,6 +5036,16 @@ impl Wallet {
             );
         }
 
+        // the operation must expire sufficiently before every invoice, so its TX can only be
+        // released while the recipients are still waiting for it
+        if !donation
+            && let Some(min_invoice_expiration) = min_invoice_expiration
+            && expiration_timestamp as i64
+                > min_invoice_expiration - i64::from(INVOICE_EXPIRATION_MARGIN_SECS)
+        {
+            return Err(Error::InvalidExpiration);
+        }
+
         // Check for duplicate recipient IDs
         let receive_ids: Vec<String> = recipient_map
             .values()
@@ -3466,6 +5061,7 @@ impl Wallet {
 
         let mut rejected = HashSet::new();
         let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> = BTreeMap::new();
+        let mut invoices_checked = false;
 
         let begin_data = loop {
             for asset_id in recipient_map.keys() {
@@ -3497,6 +5093,54 @@ impl Wallet {
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
 
+            // now that the assignments are confirmed available, ensure each invoice can still
+            // accept a transfer on (one of) its proxies, proceeding only if a proxy reports it as
+            // available. Done here (not earlier) so an InsufficientAssignments error takes
+            // precedence
+            if !invoices_checked {
+                invoices_checked = true;
+                for recipients in local_recipients.values() {
+                    for lr in recipients {
+                        let (invoice_id, _) = lr.proxy_ids("");
+                        let mut full = false;
+                        let mut unknown = false;
+                        let mut available = false;
+                        for lte in lr.transport_endpoints.iter().filter(|e| e.usable) {
+                            // a proxy that cannot be asked is skipped, as another one may still
+                            // have the invoice available
+                            let result = match ProxyClient::new(&lte.endpoint)?
+                                .check_invoices(std::slice::from_ref(&invoice_id))
+                                .await
+                            {
+                                Ok(res) => res.result,
+                                Err(e) => {
+                                    debug!(self.logger, "Invoice check error: {e}");
+                                    continue;
+                                }
+                            };
+                            match result.and_then(|r| r.get(&invoice_id).map(|r| r.status)) {
+                                Some(InvoiceStatus::Available) => {
+                                    available = true;
+                                    break;
+                                }
+                                Some(InvoiceStatus::Full) => full = true,
+                                Some(InvoiceStatus::Unknown) => unknown = true,
+                                None => {}
+                            }
+                        }
+                        if !available {
+                            return Err(if full {
+                                Error::InvoiceQuotaExceeded
+                            } else if unknown {
+                                Error::InvoiceNotReserved
+                            } else {
+                                Error::NoValidTransportEndpoint
+                            });
+                        }
+                    }
+                }
+            }
+
             match self
                 ._prepare_transfer_psbt_wasm(
                     &mut transfer_info_map,
@@ -3508,6 +5152,8 @@ impl Wallet {
                     min_confirmations,
                     Some(expiration_timestamp as i64),
                     lock_time,
+                    Some(operation_secret_key.clone()),
+                    Some(sender_transport_endpoint.clone()),
                     &mut runtime,
                     &mut rejected,
                     dry_run,
@@ -3539,6 +5185,162 @@ impl Wallet {
         })
     }
 
+    /// Post a consignment, computing the proof of work the recipient proxy requires: a proxy under
+    /// attack can raise the difficulty at any time, in which case it reports the current one and
+    /// the post is retried with a new proof of work, a limited number of times.
+    ///
+    /// The outer result is for errors that should stop the operation, the inner one for errors
+    /// specific to the proxy, which allow trying another transport endpoint.
+    async fn post_consignment_with_pow(
+        &self,
+        proxy_client: &ProxyClient,
+        data: &PostConsignmentData,
+        consignment: &[u8],
+    ) -> Result<Result<(), Error>, Error> {
+        const MAX_POW_ATTEMPTS: u8 = 3;
+        let mut difficulty = 0;
+        for _ in 0..MAX_POW_ATTEMPTS {
+            let pow_timestamp = now().unix_timestamp().to_string();
+            let pow_nonce = solve_pow_nonce(&data.transfer_id, &pow_timestamp, difficulty).await;
+            let res = proxy_client
+                .post_consignment(data, consignment, &pow_timestamp, &pow_nonce)
+                .await?;
+            debug!(self.logger, "Consignment POST response: {:?}", res);
+            let Some(err) = res.error else {
+                // skip proxies with a non-compliant API
+                return Ok(match res.result {
+                    Some(_) => Ok(()),
+                    None => Err(Error::Proxy {
+                        details: s!("missing consignment.post result"),
+                    }),
+                });
+            };
+            match pow_difficulty_required(&err) {
+                Some(required) if required <= MAX_POW_DIFFICULTY => {
+                    debug!(
+                        self.logger,
+                        "Proof of work difficulty {required} required, retrying"
+                    );
+                    difficulty = required;
+                }
+                Some(required) => {
+                    warn!(
+                        self.logger,
+                        "Proof of work difficulty {required} exceeds the maximum accepted"
+                    );
+                    return Ok(Err(map_proxy_error(err)));
+                }
+                None => return Ok(Err(map_proxy_error(err))),
+            }
+        }
+        Ok(Err(Error::Proxy {
+            details: s!("proof of work not accepted"),
+        }))
+    }
+
+    /// Post the consignment of an asset to each recipient, on the first of its transport
+    /// endpoints that accepts it, marking the endpoint as used.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_transfer_data(
+        &self,
+        recipients: &mut [LocalRecipient],
+        consignment: &[u8],
+        sender_sk: &SigningKey,
+        sender_pubkey_hex: &str,
+        sender_transport_endpoint: &str,
+        consignment_hash: &str,
+        batch: bool,
+    ) -> Result<(), Error> {
+        for recipient in recipients {
+            let recipient_id = &recipient.recipient_id;
+            let recipient_vk = verifying_key_from_bytes(&recipient.public_key)?;
+            let derived = derive_shared(sender_sk, &recipient_vk)?;
+            let (invoice_id, transfer_id) = recipient.proxy_ids(sender_pubkey_hex);
+
+            // the (optionally encrypted) consignment, signed along with the hash of the uploaded
+            // bytes, is the same for every transport endpoint
+            let posted = if recipient.encryption != Encryption::Unsupported {
+                encrypt_blob(
+                    consignment,
+                    &derived.sym_key,
+                    &decode_hash_hex(consignment_hash)?,
+                )?
+            } else {
+                consignment.to_vec()
+            };
+            let blob_hash = hex::encode(sha256_digest(&posted));
+            let consignment_data = PostConsignmentData {
+                invoice_id,
+                transfer_id: transfer_id.clone(),
+                sender_transport_endpoint: sender_transport_endpoint.to_string(),
+                sender_pk: sender_pubkey_hex.to_string(),
+                consignment_hash: consignment_hash.to_string(),
+                batch,
+                signature: hex::encode(sign_ed25519(
+                    sender_sk,
+                    &sha256_digest(
+                        post_consignment_message(&transfer_id, consignment_hash, &blob_hash)
+                            .as_bytes(),
+                    ),
+                )),
+            };
+
+            let mut found_valid = false;
+            // the error of the last endpoint that refused to create the transfer, if any
+            let mut refusal = None;
+            for transport_endpoint in recipient.transport_endpoints.iter_mut() {
+                if transport_endpoint.used {
+                    found_valid = true;
+                    break;
+                }
+                if transport_endpoint.transport_type != TransportType::JsonRpc
+                    || !transport_endpoint.usable
+                {
+                    debug!(
+                        self.logger,
+                        "Skipping transport endpoint {:?}", transport_endpoint
+                    );
+                    continue;
+                }
+                let proxy_url = transport_endpoint.endpoint.clone();
+                debug!(
+                    self.logger,
+                    "Posting consignment for recipient ID: {recipient_id}"
+                );
+                let proxy_client = ProxyClient::new(&proxy_url)?;
+
+                match self
+                    .post_consignment_with_pow(&proxy_client, &consignment_data, &posted)
+                    .await?
+                {
+                    Ok(()) => {}
+                    // the transfer cannot be created on this transport endpoint
+                    Err(
+                        e @ (Error::InvoiceNotReserved
+                        | Error::InvoiceExpired
+                        | Error::InvoiceQuotaExceeded
+                        | Error::TransferIDDeleted
+                        | Error::ProxyDraining),
+                    ) => {
+                        refusal = Some(e);
+                        continue;
+                    }
+                    Err(e @ Error::ProxyCannotChange { .. }) => return Err(e),
+                    Err(_) => continue,
+                }
+
+                transport_endpoint.used = true;
+                found_valid = true;
+                break;
+            }
+            if !found_valid {
+                return Err(refusal.unwrap_or(Error::NoValidTransportEndpoint));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Complete the send operation (wasm32 async).
     ///
     /// See native [`send_end`](Wallet::send_end) for full documentation.
@@ -3566,7 +5368,7 @@ impl Wallet {
 
         let artifacts = self
             .transfer_artifacts
-            .get_mut(&txid)
+            .get(&txid)
             .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
         if !artifacts.is_operation(TypeOfTransition::Transfer) {
             return Err(Error::WrongOperation { txid });
@@ -3574,16 +5376,17 @@ impl Wallet {
         let info_contents = artifacts.batch_info.clone().ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
         })?;
+        let mut asset_infos = artifacts.asset_infos.clone();
+        let mut consignment_bytes = artifacts.consignment_bytes.clone();
 
-        // post the consignments and keep the used flags in the artifacts
-        let TransferArtifacts {
-            asset_infos,
-            consignment_bytes,
-            ..
-        } = &mut *artifacts;
+        // extract the signed transaction (needed for its hash and, for donations, to embed it)
+        let tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
+        let tx_bytes = bdk_wallet::bitcoin::consensus::encode::serialize(&tx);
+        let signed_tx_hash_raw = sha256_digest(&tx_bytes);
+        let signed_tx_hash = hex::encode(signed_tx_hash_raw);
+
         // for a donation, put the signed TX in the consignments so the recipients can broadcast it
         if info_contents.donation {
-            let tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
             let witness_id = RgbTxid::from_str(&txid).unwrap();
             for bytes in consignment_bytes.values_mut() {
                 let mut consignment = RgbTransfer::load(&bytes[..]).map_err(InternalError::from)?;
@@ -3594,72 +5397,153 @@ impl Wallet {
                 consignment.save(&mut v)?;
                 *bytes = v;
             }
+            self.transfer_artifacts
+                .get_mut(&txid)
+                .expect("artifacts checked above")
+                .consignment_bytes = consignment_bytes.clone();
         }
-        for (asset_id, info_contents_asset) in asset_infos.iter_mut() {
-            let consignment_bytes = consignment_bytes.get(asset_id).ok_or(Error::Internal {
+
+        // sender operation key (one per operation, shared across all recipients)
+        let seed: [u8; 32] = info_contents
+            .operation_secret_key
+            .clone()
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| Error::Internal {
+                details: s!("missing operation secret key"),
+            })?;
+        let sender_sk = ed25519_from_seed(&seed);
+        let sender_pubkey_hex = hex::encode(sender_sk.verifying_key().to_bytes());
+        let sender_transport_endpoint = info_contents
+            .sender_transport_endpoint
+            .clone()
+            .ok_or_else(|| Error::Internal {
+                details: s!("missing sender transport endpoint"),
+            })?;
+
+        let total_recipients: usize = asset_infos.values().map(|t| t.recipients.len()).sum();
+        let batch = total_recipients > 1;
+
+        let mut consignment_hashes: HashMap<String, String> = HashMap::new();
+        for asset_id in asset_infos.keys() {
+            let bytes = consignment_bytes.get(asset_id).ok_or(Error::Internal {
                 details: s!("missing consignment bytes"),
             })?;
-            for recipient in &mut info_contents_asset.recipients {
-                let recipient_id = &recipient.recipient_id;
-                let mut found_valid = false;
-                for transport_endpoint in recipient.transport_endpoints.iter_mut() {
-                    if transport_endpoint.used {
-                        found_valid = true;
-                        break;
-                    }
-                    if transport_endpoint.transport_type != TransportType::JsonRpc
-                        || !transport_endpoint.usable
-                    {
-                        debug!(
-                            self.logger,
-                            "Skipping transport endpoint {:?}", transport_endpoint
-                        );
-                        continue;
-                    }
-                    let proxy_url = transport_endpoint.endpoint.clone();
-                    debug!(
-                        self.logger,
-                        "Posting consignment for recipient ID: {recipient_id}"
-                    );
-                    let vout = recipient.local_recipient_data.vout();
-                    match self
-                        .wasm_proxy_client
-                        .post_consignment(
-                            &proxy_url,
-                            recipient_id.clone(),
-                            consignment_bytes,
-                            txid.clone(),
-                            vout,
-                        )
-                        .await
-                    {
-                        Err(Error::RecipientIDAlreadyUsed) => {
-                            return Err(Error::RecipientIDAlreadyUsed);
-                        }
-                        Err(_) => continue,
-                        Ok(res) => {
-                            if let Some(err) = res.error {
-                                if err.message.contains("already used") {
-                                    return Err(Error::RecipientIDAlreadyUsed);
-                                }
-                                continue;
-                            }
-                        }
-                    }
+            consignment_hashes.insert(asset_id.clone(), hex::encode(sha256_digest(bytes)));
+        }
 
-                    transport_endpoint.used = true;
-                    found_valid = true;
-                    break;
+        // expiration plus the sender proxy retention grace, until which recipients may still
+        // obtain and broadcast the signed TX
+        let mut broadcast_deadline = None;
+        // whether the operation was registered earlier and has expired since, so there is nothing
+        // left to post
+        let mut operation_expired = false;
+        let sender_proxy_url = self.convert_transport_endpoint_url(&sender_transport_endpoint)?;
+        // ACK preparation on the sender's own proxy (non-donation only), before posting
+        // consignments
+        if !info_contents.donation {
+            let mut transfer_data: HashMap<String, AckTransferData> = HashMap::new();
+            for (asset_id, info_asset) in &asset_infos {
+                let consignment_hash = consignment_hashes[asset_id].clone();
+                for recipient in &info_asset.recipients {
+                    let vk = verifying_key_from_bytes(&recipient.public_key)?;
+                    let derived = derive_shared(&sender_sk, &vk)?;
+                    let enc_tx = encrypt_blob(&tx_bytes, &derived.sym_key, &signed_tx_hash_raw)?;
+                    let (_, transfer_id) = recipient.proxy_ids(&sender_pubkey_hex);
+                    transfer_data.insert(
+                        transfer_id,
+                        AckTransferData {
+                            recipient_pk: hex::encode(&recipient.public_key),
+                            consignment_hash: consignment_hash.clone(),
+                            signed_tx: general_purpose::STANDARD.encode(&enc_tx),
+                        },
+                    );
                 }
-                if !found_valid {
-                    return Err(Error::NoValidTransportEndpoint);
+            }
+            // a send with a counterparty always has an expiration (required by the public API)
+            let expiration = info_contents
+                .expiration_timestamp
+                .ok_or_else(|| Error::Internal {
+                    details: s!("missing expiration"),
+                })?;
+            let retention_grace = sender_proxy_retention_grace(&sender_proxy_url).await?;
+            broadcast_deadline = Some(expiration.saturating_add(i64::from(retention_grace)));
+            let proxy_client = ProxyClient::new(&sender_proxy_url)?;
+            let transfer_ids: Vec<String> = transfer_data.keys().cloned().collect();
+            let expiration = expiration.to_string();
+            // only needed by proxies with proxy-level authentication enabled
+            let signature = self.online_data.as_ref().and_then(|online_data| {
+                online_data.proxy_auth_signature(
+                    &sender_proxy_url,
+                    &prepare_ack_auth_message(
+                        &sender_pubkey_hex,
+                        &expiration,
+                        &signed_tx_hash,
+                        &transfer_data,
+                    ),
+                )
+            });
+            let res = proxy_client
+                .prepare_ack(
+                    transfer_data,
+                    &expiration,
+                    &signed_tx_hash,
+                    &sender_pubkey_hex,
+                    signature,
+                )
+                .await?;
+            if let Some(err) = res.error {
+                match map_proxy_error(err) {
+                    // a prior ACK clean nulled the signed TX for this operation; re-supplying it
+                    // is expected and ignored, the consignment(s) are posted and the local state
+                    // is updated
+                    Error::SignedTxCleared => {}
+                    // the operation has expired: if it was registered earlier (by this wallet
+                    // before a crash) only the local state is left to update, from which the
+                    // refresh settles or fails the operation, otherwise it can no longer be
+                    // started
+                    e @ Error::ExpirationInvalid => {
+                        if !sender_proxy_knows_operation(&proxy_client, &transfer_ids, &sender_sk)
+                            .await?
+                        {
+                            return Err(e);
+                        }
+                        operation_expired = true;
+                    }
+                    e => return Err(e),
                 }
             }
         }
 
-        // keep the signed PSBT for refresh
+        // an expired operation can no longer progress, so its consignments are not posted
+        let mut post_result = Ok(());
+        if !operation_expired {
+            for (asset_id, info_contents_asset) in asset_infos.iter_mut() {
+                post_result = self
+                    .post_transfer_data(
+                        &mut info_contents_asset.recipients,
+                        &consignment_bytes[asset_id],
+                        &sender_sk,
+                        &sender_pubkey_hex,
+                        &sender_transport_endpoint,
+                        &consignment_hashes[asset_id],
+                        batch,
+                    )
+                    .await;
+                if post_result.is_err() {
+                    break;
+                }
+            }
+        }
+
+        // keep the used flags, so a retry doesn't post to the same endpoints again
+        let artifacts = self
+            .transfer_artifacts
+            .get_mut(&txid)
+            .expect("artifacts checked above");
+        artifacts.asset_infos = asset_infos.clone();
+        post_result?;
+        // keep the signed PSBT for the refresh
         artifacts.signed_psbt = Some(signed_psbt.clone());
-        let transfer_info_map = artifacts.asset_infos.clone();
 
         let batch_transfer_idx = if info_contents.donation {
             // Broadcast immediately for donations
@@ -3668,19 +5552,33 @@ impl Wallet {
             runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
             let idx = self._update_or_save_transfers(
                 txid.clone(),
-                &transfer_info_map,
+                &asset_infos,
                 &info_contents,
                 TransferStatus::WaitingConfirmations,
+                &consignment_hashes,
             )?;
             self.transfer_artifacts.remove(&txid);
             idx
         } else {
-            self._update_or_save_transfers(
+            let idx = self._update_or_save_transfers(
                 txid.clone(),
-                &transfer_info_map,
+                &asset_infos,
                 &info_contents,
                 TransferStatus::WaitingCounterparty,
-            )?
+                &consignment_hashes,
+            )?;
+            if broadcast_deadline.is_some() {
+                let batch_transfer = self
+                    .database
+                    .iter_batch_transfers()?
+                    .into_iter()
+                    .find(|bt| bt.idx == idx)
+                    .expect("batch transfer has just been saved");
+                let mut updated: DbBatchTransferActMod = batch_transfer.into();
+                updated.broadcast_deadline = ActiveValue::Set(broadcast_deadline);
+                self.database.update_batch_transfer(&mut updated)?;
+            }
+            idx
         };
 
         self.update_backup_info(false)?;
@@ -3691,180 +5589,6 @@ impl Wallet {
             txid,
             batch_transfer_idx,
         })
-    }
-
-    /// Post consignments prepared by [`Wallet::send_begin`] without completing or broadcasting
-    /// the transfer.
-    ///
-    /// This is required for protocols such as Lightning channel funding where the counterparty
-    /// must validate the consignment before it is safe to broadcast the funding transaction.
-    /// The transfer artifacts remain available for a later [`Wallet::send_end`] call.
-    ///
-    /// For a donation, the posted consignments carry the unsigned TX. Its recipients wait for the
-    /// broadcast of [`Wallet::send_end`], which does not post them again.
-    pub async fn post_pending_consignments(&mut self, txid: String) -> Result<(), Error> {
-        let artifacts = self
-            .transfer_artifacts
-            .get_mut(&txid)
-            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
-
-        for (asset_id, info_contents_asset) in artifacts.asset_infos.iter_mut() {
-            let consignment_bytes =
-                artifacts
-                    .consignment_bytes
-                    .get(asset_id)
-                    .ok_or(Error::Internal {
-                        details: s!("missing consignment bytes"),
-                    })?;
-
-            for recipient in &mut info_contents_asset.recipients {
-                let mut found_valid = false;
-                for transport_endpoint in recipient.transport_endpoints.iter_mut() {
-                    if transport_endpoint.used {
-                        found_valid = true;
-                        break;
-                    }
-                    if transport_endpoint.transport_type != TransportType::JsonRpc
-                        || !transport_endpoint.usable
-                    {
-                        continue;
-                    }
-                    let vout = recipient.local_recipient_data.vout();
-                    let response = self
-                        .wasm_proxy_client
-                        .post_consignment(
-                            &transport_endpoint.endpoint,
-                            recipient.recipient_id.clone(),
-                            consignment_bytes,
-                            txid.clone(),
-                            vout,
-                        )
-                        .await;
-                    let already_used = match &response {
-                        Err(Error::RecipientIDAlreadyUsed) => true,
-                        Ok(response) => response
-                            .error
-                            .as_ref()
-                            .is_some_and(|error| error.message.contains("already used")),
-                        _ => false,
-                    };
-                    if already_used {
-                        if pending_consignment_matches(
-                            &self.wasm_proxy_client,
-                            &transport_endpoint.endpoint,
-                            &recipient.recipient_id,
-                            consignment_bytes,
-                        )
-                        .await
-                        {
-                            transport_endpoint.used = true;
-                            found_valid = true;
-                            break;
-                        }
-                        return Err(Error::RecipientIDAlreadyUsed);
-                    }
-                    match response {
-                        Err(_) => continue,
-                        Ok(res) => {
-                            if res.error.is_some() {
-                                continue;
-                            }
-                        }
-                    }
-                    transport_endpoint.used = true;
-                    found_valid = true;
-                    break;
-                }
-                if !found_valid {
-                    return Err(Error::NoValidTransportEndpoint);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Post the pending funding consignment(s) for `txid` to the proxy keyed by the **txid**
-    /// recipient_id (in addition to the witness/P2V recipient_id used by
-    /// [`Self::post_pending_consignments`]).
-    ///
-    /// This mirrors the canonical native `rgb-lib` funding flow, whose acceptor
-    /// (`accept_transfer`) resolves the funding consignment by raw bitcoin txid. Posting under the
-    /// txid lets a WASM sender fund an RGB channel to a *native* acceptor without the acceptor
-    /// having to resolve the P2V (witness) recipient_id. Unlike `post_pending_consignments` this
-    /// does not require/mutate `transport_endpoint.used`, so it can run after it.
-    pub async fn post_consignment_by_txid(&self, txid: String) -> Result<(), Error> {
-        let artifacts = self
-            .transfer_artifacts
-            .get(&txid)
-            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
-
-        for (asset_id, info_contents_asset) in artifacts.asset_infos.iter() {
-            let consignment_bytes =
-                artifacts
-                    .consignment_bytes
-                    .get(asset_id)
-                    .ok_or(Error::Internal {
-                        details: s!("missing consignment bytes"),
-                    })?;
-
-            for recipient in &info_contents_asset.recipients {
-                let mut found_valid = false;
-                for transport_endpoint in &recipient.transport_endpoints {
-                    if transport_endpoint.transport_type != TransportType::JsonRpc
-                        || !transport_endpoint.usable
-                    {
-                        continue;
-                    }
-                    let vout = recipient.local_recipient_data.vout();
-                    let response = self
-                        .wasm_proxy_client
-                        .post_consignment(
-                            &transport_endpoint.endpoint,
-                            txid.clone(),
-                            consignment_bytes,
-                            txid.clone(),
-                            vout,
-                        )
-                        .await;
-                    let already_used = match &response {
-                        Err(Error::RecipientIDAlreadyUsed) => true,
-                        Ok(response) => response
-                            .error
-                            .as_ref()
-                            .is_some_and(|error| error.message.contains("already used")),
-                        _ => false,
-                    };
-                    if already_used {
-                        if pending_consignment_matches(
-                            &self.wasm_proxy_client,
-                            &transport_endpoint.endpoint,
-                            &txid,
-                            consignment_bytes,
-                        )
-                        .await
-                        {
-                            found_valid = true;
-                            break;
-                        }
-                        return Err(Error::RecipientIDAlreadyUsed);
-                    }
-                    match response {
-                        Err(_) => continue,
-                        Ok(res) => {
-                            if res.error.is_some() {
-                                continue;
-                            }
-                        }
-                    }
-                    found_valid = true;
-                    break;
-                }
-                if !found_valid {
-                    return Err(Error::NoValidTransportEndpoint);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Prepare the PSBT to send bitcoins (wasm32 async).
@@ -4118,6 +5842,9 @@ impl Wallet {
                 }),
                 assignment: Assignment::Fungible(*amt),
                 transport_endpoints: vec![],
+                public_key: vec![],
+                encryption: Encryption::Required,
+                invoice_expiration: None,
             })
         }
 
@@ -4149,6 +5876,8 @@ impl Wallet {
                 &witness_recipients,
                 fee_rate_checked,
                 min_confirmations,
+                None,
+                None,
                 None,
                 None,
                 &mut runtime,
@@ -4218,6 +5947,9 @@ impl Wallet {
             TransferStatus::WaitingConfirmations,
             info_contents.min_confirmations,
             info_contents.expiration_timestamp,
+            None,
+            None,
+            &HashMap::new(),
         )?;
 
         let (asset_id, transfer_info) = transfer_info_map.into_iter().next().unwrap();
@@ -4441,7 +6173,7 @@ mod go_online_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod send_end_tests {
     use super::*;
     use crate::wallet::offline::address_reuse_tests::make_test_wallet;
@@ -4491,7 +6223,12 @@ mod send_end_tests {
             }],
         };
         let txid = tx.compute_txid().to_string();
-        (Psbt::from_unsigned_tx(tx).unwrap().to_string(), txid)
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: BdkAmount::from_sat(2000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        (psbt.to_string(), txid)
     }
 
     fn seed_batch(
@@ -4532,6 +6269,42 @@ mod send_end_tests {
         batch_idx
     }
 
+    // An outgoing batch of one proxy recipient (`recipient_pubkey()`), registered on the sender
+    // proxy `sender_proxy` with the operation key `OPERATION_SEED`.
+    fn seed_outgoing(
+        wallet: &Wallet,
+        txid: &str,
+        status: TransferStatus,
+        expiration: Option<i64>,
+        broadcast_deadline: Option<i64>,
+        sender_proxy: &str,
+        ack: Option<bool>,
+    ) -> i32 {
+        let batch_idx = seed_batch(wallet, txid, status, false, expiration);
+        let mut batch: DbBatchTransferActMod = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|bt| bt.idx == batch_idx)
+            .unwrap()
+            .into();
+        batch.operation_secret_key = ActiveValue::Set(Some(OPERATION_SEED.to_vec()));
+        batch.broadcast_deadline = ActiveValue::Set(broadcast_deadline);
+        wallet.database.update_batch_transfer(&mut batch).unwrap();
+        let transfer = wallet.database.iter_transfers().unwrap().pop().unwrap();
+        let mut updated: DbTransferActMod = transfer.clone().into();
+        updated.ack = ActiveValue::Set(ack);
+        updated.proxy_transfer_id = ActiveValue::Set(Some(s!("transfer")));
+        updated.consignment_hash = ActiveValue::Set(Some("00".repeat(32)));
+        updated.recipient_pubkey = ActiveValue::Set(Some(recipient_pubkey()));
+        wallet.database.update_transfer(&mut updated).unwrap();
+        wallet
+            .save_sender_transport_endpoint(transfer.idx, sender_proxy)
+            .unwrap();
+        batch_idx
+    }
+
     fn status(wallet: &Wallet, idx: i32) -> TransferStatus {
         wallet
             .database
@@ -4541,6 +6314,32 @@ mod send_end_tests {
             .find(|bt| bt.idx == idx)
             .unwrap()
             .status
+    }
+
+    // the keys of the recipient and of the operation
+    const RECIPIENT_SEED: [u8; 32] = [8; 32];
+    const OPERATION_SEED: [u8; 32] = [7; 32];
+
+    fn recipient_pubkey() -> Vec<u8> {
+        ed25519_from_seed(&RECIPIENT_SEED)
+            .verifying_key()
+            .to_bytes()
+            .to_vec()
+    }
+
+    const INFO_BODY: &str = r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"0.4.0","uptime":1,"retention_grace_secs":"100"}}"#;
+    const TRUE_BODY: &str = r#"{"jsonrpc":"2.0","id":null,"result":true}"#;
+    const ACK_GET_EMPTY: &str =
+        r#"{"jsonrpc":"2.0","id":null,"result":{"acks":{},"signatures":{}}}"#;
+
+    // answer the JSON-RPC calls of `method`
+    fn rpc_mock(server: &mut mockito::ServerGuard, method: &str, body: &str) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(method.to_string()))
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create()
     }
 
     fn recipient(id: &str, used: bool, usable: bool) -> LocalRecipient {
@@ -4558,6 +6357,9 @@ mod send_end_tests {
                 used,
                 usable,
             }],
+            public_key: recipient_pubkey(),
+            encryption: Encryption::Required,
+            invoice_expiration: None,
         }
     }
 
@@ -4597,6 +6399,8 @@ mod send_end_tests {
             min_confirmations: 1,
             expiration_timestamp: Some(i64::MAX),
             entropy: 0,
+            operation_secret_key: Some(OPERATION_SEED.to_vec()),
+            sender_transport_endpoint: Some(s!("rpc://127.0.0.1:1")),
         }
     }
 
@@ -4647,6 +6451,7 @@ mod send_end_tests {
                     .get_transfer_transport_endpoints_data(t.idx)
                     .unwrap()
             })
+            .filter(|(tte, _)| tte.kind == TransportEndpointKind::RecipientProxy)
             .map(|(tte, _)| tte.used)
             .collect()
     }
@@ -4677,12 +6482,13 @@ mod send_end_tests {
     fn fail_transfers_fails_expired_initiated_send() {
         let (mut wallet, online) = setup();
         let now = now().unix_timestamp();
+        // an outgoing transfer is expired once its expiration passed on the sender proxy's clock too
         let expired = seed_batch(
             &wallet,
             "a",
             TransferStatus::Initiated,
             false,
-            Some(now - 1),
+            Some(now - i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS) - 1),
         );
         let valid = seed_batch(
             &wallet,
@@ -4765,15 +6571,26 @@ mod send_end_tests {
     fn send_end_keeps_artifacts_when_a_post_fails() {
         let (psbt, txid) = dummy_psbt();
         let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let _info = rpc_mock(&mut server, "server.info", INFO_BODY);
+        let _prepare = rpc_mock(&mut server, "ack.prepare", TRUE_BODY);
         let transfer = info_asset(
             TypeOfTransition::Transfer,
             vec![recipient("r1", true, true), recipient("r2", false, false)],
             HashMap::new(),
         );
-        wallet.transfer_artifacts.insert(
-            txid.clone(),
-            artifacts(BTreeMap::from([(s!("asset"), transfer)])),
-        );
+        let mut transfer_artifacts = artifacts(BTreeMap::from([(s!("asset"), transfer)]));
+        transfer_artifacts
+            .batch_info
+            .as_mut()
+            .unwrap()
+            .sender_transport_endpoint = Some(format!("rpc://{}", server.host_with_port()));
+        transfer_artifacts
+            .consignment_bytes
+            .insert(s!("asset"), vec![1, 2, 3]);
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), transfer_artifacts);
         let res = send_end_err(&mut wallet, &online, &psbt);
         assert_eq!(res, Error::NoValidTransportEndpoint);
         let kept = &wallet.transfer_artifacts[&txid];
@@ -4812,6 +6629,9 @@ mod send_end_tests {
                 TransferStatus::Initiated,
                 1,
                 None,
+                None,
+                None,
+                &HashMap::new(),
             )
             .unwrap();
         // the Initiated send reserves its input
@@ -4845,6 +6665,7 @@ mod send_end_tests {
                 &map,
                 &info,
                 TransferStatus::WaitingCounterparty,
+                &HashMap::new(),
             )
             .unwrap();
         assert_eq!(idx, outgoing);
@@ -4890,6 +6711,7 @@ mod send_end_tests {
                 &map,
                 &info,
                 TransferStatus::WaitingCounterparty,
+                &HashMap::new(),
             )
             .unwrap();
         assert_ne!(idx, incoming);
@@ -5009,18 +6831,18 @@ mod send_end_tests {
     fn wait_ack_fails_expired_send_without_broadcast() {
         let (psbt, txid) = dummy_psbt();
         let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(&mut server, "ack.get", ACK_GET_EMPTY);
         let now = now().unix_timestamp();
-        let idx = seed_batch(
+        let idx = seed_outgoing(
             &wallet,
             &txid,
             TransferStatus::WaitingCounterparty,
-            false,
             Some(now - 1),
+            None,
+            &server.url(),
+            Some(true),
         );
-        let transfer = &wallet.database.get_db_data(false).unwrap().transfers[0];
-        let mut updated: DbTransferActMod = transfer.clone().into();
-        updated.ack = ActiveValue::Set(Some(true));
-        wallet.database.update_transfer(&mut updated).unwrap();
         wallet.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
@@ -5062,5 +6884,818 @@ mod send_end_tests {
         assert_eq!(Wallet::donation_signed_tx(&tx), Some(tx.clone()));
         tx.input = vec![signed, TxIn::default()];
         assert_eq!(Wallet::donation_signed_tx(&tx), None);
+    }
+
+    const ERROR_BODY: &str =
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-104,"message":"not found"}}"#;
+
+    fn proxy_error(code: i64) -> JsonRpcError {
+        JsonRpcError {
+            code,
+            message: s!("msg"),
+            data: None,
+        }
+    }
+
+    fn ack_get_body(seed: [u8; 32], ack: bool) -> String {
+        let sk = ed25519_from_seed(&seed);
+        let digest = Wallet::ack_digest("transfer", ack, &"00".repeat(32));
+        let sig = hex::encode(sign_ed25519(&sk, &digest));
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"result":{{"acks":{{"transfer":{ack}}},"signatures":{{"transfer":"{sig}"}}}}}}"#
+        )
+    }
+
+    // the sender proxy's ack.clean response decides whether a deliberate fail can proceed
+    #[test]
+    fn clean_ack_outcome_decisions() {
+        // the signed TXs were revoked
+        assert!(matches!(
+            clean_ack_outcome(None).unwrap(),
+            CleanAckOutcome::Revoked
+        ));
+        // the proxy never had or no longer has the operation
+        assert!(matches!(
+            clean_ack_outcome(Some(proxy_error(-104))).unwrap(),
+            CleanAckOutcome::Unknown
+        ));
+        // all the recipients already ACKed (-107): the TX may be in a recipient's hands
+        assert!(matches!(
+            clean_ack_outcome(Some(proxy_error(-107))).unwrap(),
+            CleanAckOutcome::Released
+        ));
+        // any other response is surfaced rather than read as "nothing to revoke"
+        assert!(matches!(
+            clean_ack_outcome(Some(proxy_error(-502))).unwrap_err(),
+            Error::InvalidEndpointAuthSignature
+        ));
+        assert!(matches!(
+            clean_ack_outcome(Some(proxy_error(-500))).unwrap_err(),
+            Error::Proxy { .. }
+        ));
+    }
+
+    // only a lost operation is tolerated when polling ack.get
+    #[test]
+    fn check_get_ack_error_decisions() {
+        assert!(check_get_ack_error(proxy_error(-104)).is_ok());
+        assert!(matches!(
+            check_get_ack_error(proxy_error(-502)).unwrap_err(),
+            Error::InvalidEndpointAuthSignature
+        ));
+        assert!(matches!(
+            check_get_ack_error(proxy_error(-500)).unwrap_err(),
+            Error::Proxy { .. }
+        ));
+    }
+
+    #[test]
+    fn decrypt_blob_with_shared_key_checks_the_hash() {
+        let plaintext = b"consignment".to_vec();
+        let hash = hex::encode(sha256_digest(&plaintext));
+        let wrong_hash = "00".repeat(32);
+        let pk = hex::encode(recipient_pubkey());
+        let (sym_key, hash_raw) = Wallet::shared_key_and_hash(&OPERATION_SEED, &pk, &hash).unwrap();
+        let encrypted = encrypt_blob(&plaintext, &sym_key, &hash_raw).unwrap();
+        let decrypt = |raw: &[u8], encryption, hash: &str| {
+            Wallet::decrypt_blob_with_shared_key(
+                raw.to_vec(),
+                encryption,
+                &OPERATION_SEED,
+                &pk,
+                hash,
+            )
+        };
+        // Optional takes the encrypted form and falls back to plaintext
+        assert_eq!(
+            decrypt(&encrypted, Encryption::Optional, &hash),
+            Ok(plaintext.clone())
+        );
+        assert_eq!(
+            decrypt(&plaintext, Encryption::Optional, &hash),
+            Ok(plaintext.clone())
+        );
+        assert!(decrypt(&plaintext, Encryption::Required, &hash).is_err());
+        // a plaintext that does not match the hash is refused
+        for encryption in [Encryption::Unsupported, Encryption::Optional] {
+            assert_eq!(
+                decrypt(&plaintext, encryption, &wrong_hash),
+                Err(Error::HashMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn find_invoice_transfer_checks_the_sender_pubkey() {
+        let (wallet, _) = setup();
+        let mut server = mockito::Server::new();
+        let invoice = invoice_id("recipient", &hex::encode(recipient_pubkey()));
+        let sender_pk = hex::encode(
+            ed25519_from_seed(&OPERATION_SEED)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let valid = transfer_id(&invoice, &sender_pk);
+        let _list = rpc_mock(
+            &mut server,
+            "transfer.list",
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":null,"result":{{"0":"pending","{valid}":"pending"}}}}"#
+            ),
+        );
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":null,"result":{{"consignment":"","sender_transport_endpoint":"","sender_pk":"{sender_pk}","consignment_hash":"","batch":false}}}}"#
+        );
+        // transfer "0" is checked first and does not match its sender pubkey
+        let forged = rpc_mock(&mut server, r#""transfer_id":"0""#, &body);
+        let genuine = rpc_mock(&mut server, &format!(r#""transfer_id":"{valid}""#), &body);
+        let (tid, res) =
+            block_on(wallet.find_invoice_transfer(&server.url(), &invoice, &RECIPIENT_SEED))
+                .unwrap()
+                .unwrap();
+        assert_eq!(tid, valid);
+        assert_eq!(res.sender_pk, sender_pk);
+        forged.assert();
+        genuine.assert();
+    }
+
+    #[test]
+    fn post_consignment_with_pow_follows_the_difficulty() {
+        let (wallet, _) = setup();
+        let data = PostConsignmentData {
+            invoice_id: s!("invoice"),
+            transfer_id: s!("transfer"),
+            sender_transport_endpoint: s!(""),
+            sender_pk: s!(""),
+            consignment_hash: s!(""),
+            batch: false,
+            signature: s!(""),
+        };
+        let pow_body = |difficulty: u32| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-114,"message":"pow","data":{{"pow_difficulty":"{difficulty}"}}}}}}"#
+            )
+        };
+        let pow_mock = |server: &mut mockito::ServerGuard, difficulty: u32, hits: usize| {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(s!("consignment.post")))
+                .with_header("content-type", "application/json")
+                .with_body(pow_body(difficulty))
+                .expect(hits)
+                .create()
+        };
+        let post = |server: &mockito::ServerGuard| {
+            let client = ProxyClient::new(&server.url()).unwrap();
+            block_on(wallet.post_consignment_with_pow(&client, &data, b"consignment")).unwrap()
+        };
+
+        // the proxy raises the difficulty, then accepts the retry
+        let mut server = mockito::Server::new();
+        let raise = pow_mock(&mut server, 1, 1);
+        let accept = rpc_mock(&mut server, "consignment.post", TRUE_BODY);
+        assert_eq!(post(&server), Ok(()));
+        raise.assert();
+        accept.assert();
+
+        // a difficulty above the maximum is not tried
+        let mut server = mockito::Server::new();
+        let too_hard = pow_mock(&mut server, MAX_POW_DIFFICULTY + 1, 1);
+        assert!(matches!(post(&server), Err(Error::Proxy { .. })));
+        too_hard.assert();
+
+        // the proxy never accepts the proof of work
+        let mut server = mockito::Server::new();
+        let always = pow_mock(&mut server, 1, 3);
+        assert_eq!(
+            post(&server),
+            Err(Error::Proxy {
+                details: s!("proof of work not accepted")
+            })
+        );
+        always.assert();
+    }
+
+    #[test]
+    fn ack_digest_binds_transfer_ack_and_hash() {
+        let hash = "00".repeat(32);
+        let digest = Wallet::ack_digest("transfer", true, &hash);
+        assert_ne!(digest, Wallet::ack_digest("other", true, &hash));
+        assert_ne!(digest, Wallet::ack_digest("transfer", false, &hash));
+        assert_ne!(
+            digest,
+            Wallet::ack_digest("transfer", true, &"11".repeat(32))
+        );
+    }
+
+    #[test]
+    fn deadline_helpers() {
+        let (wallet, _) = setup();
+        let now = now().unix_timestamp();
+        let skew = i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS);
+        let confirmation = i64::from(CONFIRMATION_MARGIN_SECS);
+        let batch = |expiration, broadcast_deadline, status, retention_deadline| {
+            let idx = seed_batch(&wallet, "t", status, false, expiration);
+            let mut updated: DbBatchTransferActMod = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .into_iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap()
+                .into();
+            updated.broadcast_deadline = ActiveValue::Set(broadcast_deadline);
+            updated.retention_deadline = ActiveValue::Set(retention_deadline);
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+            wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .into_iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap()
+        };
+        let waiting = TransferStatus::WaitingCounterparty;
+
+        // an outgoing operation is expired once the skew margin has passed too
+        assert!(!expired_beyond_skew_margin(&batch(
+            Some(now - skew + 5),
+            None,
+            waiting,
+            None
+        )));
+        assert!(expired_beyond_skew_margin(&batch(
+            Some(now - skew - 5),
+            None,
+            waiting,
+            None
+        )));
+        assert!(!expired_beyond_skew_margin(&batch(
+            None, None, waiting, None
+        )));
+
+        // the broadcast deadline defaults to the expiration
+        assert!(!broadcast_deadline_passed_beyond_skew_margin(&batch(
+            Some(now - skew - 5),
+            Some(now + 100),
+            waiting,
+            None
+        )));
+        assert!(broadcast_deadline_passed_beyond_skew_margin(&batch(
+            Some(now + 100),
+            Some(now - skew - 5),
+            waiting,
+            None
+        )));
+        assert!(broadcast_deadline_passed_beyond_skew_margin(&batch(
+            Some(now - skew - 5),
+            None,
+            waiting,
+            None
+        )));
+
+        // an unknown broadcast deadline is never past
+        assert!(!confirmation_deadline_passed(&batch(
+            None, None, waiting, None
+        )));
+        assert!(!confirmation_deadline_passed(&batch(
+            None,
+            Some(now - confirmation + 5),
+            waiting,
+            None
+        )));
+        assert!(confirmation_deadline_passed(&batch(
+            None,
+            Some(now - confirmation - 5),
+            waiting,
+            None
+        )));
+
+        // a transfer waiting for the broadcast is expired past the confirmation margin
+        let waiting_broadcast = TransferStatus::WaitingBroadcast;
+        assert!(!incoming_expired(
+            &batch(Some(now - 10), Some(now + 5), waiting_broadcast, None),
+            now
+        ));
+        assert!(incoming_expired(
+            &batch(
+                Some(now + 100),
+                Some(now - confirmation - 5),
+                waiting_broadcast,
+                None
+            ),
+            now
+        ));
+        // a blind receive reserved on proxies waits for the skew margin too
+        assert!(!incoming_expired(
+            &batch(Some(now - 10), None, waiting, Some(now + 100)),
+            now
+        ));
+        assert!(incoming_expired(
+            &batch(Some(now - skew - 5), None, waiting, Some(now + 100)),
+            now
+        ));
+        // any other is expired past its expiration
+        assert!(incoming_expired(
+            &batch(Some(now - 1), None, waiting, None),
+            now
+        ));
+        assert!(!incoming_expired(
+            &batch(Some(now + 1), None, waiting, None),
+            now
+        ));
+
+        assert_eq!(broadcast_deadline(Some("1000"), 50), Some(1050));
+        assert_eq!(broadcast_deadline(Some("soon"), 50), None);
+        assert_eq!(broadcast_deadline(None, 50), None);
+    }
+
+    #[test]
+    fn send_end_sets_broadcast_deadline() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let _info = rpc_mock(&mut server, "server.info", INFO_BODY);
+        let _prepare = rpc_mock(&mut server, "ack.prepare", TRUE_BODY);
+        let _post = rpc_mock(&mut server, "consignment.post", TRUE_BODY);
+        let transfer = info_asset(
+            TypeOfTransition::Transfer,
+            vec![recipient("r1", false, true)],
+            HashMap::new(),
+        );
+        let expiration = now().unix_timestamp() + 1000;
+        let mut transfer_artifacts = artifacts(BTreeMap::from([(s!("asset"), transfer)]));
+        let info = transfer_artifacts.batch_info.as_mut().unwrap();
+        info.expiration_timestamp = Some(expiration);
+        info.sender_transport_endpoint = Some(format!("rpc://{}", server.host_with_port()));
+        transfer_artifacts
+            .consignment_bytes
+            .insert(s!("asset"), vec![1, 2, 3]);
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), transfer_artifacts);
+        // the recipient proxy is the mock too
+        let endpoint = server.url();
+        let artifact = wallet.transfer_artifacts.get_mut(&txid).unwrap();
+        artifact.asset_infos.get_mut("asset").unwrap().recipients[0].transport_endpoints[0]
+            .endpoint = endpoint;
+
+        // the end panics on native in the backup info update, which needs JS time, once the
+        // transfers are saved
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(wallet.send_end(online, psbt, true))
+        }));
+        let batch = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|bt| bt.txid.as_deref() == Some(txid.as_str()))
+            .unwrap();
+        // the expiration plus the retention grace advertised by the sender proxy
+        assert_eq!(batch.broadcast_deadline, Some(expiration + 100));
+        assert_eq!(batch.status, TransferStatus::WaitingCounterparty);
+    }
+
+    #[test]
+    fn invalid_ack_signature_fails_once_expired() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut server = mockito::Server::new();
+        // an ACK signed by another key than the one of the recipient
+        let _ack = rpc_mock(&mut server, "ack.get", &ack_get_body([9; 32], true));
+        let now = now().unix_timestamp();
+        let idx = seed_outgoing(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingCounterparty,
+            Some(now + 1000),
+            None,
+            &server.url(),
+            None,
+        );
+        wallet.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(psbt),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+
+        let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
+        assert!(matches!(
+            res[&idx].failure,
+            Some(Error::InvalidContentSignature)
+        ));
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(idx), false, true));
+        assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+
+        // once the broadcast deadline passed, the transfer fails
+        let mut updated: DbBatchTransferActMod = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .into();
+        updated.expiration = ActiveValue::Set(Some(now - 1000));
+        updated.broadcast_deadline = ActiveValue::Set(Some(now - 1000));
+        wallet.database.update_batch_transfer(&mut updated).unwrap();
+        let res = block_on(wallet.fail_transfers(online, Some(idx), false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+    }
+
+    #[test]
+    fn wait_ack_stores_a_valid_signature() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut server = mockito::Server::new();
+        // a NACK signed by the recipient
+        let _ack = rpc_mock(&mut server, "ack.get", &ack_get_body(RECIPIENT_SEED, false));
+        let now = now().unix_timestamp();
+        let idx = seed_outgoing(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingCounterparty,
+            Some(now + 1000),
+            None,
+            &server.url(),
+            None,
+        );
+        wallet.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(psbt),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        assert_eq!(res[&idx].failure, None);
+        assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+        let transfer = wallet.database.iter_transfers().unwrap().pop().unwrap();
+        assert_eq!(transfer.ack, Some(false));
+        assert!(transfer.ack_signature.is_some());
+    }
+
+    // the recipient ACKed but the transfer expired on the sender side: the TX was released, so
+    // the transfer cannot be failed
+    #[test]
+    fn sender_expired_after_recipient_ack() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(&mut server, "ack.get", &ack_get_body(RECIPIENT_SEED, true));
+        let _clean = rpc_mock(&mut server, "ack.clean", ERROR_BODY);
+        let now = now().unix_timestamp();
+        let idx = seed_outgoing(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingCounterparty,
+            Some(now - 400),
+            Some(now + 1000),
+            &server.url(),
+            None,
+        );
+        let mut transfer: DbTransferActMod = wallet
+            .database
+            .iter_transfers()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .into();
+        transfer.invoice_expiration = ActiveValue::Set(Some(now - 1000));
+        wallet.database.update_transfer(&mut transfer).unwrap();
+        wallet.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(psbt),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+        let res = block_on(wallet.fail_transfers(online, None, false, true));
+        // the ACK is signed, so the TX was released: nothing is failed, even though the TX is not
+        // on-chain and the transfer has expired
+        assert_eq!(res, Ok(false));
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+    }
+
+    // the sender proxy lost the operation
+    #[test]
+    fn sender_proxy_lost_operation() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(&mut server, "ack.get", ERROR_BODY);
+        let _clean = rpc_mock(&mut server, "ack.clean", ERROR_BODY);
+        let now = now().unix_timestamp();
+        let idx = seed_outgoing(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingCounterparty,
+            Some(now + 1000),
+            None,
+            &server.url(),
+            None,
+        );
+        wallet.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(psbt),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+        let set = |wallet: &Wallet, expiration, deadline| {
+            let mut updated: DbBatchTransferActMod = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .into();
+            updated.expiration = ActiveValue::Set(Some(expiration));
+            updated.broadcast_deadline = ActiveValue::Set(deadline);
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+        };
+
+        // not expired: the refresh reports it and the fail is denied
+        let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
+        assert!(matches!(res[&idx].failure, Some(Error::OperationNotFound)));
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(idx), false, true));
+        assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+
+        // expired, but the broadcast deadline is not past
+        set(&wallet, now - 400, Some(now + 1000));
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(idx), false, true));
+        assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+
+        // past the broadcast deadline
+        set(&wallet, now - 1000, Some(now - 400));
+        let res = block_on(wallet.fail_transfers(online, Some(idx), false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+    }
+
+    #[test]
+    fn recipient_waits_for_the_broadcast_deadline() {
+        let (_, txid) = dummy_psbt();
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = paths.clone();
+        let inner = esplora_route(None);
+        let url = fake_esplora(move |path| {
+            seen.lock().unwrap().push(path.to_string());
+            inner(path)
+        });
+        let (mut wallet, online) = setup_at(&url);
+        let now = now().unix_timestamp();
+        wallet
+            .received_signed_txs
+            .insert(s!("recipient"), raw_tx(&dummy_psbt().0));
+        for expected in [
+            TransferStatus::WaitingBroadcast,
+            TransferStatus::WaitingConfirmations,
+        ] {
+            let idx = seed_batch(&wallet, &txid, expected, true, Some(now + 5000));
+            let mut updated: DbBatchTransferActMod = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .into_iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap()
+                .into();
+            updated.broadcast_deadline = ActiveValue::Set(Some(now + 1000));
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+            paths.lock().unwrap().clear();
+            let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
+            assert_eq!(res[&idx].updated_status, None);
+            assert_eq!(status(&wallet, idx), expected);
+            // the TX is unknown to the indexer, so it is broadcast again
+            assert!(paths.lock().unwrap().iter().any(|p| p.ends_with("/tx")));
+            let mut updated: DbBatchTransferActMod = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .into_iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap()
+                .into();
+            updated.status = ActiveValue::Set(TransferStatus::Failed);
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+        }
+    }
+
+    #[test]
+    fn recipient_fails_unconfirmed_past_the_deadline() {
+        let (_, txid) = dummy_psbt();
+        for (initial, route_raw) in [
+            (TransferStatus::WaitingBroadcast, false),
+            (TransferStatus::WaitingConfirmations, true),
+        ] {
+            let raw = route_raw.then(|| raw_tx(&dummy_psbt().0));
+            let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(raw)));
+            let now = now().unix_timestamp();
+            let idx = seed_batch(&wallet, &txid, initial, true, Some(now - 100_000));
+            let mut updated: DbBatchTransferActMod = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .into();
+            updated.broadcast_deadline =
+                ActiveValue::Set(Some(now - i64::from(CONFIRMATION_MARGIN_SECS) - 10));
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+            let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+            assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+            assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+        }
+    }
+
+    #[test]
+    fn blind_receive_waits_for_the_retention_grace() {
+        let (wallet, _) = setup();
+        let now = now().unix_timestamp();
+        let idx = seed_batch(
+            &wallet,
+            "t",
+            TransferStatus::WaitingCounterparty,
+            true,
+            Some(now - 100),
+        );
+        let transfer = wallet.database.iter_transfers().unwrap().pop().unwrap();
+        let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+        updated_transfer.recipient_pubkey = ActiveValue::Set(Some(recipient_pubkey()));
+        wallet
+            .database
+            .update_transfer(&mut updated_transfer)
+            .unwrap();
+        // the recipient proxy is unavailable
+        wallet
+            .save_transfer_transport_endpoint(
+                transfer.idx,
+                &LocalTransportEndpoint {
+                    transport_type: TransportType::JsonRpc,
+                    endpoint: ENDPOINT.to_string(),
+                    used: false,
+                    usable: true,
+                },
+            )
+            .unwrap();
+        let set = |expiration: i64, retention_deadline: i64| {
+            let mut updated: DbBatchTransferActMod = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .into();
+            updated.expiration = ActiveValue::Set(Some(expiration));
+            updated.retention_deadline = ActiveValue::Set(Some(retention_deadline));
+            updated.operation_secret_key = ActiveValue::Set(Some(OPERATION_SEED.to_vec()));
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+        };
+        let check = || {
+            let db_data = wallet.database.get_db_data(false).unwrap();
+            let batch = db_data
+                .batch_transfers
+                .iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap();
+            block_on(wallet.blind_receive_may_be_failed(batch, &db_data)).unwrap()
+        };
+        // the invoice expired, but not on the clocks of the proxies
+        set(now - 100, now + 1000);
+        assert!(!check());
+        // expired beyond the skew margin, the proxy cannot answer before the retention deadline
+        set(now - 400, now + 1000);
+        assert!(!check());
+        // past the retention deadline, but not beyond the skew margin
+        set(now - 1000, now - 200);
+        assert!(!check());
+        // past the retention deadline beyond the skew margin
+        set(now - 1000, now - 400);
+        assert!(check());
+    }
+
+    #[test]
+    fn blind_receive_waits_for_the_proxy() {
+        let (wallet, _) = setup();
+        let now = now().unix_timestamp();
+        let mut server = mockito::Server::new();
+        let idx = seed_batch(
+            &wallet,
+            "t",
+            TransferStatus::WaitingCounterparty,
+            true,
+            Some(now - 400),
+        );
+        let mut updated: DbBatchTransferActMod = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .into();
+        updated.retention_deadline = ActiveValue::Set(Some(now + 1000));
+        updated.operation_secret_key = ActiveValue::Set(Some(OPERATION_SEED.to_vec()));
+        wallet.database.update_batch_transfer(&mut updated).unwrap();
+        let transfer = wallet.database.iter_transfers().unwrap().pop().unwrap();
+        let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+        updated_transfer.recipient_pubkey = ActiveValue::Set(Some(recipient_pubkey()));
+        wallet
+            .database
+            .update_transfer(&mut updated_transfer)
+            .unwrap();
+        wallet
+            .save_transfer_transport_endpoint(
+                transfer.idx,
+                &LocalTransportEndpoint {
+                    transport_type: TransportType::JsonRpc,
+                    endpoint: server.url(),
+                    used: false,
+                    usable: true,
+                },
+            )
+            .unwrap();
+        let check = |wallet: &Wallet| {
+            let db_data = wallet.database.get_db_data(false).unwrap();
+            let batch = db_data
+                .batch_transfers
+                .iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap();
+            block_on(wallet.blind_receive_may_be_failed(batch, &db_data)).unwrap()
+        };
+        // a transfer to the invoice is pending on the proxy
+        let pending = rpc_mock(
+            &mut server,
+            "transfer.list",
+            r#"{"jsonrpc":"2.0","id":null,"result":{"transfer":"pending"}}"#,
+        );
+        assert!(!check(&wallet));
+        pending.remove();
+        // nothing is pending
+        let _empty = rpc_mock(
+            &mut server,
+            "transfer.list",
+            r#"{"jsonrpc":"2.0","id":null,"result":{}}"#,
+        );
+        assert!(check(&wallet));
+    }
+
+    #[test]
+    fn transport_endpoint_kinds() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut sender_proxy = mockito::Server::new();
+        let ack = rpc_mock(&mut sender_proxy, "ack.get", ACK_GET_EMPTY);
+        let now = now().unix_timestamp();
+        let idx = seed_outgoing(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingCounterparty,
+            Some(now + 1000),
+            None,
+            &sender_proxy.url(),
+            None,
+        );
+        let transfer = wallet.database.iter_transfers().unwrap().pop().unwrap();
+        wallet
+            .save_transfer_transport_endpoint(
+                transfer.idx,
+                &LocalTransportEndpoint {
+                    transport_type: TransportType::JsonRpc,
+                    endpoint: ENDPOINT.to_string(),
+                    used: true,
+                    usable: true,
+                },
+            )
+            .unwrap();
+        wallet.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(psbt),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+
+        // the listing tells the two apart
+        let listed = wallet
+            .list_transfers(AssetFilter::Any, None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.batch_transfer_idx == idx)
+            .unwrap();
+        assert_eq!(listed.transport_endpoints.len(), 1);
+        assert_eq!(listed.transport_endpoints[0].endpoint, ENDPOINT);
+        assert_eq!(listed.sender_transport_endpoint, Some(sender_proxy.url()));
+
+        // the ACKs are polled on the sender proxy, not on the recipient one
+        block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        ack.assert();
     }
 }

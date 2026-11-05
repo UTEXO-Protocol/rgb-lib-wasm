@@ -207,11 +207,19 @@ use crate::utils::INDEXER_PARALLEL_REQUESTS;
 use crate::utils::{OffchainResolverWasm, WasmResolver};
 #[cfg(feature = "esplora")]
 use crate::{
-    api::{
-        proxy::GetConsignmentResponse,
-        proxy_v1::{ProxyClient, ServerInfoResponse},
+    api::proxy_v1::{
+        AckTransferData, GetAckResponse, GetConsignmentResponse, InvoiceStatus, JsonRpcError,
+        JsonRpcResponse, PostAckResponse, PostConsignmentData, ProxyClient, ProxyTransferState,
+        ServerInfoResponse, get_ack_message, list_transfers_message, map_proxy_error,
+        post_consignment_message, post_media_message, pow_difficulty_required,
+        prepare_ack_auth_message, prepare_invoice_auth_message, transfer_retrieved_message,
     },
     database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
+    encryption::{
+        decode_hash_hex, decrypt_blob, derive_shared, ed25519_from_seed, encrypt_blob, invoice_id,
+        sha256_digest, sign_ed25519, solve_pow as solve_pow_nonce, transfer_id, verify_ed25519,
+        verifying_key_from_bytes,
+    },
     error::IndexerError,
     utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},
     wallet::{AssignmentsCollection, Indexer},
@@ -219,7 +227,7 @@ use crate::{
 use crate::{
     database::{
         LocalRgbAllocation, LocalTransportEndpoint, LocalUnspent, TransferData,
-        enums::{ColoringType, RecipientTypeFull, WalletTransactionType},
+        enums::{ColoringType, RecipientTypeFull, TransportEndpointKind, WalletTransactionType},
     },
     error::InternalError,
     utils::{

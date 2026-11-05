@@ -41,9 +41,6 @@ impl esplora_client::Sleeper for WasmSleeper {
 }
 
 #[cfg(feature = "esplora")]
-const PROXY_PROTOCOL_VERSION: &str = "0.2";
-
-#[cfg(feature = "esplora")]
 const PROXY_V1_PROTOCOL_VERSION: &str = "1.0";
 
 /// Supported Bitcoin networks.
@@ -460,30 +457,6 @@ pub(crate) fn calculate_descriptor_from_xpub(
         return Err(InternalError::Unexpected)?;
     };
     Ok(format!("tr({key})"))
-}
-
-#[cfg(feature = "esplora")]
-pub(crate) async fn check_proxy_async(proxy_url: &str) -> Result<(), Error> {
-    use crate::api::proxy::WasmProxyClient;
-    let client = WasmProxyClient::new()?;
-    let mut err_details = s!("unable to connect to proxy");
-    if let Ok(server_info) = client.get_info(proxy_url).await {
-        if let Some(info) = server_info.result {
-            if info.protocol_version == *PROXY_PROTOCOL_VERSION {
-                return Ok(());
-            } else {
-                return Err(Error::InvalidProxyProtocol {
-                    version: info.protocol_version,
-                });
-            }
-        }
-        if let Some(err) = server_info.error {
-            err_details = err.message;
-        }
-    }
-    Err(Error::Proxy {
-        details: err_details,
-    })
 }
 
 /// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an

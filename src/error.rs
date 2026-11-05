@@ -389,6 +389,10 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided recipient map is invalid
+    #[error("The provided recipient map is invalid")]
+    InvalidRecipientMap,
+
     /// The provided recipient ID is neither a blinded UTXO or a script
     #[error("The provided recipient ID is neither a blinded UTXO or a script")]
     InvalidRecipientID,

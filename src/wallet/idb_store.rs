@@ -32,6 +32,10 @@ pub struct WalletSnapshot {
     /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
+    /// Proxy data of each received consignment keyed by recipient_id.
+    pub(crate) received_consignment_meta: HashMap<String, super::ReceivedConsignmentMeta>,
+    /// Signed TXs released by the sender proxy keyed by recipient_id.
+    pub received_signed_txs: HashMap<String, Vec<u8>>,
     /// Encoded RGB store (base64).
     pub rgb_store: String,
     /// Pinned derivation index per keychain for address reuse.
@@ -223,7 +227,19 @@ mod tests {
             db: InMemoryDb::new(),
             bdk_changeset: None,
             transfer_artifacts: HashMap::from([("funding-txid".to_owned(), transfer_artifact)]),
-            received_consignments: HashMap::new(),
+            received_consignments: HashMap::from([("rid".to_owned(), vec![5])]),
+            received_consignment_meta: HashMap::from([(
+                "rid".to_owned(),
+                super::super::ReceivedConsignmentMeta {
+                    proxy_url: Some("proxy".to_owned()),
+                    transfer_id: Some("tid".to_owned()),
+                    sender_transport_endpoint: "rpc://proxy".to_owned(),
+                    sender_pubkey: "pk".to_owned(),
+                    consignment_hash: "hash".to_owned(),
+                    batch: true,
+                },
+            )]),
+            received_signed_txs: HashMap::from([("rid".to_owned(), vec![6])]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
         };
@@ -243,6 +259,19 @@ mod tests {
         assert_eq!(
             restored_artifact.signed_psbt.as_deref(),
             Some("signed-psbt")
+        );
+
+        assert_eq!(
+            restored_snapshot.received_consignments,
+            snapshot.received_consignments
+        );
+        assert_eq!(
+            restored_snapshot.received_consignment_meta,
+            snapshot.received_consignment_meta
+        );
+        assert_eq!(
+            restored_snapshot.received_signed_txs,
+            snapshot.received_signed_txs
         );
 
         let restored = deserialize_stock(&restored_snapshot.rgb_store).expect("deserialize stock");

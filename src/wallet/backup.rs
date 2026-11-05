@@ -39,6 +39,10 @@ pub(crate) struct WalletBackupPayload {
     #[serde(default)]
     pub(crate) transfer_artifacts:
         std::collections::HashMap<String, super::online::TransferArtifacts>,
+    pub(crate) received_consignments: std::collections::HashMap<String, Vec<u8>>,
+    pub(crate) received_consignment_meta:
+        std::collections::HashMap<String, super::ReceivedConsignmentMeta>,
+    pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -176,7 +180,9 @@ impl super::Wallet {
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
-            received_consignments: Default::default(),
+            received_consignments: payload.received_consignments,
+            received_consignment_meta: payload.received_consignment_meta,
+            received_signed_txs: payload.received_signed_txs,
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
         };
@@ -302,6 +308,9 @@ impl super::Wallet {
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
+            received_consignments: self.received_consignments.clone(),
+            received_consignment_meta: self.received_consignment_meta.clone(),
+            received_signed_txs: self.received_signed_txs.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -389,11 +398,26 @@ mod tests {
         assert_ne!(k1, k3);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    // A sender proxy that has no ACK to serve.
+    fn ack_proxy() -> (mockito::ServerGuard, mockito::Mock) {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!("ack.get")))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","id":null,"result":{"acks":{},"signatures":{}}}"#)
+            .create();
+        (server, mock)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     // Rows of one outgoing transfer after the ACK. `asset_id` is `None` for a sats-only send.
     fn seed_acknowledged_transfer(
         wallet: &mut crate::wallet::Wallet,
         txid: &str,
         asset_id: Option<&str>,
+        sender_proxy: &str,
     ) -> i32 {
         use crate::database::enums::{AssetSchema, TransferStatus};
         use crate::database::memory_db::{
@@ -408,6 +432,7 @@ mod tests {
                 status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
                 expiration: ActiveValue::Set(Some(i64::MAX)),
                 min_confirmations: ActiveValue::Set(1),
+                operation_secret_key: ActiveValue::Set(Some(vec![7; 32])),
                 ..Default::default()
             })
             .unwrap();
@@ -435,19 +460,24 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        wallet
+        let transfer_idx = wallet
             .database
             .set_transfer(DbTransferActMod {
                 asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
                 incoming: ActiveValue::Set(false),
                 recipient_id: ActiveValue::Set(Some(s!("recipient"))),
                 ack: ActiveValue::Set(Some(true)),
+                proxy_transfer_id: ActiveValue::Set(Some(s!("transfer"))),
                 ..Default::default()
             })
+            .unwrap();
+        wallet
+            .save_sender_transport_endpoint(transfer_idx, sender_proxy)
             .unwrap();
         batch_idx
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
@@ -462,7 +492,8 @@ mod tests {
 
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
-        let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id);
+        let (proxy, _mock) = ack_proxy();
+        let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id, &proxy.url());
         // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
         sender.transfer_artifacts.insert(
             txid,
@@ -491,6 +522,7 @@ mod tests {
             indexer_url: indexer_url.to_string(),
         };
         let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
             .block_on(rebuilt.refresh(online, None, vec![], true))
@@ -505,15 +537,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_after_restore_backup_reads_signed_psbt() {
         refresh_after_restore_backup_reads_signed_psbt_impl(None);
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_after_restore_backup_reads_signed_psbt_for_rgb_asset() {
         refresh_after_restore_backup_reads_signed_psbt_impl(Some("rgb:test-asset"));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_fails_transfer_without_signed_psbt_impl(asset_id: Option<&str>) {
         use crate::database::enums::TransferStatus;
         use crate::wallet::Online;
@@ -524,7 +559,8 @@ mod tests {
         let indexer_url = "http://127.0.0.1:1";
         // A wallet restored from a backup without artifacts, ACK already received.
         let mut wallet = make_test_wallet(false);
-        let batch_idx = seed_acknowledged_transfer(&mut wallet, &txid, asset_id);
+        let (proxy, _mock) = ack_proxy();
+        let batch_idx = seed_acknowledged_transfer(&mut wallet, &txid, asset_id, &proxy.url());
         let seeded_expiration = wallet
             .database
             .get_db_data(false)
@@ -541,6 +577,7 @@ mod tests {
             indexer_url: indexer_url.to_string(),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
         let result = rt
@@ -574,21 +611,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_fails_transfer_without_signed_psbt() {
         refresh_fails_transfer_without_signed_psbt_impl(None);
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_fails_transfer_without_signed_psbt_for_rgb_asset() {
         refresh_fails_transfer_without_signed_psbt_impl(Some("rgb:test-asset"));
     }
 
+    // The backup, which VSS shares, and the IndexedDB snapshot carry the transfer artifacts and
+    // the data of the proxy v1 flow.
     #[test]
     fn vss_restore_payload_keeps_transfer_artifacts() {
         // vss_restore_backup shares restore_payload with restore_backup, so this
         // exercises the exact code the VSS path runs on the downloaded backup.
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
+        use crate::wallet::offline::ReceivedConsignmentMeta;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
         use crate::wallet::online::TransferArtifacts;
 
@@ -604,10 +646,31 @@ mod tests {
                 ..Default::default()
             },
         );
+        let meta = ReceivedConsignmentMeta {
+            proxy_url: Some(s!("http://127.0.0.1:3000")),
+            transfer_id: Some(s!("transfer")),
+            sender_transport_endpoint: s!("rpc://127.0.0.1:3000"),
+            sender_pubkey: "11".repeat(32),
+            consignment_hash: "22".repeat(32),
+            batch: true,
+        };
+        sender
+            .received_consignments
+            .insert(s!("recipient"), vec![1, 2, 3]);
+        sender
+            .received_consignment_meta
+            .insert(s!("recipient"), meta.clone());
+        sender
+            .received_signed_txs
+            .insert(s!("recipient"), vec![4, 5, 6]);
         let payload_json = sender.serialize_backup_payload().unwrap();
 
-        let mut restored = make_test_wallet_with_keys(keys, false);
+        let mut restored = make_test_wallet_with_keys(keys.clone(), false);
         restored.restore_payload(&payload_json).unwrap();
+        let mut from_snapshot = make_test_wallet_with_keys(keys, false);
+        from_snapshot
+            .restore_from_snapshot(sender.snapshot().unwrap())
+            .unwrap();
 
         assert_eq!(
             restored
@@ -616,5 +679,19 @@ mod tests {
                 .and_then(|a| a.signed_psbt.clone()),
             Some(s!("psbt"))
         );
+        for restored in [&restored, &from_snapshot] {
+            assert_eq!(
+                restored.received_consignments.get("recipient"),
+                Some(&vec![1, 2, 3])
+            );
+            assert_eq!(
+                restored.received_consignment_meta.get("recipient"),
+                Some(&meta)
+            );
+            assert_eq!(
+                restored.received_signed_txs.get("recipient"),
+                Some(&vec![4, 5, 6])
+            );
+        }
     }
 }

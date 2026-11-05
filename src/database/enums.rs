@@ -112,6 +112,15 @@ pub enum TransportType {
     JsonRpc = 1,
 }
 
+/// The role of a transport endpoint in a transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TransportEndpointKind {
+    /// The proxy of the recipient, where the sender posts the consignment
+    RecipientProxy = 1,
+    /// The proxy of the sender, where the recipient gets the signed TX
+    SenderProxy = 2,
+}
+
 /// The consignment and media encryption preference of a recipient (mirrors
 /// [`rgbinvoice::Encryption`]).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]

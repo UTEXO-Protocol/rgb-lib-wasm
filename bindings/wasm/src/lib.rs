@@ -18,6 +18,28 @@ fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Parse an optional encryption preference: "Required", "Unsupported" or "Optional".
+fn parse_encryption(
+    encryption: Option<String>,
+) -> Result<Option<rgb_lib_wasm::Encryption>, JsValue> {
+    encryption
+        .map(|e| {
+            serde_wasm_bindgen::from_value(JsValue::from_str(&e))
+                .map_err(|_| JsValue::from_str(&format!("Invalid encryption: {e}")))
+        })
+        .transpose()
+}
+
+/// Parse an optional Online object, `null` and `undefined` meaning none.
+fn js_to_online_opt(value: JsValue) -> Result<Option<Online>, JsValue> {
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    serde_wasm_bindgen::from_value(value)
+        .map(Some)
+        .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))
+}
+
 /// Read a u64 from a JS number, BigInt or decimal string.
 fn js_to_u64(value: JsValue) -> Result<u64, JsValue> {
     match value.as_string() {
@@ -284,66 +306,85 @@ impl WasmWallet {
 
     /// Blind an UTXO to receive RGB assets. Returns ReceiveData as a JS object.
     ///
+    /// `online_js` is the Online object returned by `goOnline` (the wallet reserves the invoice on
+    /// its proxies).
     /// `assignment_js` is a JS object like `{ "Fungible": 100 }` or `"NonFungible"` or `"Any"`.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `transport_endpoints_js` is a JS array of endpoint strings.
+    /// `encryption` is "Required" (default), "Unsupported" or "Optional".
     #[wasm_bindgen(js_name = "blindReceive")]
-    pub fn blind_receive(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blind_receive(
         &self,
+        online_js: JsValue,
         asset_id: Option<String>,
         assignment_js: JsValue,
         expiration_timestamp_js: JsValue,
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
+        encryption: Option<String>,
     ) -> Result<JsValue, JsValue> {
+        let online = js_to_online_opt(online_js)?;
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let assignment: rgb_lib_wasm::Assignment = serde_wasm_bindgen::from_value(assignment_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid assignment: {e}")))?;
         let transport_endpoints: Vec<String> =
             serde_wasm_bindgen::from_value(transport_endpoints_js)
                 .map_err(|e| JsValue::from_str(&format!("Invalid transport endpoints: {e}")))?;
-        let data = self
-            .inner
-            .borrow()
+        let encryption = parse_encryption(encryption)?;
+        let mut wallet = self.inner.borrow_mut();
+        let data = wallet
             .blind_receive(
+                online,
                 asset_id,
                 assignment,
                 expiration_timestamp,
                 transport_endpoints,
                 min_confirmations,
+                encryption,
             )
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&data)
     }
 
     /// Create an address to receive RGB assets via witness TX. Returns ReceiveData as a JS object.
     ///
+    /// `online_js` is the Online object returned by `goOnline`.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
+    /// `encryption` is "Required" (default), "Unsupported" or "Optional".
     #[wasm_bindgen(js_name = "witnessReceive")]
-    pub fn witness_receive(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn witness_receive(
         &self,
+        online_js: JsValue,
         asset_id: Option<String>,
         assignment_js: JsValue,
         expiration_timestamp_js: JsValue,
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
+        encryption: Option<String>,
     ) -> Result<JsValue, JsValue> {
+        let online = js_to_online_opt(online_js)?;
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let assignment: rgb_lib_wasm::Assignment = serde_wasm_bindgen::from_value(assignment_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid assignment: {e}")))?;
         let transport_endpoints: Vec<String> =
             serde_wasm_bindgen::from_value(transport_endpoints_js)
                 .map_err(|e| JsValue::from_str(&format!("Invalid transport endpoints: {e}")))?;
-        let data = self
-            .inner
-            .borrow_mut()
+        let encryption = parse_encryption(encryption)?;
+        let mut wallet = self.inner.borrow_mut();
+        let data = wallet
             .witness_receive(
+                online,
                 asset_id,
                 assignment,
                 expiration_timestamp,
                 transport_endpoints,
                 min_confirmations,
+                encryption,
             )
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&data)
     }
@@ -476,6 +517,8 @@ impl WasmWallet {
     ///
     /// `recipient_map_js` is a JS object mapping asset IDs to arrays of Recipient objects.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
+    /// `sender_transport_endpoint` is the sender's own proxy (e.g. `rpc://127.0.0.1:3000/json-rpc`),
+    /// where the recipients post their ACK.
     /// If `dry_run` is true, the wallet does not save the transfer as Initiated.
     #[wasm_bindgen(js_name = "sendBegin")]
     #[allow(clippy::too_many_arguments)]
@@ -487,6 +530,7 @@ impl WasmWallet {
         fee_rate: u64,
         min_confirmations: u8,
         expiration_timestamp_js: JsValue,
+        sender_transport_endpoint: Option<String>,
         lock_time: Option<u32>,
         dry_run: bool,
     ) -> Result<JsValue, JsValue> {
@@ -505,6 +549,7 @@ impl WasmWallet {
                 fee_rate,
                 min_confirmations,
                 expiration_timestamp,
+                sender_transport_endpoint,
                 lock_time,
                 dry_run,
             )
