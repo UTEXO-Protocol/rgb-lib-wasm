@@ -1,12 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
-use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
+use rgb_lib_wasm::wallet::{
+    AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
+};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, bitcoin::Psbt, generate_keys,
+};
 use utils::*;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
@@ -50,6 +54,300 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_no_receive_on_pending_send_input() {
+    let transport = transport_endpoint();
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    let mut rcv_wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+
+    // issue an NIA asset on a UTXO with not enough bitcoins for a send
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let asset = wallet
+        .issue_asset_nia(
+            "PSI".to_string(),
+            "Pending send input".to_string(),
+            0,
+            vec![1000],
+        )
+        .unwrap();
+
+    // create 1 UTXO with no allocations, to be used as additional bitcoin input
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    let colored: HashSet<Outpoint> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert_eq!(colored.len(), 2);
+
+    // begin a witness send, without ending it
+    let receive_data = rcv_wallet
+        .witness_receive(None, Assignment::Any, None, vec![transport.clone()], 1)
+        .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            recipient_id: receive_data.recipient_id,
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            assignment: Assignment::Fungible(1),
+            transport_endpoints: vec![transport.clone()],
+        }],
+    )]);
+    let psbt = wallet
+        .send_begin(online.clone(), recipient_map, false, 1, 1, None)
+        .await
+        .unwrap()
+        .parse::<Psbt>()
+        .unwrap();
+    let inputs: HashSet<Outpoint> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect();
+    assert_eq!(inputs, colored);
+
+    // the UTXO with no allocations is being spent by the pending send, so it cannot receive
+    let result = wallet.blind_receive(None, Assignment::Any, None, vec![transport.clone()], 1);
+    assert!(
+        matches!(result, Err(Error::InsufficientAllocationSlots)),
+        "a receive must not use an input of a pending send, got: {:?}",
+        result.map(|r| r.recipient_id)
+    );
+
+    // another send cannot use the asset input of the pending send
+    let receive_data = rcv_wallet
+        .witness_receive(None, Assignment::Any, None, vec![transport.clone()], 1)
+        .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            recipient_id: receive_data.recipient_id,
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            assignment: Assignment::Fungible(1),
+            transport_endpoints: vec![transport.clone()],
+        }],
+    )]);
+    let result = wallet
+        .send_begin(online.clone(), recipient_map.clone(), false, 1, 1, None)
+        .await;
+    assert!(
+        matches!(result, Err(Error::InsufficientAssignments { .. })),
+        "a send must not use an input of a pending send, got: {result:?}"
+    );
+
+    // a failed send cannot be ended and frees its inputs, also after it is deleted
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let transfers = wallet
+        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid))
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].status, TransferStatus::Initiated);
+    let batch_transfer_idx = transfers[0].batch_transfer_idx;
+    assert!(
+        wallet
+            .fail_transfers(online.clone(), Some(batch_transfer_idx), false, false)
+            .await
+            .unwrap()
+    );
+    let signed = wallet.sign_psbt(psbt.to_string(), None).unwrap();
+    let result = wallet.send_end(online.clone(), signed, false).await;
+    assert!(matches!(result, Err(Error::CannotEndTransfer { .. })));
+    assert!(
+        wallet
+            .delete_transfers(Some(batch_transfer_idx), false)
+            .unwrap()
+    );
+    wallet
+        .blind_receive(None, Assignment::Any, None, vec![transport.clone()], 1)
+        .unwrap();
+
+    // an expired send fails with no index
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let txid = wallet
+        .send_begin(online.clone(), recipient_map, false, 1, 1, None)
+        .await
+        .unwrap()
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
+        .unwrap();
+    let result = wallet
+        .fail_transfers(online.clone(), None, false, false)
+        .await;
+    js_sys::eval("Date.now = realDateNow").unwrap();
+    assert!(result.unwrap());
+    let transfers = wallet
+        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid))
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].status, TransferStatus::Failed);
+}
+
+#[wasm_bindgen_test]
+async fn test_no_inflate_end_after_expiration() {
+    let transport = transport_endpoint();
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let online = wallet
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+
+    // issue IFA inflation rights on a UTXO with not enough bitcoins for an inflation
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let asset = wallet
+        .issue_asset_ifa(
+            "EXP".to_string(),
+            "Expired inflation".to_string(),
+            0,
+            vec![],
+            vec![1000],
+            None,
+        )
+        .unwrap();
+
+    // create 1 UTXO with no allocations, to be used as additional bitcoin input
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    let colored: HashSet<Outpoint> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert_eq!(colored.len(), 2);
+
+    // begin an inflation, without ending it
+    let unsigned = wallet
+        .inflate_begin(online.clone(), asset.asset_id.clone(), vec![500], 1, 1)
+        .await
+        .unwrap();
+    let psbt = unsigned.parse::<Psbt>().unwrap();
+    let inputs: HashSet<Outpoint> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect();
+    assert_eq!(inputs, colored);
+    let result = wallet.blind_receive(None, Assignment::Any, None, vec![transport.clone()], 1);
+    assert!(
+        matches!(result, Err(Error::InsufficientAllocationSlots)),
+        "a receive must not use an input of a begun inflation, got: {:?}",
+        result.map(|r| r.recipient_id)
+    );
+
+    // move the clock past the expiration and receive on an input of the inflation
+    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
+        .unwrap();
+    let receive_data = wallet
+        .blind_receive(None, Assignment::Any, None, vec![transport.clone()], 1)
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let result = wallet.inflate_end(online.clone(), signed).await;
+    js_sys::eval("Date.now = realDateNow").unwrap();
+    assert!(
+        matches!(result, Err(Error::CannotEndTransfer { .. })),
+        "an expired inflation must not be ended, got: {:?}",
+        result.map(|r| r.txid)
+    );
+
+    // the received allocation is intact
+    let receive = wallet
+        .list_transfers(AssetFilter::Any, None)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.recipient_id.as_ref() == Some(&receive_data.recipient_id))
+        .unwrap();
+    assert_eq!(receive.status, TransferStatus::WaitingCounterparty);
+    assert!(inputs.contains(&receive.receive_utxo.unwrap()));
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let unspents: HashSet<Outpoint> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert_eq!(unspents, colored);
 }
 
 #[wasm_bindgen_test]
@@ -162,12 +460,37 @@ async fn test_full_wallet_flow() {
         .send_begin(online.clone(), recipient_map, false, 1, 1, None)
         .await
         .unwrap();
+    let begin_txid = unsigned_psbt
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let begun = wallet
+        .list_transfers(AssetFilter::Any, Some(begin_txid))
+        .unwrap();
+    assert!(!begun.is_empty());
+    assert!(begun.iter().all(|t| t.status == TransferStatus::Initiated));
     let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
     let send_result = wallet
         .send_end(online.clone(), signed_psbt, false)
         .await
         .unwrap();
     assert!(!send_result.txid.is_empty());
+    // send_end updates the begun records and adds none
+    let ended = wallet
+        .list_transfers(AssetFilter::Any, Some(send_result.txid.clone()))
+        .unwrap();
+    assert_eq!(
+        ended.iter().map(|t| t.idx).collect::<Vec<_>>(),
+        begun.iter().map(|t| t.idx).collect::<Vec<_>>()
+    );
+    assert!(
+        ended
+            .iter()
+            .all(|t| t.status == TransferStatus::WaitingCounterparty
+                && t.batch_transfer_idx == begun[0].batch_transfer_idx)
+    );
 
     // validate_consignment_offchain: fetch from proxy and validate before broadcast
     let (consignment_bytes, proxy_txid) = get_consignment_from_proxy(&recv_b.recipient_id).await;

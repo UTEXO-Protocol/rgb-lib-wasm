@@ -182,6 +182,8 @@ pub(crate) struct TransferArtifacts {
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
     pub(crate) signed_psbt: Option<String>,
+    pub(crate) inputs: Vec<Outpoint>,
+    pub(crate) expiration: i64,
 }
 
 async fn pending_consignment_matches(
@@ -536,9 +538,16 @@ impl Wallet {
     }
 
     fn _fail_batch_transfer(
-        &self,
+        &mut self,
         batch_transfer: &DbBatchTransfer,
     ) -> Result<DbBatchTransfer, Error> {
+        if let Some(artifacts) = batch_transfer
+            .txid
+            .as_ref()
+            .and_then(|txid| self.transfer_artifacts.get_mut(txid))
+        {
+            artifacts.inputs.clear();
+        }
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         updated_batch_transfer.expiration = ActiveValue::Set(Some(now().unix_timestamp()));
@@ -548,7 +557,7 @@ impl Wallet {
     }
 
     fn _fail_batch_transfer_if_no_endpoints(
-        &self,
+        &mut self,
         batch_transfer: &DbBatchTransfer,
         transfer_transport_endpoints_data: &[(DbTransferTransportEndpoint, DbTransportEndpoint)],
     ) -> Result<Option<DbBatchTransfer>, Error> {
@@ -1182,13 +1191,15 @@ impl Wallet {
 
         let utxos = self.database.get_unspent_txos(db_data.txos.clone())?;
 
-        let unspents = self.database.get_rgb_allocations(
+        let mut unspents = self.database.get_rgb_allocations(
             utxos,
             Some(db_data.colorings.clone()),
             Some(db_data.batch_transfers.clone()),
             Some(db_data.asset_transfers.clone()),
             Some(db_data.transfers.clone()),
         )?;
+        let reserved = self.get_reserved_outpoints()?;
+        unspents.retain(|u| !reserved.contains(&u.utxo.outpoint()));
 
         let input_unspents = self.get_input_unspents(&unspents)?;
 
@@ -1968,11 +1979,16 @@ impl Wallet {
             .map_err(InternalError::from)?
             .compute_txid()
             .to_string();
-        if final_txid != txid {
-            if let Some(artifacts) = self.transfer_artifacts.remove(&txid) {
-                self.transfer_artifacts.insert(final_txid, artifacts);
-            }
-        }
+        // reserve all inputs, also the ones with no allocations, until the send ends, fails or expires
+        let mut artifacts = self.transfer_artifacts.remove(&txid).unwrap_or_default();
+        artifacts.inputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.into())
+            .collect();
+        artifacts.expiration = now().unix_timestamp() + DURATION_SEND_TRANSFER;
+        self.transfer_artifacts.insert(final_txid, artifacts);
 
         Ok(PrepareTransferPsbtResult::Success(psbt.to_string()))
     }
@@ -2832,7 +2848,9 @@ impl Wallet {
                 .batch_transfers
                 .retain(|t| batch_transfers_ids.contains(&t.idx));
         };
-        db_data.batch_transfers.retain(|t| t.pending());
+        db_data
+            .batch_transfers
+            .retain(|t| t.pending() && !t.status.initiated());
 
         let mut refresh_result = HashMap::new();
         for transfer in db_data.batch_transfers.clone().into_iter() {
@@ -2918,7 +2936,7 @@ impl Wallet {
                 .database
                 .get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
 
-            if !batch_transfer.waiting_counterparty() {
+            if !batch_transfer.waiting_counterparty() && !batch_transfer.status.initiated() {
                 return Err(Error::CannotFailBatchTransfer);
             }
 
@@ -2935,13 +2953,16 @@ impl Wallet {
             self._try_fail_batch_transfer_async(batch_transfer, true, &mut db_data)
                 .await?
         } else {
-            // fail all transfers in status WaitingCounterparty
+            // fail all expired transfers in status Initiated or WaitingCounterparty
             let now = now().unix_timestamp();
             let mut expired_batch_transfers: Vec<DbBatchTransfer> = db_data
                 .batch_transfers
                 .clone()
                 .into_iter()
-                .filter(|t| t.waiting_counterparty() && t.expiration.unwrap_or(now) < now)
+                .filter(|t| {
+                    (t.waiting_counterparty() || t.status.initiated())
+                        && t.expiration.unwrap_or(now) < now
+                })
                 .collect();
             for batch_transfer in expired_batch_transfers.iter_mut() {
                 if no_asset_only {
@@ -3164,6 +3185,24 @@ impl Wallet {
             }
         };
 
+        // save the transfer as Initiated to reserve its inputs until it ends or fails
+        let txid = Psbt::from_str(&psbt_string)?
+            .unsigned_tx
+            .compute_txid()
+            .to_string();
+        let artifacts = self.transfer_artifacts[&txid].clone();
+        let info_contents = artifacts.batch_info.expect("send_begin stores batch info");
+        self._save_transfers(
+            txid,
+            &artifacts.asset_infos,
+            info_contents.extra_allocations,
+            info_contents.change_utxo_idx,
+            info_contents.btc_change,
+            TransferStatus::Initiated,
+            info_contents.min_confirmations,
+        )?;
+        self.update_backup_info(false)?;
+
         info!(self.logger, "Send (begin) completed");
         Ok(psbt_string)
     }
@@ -3188,26 +3227,32 @@ impl Wallet {
             .compute_txid()
             .to_string();
 
-        // Clone data out of transfer_artifacts to avoid borrow conflicts
+        // a send that has failed or progressed cannot be ended again
+        let db_data = self.database.get_db_data(false)?;
+        let mut batch_transfer = None;
+        for bt in &db_data.batch_transfers {
+            if bt.txid.as_ref() == Some(&txid)
+                && !bt.incoming(&db_data.asset_transfers, &db_data.transfers)?
+            {
+                batch_transfer = Some(bt.clone());
+            }
+        }
+        let batch_transfer = batch_transfer.ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+        if !batch_transfer.status.initiated() && !batch_transfer.waiting_counterparty() {
+            return Err(Error::CannotEndTransfer { txid });
+        }
+
+        // Keep the artifacts until the send succeeds, so a failed send_end can be retried
         let artifacts = self
             .transfer_artifacts
-            .remove(&txid)
+            .get(&txid)
+            .cloned()
             .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
         let info_contents = artifacts.batch_info.ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
         })?;
         let mut transfer_info_map = artifacts.asset_infos;
         let consignment_bytes_map = artifacts.consignment_bytes;
-
-        // Store signed PSBT for later use by refresh() → _wait_ack_async()
-        // (replaces filesystem "signed.psbt" from upstream)
-        self.transfer_artifacts.insert(
-            txid.clone(),
-            TransferArtifacts {
-                signed_psbt: Some(signed_psbt.clone()),
-                ..Default::default()
-            },
-        );
 
         // Post consignment(s) to proxy server
         for (asset_id, info_contents_asset) in transfer_info_map.iter_mut() {
@@ -3273,32 +3318,60 @@ impl Wallet {
             }
         }
 
-        let batch_transfer_idx = if info_contents.donation {
+        if info_contents.donation {
             // Broadcast immediately for donations
             let mut runtime = self.rgb_runtime()?;
             let tx = self._broadcast_psbt(psbt, skip_sync).await?;
             let _ = tx; // ensure broadcast completes
             runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
-            self._save_transfers(
-                txid.clone(),
-                &transfer_info_map,
-                info_contents.extra_allocations,
-                info_contents.change_utxo_idx,
-                info_contents.btc_change,
-                TransferStatus::WaitingConfirmations,
-                info_contents.min_confirmations,
-            )?
+        }
+
+        // Keep the signed PSBT for refresh, which reads it when the ACK arrives
+        self.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(signed_psbt.clone()),
+                inputs: artifacts.inputs,
+                ..Default::default()
+            },
+        );
+
+        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
+        updated_batch_transfer.status = ActiveValue::Set(if info_contents.donation {
+            TransferStatus::WaitingConfirmations
         } else {
-            self._save_transfers(
-                txid.clone(),
-                &transfer_info_map,
-                info_contents.extra_allocations,
-                info_contents.change_utxo_idx,
-                info_contents.btc_change,
-                TransferStatus::WaitingCounterparty,
-                info_contents.min_confirmations,
-            )?
-        };
+            TransferStatus::WaitingCounterparty
+        });
+        self.database
+            .update_batch_transfer(&mut updated_batch_transfer)?;
+        let batch_transfer_idx = batch_transfer.idx;
+        let batch_data =
+            batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+        let transfers = batch_data
+            .asset_transfers_data
+            .iter()
+            .flat_map(|atd| atd.transfers.iter());
+        for transfer in transfers {
+            let used: Vec<&String> = transfer_info_map
+                .values()
+                .flat_map(|ti| ti.recipients.iter())
+                .filter(|r| Some(&r.recipient_id) == transfer.recipient_id.as_ref())
+                .flat_map(|r| r.transport_endpoints.iter())
+                .filter(|te| te.used)
+                .map(|te| &te.endpoint)
+                .collect();
+            for (tte, te) in self
+                .database
+                .get_transfer_transport_endpoints_data(transfer.idx)?
+            {
+                if used.contains(&&te.endpoint) {
+                    let mut updated_tte: DbTransferTransportEndpointActMod = tte.into();
+                    updated_tte.used = ActiveValue::Set(true);
+                    self.database
+                        .update_transfer_transport_endpoint(&mut updated_tte)?;
+                }
+            }
+        }
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
@@ -3800,10 +3873,17 @@ impl Wallet {
             .compute_txid()
             .to_string();
 
-        let artifacts = self
+        // an expired inflation no longer reserves its inputs, so it cannot be ended
+        let expiration = self
             .transfer_artifacts
-            .remove(&txid)
-            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+            .get(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?
+            .expiration;
+        if now().unix_timestamp() >= expiration {
+            return Err(Error::CannotEndTransfer { txid });
+        }
+
+        let artifacts = self.transfer_artifacts.remove(&txid).unwrap();
         let info_contents = artifacts.batch_info.ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
         })?;
