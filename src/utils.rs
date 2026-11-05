@@ -491,6 +491,21 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
     Some(Indexer::EsploraAsync(Box::new(client)))
 }
 
+#[cfg(feature = "esplora")]
+pub(crate) fn check_indexer_network(
+    bitcoin_network: BitcoinNetwork,
+    genesis_hash: &str,
+) -> Result<(), Error> {
+    let chain_net: ChainNet = bitcoin_network.into();
+    let expected = BlockHash::from_byte_array(chain_net.chain_hash().to_bytes());
+    if expected.to_string() != genesis_hash {
+        return Err(Error::InvalidIndexer {
+            details: WitnessResolverError::WrongChainNet.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn convert_time_fmt_error(cause: time::error::Format) -> io::Error {
     io::Error::other(cause)
 }

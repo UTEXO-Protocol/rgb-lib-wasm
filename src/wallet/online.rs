@@ -1209,12 +1209,13 @@ impl Wallet {
             crate::utils::build_indexer(&indexer_url).ok_or_else(|| Error::InvalidIndexer {
                 details: s!("failed to build esplora async client"),
             })?;
-        indexer
+        let genesis_hash = indexer
             .block_hash(0)
             .await
             .map_err(|_| Error::InvalidIndexer {
                 details: s!("not a valid esplora server"),
             })?;
+        crate::utils::check_indexer_network(self.bitcoin_network(), &genesis_hash)?;
         indexer.populate_tx_cache(&self.bdk_wallet);
         let online_data = OnlineData {
             id: online.id,
