@@ -10,7 +10,7 @@ use rgb_lib_wasm::bitcoin::{consensus::encode::serialize_hex, psbt::Psbt};
 use rgb_lib_wasm::utils::script_buf_from_recipient_id;
 use rgb_lib_wasm::wallet::{DatabaseType, Online, Recipient, Wallet, WalletData};
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, TransferKind,
+    AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, RgbTxid, TransferKind,
     TransferStatus, generate_keys,
 };
 use utils::*;
@@ -169,7 +169,7 @@ async fn witness_receive_settles_without_proxy_txid_and_vout() {
     refresh(&mut wallet_b, &online_b).await;
     for rid in &rids[..2] {
         let transfer = transfer_of(&wallet_b, rid);
-        assert_eq!(transfer.status, TransferStatus::WaitingConfirmations);
+        assert_eq!(transfer.status, TransferStatus::WaitingBroadcast);
         assert_eq!(transfer.kind, TransferKind::ReceiveWitness);
         assert_eq!(transfer.txid, Some(txid.clone()));
     }
@@ -220,9 +220,11 @@ async fn blind_receive_settles_without_proxy_txid() {
 
     refresh(&mut wallet_b, &online_b).await;
     let transfer = transfer_of(&wallet_b, &rid);
-    assert_eq!(transfer.status, TransferStatus::WaitingConfirmations);
+    assert_eq!(transfer.status, TransferStatus::WaitingBroadcast);
     assert_eq!(transfer.kind, TransferKind::ReceiveBlind);
     assert_eq!(transfer.txid, Some(txid));
+    let b = wallet_b.get_asset_balance(asset_id.clone()).unwrap();
+    assert_eq!((b.settled, b.future), (0, 66));
 
     broadcast(&signed).await;
     settle(&mut wallet_b, &online_b, std::slice::from_ref(&rid)).await;
@@ -326,7 +328,7 @@ async fn witness_receive_multiple_assets_success() {
     refresh(&mut wallet_b, &online_b).await;
     for rid in &rids {
         let transfer = transfer_of(&wallet_b, rid);
-        assert_eq!(transfer.status, TransferStatus::WaitingConfirmations);
+        assert_eq!(transfer.status, TransferStatus::WaitingBroadcast);
         assert_eq!(transfer.kind, TransferKind::ReceiveWitness);
         assert_eq!(transfer.txid, Some(txid.clone()));
     }
@@ -385,6 +387,53 @@ async fn witness_receive_accepts_repeated_terminal_seal() {
     refresh(&mut wallet_b, &online_b).await;
     assert_eq!(
         transfer_of(&wallet_b, &rid).status,
-        TransferStatus::WaitingConfirmations
+        TransferStatus::WaitingBroadcast
     );
+}
+
+#[wasm_bindgen_test]
+async fn donation_receive_broadcasts_signed_tx() {
+    let (mut wallet_a, online_a) = sender().await;
+    let asset_id = issue(&wallet_a);
+    let (mut wallet_b, online_b) = new_wallet().await;
+    let rid = wallet_b
+        .witness_receive(
+            None,
+            Assignment::Fungible(66),
+            default_rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+        )
+        .unwrap()
+        .recipient_id;
+    let map = HashMap::from([(
+        asset_id.clone(),
+        vec![recipient(&rid, 66, Some(2000), PROXY_URL)],
+    )]);
+    let (signed, txid) = begin_send(&mut wallet_a, &online_a, map).await;
+    let bytes = get_consignment_from(PROXY_URL, &txid).await.0;
+    let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
+    let signed_tx = Psbt::from_str(&signed).unwrap().extract_tx().unwrap();
+    assert!(
+        consignment.modify_bundle(RgbTxid::from_str(&txid).unwrap(), |b| b.tx =
+            signed_tx.clone())
+    );
+    wallet_a
+        .post_consignment(
+            PROXY_URL,
+            rid.clone(),
+            &save(&consignment),
+            txid.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // nobody else broadcasts the TX
+    refresh(&mut wallet_b, &online_b).await;
+    let transfer = transfer_of(&wallet_b, &rid);
+    assert_eq!(transfer.status, TransferStatus::WaitingConfirmations);
+    assert_eq!(transfer.txid, Some(txid));
+    settle(&mut wallet_b, &online_b, std::slice::from_ref(&rid)).await;
+    assert_eq!(wallet_b.get_asset_balance(asset_id).unwrap().settled, 66);
 }

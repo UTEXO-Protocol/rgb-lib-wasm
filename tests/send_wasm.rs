@@ -12,7 +12,8 @@ use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, Online, Recipient, SendBeginResult, Transfer, Wallet, WalletData,
 };
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, TransferKind, TransferStatus, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, Error, FileContent, RgbTransfer, RgbTxid,
+    TransferKind, TransferStatus, generate_keys,
 };
 use utils::*;
 
@@ -375,7 +376,7 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
         .iter()
         .find(|t| t.kind == TransferKind::ReceiveBlind)
         .unwrap();
-    assert_eq!(r1_transfer.status, TransferStatus::WaitingConfirmations);
+    assert_eq!(r1_transfer.status, TransferStatus::WaitingBroadcast);
 }
 
 #[wasm_bindgen_test]
@@ -527,4 +528,106 @@ async fn blinded_change_send_begin_only() {
     }
     assert_eq!(balance(&w2, &asset_id), 132);
     assert_eq!(balance(&w1, &asset_id), 868);
+}
+
+#[wasm_bindgen_test]
+async fn batch_donation_success() {
+    let (mut wallet, online) = sender().await;
+    let asset_a = issue(&wallet, "TSTA", 1000);
+    let asset_b = issue(&wallet, "TSTB", 1000);
+    let (mut rcv1, rcv1_online) = sender().await;
+    let (mut rcv2, rcv2_online) = sender().await;
+    let a1 = blind(&rcv1, 11, PROXY_URL);
+    let b1 = blind(&rcv1, 25, PROXY_URL);
+    let a2 = blind(&rcv2, 12, PROXY_URL);
+    let b2 = blind(&rcv2, 22, PROXY_URL);
+    let map = HashMap::from([
+        (
+            asset_a.clone(),
+            vec![
+                recipient(&a1, 11, None, PROXY_URL),
+                recipient(&a2, 12, None, PROXY_URL),
+            ],
+        ),
+        (
+            asset_b.clone(),
+            vec![
+                recipient(&b1, 25, None, PROXY_URL),
+                recipient(&b2, 22, None, PROXY_URL),
+            ],
+        ),
+    ]);
+    let (_, signed, txid) = begin(&mut wallet, &online, map, true, false).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+    assert!(
+        sends(&wallet, &txid)
+            .iter()
+            .all(|t| t.status == TransferStatus::WaitingConfirmations)
+    );
+
+    // the consignments carry the signed TX
+    let signed_tx = Psbt::from_str(&signed).unwrap().extract_tx().unwrap();
+    let witness_id = RgbTxid::from_str(&txid).unwrap();
+    for rid in [&a1, &b1, &a2, &b2] {
+        let bytes = get_consignment_from(PROXY_URL, rid).await.0;
+        let consignment = RgbTransfer::load(&bytes[..]).unwrap();
+        let bundle = consignment
+            .bundles
+            .iter()
+            .find(|b| b.witness_id() == witness_id)
+            .unwrap();
+        assert_eq!(bundle.tx, signed_tx);
+    }
+
+    // a donation skips WaitingBroadcast
+    assert_eq!(
+        transfer_of(&rcv1, &a1).status,
+        TransferStatus::WaitingCounterparty
+    );
+    refresh(&mut rcv1, &rcv1_online).await;
+    refresh(&mut rcv2, &rcv2_online).await;
+    for (w, rid) in [(&rcv1, &a1), (&rcv1, &b1), (&rcv2, &a2), (&rcv2, &b2)] {
+        assert_eq!(
+            transfer_of(w, rid).status,
+            TransferStatus::WaitingConfirmations
+        );
+    }
+
+    settle(&mut rcv1, &rcv1_online, &[a1.clone(), b1.clone()]).await;
+    settle(&mut rcv2, &rcv2_online, &[a2.clone(), b2.clone()]).await;
+    settle(&mut wallet, &online, &[a1, a2, b1, b2]).await;
+    assert_eq!(balance(&rcv1, &asset_a), 11);
+    assert_eq!(balance(&rcv1, &asset_b), 25);
+    assert_eq!(balance(&rcv2, &asset_a), 12);
+    assert_eq!(balance(&rcv2, &asset_b), 22);
+    assert_eq!(balance(&wallet, &asset_a), 977);
+    assert_eq!(balance(&wallet, &asset_b), 953);
+}
+
+#[wasm_bindgen_test]
+async fn donation_posted_before_end_waits_for_broadcast() {
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender().await;
+    let rid = blind(&rcv, 66, PROXY_URL);
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    let (_, signed, txid) = begin(&mut wallet, &online, map, true, false).await;
+    wallet
+        .post_pending_consignments(txid.clone())
+        .await
+        .unwrap();
+
+    refresh(&mut rcv, &rcv_online).await;
+    assert_eq!(
+        transfer_of(&rcv, &rid).status,
+        TransferStatus::WaitingBroadcast
+    );
+
+    end(&mut wallet, &online, &signed).await.unwrap();
+    assert_eq!(
+        sends(&wallet, &txid)[0].status,
+        TransferStatus::WaitingConfirmations
+    );
+    settle(&mut rcv, &rcv_online, std::slice::from_ref(&rid)).await;
+    assert_eq!(balance(&rcv, &asset_id), 66);
 }
