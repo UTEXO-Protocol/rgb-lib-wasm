@@ -158,8 +158,9 @@ const recipientMap = {
     transportEndpoints: ['rpc://localhost:3000/json-rpc'],
   }]
 };
-const psbt = await wallet.sendBegin(online, recipientMap, false, 1n, 1, Math.floor(Date.now() / 1000) + 3600);
-const signed = wallet.signPsbt(psbt);
+const begin = await wallet.sendBegin(online, recipientMap, false, 1n, 1, Math.floor(Date.now() / 1000) + 3600, null, false);
+// begin: { psbt, batchTransferIdx, details }; dryRun = true saves nothing and gives batchTransferIdx null
+const signed = wallet.signPsbt(begin.psbt);
 const result = await wallet.sendEnd(online, signed, false);
 // result: { txid, batchTransferIdx }
 ```
@@ -334,7 +335,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `issueAssetIfa(...)` | no | Issue an Inflatable Fungible Asset |
 | `blindReceive(...)` | no | Create a blind receive invoice |
 | `witnessReceive(...)` | no | Create a witness receive invoice |
-| `sendBegin(...)` | yes | Prepare RGB send PSBT |
+| `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
 | `sendEnd(online, psbt, skipSync)` | yes | Broadcast RGB send PSBT |
 | `sendBtcBegin(...)` | yes | Prepare BTC send PSBT |
 | `sendBtcEnd(online, psbt, skipSync)` | yes | Broadcast BTC send PSBT |
@@ -381,6 +382,7 @@ wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 cd tests && bash regtest.sh start
 cd .. && wasm-pack test --headless --firefox --release -- --test integration_wasm
 wasm-pack test --headless --firefox --release -- --test receive_wasm
+wasm-pack test --headless --firefox --release -- --test send_wasm
 cd tests && bash regtest.sh stop
 ```
 
