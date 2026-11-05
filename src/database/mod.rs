@@ -76,11 +76,6 @@ impl DbBatchTransfer {
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn initiated(&self) -> bool {
-        self.status.initiated()
-    }
-
-    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn waiting(&self) -> bool {
         self.status.waiting()
     }
@@ -90,8 +85,8 @@ impl DbBatchTransfer {
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn waiting_counterparty(&self) -> bool {
-        self.status.waiting_counterparty()
+    pub(crate) fn is_fallible(&self) -> bool {
+        self.status.is_fallible()
     }
 }
 

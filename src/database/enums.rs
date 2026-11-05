@@ -115,16 +115,18 @@ pub enum TransportType {
 /// The status of a [`crate::wallet::Transfer`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Deserialize, Serialize)]
 pub enum TransferStatus {
+    /// Transfer has been initiated (PSBT prepared) but not yet finalized
+    Initiated = 5,
     /// Waiting for the counterparty to take action
     WaitingCounterparty = 1,
+    /// Waiting for the transfer transaction to be broadcasted
+    WaitingBroadcast = 7,
     /// Waiting for the transfer transaction to reach the required number of confirmations
     WaitingConfirmations = 2,
     /// Settled transfer, this status is final
     Settled = 3,
     /// Failed transfer, this status is final
     Failed = 4,
-    /// Transfer has been initiated (PSBT prepared) but not yet finalized
-    Initiated = 5,
 }
 
 impl TransferStatus {
@@ -141,6 +143,7 @@ impl TransferStatus {
             TransferStatus::Initiated,
             TransferStatus::WaitingCounterparty,
             TransferStatus::WaitingConfirmations,
+            TransferStatus::WaitingBroadcast,
         ]
         .contains(self)
     }
@@ -159,7 +162,22 @@ impl TransferStatus {
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn waiting(&self) -> bool {
-        self.waiting_counterparty() || self.waiting_confirmations()
+        [
+            TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingConfirmations,
+            TransferStatus::WaitingBroadcast,
+        ]
+        .contains(self)
+    }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn is_fallible(&self) -> bool {
+        [
+            TransferStatus::Initiated,
+            TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingBroadcast,
+        ]
+        .contains(self)
     }
 }
 
@@ -242,5 +260,29 @@ mod tests {
                 "SCHEMA_ID constant for {asset_schema} is stale"
             );
         }
+    }
+
+    #[test]
+    fn test_transfer_status_methods() {
+        assert!(TransferStatus::Initiated.pending());
+        assert!(TransferStatus::WaitingCounterparty.pending());
+        assert!(TransferStatus::WaitingConfirmations.pending());
+        assert!(TransferStatus::WaitingBroadcast.pending());
+        assert!(!TransferStatus::Settled.pending());
+        assert!(!TransferStatus::Failed.pending());
+
+        assert!(TransferStatus::WaitingCounterparty.waiting());
+        assert!(TransferStatus::WaitingConfirmations.waiting());
+        assert!(TransferStatus::WaitingBroadcast.waiting());
+        assert!(!TransferStatus::Initiated.waiting());
+        assert!(!TransferStatus::Settled.waiting());
+        assert!(!TransferStatus::Failed.waiting());
+
+        assert!(TransferStatus::Initiated.is_fallible());
+        assert!(TransferStatus::WaitingCounterparty.is_fallible());
+        assert!(TransferStatus::WaitingBroadcast.is_fallible());
+        assert!(!TransferStatus::WaitingConfirmations.is_fallible());
+        assert!(!TransferStatus::Settled.is_fallible());
+        assert!(!TransferStatus::Failed.is_fallible());
     }
 }

@@ -575,6 +575,8 @@ impl RefreshResultTrait for RefreshResult {
 pub enum RefreshTransferStatus {
     /// Waiting for the counterparty to take action
     WaitingCounterparty = 1,
+    /// Waiting for the transfer transaction to be broadcasted
+    WaitingBroadcast = 7,
     /// Waiting for the transfer transaction to reach the minimum number of confirmations
     WaitingConfirmations = 2,
 }
@@ -585,8 +587,9 @@ impl TryFrom<TransferStatus> for RefreshTransferStatus {
     fn try_from(x: TransferStatus) -> Result<Self, Self::Error> {
         match x {
             TransferStatus::WaitingCounterparty => Ok(RefreshTransferStatus::WaitingCounterparty),
+            TransferStatus::WaitingBroadcast => Ok(RefreshTransferStatus::WaitingBroadcast),
             TransferStatus::WaitingConfirmations => Ok(RefreshTransferStatus::WaitingConfirmations),
-            _ => Err("ResfreshStatus only accepts pending statuses"),
+            _ => Err("RefreshTransferStatus only accepts waiting statuses"),
         }
     }
 }
@@ -713,6 +716,16 @@ impl Wallet {
             .find(|bundle| bundle.witness_id() == witness_id)
             .map(|bundle| self.assignments_for_bundle(bundle, vout, known_concealed))
             .unwrap_or_default()
+    }
+
+    /// Return the TX when every input is signed.
+    fn donation_signed_tx(tx: &BdkTransaction) -> Option<BdkTransaction> {
+        (!tx.input.is_empty()
+            && tx
+                .input
+                .iter()
+                .all(|i| !i.witness.is_empty() || !i.script_sig.is_empty()))
+        .then(|| tx.clone())
     }
 
     /// Find the consignment terminal that pays this recipient. Return its bundle and, for a
@@ -2538,6 +2551,7 @@ impl Wallet {
         };
         let witness_id = terminal_bundle.witness_id();
         let txid = witness_id.to_string();
+        let donation_tx = Self::donation_signed_tx(&terminal_bundle.tx);
         let known_concealed = match matcher {
             ReceiveMatcher::Blind(secret_seal) => Some(secret_seal),
             ReceiveMatcher::Witness(_) => None,
@@ -2761,6 +2775,24 @@ impl Wallet {
             }
         };
 
+        let new_status = match donation_tx {
+            Some(tx) => {
+                debug!(
+                    self.logger,
+                    "Consignment contains the signed TX, broadcasting it"
+                );
+                self._broadcast_tx(tx).await?;
+                TransferStatus::WaitingConfirmations
+            }
+            None => {
+                debug!(
+                    self.logger,
+                    "Consignment doesn't contain the signed TX, waiting for broadcast"
+                );
+                TransferStatus::WaitingBroadcast
+            }
+        };
+
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
                 self.database
@@ -2798,7 +2830,7 @@ impl Wallet {
         }
 
         updated_batch_transfer.txid = ActiveValue::Set(Some(txid));
-        updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+        updated_batch_transfer.status = ActiveValue::Set(new_status);
 
         Ok(Some(
             self.database
@@ -2867,6 +2899,15 @@ impl Wallet {
         {
             updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         } else if batch_transfer_transfers.iter().all(|t| t.ack == Some(true)) {
+            // do not broadcast an expired transfer: the recipient can fail it after expiration
+            let now = now().unix_timestamp();
+            if batch_transfer.expiration.unwrap_or(now) < now {
+                debug!(
+                    self.logger,
+                    "Transfer expired before the ACK was seen, failing it instead of broadcasting"
+                );
+                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+            }
             let txid = batch_transfer
                 .txid
                 .as_ref()
@@ -2918,11 +2959,21 @@ impl Wallet {
         let confirmations = self.indexer().get_tx_confirmations(&txid).await?;
         debug!(self.logger, "Confirmations: {:?}", confirmations);
 
-        if let Some(confirmations) = confirmations {
-            if confirmations < batch_transfer.min_confirmations as u64 {
-                return Ok(None);
+        let Some(confirmations) = confirmations else {
+            return Ok(None);
+        };
+
+        if confirmations < batch_transfer.min_confirmations as u64 {
+            if batch_transfer.status == TransferStatus::WaitingBroadcast {
+                let mut updated_batch_transfer: DbBatchTransferActMod =
+                    batch_transfer.clone().into();
+                updated_batch_transfer.status =
+                    ActiveValue::Set(TransferStatus::WaitingConfirmations);
+                return Ok(Some(
+                    self.database
+                        .update_batch_transfer(&mut updated_batch_transfer)?,
+                ));
             }
-        } else {
             return Ok(None);
         }
 
@@ -3073,7 +3124,7 @@ impl Wallet {
                 self._wait_counterparty_async(transfer, db_data, incoming, skip_sync)
                     .await
             }
-            TransferStatus::WaitingConfirmations => {
+            TransferStatus::WaitingBroadcast | TransferStatus::WaitingConfirmations => {
                 self._wait_confirmations_async(transfer, db_data, incoming, skip_sync)
                     .await
             }
@@ -3173,6 +3224,9 @@ impl Wallet {
     /// Fail pending RGB transfers (wasm32 async).
     ///
     /// See native [`fail_transfers`](Wallet::fail_transfers) for full documentation.
+    ///
+    /// A transfer in status [`TransferStatus::WaitingBroadcast`] can be failed only after it
+    /// expires, because its TX can still be broadcast before then.
     pub async fn fail_transfers(
         &mut self,
         online: Online,
@@ -3192,13 +3246,21 @@ impl Wallet {
 
         let mut db_data = self.database.get_db_data(false)?;
         let mut transfers_changed = false;
+        let now = now().unix_timestamp();
 
         if let Some(batch_transfer_idx) = batch_transfer_idx {
             let batch_transfer = &self
                 .database
                 .get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
 
-            if !(batch_transfer.initiated() || batch_transfer.waiting_counterparty()) {
+            if !batch_transfer.is_fallible() {
+                return Err(Error::CannotFailBatchTransfer);
+            }
+
+            // the TX can still be broadcast before expiration
+            if batch_transfer.status == TransferStatus::WaitingBroadcast
+                && batch_transfer.expiration.unwrap_or(now) >= now
+            {
                 return Err(Error::CannotFailBatchTransfer);
             }
 
@@ -3215,15 +3277,12 @@ impl Wallet {
             self._try_fail_batch_transfer_async(batch_transfer, true, &mut db_data)
                 .await?
         } else {
-            // fail all expired transfers in status Initiated or WaitingCounterparty
-            let now = now().unix_timestamp();
+            // fail all expired transfers in a fallible status
             let mut expired_batch_transfers: Vec<DbBatchTransfer> = db_data
                 .batch_transfers
                 .clone()
                 .into_iter()
-                .filter(|t| {
-                    (t.initiated() || t.waiting_counterparty()) && t.expiration.unwrap_or(now) < now
-                })
+                .filter(|t| t.is_fallible() && t.expiration.unwrap_or(now) < now)
                 .collect();
             for batch_transfer in expired_batch_transfers.iter_mut() {
                 if no_asset_only {
@@ -3250,9 +3309,10 @@ impl Wallet {
     /// See native [`send_begin`](Wallet::send_begin) for full documentation.
     ///
     /// An expiration UTC timestamp must be specified, which will set the expiration of the
-    /// transfer. This should be set to the same value specified by the recipient's invoice. In case
-    /// of a batch transfer, set it to the minimum (earliest) expiration across the recipients'
-    /// invoices.
+    /// transfer. This should be set to the same value specified by the recipient's invoice. After it
+    /// passes, the recipient can fail the transfer and the sender does not broadcast it, even when
+    /// a late ACK arrives. In case of a batch transfer, set it to the minimum (earliest) expiration
+    /// across the recipients' invoices.
     ///
     /// If `dry_run` is true, the wallet does not save the transfer in
     /// [`TransferStatus::Initiated`]. The returned `batch_transfer_idx` is then None.
@@ -3521,6 +3581,20 @@ impl Wallet {
             consignment_bytes,
             ..
         } = &mut *artifacts;
+        // for a donation, put the signed TX in the consignments so the recipients can broadcast it
+        if info_contents.donation {
+            let tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
+            let witness_id = RgbTxid::from_str(&txid).unwrap();
+            for bytes in consignment_bytes.values_mut() {
+                let mut consignment = RgbTransfer::load(&bytes[..]).map_err(InternalError::from)?;
+                if !consignment.modify_bundle(witness_id, |b| b.tx = tx.clone()) {
+                    return Err(InternalError::Unexpected.into());
+                }
+                let mut v = vec![];
+                consignment.save(&mut v)?;
+                *bytes = v;
+            }
+        }
         for (asset_id, info_contents_asset) in asset_infos.iter_mut() {
             let consignment_bytes = consignment_bytes.get(asset_id).ok_or(Error::Internal {
                 details: s!("missing consignment bytes"),
@@ -3625,6 +3699,9 @@ impl Wallet {
     /// This is required for protocols such as Lightning channel funding where the counterparty
     /// must validate the consignment before it is safe to broadcast the funding transaction.
     /// The transfer artifacts remain available for a later [`Wallet::send_end`] call.
+    ///
+    /// For a donation, the posted consignments carry the unsigned TX. Its recipients wait for the
+    /// broadcast of [`Wallet::send_end`], which does not post them again.
     pub async fn post_pending_consignments(&mut self, txid: String) -> Result<(), Error> {
         let artifacts = self
             .transfer_artifacts
@@ -4207,6 +4284,27 @@ impl Wallet {
     }
 }
 
+// Serve an esplora: `route` maps a request path to a status line and a body.
+#[cfg(test)]
+fn fake_esplora(route: impl Fn(&str) -> (&'static str, Vec<u8>) + Send + 'static) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let (code, body) = route(req.split_whitespace().nth(1).unwrap_or_default());
+            let head = format!(
+                "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, &[head.as_bytes(), &body].concat());
+        }
+    });
+    url
+}
+
 #[cfg(test)]
 mod go_online_tests {
     use super::*;
@@ -4235,25 +4333,6 @@ mod go_online_tests {
             .build()
             .unwrap()
             .block_on(wallet.go_online(options))
-    }
-
-    // Serves one block hash for every request, like an esplora server.
-    fn fake_esplora() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let mut buf = [0u8; 1024];
-                let _ = std::io::Read::read(&mut stream, &mut buf);
-                let body = "00".repeat(32);
-                let res = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = std::io::Write::write_all(&mut stream, res.as_bytes());
-            }
-        });
-        url
     }
 
     fn stored_keys(wallet: &Wallet) -> HashMap<String, [u8; 32]> {
@@ -4299,8 +4378,9 @@ mod go_online_tests {
     #[test]
     fn go_online_stores_proxy_auth_keys() {
         let mut wallet = make_test_wallet(false);
-        let url = fake_esplora();
-        let other_url = fake_esplora();
+        let block_hash = |_: &str| ("200 OK", "00".repeat(32).into_bytes());
+        let url = fake_esplora(block_hash);
+        let other_url = fake_esplora(block_hash);
         let seed1 = "11".repeat(32);
         let seed2 = "22".repeat(32);
 
@@ -4370,13 +4450,30 @@ mod send_end_tests {
     const ENDPOINT: &str = "http://127.0.0.1:1/json-rpc";
 
     fn setup() -> (Wallet, Online) {
+        setup_at(INDEXER_URL)
+    }
+
+    fn setup_at(url: &str) -> (Wallet, Online) {
         let mut wallet = make_test_wallet(false);
-        wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
+        wallet.online_data = Some(OnlineData::for_test(url));
         let online = Online {
             id: 1,
-            indexer_url: INDEXER_URL.to_string(),
+            indexer_url: url.to_string(),
         };
         (wallet, online)
+    }
+
+    // The TX is unconfirmed when `raw_tx` is given, unknown otherwise.
+    fn esplora_route(raw_tx: Option<Vec<u8>>) -> impl Fn(&str) -> (&'static str, Vec<u8>) {
+        move |path| match (&raw_tx, path) {
+            (_, p) if p.ends_with("/status") => ("200 OK", b"{\"confirmed\":false}".to_vec()),
+            (Some(raw), p) if p.ends_with("/raw") => ("200 OK", raw.clone()),
+            _ => ("404 Not Found", vec![]),
+        }
+    }
+
+    fn raw_tx(psbt: &str) -> Vec<u8> {
+        bdk_wallet::bitcoin::consensus::serialize(&Psbt::from_str(psbt).unwrap().unsigned_tx)
     }
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -4839,5 +4936,139 @@ mod send_end_tests {
         updated.status = ActiveValue::Set(TransferStatus::WaitingCounterparty);
         wallet.database.update_batch_transfer(&mut updated).unwrap();
         assert_eq!(wallet.is_batch_transfer_sent("t"), Ok(true));
+    }
+
+    #[test]
+    fn refresh_moves_waiting_broadcast_to_waiting_confirmations() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(Some(raw_tx(&psbt)))));
+        let idx = seed_batch(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingBroadcast,
+            true,
+            Some(i64::MAX),
+        );
+
+        let filter = |incoming| {
+            vec![RefreshFilter {
+                status: RefreshTransferStatus::WaitingBroadcast,
+                incoming,
+            }]
+        };
+        block_on(wallet.refresh(online.clone(), None, filter(false), true)).unwrap();
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingBroadcast);
+
+        let res = block_on(wallet.refresh(online.clone(), None, filter(true), true)).unwrap();
+        assert_eq!(
+            res[&idx].updated_status,
+            Some(TransferStatus::WaitingConfirmations)
+        );
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingConfirmations);
+
+        let now = now().unix_timestamp();
+        let idx2 = seed_batch(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingBroadcast,
+            true,
+            Some(now - 1),
+        );
+        let res = block_on(wallet.fail_transfers(online, Some(idx2), false, true));
+        assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+        assert_eq!(status(&wallet, idx2), TransferStatus::WaitingConfirmations);
+    }
+
+    #[test]
+    fn fail_transfers_fails_waiting_broadcast_only_once_expired() {
+        let (_, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let now = now().unix_timestamp();
+        let seed = |wallet: &Wallet, expiration| {
+            seed_batch(
+                wallet,
+                &txid,
+                TransferStatus::WaitingBroadcast,
+                true,
+                Some(expiration),
+            )
+        };
+
+        let live = seed(&wallet, i64::MAX);
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(live), false, true));
+        assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+        let res = block_on(wallet.fail_transfers(online.clone(), None, false, true));
+        assert_eq!(res, Ok(false));
+        assert_eq!(status(&wallet, live), TransferStatus::WaitingBroadcast);
+
+        let expired = seed(&wallet, now - 1);
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(expired), false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, expired), TransferStatus::Failed);
+
+        let expired = seed(&wallet, now - 1);
+        let res = block_on(wallet.fail_transfers(online, None, false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, expired), TransferStatus::Failed);
+        assert_eq!(status(&wallet, live), TransferStatus::WaitingBroadcast);
+    }
+
+    #[test]
+    fn wait_ack_fails_expired_send_without_broadcast() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup();
+        let now = now().unix_timestamp();
+        let idx = seed_batch(
+            &wallet,
+            &txid,
+            TransferStatus::WaitingCounterparty,
+            false,
+            Some(now - 1),
+        );
+        let transfer = &wallet.database.get_db_data(false).unwrap().transfers[0];
+        let mut updated: DbTransferActMod = transfer.clone().into();
+        updated.ack = ActiveValue::Set(Some(true));
+        wallet.database.update_transfer(&mut updated).unwrap();
+        wallet.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(psbt),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        assert_eq!(
+            res[&idx],
+            RefreshedTransfer {
+                updated_status: Some(TransferStatus::Failed),
+                failure: None,
+            }
+        );
+        assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+    }
+
+    #[test]
+    fn donation_signed_tx_needs_every_input_signed() {
+        use bdk_wallet::bitcoin::{ScriptBuf, TxIn, Witness};
+        let (psbt, _) = dummy_psbt();
+        let mut tx = Psbt::from_str(&psbt).unwrap().unsigned_tx;
+        let signed = TxIn {
+            witness: Witness::from_slice(&[[1u8]]),
+            ..Default::default()
+        };
+
+        tx.input = vec![];
+        assert_eq!(Wallet::donation_signed_tx(&tx), None);
+        tx.input = vec![TxIn::default()];
+        assert_eq!(Wallet::donation_signed_tx(&tx), None);
+        tx.input = vec![signed.clone()];
+        assert_eq!(Wallet::donation_signed_tx(&tx), Some(tx.clone()));
+        tx.input = vec![TxIn {
+            script_sig: ScriptBuf::from_bytes(vec![1]),
+            ..Default::default()
+        }];
+        assert_eq!(Wallet::donation_signed_tx(&tx), Some(tx.clone()));
+        tx.input = vec![signed, TxIn::default()];
+        assert_eq!(Wallet::donation_signed_tx(&tx), None);
     }
 }
