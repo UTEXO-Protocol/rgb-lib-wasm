@@ -83,6 +83,10 @@ cargo test --lib
 # WASM key and wallet tests (no Docker needed)
 wasm-pack test --headless --firefox --release -- --test keys_wasm
 wasm-pack test --headless --firefox --release -- --test wallet_wasm
+WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --firefox --release -- --test pow_wasm
+
+# proof of work time at the highest difficulty (slow, not in CI)
+WASM_BINDGEN_TEST_TIMEOUT=3600 wasm-pack test --headless --firefox --release -- --test pow_wasm -- --nocapture --include-ignored pow_max_difficulty_time
 
 # Integration tests (Docker required)
 cd tests && bash regtest.sh start && cd ..
@@ -117,6 +121,7 @@ Runs 94 native unit tests (database, crypto, backup, VSS encryption).
 ```yaml
 wasm-pack test --headless --firefox --release -- --test keys_wasm
 wasm-pack test --headless --firefox --release -- --test wallet_wasm
+WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --firefox --release -- --test pow_wasm
 wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 ```
 

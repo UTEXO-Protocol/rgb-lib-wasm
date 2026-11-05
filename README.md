@@ -376,6 +376,7 @@ cargo test --lib
 # WASM unit tests (headless Firefox)
 wasm-pack test --headless --firefox --release -- --test keys_wasm
 wasm-pack test --headless --firefox --release -- --test wallet_wasm
+WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --firefox --release -- --test pow_wasm
 wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 
 # Integration tests (requires regtest Docker services)
