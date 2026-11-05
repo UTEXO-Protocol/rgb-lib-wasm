@@ -2,7 +2,7 @@
 
 use amplify::s;
 use base64::{Engine as _, engine::general_purpose};
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
+use chacha20poly1305_010::{KeyInit, XChaCha20Poly1305, aead::Aead};
 use generic_array::GenericArray;
 use scrypt::{
     Scrypt,

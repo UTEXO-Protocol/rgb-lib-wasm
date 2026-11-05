@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 
 use bdk_wallet::bitcoin::hashes::{Hash as _, sha256::Hash as Sha256};
 use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1, SecretKey, SignOnly};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, aead::stream};
+use chacha20poly1305_010::{Key, KeyInit, XChaCha20Poly1305, aead::stream};
 use hkdf::Hkdf;
 use prost::Message as ProstMessage; // trait (for .decode() etc.)
 use serde::{Deserialize, Serialize};
@@ -334,7 +334,7 @@ pub fn encrypt_data(
     let key = derive_encryption_key(signing_key, metadata, info)?;
     let aead = XChaCha20Poly1305::new(&key);
     let nonce = metadata.nonce_bytes()?;
-    let nonce = chacha20poly1305::aead::generic_array::GenericArray::from_slice(&nonce);
+    let nonce = chacha20poly1305_010::aead::generic_array::GenericArray::from_slice(&nonce);
 
     let mut stream_encryptor = stream::EncryptorBE32::from_aead(aead, nonce);
     let mut encrypted = Vec::new();
@@ -376,7 +376,7 @@ pub fn decrypt_data(
     let key = derive_encryption_key(signing_key, metadata, info)?;
     let aead = XChaCha20Poly1305::new(&key);
     let nonce = metadata.nonce_bytes()?;
-    let nonce = chacha20poly1305::aead::generic_array::GenericArray::from_slice(&nonce);
+    let nonce = chacha20poly1305_010::aead::generic_array::GenericArray::from_slice(&nonce);
 
     let mut stream_decryptor = stream::DecryptorBE32::from_aead(aead, nonce);
     let mut decrypted = Vec::new();

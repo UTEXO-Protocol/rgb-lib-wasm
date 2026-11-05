@@ -4476,14 +4476,6 @@ mod send_end_tests {
         bdk_wallet::bitcoin::consensus::serialize(&Psbt::from_str(psbt).unwrap().unsigned_tx)
     }
 
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(f)
-    }
-
     fn dummy_psbt() -> (String, String) {
         use bdk_wallet::bitcoin::{Transaction, TxIn, TxOut};
         let tx = Transaction {

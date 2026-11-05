@@ -43,6 +43,9 @@ impl esplora_client::Sleeper for WasmSleeper {
 #[cfg(feature = "esplora")]
 const PROXY_PROTOCOL_VERSION: &str = "0.2";
 
+#[cfg(feature = "esplora")]
+const PROXY_V1_PROTOCOL_VERSION: &str = "1.0";
+
 /// Supported Bitcoin networks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum BitcoinNetwork {
@@ -481,6 +484,45 @@ pub(crate) async fn check_proxy_async(proxy_url: &str) -> Result<(), Error> {
     Err(Error::Proxy {
         details: err_details,
     })
+}
+
+/// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
+/// expiration it keeps the data awaiting retrieval. A proxy not advertising it is considered to
+/// grant none.
+#[cfg(feature = "esplora")]
+pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
+    info.retention_grace_secs
+        .as_ref()
+        .and_then(|grace| grace.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// The max number of media per transfer advertised by a proxy (`max_media`), `None` if it doesn't
+/// advertise a valid one.
+#[cfg(feature = "esplora")]
+pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
+    info.max_media.as_ref().and_then(|max| max.parse().ok())
+}
+
+/// Check that the proxy at `proxy_url` runs the supported protocol version, returning its info.
+#[cfg(feature = "esplora")]
+pub(crate) async fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, Error> {
+    let proxy_client = ProxyClient::new(proxy_url)?;
+    let server_info = proxy_client.get_info().await?;
+    if let Some(info) = server_info.result {
+        if info.protocol_version == *PROXY_V1_PROTOCOL_VERSION {
+            return Ok(info);
+        } else {
+            return Err(Error::InvalidProxyProtocol {
+                version: info.protocol_version,
+            });
+        }
+    }
+    let details = match server_info.error {
+        Some(err) => err.message,
+        None => s!("proxy response has neither result nor error"),
+    };
+    Err(Error::Proxy { details })
 }
 
 #[cfg(feature = "esplora")]
@@ -1404,5 +1446,94 @@ mod tests {
         let keys = fresh_keys();
         let result = str_to_xpub(&keys.xpub, BdkNetwork::Testnet);
         assert!(result.is_ok());
+    }
+
+    #[cfg(all(feature = "esplora", not(target_arch = "wasm32")))]
+    mod check_proxy_tests {
+        use super::*;
+
+        #[test]
+        fn test_check_proxy_json_rpc_error() {
+            // server returns HTTP 200 with result=null and a JSON-RPC error field
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":null,"error":{"code":-32601,"message":"method not found"}}"#,
+                )
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details == "method not found")
+            );
+            mock.assert();
+        }
+
+        #[test]
+        fn test_check_proxy_invalid_body_error_details() {
+            // server returns HTTP 200 with a body that is not a JSON-RPC response: the transport
+            // error (body decoding) must be reported, not the generic connection message
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body("not json")
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details.starts_with("error decoding response body"))
+            );
+            mock.assert();
+        }
+
+        #[test]
+        fn test_check_proxy_connection_error_details() {
+            // bind then drop a listener to get a port that refuses connections: the transport error
+            // (connection refused) must be reported, not the generic connection message
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let result = block_on(check_proxy(&format!("http://127.0.0.1:{port}")));
+            let expected = format!("error sending request for url (http://127.0.0.1:{port}/");
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details.starts_with(&expected))
+            );
+        }
+
+        #[test]
+        fn test_check_proxy_version() {
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"0.4.0","uptime":1,"max_media":"3"}}"#,
+                )
+                .create();
+            let info = block_on(check_proxy(&server.url())).unwrap();
+            assert_eq!(proxy_max_media(&info), Some(3));
+            assert_eq!(proxy_retention_grace(&info), 0);
+            mock.assert();
+
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"0.2","version":"0.3.0","uptime":1}}"#,
+                )
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::InvalidProxyProtocol { version }) if version == "0.2")
+            );
+            mock.assert();
+        }
     }
 }

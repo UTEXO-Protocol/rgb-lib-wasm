@@ -112,6 +112,38 @@ pub enum TransportType {
     JsonRpc = 1,
 }
 
+/// The consignment and media encryption preference of a recipient (mirrors
+/// [`rgbinvoice::Encryption`]).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum Encryption {
+    /// Encryption is mandatory for consignment and media (the recipient refuses cleartext)
+    Required = 1,
+    /// Encryption must not be used for consignment and media (the recipient refuses encrypted)
+    Unsupported = 2,
+    /// Encryption may be used for consignment and media (the recipient accepts both)
+    Optional = 3,
+}
+
+impl From<rgbinvoice::Encryption> for Encryption {
+    fn from(e: rgbinvoice::Encryption) -> Self {
+        match e {
+            rgbinvoice::Encryption::Required => Encryption::Required,
+            rgbinvoice::Encryption::Unsupported => Encryption::Unsupported,
+            rgbinvoice::Encryption::Optional => Encryption::Optional,
+        }
+    }
+}
+
+impl From<Encryption> for rgbinvoice::Encryption {
+    fn from(e: Encryption) -> Self {
+        match e {
+            Encryption::Required => rgbinvoice::Encryption::Required,
+            Encryption::Unsupported => rgbinvoice::Encryption::Unsupported,
+            Encryption::Optional => rgbinvoice::Encryption::Optional,
+        }
+    }
+}
+
 /// The status of a [`crate::wallet::Transfer`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Deserialize, Serialize)]
 pub enum TransferStatus {
@@ -284,5 +316,34 @@ mod tests {
         assert!(!TransferStatus::WaitingConfirmations.is_fallible());
         assert!(!TransferStatus::Settled.is_fallible());
         assert!(!TransferStatus::Failed.is_fallible());
+    }
+
+    #[test]
+    fn test_encryption_conversions() {
+        // every variant maps both ways between the DB enum and the rgb-invoicing enum, and keeps a
+        // stable on-disk num_value (the DB persistence contract)
+        for (encryption, num_value) in [
+            (Encryption::Required, 1u8),
+            (Encryption::Unsupported, 2),
+            (Encryption::Optional, 3),
+        ] {
+            // DB -> invoicing maps to the matching concrete variant
+            let to_invoicing: rgbinvoice::Encryption = encryption.into();
+            let invoicing_ok = matches!(
+                (encryption, &to_invoicing),
+                (Encryption::Required, rgbinvoice::Encryption::Required)
+                    | (Encryption::Unsupported, rgbinvoice::Encryption::Unsupported)
+                    | (Encryption::Optional, rgbinvoice::Encryption::Optional)
+            );
+            assert!(
+                invoicing_ok,
+                "{encryption:?} mapped to the wrong invoicing variant"
+            );
+            // invoicing -> DB round-trips back to the original variant
+            let back: Encryption = to_invoicing.into();
+            assert_eq!(back, encryption);
+            // the integer stored in the DB must not change across versions
+            assert_eq!(encryption as u8, num_value);
+        }
     }
 }

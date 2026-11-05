@@ -13,6 +13,30 @@ const ASSETS_DIR: &str = "assets";
 
 const MIN_BTC_REQUIRED: u64 = 2000;
 
+/// Seconds a deadline must have passed on the local clock before the proxy deadline counts as
+/// passed. It matches the proxy's timestamp tolerance.
+#[cfg(feature = "esplora")]
+pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
+
+/// Minimum seconds between an outgoing operation's expiration and the earliest invoice expiration
+/// among its recipients. It leaves time to detect the ACKs and broadcast, and covers clock skew.
+#[cfg(feature = "esplora")]
+pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
+
+/// Minimum `retention_grace_secs` a recipient requires from the sender proxy to ACK a transfer.
+/// A transfer whose sender proxy grants less is NACKed.
+#[cfg(feature = "esplora")]
+pub(crate) const MIN_SENDER_RETENTION_GRACE_SECS: u32 = 86400;
+
+/// Seconds a recipient waits after the broadcast deadline (operation expiration plus sender proxy
+/// retention grace) before failing a transfer whose TX is unconfirmed.
+#[cfg(feature = "esplora")]
+pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
+
+/// Maximum proof of work difficulty (leading zero bits) the wallet computes for a consignment.
+#[cfg(feature = "esplora")]
+pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
+
 pub(crate) const NUM_KNOWN_SCHEMAS: usize = 2;
 
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;

@@ -29,6 +29,7 @@
 
 pub(crate) mod api;
 pub(crate) mod database;
+pub(crate) mod encryption;
 pub(crate) mod error;
 pub mod keys;
 pub mod utils;
@@ -48,12 +49,25 @@ pub use rgbstd::{
 };
 
 pub use crate::{
-    database::enums::{AssetSchema, Assignment, TransferStatus, TransportType},
+    database::enums::{AssetSchema, Assignment, Encryption, TransferStatus, TransportType},
     error::Error,
     keys::{generate_keys, restore_keys},
     utils::BitcoinNetwork,
     wallet::{RecipientType, TransactionType, TransferKind, Wallet},
 };
+
+#[cfg(feature = "esplora")]
+#[doc(hidden)]
+pub use crate::encryption::solve_pow;
+
+#[cfg(test)]
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
 
 #[cfg(feature = "esplora")]
 use std::{
@@ -66,7 +80,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::Hash,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Read, Write},
     panic,
     path::{Path, PathBuf},
     str::FromStr,
@@ -110,12 +124,18 @@ use bdk_wallet::{
     },
     coin_selection::InsufficientFunds,
 };
-use chacha20poly1305::{
-    Key, KeyInit, XChaCha20Poly1305,
-    aead::{generic_array::GenericArray, stream},
-};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use ed25519_dalek::SigningKey;
+#[cfg(feature = "esplora")]
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+#[cfg(feature = "esplora")]
+use hkdf::Hkdf;
+#[cfg(feature = "esplora")]
+use hmac::{Mac, SimpleHmac};
 use psrgbt::{RgbOutExt, RgbPsbtExt};
-use rand::{Rng, distr::Alphanumeric};
+use rand::{Rng, TryRng, distr::Alphanumeric, rngs::SysRng};
+#[cfg(feature = "esplora")]
+use reqwest::{Client as RestClient, header::CONTENT_TYPE, multipart};
 use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
     Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, Opout, OutputSeal,
@@ -162,10 +182,15 @@ use scrypt::{
 };
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+#[cfg(feature = "esplora")]
+use sha2::Sha512;
+use sha2::{Digest, Sha256};
 use slog::{Drain, Logger, debug, error, info, o, warn};
 use strict_encoding::{DecodeError, DeserializeError, FieldName, StrictSerialize};
 use time::OffsetDateTime;
 use typenum::consts::U32;
+#[cfg(feature = "esplora")]
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
 use crate::database::{
     DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
@@ -182,7 +207,10 @@ use crate::utils::INDEXER_PARALLEL_REQUESTS;
 use crate::utils::{OffchainResolverWasm, WasmResolver};
 #[cfg(feature = "esplora")]
 use crate::{
-    api::proxy::GetConsignmentResponse,
+    api::{
+        proxy::GetConsignmentResponse,
+        proxy_v1::{ProxyClient, ServerInfoResponse},
+    },
     database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
     error::IndexerError,
     utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},

@@ -27,13 +27,22 @@ bdk_core = { version = "0.6" }
 bdk_esplora = { version = "0.22.0", optional = true, default-features = false, features = [
     "async-https",
 ] }
-chacha20poly1305 = { version = "0.10.1", default-features = false, features = [
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = [
+    "alloc",
+] }
+# VSS and backup need the AEAD stream API of chacha20poly1305 0.10
+chacha20poly1305_010 = { package = "chacha20poly1305", version = "0.10.1", default-features = false, features = [
     "alloc",
     "stream",
 ] }
-hkdf = { version = "0.12", default-features = false }
+ed25519-dalek = { version = "3", default-features = false }
+hkdf = { version = "0.13", default-features = false }
+hmac = { version = "0.13", default-features = false }
 prost = { version = "0.11.6", default-features = false, features = ["prost-derive"] }
-sha2 = { version = "0.10", default-features = false, features = ["std"] }
+sha2 = { version = "0.11", default-features = false }
+x25519-dalek = { version = "3", default-features = false, features = [
+    "static_secrets",
+] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 generic-array = "=0.14.7"  # temporary pin while waiting for chacha20poly1305 update
 esplora-client = { version = "0.12", default-features = false, features = [
@@ -44,9 +53,10 @@ gloo-net = { version = "0.6", default-features = false, features = ["http", "jso
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 instant = { version = "0.1", features = ["wasm-bindgen"] }
 js-sys = "0.3"
-rand = { version = "0.10.0", default-features = false }
+rand = { version = "0.10.0", default-features = false, features = ["sys_rng"] }
 reqwest = { version = "0.13", optional = true, default-features = false, features = [
     "json",
+    "multipart",
 ] }
 rexie = "0.6"
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
@@ -66,7 +76,7 @@ time = { version = "0.3.41", default-features = false, features = ["macros", "fo
 typenum = { version = "1.19.0", default-features = false }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["FormData", "Blob", "BlobPropertyBag", "console"] }
+web-sys = { version = "0.3", features = ["FormData", "Blob", "BlobPropertyBag", "console", "MessageChannel", "MessagePort"] }
 
 # RGB-related deps
 amplify = { version = "=4.8.1", default-features = false }
@@ -89,8 +99,14 @@ esplora = [
 ]
 camel_case = []
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+mockito = "1"
 
 [profile.reldebug]
 inherits = "release"

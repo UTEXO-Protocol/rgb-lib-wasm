@@ -79,6 +79,10 @@ pub enum Error {
         file_path: String,
     },
 
+    /// The provided expiration is invalid (in the past or too far in the future)
+    #[error("Invalid expiration")]
+    ExpirationInvalid,
+
     /// Syncing BDK with the blockchain has failed
     #[error("Failed bdk sync: {details}")]
     FailedBdkSync {
@@ -111,6 +115,10 @@ pub enum Error {
     #[error("Fingerprint mismatch")]
     FingerprintMismatch,
 
+    /// A proxy payload, decrypted if it was encrypted, doesn't match its expected hash
+    #[error("Hash mismatch")]
+    HashMismatch,
+
     /// An I/O error has been encountered
     #[error("I/O error: {details}")]
     IO {
@@ -125,6 +133,50 @@ pub enum Error {
         /// Error details
         details: String,
     },
+
+    /// The content signature was rejected as invalid
+    #[error("Invalid content signature")]
+    InvalidContentSignature,
+
+    /// A proxy payload is malformed or cannot be decrypted
+    #[error("Invalid encrypted blob: {details}")]
+    InvalidEncryptedBlob {
+        /// Error details
+        details: String,
+    },
+
+    /// The endpoint signature was rejected as invalid
+    #[error("Invalid endpoint auth signature")]
+    InvalidEndpointAuthSignature,
+
+    /// The proxy auth signature was rejected as invalid
+    #[error("Invalid proxy auth signature")]
+    InvalidProxyAuthSignature,
+
+    /// The recipient proxy refused the transfer as the invoice has expired, or the invoice
+    /// expiration has passed before the transfer could be created
+    #[error("Invoice expired")]
+    InvoiceExpired,
+
+    /// The invoice has not been reserved on the recipient proxy
+    #[error("Invoice not reserved")]
+    InvoiceNotReserved,
+
+    /// The invoice cannot accept more transfers on the recipient proxy
+    #[error("Invoice quota exceeded")]
+    InvoiceQuotaExceeded,
+
+    /// No media found
+    #[error("No media found")]
+    NoMedia,
+
+    /// The proxy operation has expired
+    #[error("Operation expired")]
+    OperationExpired,
+
+    /// The proxy operation was not found
+    #[error("Operation not found")]
+    OperationNotFound,
 
     /// Durable wallet persistence failed
     #[error("Persistence error: {details}")]
@@ -448,6 +500,25 @@ pub enum Error {
         details: String,
     },
 
+    /// The proxy rejected a change to immutable operation data
+    #[error("Proxy cannot change: {details}")]
+    ProxyCannotChange {
+        /// Error details
+        details: String,
+    },
+
+    /// The proxy is draining and doesn't accept new transfers
+    #[error("Proxy draining")]
+    ProxyDraining,
+
+    /// The proxy doesn't accept any more media for the transfer
+    #[error("Proxy doesn't accept so many media")]
+    ProxyTooManyMedia,
+
+    /// The signed TX was already released to a recipient, so it can no longer be revoked
+    #[error("TX already released")]
+    ProxyTxAlreadyReleased,
+
     /// Provided recipient ID has already been used for another transfer
     #[error("Recipient ID already used")]
     RecipientIDAlreadyUsed,
@@ -470,6 +541,10 @@ pub enum Error {
         details: String,
     },
 
+    /// The proxy's registered signed TX for this operation was previously cleared
+    #[error("Signed TX was cleared")]
+    SignedTxCleared,
+
     /// The inflation amount exceeds the max possible supply
     #[error("The inflation amount exceeds the max possible supply")]
     TooHighInflationAmounts,
@@ -477,6 +552,14 @@ pub enum Error {
     /// Trying to issue too many assets
     #[error("Trying to issue too many assets")]
     TooHighIssuanceAmounts,
+
+    /// The transfer ID has been deleted on the recipient proxy and cannot be reused
+    #[error("Transfer ID deleted")]
+    TransferIDDeleted,
+
+    /// The transfer ID is already in use by a different operation on the sender proxy
+    #[error("Transfer ID in use")]
+    TransferIDInUse,
 
     /// The detected RGB schema is unknown
     #[error("Unknown RGB schema: {schema_id}")]
