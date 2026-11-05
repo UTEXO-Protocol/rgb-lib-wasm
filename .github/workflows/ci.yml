@@ -174,7 +174,7 @@ jobs:
 
       - name: Run send tests
         env:
-          WASM_BINDGEN_TEST_TIMEOUT: 1200
+          WASM_BINDGEN_TEST_TIMEOUT: 3600
         run: wasm-pack test --headless --firefox --release --test send_wasm
 
       - name: Stop regtest services

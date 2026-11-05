@@ -1,6 +1,5 @@
 use std::{collections::HashMap, str::FromStr};
 
-use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -12,8 +11,8 @@ use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, Online, Recipient, SendBeginResult, Transfer, Wallet, WalletData,
 };
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, FileContent, RgbTransfer, RgbTxid,
-    TransferKind, TransferStatus, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
+    generate_keys,
 };
 use utils::*;
 
@@ -46,12 +45,22 @@ async fn create_utxos(
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let txid = txid_of(&signed);
     wallet
         .create_utxos_end(online.clone(), signed, true)
         .await
         .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    // A block can miss the TX before it reaches the mining node: mine until it confirms.
+    let status = format!("{ESPLORA_URL}/tx/{txid}/status");
+    for _ in 0..20 {
+        mine_blocks(1).await;
+        wait_for_esplora_sync().await;
+        let res = reqwest::get(&status).await.unwrap().text().await.unwrap();
+        if res.contains("\"confirmed\":true") {
+            break;
+        }
+        sleep_ms(500).await;
+    }
     wallet.sync(online.clone()).await.unwrap();
 }
 
@@ -75,17 +84,18 @@ fn issue(wallet: &Wallet, ticker: &str, amount: u64) -> String {
         .asset_id
 }
 
-fn blind(wallet: &Wallet, amount: u64, url: &str) -> String {
-    wallet
-        .blind_receive(
-            None,
-            Assignment::Fungible(amount),
-            default_rcv_expiration(),
-            vec![transport_endpoint(url)],
-            1,
-        )
-        .unwrap()
-        .recipient_id
+async fn blind(wallet: &mut Wallet, online: &Online, amount: u64, url: &str) -> String {
+    blind_rcv(
+        wallet,
+        online,
+        None,
+        Assignment::Fungible(amount),
+        default_rcv_expiration(),
+        vec![transport_endpoint(url)],
+    )
+    .await
+    .unwrap()
+    .recipient_id
 }
 
 async fn begin(
@@ -95,6 +105,25 @@ async fn begin(
     donation: bool,
     dry_run: bool,
 ) -> (SendBeginResult, String, String) {
+    begin_with(
+        wallet,
+        online,
+        map,
+        donation,
+        dry_run,
+        default_send_expiration(),
+    )
+    .await
+}
+
+async fn begin_with(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    donation: bool,
+    dry_run: bool,
+    expiration: u64,
+) -> (SendBeginResult, String, String) {
     let res = wallet
         .send_begin(
             online.clone(),
@@ -102,7 +131,8 @@ async fn begin(
             donation,
             1,
             1,
-            default_send_expiration(),
+            expiration,
+            Some(transport_endpoint(PROXY_URL)),
             None,
             dry_run,
         )
@@ -115,6 +145,27 @@ async fn begin(
         .compute_txid()
         .to_string();
     (res, signed, txid)
+}
+
+async fn begin_dry(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    expiration: u64,
+) -> Result<SendBeginResult, Error> {
+    wallet
+        .send_begin(
+            online.clone(),
+            map,
+            false,
+            1,
+            1,
+            expiration,
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            true,
+        )
+        .await
 }
 
 async fn end(wallet: &mut Wallet, online: &Online, signed: &str) -> Result<(String, i32), Error> {
@@ -133,37 +184,12 @@ fn sends(wallet: &Wallet, txid: &str) -> Vec<Transfer> {
         .collect()
 }
 
-// Make every consignment post for `recipient_id` fail, or stop the failures.
-fn fail_posts(recipient_id: &str, fail: bool) {
-    js_sys::Function::new_no_args(
-        "if (!globalThis.__rgbFetch) {
-            globalThis.__rgbFetch = globalThis.fetch;
-            globalThis.__rgbFailIds = new Set();
-            globalThis.fetch = function (input, init) {
-                const self = this;
-                const orig = () => globalThis.__rgbFetch.call(self, input, init);
-                const req = input instanceof Request ? input.clone() : null;
-                const body = init && init.body instanceof FormData ? init.body : null;
-                if (globalThis.__rgbFailIds.size === 0 || (!body && (!req || req.method !== 'POST'))) {
-                    return orig();
-                }
-                const form = body ? Promise.resolve(body) : req.formData();
-                return form.then((fd) => {
-                    const params = String(fd.get('params') || '');
-                    for (const id of globalThis.__rgbFailIds) {
-                        if (params.includes(id)) throw new TypeError('injected failure');
-                    }
-                    return orig();
-                }, orig);
-            };
-        }",
-    )
-    .call0(&JsValue::NULL)
-    .unwrap();
-    let ids = js_sys::Reflect::get(&js_sys::global(), &"__rgbFailIds".into()).unwrap();
-    let method = if fail { "add" } else { "delete" };
-    let f: js_sys::Function = js_sys::Reflect::get(&ids, &method.into()).unwrap().into();
-    f.call1(&ids, &recipient_id.into()).unwrap();
+// Make every consignment post to the proxy at `url_part` fail, or stop the failures.
+fn fail_posts(url_part: &str, fail: bool) {
+    clear_rpc_hooks();
+    if fail {
+        rpc_fail(url_part, "consignment.post");
+    }
 }
 
 fn balance(wallet: &Wallet, asset_id: &str) -> u64 {
@@ -177,8 +203,8 @@ fn balance(wallet: &Wallet, asset_id: &str) -> u64 {
 async fn begin_end() {
     let (mut wallet, online) = sender().await;
     let asset_id = issue(&wallet, "TST", 1000);
-    let (rcv, _) = sender().await;
-    let rid = blind(&rcv, 66, PROXY_URL);
+    let (mut rcv, rcv_online) = sender().await;
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
     wallet.backup("pw").unwrap();
     assert!(!wallet.backup_info().unwrap());
@@ -188,6 +214,34 @@ async fn begin_end() {
     assert_eq!(res.batch_transfer_idx, None);
     assert!(sends(&wallet, &txid).is_empty());
     assert!(!wallet.backup_info().unwrap());
+
+    // the operation expires at least the margin before the earliest invoice
+    let early_rid = blind_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(34),
+        default_rcv_expiration() - 1000,
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+    let early = recipient(&early_rid, 34, None, PROXY_URL);
+    let latest = early.expiration_timestamp.unwrap() - 600;
+    let two = HashMap::from([(
+        asset_id.clone(),
+        vec![recipient(&rid, 66, None, PROXY_URL), early],
+    )]);
+    assert!(
+        begin_dry(&mut wallet, &online, two.clone(), latest)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, two, latest + 1).await,
+        Err(Error::InvalidExpiration)
+    ));
 
     sleep_ms(1100).await;
     let (res, signed, txid) = begin(&mut wallet, &online, map.clone(), false, false).await;
@@ -202,6 +256,7 @@ async fn begin_end() {
                 1,
                 1,
                 default_send_expiration(),
+                Some(transport_endpoint(PROXY_URL)),
                 None,
                 false,
             )
@@ -235,8 +290,8 @@ async fn send_end_retry_after_post_failure() {
     let (mut rcv, rcv_online) = sender().await;
 
     // a send whose second post fails can be failed
-    let ra = blind(&rcv, 66, PROXY_URL);
-    let rb = blind(&rcv, 34, PROXY_B_URL);
+    let ra = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let rb = blind(&mut rcv, &rcv_online, 34, PROXY_B_URL).await;
     let map = HashMap::from([(
         asset_id.clone(),
         vec![
@@ -246,11 +301,11 @@ async fn send_end_retry_after_post_failure() {
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, false).await;
     let idx = res.batch_transfer_idx.unwrap();
-    fail_posts(&rb, true);
-    assert_eq!(
+    fail_posts(":3010", true);
+    assert!(matches!(
         end(&mut wallet, &online, &signed).await,
-        Err(Error::NoValidTransportEndpoint)
-    );
+        Err(Error::Proxy { .. })
+    ));
     let saved = sends(&wallet, &txid);
     assert_eq!(saved.len(), 2);
     assert!(saved.iter().all(|t| t.status == TransferStatus::Initiated));
@@ -265,15 +320,15 @@ async fn send_end_retry_after_post_failure() {
             .iter()
             .all(|t| t.status == TransferStatus::Failed)
     );
-    fail_posts(&rb, false);
+    fail_posts(":3010", false);
     assert_eq!(
         end(&mut wallet, &online, &signed).await,
         Err(Error::CannotEndTransfer { txid })
     );
 
     // a send whose second post fails can be retried
-    let ra = blind(&rcv, 66, PROXY_URL);
-    let rb = blind(&rcv, 34, PROXY_B_URL);
+    let ra = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let rb = blind(&mut rcv, &rcv_online, 34, PROXY_B_URL).await;
     let map = HashMap::from([(
         asset_id.clone(),
         vec![
@@ -283,11 +338,11 @@ async fn send_end_retry_after_post_failure() {
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, false).await;
     let idx = res.batch_transfer_idx.unwrap();
-    fail_posts(&rb, true);
-    assert_eq!(
+    fail_posts(":3010", true);
+    assert!(matches!(
         end(&mut wallet, &online, &signed).await,
-        Err(Error::NoValidTransportEndpoint)
-    );
+        Err(Error::Proxy { .. })
+    ));
     let saved = sends(&wallet, &txid);
     assert_eq!(saved.len(), 2);
     assert!(
@@ -295,7 +350,7 @@ async fn send_end_retry_after_post_failure() {
             .iter()
             .all(|t| t.status == TransferStatus::Initiated && t.batch_transfer_idx == idx)
     );
-    fail_posts(&rb, false);
+    fail_posts(":3010", false);
     assert_eq!(
         end(&mut wallet, &online, &signed).await,
         Ok((txid.clone(), idx))
@@ -320,17 +375,18 @@ async fn send_end_retry_after_post_failure() {
 async fn send_to_oneself_crash_impl(dry_run: bool) {
     let (mut wallet, online) = sender().await;
     let asset_id = issue(&wallet, "TST", 1000);
-    let r1 = blind(&wallet, 66, PROXY_URL);
-    let r2 = wallet
-        .witness_receive(
-            None,
-            Assignment::Fungible(33),
-            default_rcv_expiration(),
-            vec![transport_endpoint(PROXY_B_URL)],
-            1,
-        )
-        .unwrap()
-        .recipient_id;
+    let r1 = blind(&mut wallet, &online, 66, PROXY_URL).await;
+    let r2 = witness_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Fungible(33),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_B_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
     let map = HashMap::from([(
         asset_id.clone(),
         vec![
@@ -339,11 +395,11 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
         ],
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, dry_run).await;
-    fail_posts(&r2, true);
-    assert_eq!(
+    fail_posts(":3010", true);
+    assert!(matches!(
         end(&mut wallet, &online, &signed).await,
-        Err(Error::NoValidTransportEndpoint)
-    );
+        Err(Error::Proxy { .. })
+    ));
     let saved = sends(&wallet, &txid);
     if dry_run {
         assert!(saved.is_empty());
@@ -354,7 +410,7 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
     refresh(&mut wallet, &online).await;
     assert_eq!(transfer_of(&wallet, &r1).txid, Some(txid.clone()));
 
-    fail_posts(&r2, false);
+    fail_posts(":3010", false);
     let (end_txid, idx) = end(&mut wallet, &online, &signed).await.unwrap();
     assert_eq!(end_txid, txid);
     if let Some(begin_idx) = res.batch_transfer_idx {
@@ -409,7 +465,7 @@ async fn send_extra_allocations_no_dry_run_impl(donation: bool) {
     assert_eq!(colorable(&mut wallet).len(), 2);
 
     let (mut rcv, rcv_online) = sender().await;
-    let rid = blind(&rcv, 66, PROXY_URL);
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
     let map = HashMap::from([(asset_a.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, donation, false).await;
     let idx = res.batch_transfer_idx.unwrap();
@@ -470,15 +526,16 @@ async fn blinded_change_send_begin_only() {
     let (mut w2, o2) = sender().await;
 
     // send 1: begin only, to a failed invoice, then fail the send
-    let rd = w2
-        .blind_receive(
-            None,
-            Assignment::Fungible(66),
-            default_rcv_expiration(),
-            vec![transport_endpoint(PROXY_URL)],
-            1,
-        )
-        .unwrap();
+    let rd = blind_rcv(
+        &mut w2,
+        &o2,
+        None,
+        Assignment::Fungible(66),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
     assert!(
         w2.fail_transfers(o2.clone(), Some(rd.batch_transfer_idx), false, false)
             .await
@@ -490,7 +547,7 @@ async fn blinded_change_send_begin_only() {
     )]);
     let (res, _, _) = begin(&mut w1, &o1, map, false, false).await;
     // the Initiated send reserves the only asset UTXO
-    let rid = blind(&w2, 66, PROXY_URL);
+    let rid = blind(&mut w2, &o2, 66, PROXY_URL).await;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
     assert!(
         w1.send_begin(
@@ -500,6 +557,7 @@ async fn blinded_change_send_begin_only() {
             1,
             1,
             default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
             None,
             false,
         )
@@ -517,7 +575,7 @@ async fn blinded_change_send_begin_only() {
         if round == 1 {
             create_utxos(&mut w1, &o1, false, Some(1), Some(487)).await;
         }
-        let rid = blind(&w2, 66, PROXY_URL);
+        let rid = blind(&mut w2, &o2, 66, PROXY_URL).await;
         let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
         let (_, signed, _) = begin(&mut w1, &o1, map, false, false).await;
         end(&mut w1, &o1, &signed).await.unwrap();
@@ -537,10 +595,10 @@ async fn batch_donation_success() {
     let asset_b = issue(&wallet, "TSTB", 1000);
     let (mut rcv1, rcv1_online) = sender().await;
     let (mut rcv2, rcv2_online) = sender().await;
-    let a1 = blind(&rcv1, 11, PROXY_URL);
-    let b1 = blind(&rcv1, 25, PROXY_URL);
-    let a2 = blind(&rcv2, 12, PROXY_URL);
-    let b2 = blind(&rcv2, 22, PROXY_URL);
+    let a1 = blind(&mut rcv1, &rcv1_online, 11, PROXY_URL).await;
+    let b1 = blind(&mut rcv1, &rcv1_online, 25, PROXY_URL).await;
+    let a2 = blind(&mut rcv2, &rcv2_online, 12, PROXY_URL).await;
+    let b2 = blind(&mut rcv2, &rcv2_online, 22, PROXY_URL).await;
     let map = HashMap::from([
         (
             asset_a.clone(),
@@ -564,20 +622,6 @@ async fn batch_donation_success() {
             .iter()
             .all(|t| t.status == TransferStatus::WaitingConfirmations)
     );
-
-    // the consignments carry the signed TX
-    let signed_tx = Psbt::from_str(&signed).unwrap().extract_tx().unwrap();
-    let witness_id = RgbTxid::from_str(&txid).unwrap();
-    for rid in [&a1, &b1, &a2, &b2] {
-        let bytes = get_consignment_from(PROXY_URL, rid).await.0;
-        let consignment = RgbTransfer::load(&bytes[..]).unwrap();
-        let bundle = consignment
-            .bundles
-            .iter()
-            .find(|b| b.witness_id() == witness_id)
-            .unwrap();
-        assert_eq!(bundle.tx, signed_tx);
-    }
 
     // a donation skips WaitingBroadcast
     assert_eq!(
@@ -604,30 +648,641 @@ async fn batch_donation_success() {
     assert_eq!(balance(&wallet, &asset_b), 953);
 }
 
-#[wasm_bindgen_test]
-async fn donation_posted_before_end_waits_for_broadcast() {
+fn now_secs() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}
+
+async fn sleep_until(timestamp: u64) {
+    let now = js_sys::Date::now() as u64;
+    if timestamp * 1000 > now {
+        sleep_ms((timestamp * 1000 - now) as u32).await;
+    }
+}
+
+// The transfer ID of the first transfer registered by the last `ack.prepare`.
+fn prepared_transfer_id() -> String {
+    let params = rpc_capture("ack.prepare");
+    let data = js_sys::Reflect::get(&params, &"transfer_data".into()).unwrap();
+    js_sys::Object::keys(&data.into())
+        .get(0)
+        .as_string()
+        .unwrap()
+}
+
+// A funded sender, a recipient and the signed PSBT of a send of 66 from one to the other.
+async fn pending_send(
+    encryption: Option<Encryption>,
+) -> (Wallet, Online, Wallet, Online, String, String, String, i32) {
     let (mut wallet, online) = sender().await;
     let asset_id = issue(&wallet, "TST", 1000);
     let (mut rcv, rcv_online) = sender().await;
-    let rid = blind(&rcv, 66, PROXY_URL);
+    let rid = blind_rcv_enc(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(66),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+        encryption,
+    )
+    .await
+    .unwrap()
+    .recipient_id;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
-    let (_, signed, txid) = begin(&mut wallet, &online, map, true, false).await;
-    wallet
-        .post_pending_consignments(txid.clone())
-        .await
-        .unwrap();
+    let (res, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    let idx = res.batch_transfer_idx.unwrap();
+    (wallet, online, rcv, rcv_online, asset_id, rid, signed, idx)
+}
 
+fn txid_of(signed: &str) -> String {
+    Psbt::from_str(signed)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string()
+}
+
+async fn settled_send(encryption: Encryption) {
+    let (mut wallet, online, mut rcv, rcv_online, asset_id, rid, signed, _) =
+        pending_send(Some(encryption)).await;
+    let plaintext = wallet
+        .send_consignment_bytes(&txid_of(&signed), &asset_id)
+        .unwrap();
+    end(&mut wallet, &online, &signed).await.unwrap();
+    rpc_hook(
+        PROXY_URL,
+        "consignment.get",
+        "globalThis.__rgbConsignment = res.result.consignment; return res;",
+    );
+    refresh(&mut rcv, &rcv_online).await;
+    clear_rpc_hooks();
+    let posted = js_sys::Reflect::get(&js_sys::global(), &"__rgbConsignment".into())
+        .unwrap()
+        .as_string()
+        .unwrap();
+    let posted =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, posted).unwrap();
+    // only Unsupported sends the consignment in plaintext
+    assert_eq!(posted == plaintext, encryption == Encryption::Unsupported);
+    // the TX released by the sender proxy is broadcast by the recipient
+    assert_eq!(
+        transfer_of(&rcv, &rid).status,
+        TransferStatus::WaitingConfirmations
+    );
+    refresh(&mut wallet, &online).await;
+    settle(&mut rcv, &rcv_online, std::slice::from_ref(&rid)).await;
+    settle(&mut wallet, &online, std::slice::from_ref(&rid)).await;
+    assert_eq!(balance(&rcv, &asset_id), 66);
+    assert_eq!(balance(&wallet, &asset_id), 934);
+}
+
+#[wasm_bindgen_test]
+async fn encryption_variants() {
+    for encryption in [
+        Encryption::Required,
+        Encryption::Unsupported,
+        Encryption::Optional,
+    ] {
+        settled_send(encryption).await;
+    }
+}
+
+#[wasm_bindgen_test]
+async fn forged_ack_signature_rejected() {
+    spy_rpc();
+    clear_rpc_hooks();
+    let (mut wallet, online, _rcv, _rcv_online, _, _, signed, idx) = pending_send(None).await;
+    let txid = end(&mut wallet, &online, &signed).await.unwrap().0;
+
+    // a third party cannot forge an ACK: the proxy verifies its signature against the recipient
+    // pubkey registered by the sender
+    let forged = rpc_post(
+        PROXY_URL,
+        "ack.post",
+        serde_json::json!({
+            "transfer_id": prepared_transfer_id(),
+            "ack": true,
+            "signature": "00".repeat(64),
+        }),
+    )
+    .await;
+    assert_eq!(forged["error"]["code"], -503);
+
+    // the forged ACK was not stored, so the sender is not tricked into broadcasting
+    refresh(&mut wallet, &online).await;
+    assert_eq!(
+        sends(&wallet, &txid)[0].status,
+        TransferStatus::WaitingCounterparty
+    );
+    assert_eq!(sends(&wallet, &txid)[0].batch_transfer_idx, idx);
+}
+
+// A consignment altered on the way fails the decryption, or the plaintext hash check when it is
+// not encrypted.
+#[wasm_bindgen_test]
+async fn recipient_refuses_ciphertext_altered_in_transit() {
+    for encryption in [Encryption::Unsupported, Encryption::Required] {
+        let (mut wallet, online, mut rcv, rcv_online, _, rid, signed, _) =
+            pending_send(Some(encryption)).await;
+        let txid = end(&mut wallet, &online, &signed).await.unwrap().0;
+        rpc_hook(
+            PROXY_URL,
+            "consignment.get",
+            "const c = res.result.consignment; \
+             res.result.consignment = c.slice(0, -8) + (c.endsWith('AAAAAAAA') ? 'BBBBBBBB' : 'AAAAAAAA'); \
+             return res;",
+        );
+        refresh(&mut rcv, &rcv_online).await;
+        clear_rpc_hooks();
+        assert_eq!(transfer_of(&rcv, &rid).status, TransferStatus::Failed);
+        // the sender sees the NACK
+        refresh(&mut wallet, &online).await;
+        assert_eq!(sends(&wallet, &txid)[0].status, TransferStatus::Failed);
+    }
+}
+
+// The sender proxy already holds a NACK for the recipient.
+#[wasm_bindgen_test]
+async fn nack_pre_existing_receiver_fails() {
+    let (mut wallet, online, mut rcv, rcv_online, _, rid, signed, _) = pending_send(None).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+    rpc_hook(
+        PROXY_URL,
+        "ack.post",
+        "res.error = { code: -100, message: 'cannot change' }; delete res.result; return res;",
+    );
+    refresh(&mut rcv, &rcv_online).await;
+    clear_rpc_hooks();
+    assert_eq!(transfer_of(&rcv, &rid).status, TransferStatus::Failed);
+}
+
+#[wasm_bindgen_test]
+async fn recipient_operation_expired() {
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv1, o1) = sender().await;
+    let (mut rcv2, o2) = sender().await;
+    let rid1 = blind(&mut rcv1, &o1, 66, PROXY_URL).await;
+    let rid2 = blind(&mut rcv2, &o2, 34, PROXY_URL).await;
+    let map = HashMap::from([(
+        asset_id,
+        vec![
+            recipient(&rid1, 66, None, PROXY_URL),
+            recipient(&rid2, 34, None, PROXY_URL),
+        ],
+    )]);
+    let expiration = now_secs() + 20;
+    let (_, signed, _) = begin_with(&mut wallet, &online, map, false, false, expiration).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+
+    // recipient 1 ACKs, recipient 2 never does, so the TX is not released
+    refresh(&mut rcv1, &o1).await;
+    assert_eq!(
+        transfer_of(&rcv1, &rid1).status,
+        TransferStatus::WaitingBroadcast
+    );
+    sleep_until(expiration + 2).await;
+    refresh(&mut rcv1, &o1).await;
+    assert_eq!(transfer_of(&rcv1, &rid1).status, TransferStatus::Failed);
+}
+
+#[wasm_bindgen_test]
+async fn send_end_after_expiration() {
+    spy_rpc();
+    clear_rpc_hooks();
+    let (mut wallet, online2) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender().await;
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let map = HashMap::from([(asset_id, vec![recipient(&rid, 66, None, PROXY_URL)])]);
+
+    // an operation that expired before its registration cannot start
+    let (mut other, other_online) = sender().await;
+    let other_asset = issue(&other, "TST", 1000);
+    let other_rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let other_map = HashMap::from([(
+        other_asset,
+        vec![recipient(&other_rid, 66, None, PROXY_URL)],
+    )]);
+    let other_expiration = now_secs() + 10;
+    let (_, other_signed, _) = begin_with(
+        &mut other,
+        &other_online,
+        other_map,
+        false,
+        false,
+        other_expiration,
+    )
+    .await;
+    sleep_until(other_expiration + 1).await;
+    assert!(matches!(
+        end(&mut other, &other_online, &other_signed).await,
+        Err(Error::ExpirationInvalid)
+    ));
+
+    let expiration = now_secs() + 10;
+    let (_, signed, txid) = begin_with(&mut wallet, &online2, map, false, false, expiration).await;
+    // the operation is registered on the sender proxy, then the post fails
+    rpc_fail(PROXY_URL, "consignment.post");
+    assert!(matches!(
+        end(&mut wallet, &online2, &signed).await,
+        Err(Error::Proxy { .. })
+    ));
+    clear_rpc_hooks();
+
+    // once expired, a retry only completes the local state, without posting again
+    sleep_until(expiration + 1).await;
+    assert!(end(&mut wallet, &online2, &signed).await.is_ok());
+    assert_eq!(rpc_count("consignment.post"), 0);
+    assert_eq!(
+        sends(&wallet, &txid)[0].status,
+        TransferStatus::WaitingCounterparty
+    );
+}
+
+#[wasm_bindgen_test]
+async fn fail_before_ack_revokes_operation() {
+    let (mut wallet, online, mut rcv, rcv_online, asset_id, rid, signed, idx) =
+        pending_send(None).await;
+    let txid = end(&mut wallet, &online, &signed).await.unwrap().0;
+    assert!(
+        wallet
+            .fail_transfers(online.clone(), Some(idx), false, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(sends(&wallet, &txid)[0].status, TransferStatus::Failed);
+    // the operation is revoked, so the recipient's ACK is refused
+    refresh(&mut rcv, &rcv_online).await;
+    assert_ne!(
+        transfer_of(&rcv, &rid).status,
+        TransferStatus::WaitingConfirmations
+    );
+    // the single-use invoice has had its transfer
+    let map = HashMap::from([(asset_id, vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map, default_send_expiration()).await,
+        Err(Error::InvoiceQuotaExceeded)
+    ));
+}
+
+#[wasm_bindgen_test]
+async fn fail_after_recipient_ack_refused() {
+    let (mut wallet, online, mut rcv, rcv_online, _, _, signed, idx) = pending_send(None).await;
+    let txid = end(&mut wallet, &online, &signed).await.unwrap().0;
+    refresh(&mut rcv, &rcv_online).await;
+    assert_eq!(
+        wallet
+            .fail_transfers(online.clone(), Some(idx), false, false)
+            .await,
+        Err(Error::CannotFailBatchTransfer)
+    );
+    assert_ne!(sends(&wallet, &txid)[0].status, TransferStatus::Failed);
+
+    // the sender expires after the recipient ACK: the released TX still settles
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    let expiration = now_secs() + 20;
+    let (res, signed, _) = begin_with(&mut wallet, &online, map, false, false, expiration).await;
+    let idx = res.batch_transfer_idx.unwrap();
+    end(&mut wallet, &online, &signed).await.unwrap();
     refresh(&mut rcv, &rcv_online).await;
     assert_eq!(
         transfer_of(&rcv, &rid).status,
-        TransferStatus::WaitingBroadcast
-    );
-
-    end(&mut wallet, &online, &signed).await.unwrap();
-    assert_eq!(
-        sends(&wallet, &txid)[0].status,
         TransferStatus::WaitingConfirmations
     );
+    sleep_until(expiration + 2).await;
+    assert_eq!(
+        wallet
+            .fail_transfers(online.clone(), Some(idx), false, false)
+            .await,
+        Err(Error::CannotFailBatchTransfer)
+    );
     settle(&mut rcv, &rcv_online, std::slice::from_ref(&rid)).await;
-    assert_eq!(balance(&rcv, &asset_id), 66);
+    settle(&mut wallet, &online, std::slice::from_ref(&rid)).await;
+    assert_eq!(balance(&wallet, &asset_id), 934);
+}
+
+// The sender proxy lost the operation after the recipient broadcast its TX.
+#[wasm_bindgen_test]
+async fn sender_proxy_lost_operation() {
+    let (mut wallet, online, mut rcv, rcv_online, asset_id, rid, signed, _) =
+        pending_send(None).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+    refresh(&mut rcv, &rcv_online).await;
+    assert_eq!(
+        transfer_of(&rcv, &rid).status,
+        TransferStatus::WaitingConfirmations
+    );
+    rpc_hook(
+        PROXY_URL,
+        "ack.get",
+        "res.error = { code: -104, message: 'not found' }; delete res.result; return res;",
+    );
+    settle(&mut rcv, &rcv_online, std::slice::from_ref(&rid)).await;
+    settle(&mut wallet, &online, std::slice::from_ref(&rid)).await;
+    clear_rpc_hooks();
+    assert_eq!(balance(&wallet, &asset_id), 934);
+}
+
+#[wasm_bindgen_test]
+async fn no_change_on_pending_send() {
+    let (mut wallet, online, _rcv, _rcv_online, _, _, signed, idx) = pending_send(None).await;
+    let txid = end(&mut wallet, &online, &signed).await.unwrap().0;
+    // the counterparty has not answered: refresh and fail change nothing
+    refresh(&mut wallet, &online).await;
+    assert_eq!(
+        sends(&wallet, &txid)[0].status,
+        TransferStatus::WaitingCounterparty
+    );
+    assert_eq!(
+        wallet
+            .fail_transfers(online.clone(), None, false, false)
+            .await,
+        Ok(false)
+    );
+    assert_eq!(sends(&wallet, &txid)[0].batch_transfer_idx, idx);
+    assert_eq!(
+        sends(&wallet, &txid)[0].status,
+        TransferStatus::WaitingCounterparty
+    );
+}
+
+#[wasm_bindgen_test]
+async fn invoice_not_reserved_fail() {
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender().await;
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let exp = default_send_expiration();
+    let with = |edit: fn(&mut Recipient)| {
+        let mut rcpt = recipient(&rid, 66, None, PROXY_URL);
+        edit(&mut rcpt);
+        HashMap::from([(asset_id.clone(), vec![rcpt])])
+    };
+
+    // invalid recipients
+    for map in [HashMap::new(), HashMap::from([(asset_id.clone(), vec![])])] {
+        assert!(matches!(
+            begin_dry(&mut wallet, &online, map, exp).await,
+            Err(Error::InvalidRecipientMap)
+        ));
+    }
+    let map = with(|r| r.public_key = Some("not hex".to_string()));
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map, exp).await,
+        Err(Error::InvalidPubkey { .. })
+    ));
+    let map = with(|r| r.expiration_timestamp = None);
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map, exp).await,
+        Err(Error::InvalidRecipientData { details }) if details == "missing invoice expiration"
+    ));
+    let map = with(|r| r.expiration_timestamp = Some(1));
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map, exp).await,
+        Err(Error::InvoiceExpired)
+    ));
+    let map = with(|r| r.expiration_timestamp = Some(default_send_expiration() + 100));
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map, exp).await,
+        Err(Error::InvalidExpiration)
+    ));
+
+    // an invoice with another pubkey was never reserved on the proxy
+    let map = with(|r| {
+        r.public_key =
+            Some("0738ae88b5bfc7f915b809937573aa51d3bf00cce2edb5795b99f682d4065f07".to_string())
+    });
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map, exp).await,
+        Err(Error::InvoiceNotReserved)
+    ));
+
+    // the invoice is full
+    rpc_hook(
+        PROXY_URL,
+        "invoice.check",
+        "for (const k in res.result) res.result[k].status = 'full'; return res;",
+    );
+    let res = begin_dry(&mut wallet, &online, with(|_| {}), exp).await;
+    clear_rpc_hooks();
+    assert!(matches!(res, Err(Error::InvoiceQuotaExceeded)));
+
+    // an unavailable proxy is skipped for the next one
+    let map = with(|r| {
+        r.transport_endpoints = vec![
+            "rpc://127.0.0.1:1/json-rpc".to_string(),
+            transport_endpoint(PROXY_URL),
+        ]
+    });
+    assert!(begin_dry(&mut wallet, &online, map, exp).await.is_ok());
+}
+
+#[wasm_bindgen_test]
+async fn proxy_auth() {
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let endpoint = transport_endpoint(PROXY_AUTH_URL);
+    let mut options = go_online_options(false);
+    let online = wallet.go_online(options.clone()).await.unwrap();
+
+    // no key
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, true, Some(2), None).await;
+    let res = wallet
+        .blind_receive(
+            Some(online.clone()),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![endpoint.clone()],
+            1,
+            None,
+        )
+        .await;
+    assert!(res.is_err());
+
+    // wrong key
+    options
+        .proxy_auth_keys
+        .insert(endpoint.clone(), "11".repeat(32));
+    let online = wallet.go_online(options.clone()).await.unwrap();
+    let res = wallet
+        .blind_receive(
+            Some(online.clone()),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![endpoint.clone()],
+            1,
+            None,
+        )
+        .await;
+    assert!(matches!(res, Err(Error::InvalidProxyAuthSignature)));
+
+    // right key
+    options
+        .proxy_auth_keys
+        .insert(endpoint.clone(), PROXY_AUTH_SEED.to_string());
+    let online = wallet.go_online(options).await.unwrap();
+    wallet
+        .blind_receive(
+            Some(online),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![endpoint.clone()],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // the sender signs ack.prepare on its own proxy
+    let (mut payer, payer_online) = sender().await;
+    let asset_id = issue(&payer, "TST", 1000);
+    let (mut rcv, rcv_online) = sender().await;
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let map = HashMap::from([(asset_id, vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    let res = payer
+        .send_begin(
+            payer_online.clone(),
+            map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(endpoint.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let signed = payer.sign_psbt(res.psbt, None).unwrap();
+    // no key
+    assert!(matches!(
+        end(&mut payer, &payer_online, &signed).await,
+        Err(Error::Proxy { .. })
+    ));
+    // wrong key
+    let mut options = go_online_options(false);
+    options
+        .proxy_auth_keys
+        .insert(endpoint.clone(), "11".repeat(32));
+    let payer_online = payer.go_online(options.clone()).await.unwrap();
+    assert!(matches!(
+        end(&mut payer, &payer_online, &signed).await,
+        Err(Error::InvalidProxyAuthSignature)
+    ));
+    // right key
+    options
+        .proxy_auth_keys
+        .insert(endpoint, PROXY_AUTH_SEED.to_string());
+    let payer_online = payer.go_online(options).await.unwrap();
+    let txid = end(&mut payer, &payer_online, &signed).await.unwrap().0;
+    assert_eq!(
+        sends(&payer, &txid)[0].status,
+        TransferStatus::WaitingCounterparty
+    );
+}
+
+#[wasm_bindgen_test]
+async fn recipient_nacks_short_retention_grace() {
+    let (mut wallet, online, mut rcv, rcv_online, _, rid, signed, _) = pending_send(None).await;
+    let txid = end(&mut wallet, &online, &signed).await.unwrap().0;
+    rpc_hook(
+        PROXY_URL,
+        "server.info",
+        "res.result.retention_grace_secs = '10'; return res;",
+    );
+    refresh(&mut rcv, &rcv_online).await;
+    clear_rpc_hooks();
+    assert_eq!(transfer_of(&rcv, &rid).status, TransferStatus::Failed);
+    refresh(&mut wallet, &online).await;
+    assert_eq!(sends(&wallet, &txid)[0].status, TransferStatus::Failed);
+}
+
+#[wasm_bindgen_test]
+async fn proxy_draining() {
+    let (mut wallet, online) = sender().await;
+    rpc_hook(
+        PROXY_URL,
+        "invoice.prepare",
+        "res.error = { code: -115, message: 'draining' }; delete res.result; return res;",
+    );
+    let res = blind_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await;
+    clear_rpc_hooks();
+    assert!(matches!(res, Err(Error::ProxyDraining)));
+
+    let draining =
+        "res.error = { code: -115, message: 'draining' }; delete res.result; return res;";
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender().await;
+
+    // the only recipient proxy drains
+    let rid = blind(&mut rcv, &rcv_online, 10, PROXY_URL).await;
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 10, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    rpc_hook(PROXY_URL, "consignment.post", draining);
+    let res = end(&mut wallet, &online, &signed).await;
+    clear_rpc_hooks();
+    assert!(matches!(res, Err(Error::ProxyDraining)));
+
+    // the next recipient proxy takes the consignment
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let rid = blind_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(10),
+        default_rcv_expiration(),
+        vec![
+            transport_endpoint(PROXY_URL),
+            transport_endpoint(PROXY_B_URL),
+        ],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+    let mut rcpt = recipient(&rid, 10, None, PROXY_URL);
+    rcpt.transport_endpoints = vec![
+        transport_endpoint(PROXY_URL),
+        transport_endpoint(PROXY_B_URL),
+    ];
+    let map = HashMap::from([(asset_id.clone(), vec![rcpt])]);
+    let (_, signed, txid) = begin(&mut wallet, &online, map, false, false).await;
+    rpc_hook(PROXY_URL, "consignment.post", draining);
+    let res = end(&mut wallet, &online, &signed).await;
+    clear_rpc_hooks();
+    assert!(res.is_ok());
+    let used: Vec<_> = sends(&wallet, &txid)[0]
+        .transport_endpoints
+        .iter()
+        .filter(|e| e.used)
+        .map(|e| e.endpoint.clone())
+        .collect();
+    assert_eq!(used.len(), 1);
+    assert!(used[0].contains("3010"), "{used:?}");
+
+    // the sender proxy drains
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let rid = blind(&mut rcv, &rcv_online, 10, PROXY_URL).await;
+    let map = HashMap::from([(asset_id, vec![recipient(&rid, 10, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    rpc_hook(PROXY_URL, "ack.prepare", draining);
+    let res = end(&mut wallet, &online, &signed).await;
+    clear_rpc_hooks();
+    assert!(matches!(res, Err(Error::ProxyDraining)));
 }

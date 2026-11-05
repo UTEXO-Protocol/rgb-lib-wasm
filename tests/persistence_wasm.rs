@@ -17,7 +17,9 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, RgbTransport, generate_keys};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, TransferStatus, generate_keys,
+};
 use utils::*;
 
 fn test_wallet_data(
@@ -282,15 +284,16 @@ async fn test_persistence_across_reload() {
     create_utxos(&mut wallet_b, &online_b, 5).await;
 
     let transport = transport_endpoint();
-    let recv_b = wallet_b
-        .witness_receive(
-            None,
-            Assignment::Fungible(100),
-            default_rcv_expiration(),
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let recv_b = witness_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
 
     let recipient = Recipient {
         recipient_id: recv_b.recipient_id.clone(),
@@ -300,6 +303,9 @@ async fn test_persistence_across_reload() {
         }),
         assignment: Assignment::Fungible(100),
         transport_endpoints: vec![transport.clone()],
+        public_key: Some(recv_b.public_key.clone()),
+        encryption: Encryption::Required,
+        expiration_timestamp: Some(recv_b.expiration_timestamp),
     };
     let mut recipient_map = HashMap::new();
     recipient_map.insert(asset_id.clone(), vec![recipient]);
@@ -313,6 +319,7 @@ async fn test_persistence_across_reload() {
             1,
             1,
             default_send_expiration(),
+            Some(transport.clone()),
             None,
             false,
         )
@@ -375,15 +382,16 @@ async fn test_persistence_across_reload() {
 
     // === Section 4: Backup restore persists to IndexedDB ===
     // Create a witness receive to add more state
-    let _recv = wallet
-        .witness_receive(
-            None,
-            Assignment::Any,
-            default_rcv_expiration(),
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let _recv = witness_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
 
     // Backup
     let password = "persist_test_pw";
@@ -430,10 +438,10 @@ async fn test_persistence_across_reload() {
     );
 }
 
-/// Test the exact Lightning incoming-funding operation: `accept_transfer` must not report success
-/// until its RGB stock mutation has committed to IndexedDB.
+/// Test: the contract of a received consignment is in IndexedDB once the refresh that accepts the
+/// consignment has been flushed.
 #[wasm_bindgen_test]
-async fn test_accept_transfer_is_durable_before_success() {
+async fn test_received_contract_survives_reload() {
     let keys_a = generate_keys(BitcoinNetwork::Regtest);
     let keys_b = generate_keys(BitcoinNetwork::Regtest);
     let wd_a = test_wallet_data(&keys_a, vec![AssetSchema::Nia], "/tmp/persist_accept_a");
@@ -456,33 +464,25 @@ async fn test_accept_transfer_is_durable_before_success() {
             vec![1000],
         )
         .unwrap();
-    let transport = transport_endpoint();
-    let receive = wallet_b
-        .witness_receive(
-            None,
-            Assignment::Fungible(100),
-            default_rcv_expiration(),
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
-    let recipient_id = receive.recipient_id.clone();
-    let recipient_script =
-        rgb_lib_wasm::utils::script_buf_from_recipient_id(receive.recipient_id.clone())
-            .unwrap()
-            .unwrap();
-    let recipient = Recipient {
-        recipient_id,
-        witness_data: Some(WitnessData {
-            amount_sat: 2000,
-            blinding: Some(777),
-        }),
-        assignment: Assignment::Fungible(100),
-        transport_endpoints: vec![transport.clone()],
-    };
-    let mut recipient_map = HashMap::new();
-    recipient_map.insert(asset.asset_id, vec![recipient]);
-
+    let receive = witness_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport_endpoint()],
+    )
+    .await
+    .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id,
+        vec![utils::recipient(
+            &receive.recipient_id,
+            100,
+            Some(2000),
+            PROXY_URL,
+        )],
+    )]);
     let unsigned = wallet_a
         .send_begin(
             online_a.clone(),
@@ -491,6 +491,7 @@ async fn test_accept_transfer_is_durable_before_success() {
             1,
             1,
             default_send_expiration(),
+            Some(transport_endpoint()),
             None,
             false,
         )
@@ -498,64 +499,59 @@ async fn test_accept_transfer_is_durable_before_success() {
         .unwrap()
         .psbt;
     let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
-    let psbt = Psbt::from_str(&signed).unwrap();
-    let recipient_vout = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .position(|output| output.script_pubkey == recipient_script)
-        .unwrap() as u32;
-    let send = wallet_a.send_end(online_a, signed, false).await.unwrap();
-    let (consignment_bytes, _) = get_consignment_from_proxy(&receive.recipient_id).await;
-    wallet_a
-        .post_consignment(
-            PROXY_URL,
-            send.txid.clone(),
-            &consignment_bytes,
-            send.txid.clone(),
-            Some(recipient_vout),
-        )
-        .await
-        .unwrap();
+    wallet_a.send_end(online_a, signed, false).await.unwrap();
 
-    let (_, assignments) = wallet_b
-        .accept_transfer(
-            online_b,
-            send.txid,
-            recipient_vout,
-            RgbTransport::from_str(&transport).unwrap(),
-            777,
-        )
+    // the ACK post fails after the download
+    rpc_fail(PROXY_URL, "ack.post");
+    let _ = wallet_b.refresh(online_b, None, vec![], false).await;
+    clear_rpc_hooks();
+    wallet_b.flush().await.unwrap();
+    drop(wallet_b);
+
+    // after a reload the cached consignment completes the receive, with no download
+    let mut wallet_b = Wallet::restore(wd_b.clone()).await.unwrap();
+    let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
+    rpc_fail(PROXY_URL, "consignment.get");
+    let refresh = wallet_b
+        .refresh(online_b, None, vec![], false)
         .await
         .unwrap();
-    assert_eq!(assignments, vec![Assignment::Fungible(100)]);
+    clear_rpc_hooks();
+    assert!(refresh.values().all(|r| r.failure.is_none()));
+    assert_eq!(
+        transfer_of(&wallet_b, &receive.recipient_id).status,
+        TransferStatus::WaitingConfirmations
+    );
+    // the refresh imports the contract of the consignment
     let contract_ids = wallet_b.rgb_contract_ids().unwrap();
+    assert_eq!(contract_ids.len(), 1);
 
+    wallet_b.flush().await.unwrap();
     drop(wallet_b);
     let restored = Wallet::restore(wd_b).await.unwrap();
     assert_eq!(restored.rgb_contract_ids().unwrap(), contract_ids);
 }
 
-/// Test: Lightning-style funding can post a consignment before broadcast, survive a browser
-/// reload, and complete without posting the already-used recipient endpoint again.
+/// Test: an Initiated send survives a browser reload and completes with its operation key.
 #[wasm_bindgen_test]
-async fn test_pending_funding_transfer_completes_after_reload() {
+async fn test_initiated_send_completes_after_reload() {
     let unique = js_sys::Date::now().to_string();
     let keys_a = generate_keys(BitcoinNetwork::Regtest);
     let keys_b = generate_keys(BitcoinNetwork::Regtest);
     let wd_a = test_wallet_data(
         &keys_a,
         vec![AssetSchema::Nia],
-        &format!("/tmp/persist-pending-funding-a-{unique}"),
+        &format!("/tmp/persist-initiated-a-{unique}"),
     );
     let wd_b = test_wallet_data(
         &keys_b,
         vec![AssetSchema::Nia],
-        &format!("/tmp/persist-pending-funding-b-{unique}"),
+        &format!("/tmp/persist-initiated-b-{unique}"),
     );
     let mut wallet_a = Wallet::new(wd_a.clone()).unwrap();
     let mut wallet_b = Wallet::new(wd_b).unwrap();
     let online_a = wallet_a.go_online(go_online_options(false)).await.unwrap();
+    let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
     create_utxos(&mut wallet_a, &online_a, 5).await;
@@ -563,35 +559,34 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         .issue_asset_nia("LDKF".to_string(), "LDK Funding".to_string(), 0, vec![1000])
         .unwrap();
 
-    let transport = transport_endpoint();
-    let receive = wallet_b
-        .witness_receive(
-            None,
-            Assignment::Fungible(100),
-            default_rcv_expiration(),
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
-    let recipient = Recipient {
-        recipient_id: receive.recipient_id.clone(),
-        witness_data: Some(WitnessData {
-            amount_sat: 2000,
-            blinding: Some(777),
-        }),
-        assignment: Assignment::Fungible(100),
-        transport_endpoints: vec![transport],
-    };
-    let recipient_map = HashMap::from([(asset.asset_id, vec![recipient])]);
-
+    let receive = witness_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport_endpoint()],
+    )
+    .await
+    .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id,
+        vec![utils::recipient(
+            &receive.recipient_id,
+            100,
+            Some(2000),
+            PROXY_URL,
+        )],
+    )]);
     let unsigned = wallet_a
         .send_begin(
             online_a.clone(),
             recipient_map,
-            true,
+            false,
             1,
             1,
             default_send_expiration(),
+            Some(transport_endpoint()),
             None,
             false,
         )
@@ -599,34 +594,24 @@ async fn test_pending_funding_transfer_completes_after_reload() {
         .unwrap()
         .psbt;
     let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
-    let funding_txid = Psbt::from_str(&signed)
+    let txid = Psbt::from_str(&signed)
         .unwrap()
         .unsigned_tx
         .compute_txid()
         .to_string();
-    // Persist the not-yet-posted state, then simulate a page exit after the proxy accepted the
-    // consignment but before the used endpoint flag could be flushed.
-    wallet_a.flush().await.unwrap();
-    wallet_a
-        .post_pending_consignments(funding_txid.clone())
-        .await
-        .unwrap();
-    let (consignment, proxy_txid) = get_consignment_from_proxy(&receive.recipient_id).await;
-    assert!(!consignment.is_empty());
-    assert_eq!(proxy_txid, funding_txid);
 
-    drop(wallet_a);
-    let mut wallet_a = Wallet::restore(wd_a.clone()).await.unwrap();
-    wallet_a
-        .post_pending_consignments(funding_txid.clone())
-        .await
-        .unwrap();
     let mut wallet_a = simulate_reload(wallet_a, &wd_a).await;
     let restored_online = wallet_a.go_online(go_online_options(true)).await.unwrap();
     let completed = wallet_a
-        .send_end(restored_online, signed, false)
+        .send_end(restored_online.clone(), signed, false)
         .await
         .unwrap();
-    assert_eq!(completed.txid, funding_txid);
+    assert_eq!(completed.txid, txid);
+
+    wallet_b
+        .refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    settle(&mut wallet_b, &online_b, &[receive.recipient_id.clone()]).await;
     wallet_a.flush().await.unwrap();
 }

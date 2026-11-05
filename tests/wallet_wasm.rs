@@ -2,9 +2,12 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+mod utils;
+
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
+use utils::{PROXY_URL, go_online_options, transport_endpoint};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -136,25 +139,30 @@ fn rcv_expiration() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64 + 86400
 }
 
-/// Tests receive operations: witness_receive (works offline), list_transfers
+/// Tests receive operations: witness_receive (needs the proxy), list_transfers
 /// after receive, and error cases for invalid asset IDs.
 /// Note: blind_receive requires funded UTXOs so it's tested in integration_wasm.
 #[wasm_bindgen_test]
-fn test_receive_and_transfers() {
+async fn test_receive_and_transfers() {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
 
     // witness_receive: success
     let expiration = rcv_expiration();
     let recv = wallet
         .witness_receive(
+            Some(online.clone()),
             None,
             Assignment::Any,
             expiration,
-            vec!["rpc://127.0.0.1".into()],
+            vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
         )
+        .await
         .unwrap();
     assert!(!recv.invoice.is_empty());
+    assert_eq!(recv.public_key.len(), 64);
     assert!(!recv.recipient_id.is_empty());
     assert_eq!(recv.expiration_timestamp, expiration);
 
@@ -179,12 +187,15 @@ fn test_receive_and_transfers() {
     // witness_receive: invalid asset
     let err = wallet
         .witness_receive(
+            Some(online.clone()),
             Some("nonexistent_asset_id".into()),
             Assignment::Fungible(100),
             rcv_expiration(),
-            vec!["rpc://127.0.0.1".into()],
+            vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
         )
+        .await
         .unwrap_err();
     assert!(format!("{:?}", err).contains("AssetNotFound"));
     // Note: blind_receive requires funded UTXOs even for error paths,
@@ -200,6 +211,23 @@ fn test_receive_and_transfers() {
     assert_eq!(data.assignment, Assignment::Any);
     assert!(!data.transport_endpoints.is_empty());
     assert_eq!(data.expiration_timestamp, Some(expiration as i64));
+    assert_eq!(data.public_key, Some(recv.public_key.clone()));
+    assert_eq!(data.encryption, rgb_lib_wasm::Encryption::Required);
+
+    // witness_receive: without being online
+    let err = wallet
+        .witness_receive(
+            None,
+            None,
+            Assignment::Any,
+            rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{:?}", err).contains("OnlineNeeded"));
 
     // Invoice: invalid string should fail
     assert!(Invoice::new("not-a-valid-invoice".to_string()).is_err());
@@ -208,8 +236,9 @@ fn test_receive_and_transfers() {
 /// Tests error paths and backup: invalid PSBT, issue without UTXOs,
 /// nonexistent asset balance, backup/restore round-trip
 #[wasm_bindgen_test]
-fn test_errors_and_backup() {
+async fn test_errors_and_backup() {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
 
     // sign_psbt: invalid PSBT
     assert!(
@@ -238,12 +267,15 @@ fn test_errors_and_backup() {
     // backup/restore round-trip: use witness_receive to create state
     let _recv = wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
             rcv_expiration(),
-            vec!["rpc://127.0.0.1".into()],
+            vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
         )
+        .await
         .unwrap();
 
     let password = "test_pass_123";

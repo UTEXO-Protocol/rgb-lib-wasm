@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -7,7 +7,8 @@ mod utils;
 
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, TransferKind, TransferStatus, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, TransferKind, TransferStatus,
+    generate_keys,
 };
 use utils::*;
 
@@ -131,15 +132,16 @@ async fn test_full_wallet_flow() {
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
     create_utxos(&mut wallet_b, &online_b, 5).await;
 
-    let recv_b = wallet_b
-        .witness_receive(
-            None,
-            Assignment::Fungible(200),
-            default_rcv_expiration(),
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let recv_b = witness_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(200),
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
 
     // 2000 sats witness amount covers the dust output for the RGB transfer
     let recipient = Recipient {
@@ -150,6 +152,9 @@ async fn test_full_wallet_flow() {
         }),
         assignment: Assignment::Fungible(200),
         transport_endpoints: vec![transport.clone()],
+        public_key: Some(recv_b.public_key.clone()),
+        encryption: Encryption::Required,
+        expiration_timestamp: Some(recv_b.expiration_timestamp),
     };
     let mut recipient_map = HashMap::new();
     recipient_map.insert(nia.asset_id.clone(), vec![recipient]);
@@ -163,6 +168,7 @@ async fn test_full_wallet_flow() {
             1,
             1,
             send_exp,
+            Some(transport.clone()),
             None,
             false,
         )
@@ -170,6 +176,15 @@ async fn test_full_wallet_flow() {
         .unwrap()
         .psbt;
     let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
+    let signed_txid = rgb_lib_wasm::bitcoin::psbt::Psbt::from_str(&signed_psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    // the consignment is validated before the broadcast
+    let consignment_bytes = wallet
+        .send_consignment_bytes(&signed_txid, &nia.asset_id)
+        .unwrap();
     let send_result = wallet
         .send_end(online.clone(), signed_psbt, false)
         .await
@@ -184,10 +199,9 @@ async fn test_full_wallet_flow() {
     let sent = sent.iter().find(|t| t.kind == TransferKind::Send).unwrap();
     assert_eq!(sent.expiration_timestamp, Some(send_exp));
 
-    // validate_consignment_offchain: fetch from proxy and validate before broadcast
-    let (consignment_bytes, proxy_txid) = get_consignment_from_proxy(&recv_b.recipient_id).await;
+    // validate_consignment_offchain: validate the consignment before broadcast
     assert!(!consignment_bytes.is_empty());
-    assert_eq!(proxy_txid, send_result.txid);
+    assert_eq!(signed_txid, send_result.txid);
     let validation = rgb_lib_wasm::wallet::rust_only::validate_consignment_offchain(
         &consignment_bytes,
         &send_result.txid,
@@ -398,21 +412,25 @@ async fn test_full_wallet_flow() {
     // Two-wallet IFA send: wallet A → wallet B via a blank blinded invoice.
     // Regression test for UTEXO-Protocol/rgb-lightning-node#126: the receiver
     // must recognize the IFA schema, accept the consignment and post the ack.
-    let recv_ifa = wallet_b
-        .blind_receive(
-            None,
-            Assignment::Any,
-            default_rcv_expiration(),
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let recv_ifa = blind_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
 
     let ifa_recipient = Recipient {
         recipient_id: recv_ifa.recipient_id.clone(),
         witness_data: None,
         assignment: Assignment::Fungible(5),
         transport_endpoints: vec![transport.clone()],
+        public_key: Some(recv_ifa.public_key.clone()),
+        encryption: Encryption::Required,
+        expiration_timestamp: Some(recv_ifa.expiration_timestamp),
     };
     let mut ifa_recipient_map = HashMap::new();
     ifa_recipient_map.insert(ifa.asset_id.clone(), vec![ifa_recipient]);
@@ -425,6 +443,7 @@ async fn test_full_wallet_flow() {
             1,
             1,
             default_send_expiration(),
+            Some(transport.clone()),
             None,
             false,
         )
@@ -761,29 +780,31 @@ async fn test_full_wallet_flow() {
 
     // Receive API tests (after send, since blind_receive locks NIA UTXO)
     let blind_exp = default_rcv_expiration();
-    let blind_recv = wallet
-        .blind_receive(
-            Some(nia.asset_id.clone()),
-            Assignment::Fungible(100),
-            blind_exp,
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let blind_recv = blind_rcv(
+        &mut wallet,
+        &online,
+        Some(nia.asset_id.clone()),
+        Assignment::Fungible(100),
+        blind_exp,
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
     assert!(!blind_recv.invoice.is_empty());
     assert!(!blind_recv.recipient_id.is_empty());
     assert_eq!(blind_recv.expiration_timestamp, blind_exp);
 
     let witness_exp = default_rcv_expiration();
-    let witness_recv = wallet
-        .witness_receive(
-            None,
-            Assignment::Any,
-            witness_exp,
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let witness_recv = witness_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        witness_exp,
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
     assert!(!witness_recv.invoice.is_empty());
     assert_eq!(witness_recv.expiration_timestamp, witness_exp);
 

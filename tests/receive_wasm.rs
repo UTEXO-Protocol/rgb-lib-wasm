@@ -6,11 +6,11 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
-use rgb_lib_wasm::bitcoin::{consensus::encode::serialize_hex, psbt::Psbt};
+use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::utils::script_buf_from_recipient_id;
 use rgb_lib_wasm::wallet::{DatabaseType, Online, Recipient, Wallet, WalletData};
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, RgbTxid, TransferKind,
+    AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, TransferKind,
     TransferStatus, generate_keys,
 };
 use utils::*;
@@ -67,21 +67,26 @@ fn issue(wallet: &Wallet) -> String {
         .asset_id
 }
 
-async fn begin_send(
+// Begin, sign and end a send, optionally editing the consignment of each asset in between.
+async fn begin_end(
     wallet: &mut Wallet,
     online: &Online,
     map: HashMap<String, Vec<Recipient>>,
+    donation: bool,
+    edit: Option<fn(&mut RgbTransfer)>,
 ) -> (String, String) {
+    let assets: Vec<String> = map.keys().cloned().collect();
     let unsigned = wallet
         .send_begin(
             online.clone(),
             map,
-            false,
+            donation,
             1,
             1,
             default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
             None,
-            true,
+            false,
         )
         .await
         .unwrap()
@@ -92,7 +97,20 @@ async fn begin_send(
         .unsigned_tx
         .compute_txid()
         .to_string();
-    wallet.post_consignment_by_txid(txid.clone()).await.unwrap();
+    if let Some(edit) = edit {
+        for asset_id in &assets {
+            let bytes = wallet.send_consignment_bytes(&txid, asset_id).unwrap();
+            let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
+            edit(&mut consignment);
+            wallet
+                .set_send_consignment_bytes(&txid, asset_id, save(&consignment))
+                .unwrap();
+        }
+    }
+    wallet
+        .send_end(online.clone(), signed.clone(), false)
+        .await
+        .unwrap();
     (signed, txid)
 }
 
@@ -109,42 +127,42 @@ fn vout_paying(signed: &str, recipient_id: &str) -> u32 {
         .unwrap() as u32
 }
 
-async fn broadcast(signed: &str) {
-    let tx = Psbt::from_str(signed).unwrap().extract_tx().unwrap();
-    reqwest::Client::new()
-        .post(format!("{}/tx", ESPLORA_URL))
-        .body(serialize_hex(&tx))
-        .send()
-        .await
-        .expect("broadcast request failed");
-}
-
 fn save(consignment: &RgbTransfer) -> Vec<u8> {
     let mut bytes = vec![];
     consignment.save(&mut bytes).unwrap();
     bytes
 }
 
+fn waiting_for_tx(wallet: &Wallet, rid: &str) -> bool {
+    matches!(
+        transfer_of(wallet, rid).status,
+        TransferStatus::WaitingBroadcast | TransferStatus::WaitingConfirmations
+    )
+}
+
+async fn receive_witness(wallet: &mut Wallet, online: &Online, amount: u64, url: &str) -> String {
+    witness_rcv(
+        wallet,
+        online,
+        None,
+        Assignment::Fungible(amount),
+        default_rcv_expiration(),
+        vec![transport_endpoint(url)],
+    )
+    .await
+    .unwrap()
+    .recipient_id
+}
+
 #[wasm_bindgen_test]
-async fn witness_receive_settles_without_proxy_txid_and_vout() {
+async fn witness_receive_locates_payment() {
     let (mut wallet_a, online_a) = sender().await;
     let asset_id = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
-    let decoy = fund_address(&wallet_b.get_address().unwrap(), "0.001").await;
 
     let mut rids = vec![];
     for amount in [66, 34, 10] {
-        let rid = wallet_b
-            .witness_receive(
-                None,
-                Assignment::Fungible(amount),
-                default_rcv_expiration(),
-                vec![transport_endpoint(PROXY_URL)],
-                1,
-            )
-            .unwrap()
-            .recipient_id;
-        rids.push(rid);
+        rids.push(receive_witness(&mut wallet_b, &online_b, amount, PROXY_URL).await);
     }
     let map = HashMap::from([(
         asset_id.clone(),
@@ -153,32 +171,21 @@ async fn witness_receive_settles_without_proxy_txid_and_vout() {
             recipient(&rids[1], 34, Some(1500), PROXY_URL),
         ],
     )]);
-    let (signed, txid) = begin_send(&mut wallet_a, &online_a, map).await;
-    let bytes = get_consignment_from(PROXY_URL, &txid).await.0;
-    for rid in &rids {
-        wallet_a
-            .post_consignment(PROXY_URL, rid.clone(), &bytes, decoy.clone(), None)
-            .await
-            .unwrap();
-    }
-    wallet_a
-        .post_pending_consignments(txid.clone())
-        .await
-        .unwrap();
+    let (signed, txid) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
 
     refresh(&mut wallet_b, &online_b).await;
     for rid in &rids[..2] {
         let transfer = transfer_of(&wallet_b, rid);
-        assert_eq!(transfer.status, TransferStatus::WaitingBroadcast);
+        assert!(waiting_for_tx(&wallet_b, rid));
         assert_eq!(transfer.kind, TransferKind::ReceiveWitness);
         assert_eq!(transfer.txid, Some(txid.clone()));
     }
+    // nothing was sent to the third invoice
     assert_eq!(
         transfer_of(&wallet_b, &rids[2]).status,
-        TransferStatus::Failed
+        TransferStatus::WaitingCounterparty
     );
 
-    broadcast(&signed).await;
     settle(&mut wallet_b, &online_b, &rids[..2]).await;
     for (rid, amount) in rids.iter().zip([66, 34]) {
         let transfer = transfer_of(&wallet_b, rid);
@@ -192,45 +199,48 @@ async fn witness_receive_settles_without_proxy_txid_and_vout() {
 }
 
 #[wasm_bindgen_test]
-async fn blind_receive_settles_without_proxy_txid() {
+async fn blind_receive_locates_payment() {
     let (mut wallet_a, online_a) = sender().await;
     let asset_id = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
     create_utxos(&mut wallet_b, &online_b, 1).await;
-    let decoy = fund_address(&wallet_b.get_address().unwrap(), "0.001").await;
 
-    let rid = wallet_b
-        .blind_receive(
-            None,
-            Assignment::Fungible(66),
-            default_rcv_expiration(),
-            vec![transport_endpoint(PROXY_URL)],
-            1,
-        )
-        .unwrap()
-        .recipient_id;
+    let rid = blind_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(66),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
-    let (signed, txid) = begin_send(&mut wallet_a, &online_a, map).await;
-    let bytes = get_consignment_from(PROXY_URL, &txid).await.0;
-    wallet_a
-        .post_consignment(PROXY_URL, rid.clone(), &bytes, decoy, None)
-        .await
-        .unwrap();
+    let (_, txid) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
 
     refresh(&mut wallet_b, &online_b).await;
     let transfer = transfer_of(&wallet_b, &rid);
-    assert_eq!(transfer.status, TransferStatus::WaitingBroadcast);
+    // the TX of a single-recipient send is released with the ACK and broadcast by the recipient
+    assert_eq!(transfer.status, TransferStatus::WaitingConfirmations);
     assert_eq!(transfer.kind, TransferKind::ReceiveBlind);
     assert_eq!(transfer.txid, Some(txid));
     let b = wallet_b.get_asset_balance(asset_id.clone()).unwrap();
     assert_eq!((b.settled, b.future), (0, 66));
 
-    broadcast(&signed).await;
     settle(&mut wallet_b, &online_b, std::slice::from_ref(&rid)).await;
     let transfer = transfer_of(&wallet_b, &rid);
     assert_eq!(transfer.assignments, vec![Assignment::Fungible(66)]);
-    assert_eq!(wallet_b.get_asset_balance(asset_id).unwrap().settled, 66);
+    assert_eq!(
+        wallet_b
+            .get_asset_balance(asset_id.clone())
+            .unwrap()
+            .settled,
+        66
+    );
+    settle(&mut wallet_a, &online_a, std::slice::from_ref(&rid)).await;
+    assert_eq!(wallet_a.get_asset_balance(asset_id).unwrap().settled, 934);
 }
 
 #[wasm_bindgen_test]
@@ -241,26 +251,23 @@ async fn receive_refuses_consignment_without_terminals() {
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
     create_utxos(&mut wallet_b, &online_b, 1).await;
 
-    let rid = wallet_b
-        .blind_receive(
-            None,
-            Assignment::Fungible(66),
-            default_rcv_expiration(),
-            vec![transport_endpoint(PROXY_URL)],
-            1,
-        )
-        .unwrap()
-        .recipient_id;
+    let rid = blind_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(66),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
     let map = HashMap::from([(asset_id, vec![recipient(&rid, 66, None, PROXY_URL)])]);
-    let (_, txid) = begin_send(&mut wallet_a, &online_a, map).await;
-    let bytes = get_consignment_from(PROXY_URL, &txid).await.0;
-    let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
-    assert!(!consignment.terminals.is_empty());
-    consignment.terminals = Default::default();
-    wallet_a
-        .post_consignment(PROXY_URL, rid.clone(), &save(&consignment), txid, None)
-        .await
-        .unwrap();
+    let edit: fn(&mut RgbTransfer) = |c| {
+        assert!(!c.terminals.is_empty());
+        c.terminals = Default::default();
+    };
+    begin_end(&mut wallet_a, &online_a, map, false, Some(edit)).await;
 
     refresh(&mut wallet_b, &online_b).await;
     assert_eq!(transfer_of(&wallet_b, &rid).status, TransferStatus::Failed);
@@ -272,7 +279,6 @@ async fn witness_receive_multiple_assets_success() {
     let asset_1 = issue(&wallet_a);
     let asset_2 = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
-    let decoy = fund_address(&wallet_b.get_address().unwrap(), "0.001").await;
 
     let mut rids = vec![];
     for (amount, url) in [
@@ -281,17 +287,7 @@ async fn witness_receive_multiple_assets_success() {
         (198, PROXY_B_URL),
         (264, PROXY_B_URL),
     ] {
-        let rid = wallet_b
-            .witness_receive(
-                None,
-                Assignment::Fungible(amount),
-                default_rcv_expiration(),
-                vec![transport_endpoint(url)],
-                1,
-            )
-            .unwrap()
-            .recipient_id;
-        rids.push(rid);
+        rids.push(receive_witness(&mut wallet_b, &online_b, amount, url).await);
     }
     let map = HashMap::from([
         (
@@ -309,31 +305,16 @@ async fn witness_receive_multiple_assets_success() {
             ],
         ),
     ]);
-    let (signed, txid) = begin_send(&mut wallet_a, &online_a, map).await;
-    let bytes_1 = get_consignment_from(PROXY_URL, &txid).await.0;
-    let bytes_2 = get_consignment_from(PROXY_B_URL, &txid).await.0;
-    assert_ne!(bytes_1, bytes_2);
-    for (rid, url, bytes) in [
-        (&rids[0], PROXY_URL, &bytes_1),
-        (&rids[1], PROXY_URL, &bytes_1),
-        (&rids[2], PROXY_B_URL, &bytes_2),
-        (&rids[3], PROXY_B_URL, &bytes_2),
-    ] {
-        wallet_a
-            .post_consignment(url, rid.clone(), bytes, decoy.clone(), None)
-            .await
-            .unwrap();
-    }
+    let (signed, txid) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
 
     refresh(&mut wallet_b, &online_b).await;
     for rid in &rids {
         let transfer = transfer_of(&wallet_b, rid);
-        assert_eq!(transfer.status, TransferStatus::WaitingBroadcast);
+        assert!(waiting_for_tx(&wallet_b, rid));
         assert_eq!(transfer.kind, TransferKind::ReceiveWitness);
         assert_eq!(transfer.txid, Some(txid.clone()));
     }
 
-    broadcast(&signed).await;
     settle(&mut wallet_b, &online_b, &rids).await;
     for (rid, amount) in rids.iter().zip([66, 132, 198, 264]) {
         let transfer = transfer_of(&wallet_b, rid);
@@ -354,40 +335,22 @@ async fn witness_receive_accepts_repeated_terminal_seal() {
     let asset_id = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
 
-    let rid = wallet_b
-        .witness_receive(
-            None,
-            Assignment::Fungible(66),
-            default_rcv_expiration(),
-            vec![transport_endpoint(PROXY_URL)],
-            1,
-        )
-        .unwrap()
-        .recipient_id;
+    let rid = receive_witness(&mut wallet_b, &online_b, 66, PROXY_URL).await;
     let map = HashMap::from([(asset_id, vec![recipient(&rid, 66, Some(2000), PROXY_URL)])]);
-    let (signed, txid) = begin_send(&mut wallet_a, &online_a, map).await;
-    let bytes = get_consignment_from(PROXY_URL, &txid).await.0;
-    let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
-    assert_eq!(consignment.terminals.len(), 1);
-    let seals = consignment.terminals.values_mut().next().unwrap();
-    assert_eq!(seals.len(), 1);
-    let seal = seals.iter().next().copied().unwrap();
-    seals.push(seal).unwrap();
-    wallet_a
-        .post_consignment(
-            PROXY_URL,
-            rid.clone(),
-            &save(&consignment),
-            txid,
-            Some(vout_paying(&signed, &rid)),
-        )
-        .await
-        .unwrap();
+    let edit: fn(&mut RgbTransfer) = |c| {
+        assert_eq!(c.terminals.len(), 1);
+        let seals = c.terminals.values_mut().next().unwrap();
+        assert_eq!(seals.len(), 1);
+        let seal = seals.iter().next().copied().unwrap();
+        seals.push(seal).unwrap();
+    };
+    begin_end(&mut wallet_a, &online_a, map, false, Some(edit)).await;
 
     refresh(&mut wallet_b, &online_b).await;
+    // the TX of a single-recipient send is released with the ACK and broadcast by the recipient
     assert_eq!(
         transfer_of(&wallet_b, &rid).status,
-        TransferStatus::WaitingBroadcast
+        TransferStatus::WaitingConfirmations
     );
 }
 
@@ -396,44 +359,19 @@ async fn donation_receive_broadcasts_signed_tx() {
     let (mut wallet_a, online_a) = sender().await;
     let asset_id = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
-    let rid = wallet_b
-        .witness_receive(
-            None,
-            Assignment::Fungible(66),
-            default_rcv_expiration(),
-            vec![transport_endpoint(PROXY_URL)],
-            1,
-        )
-        .unwrap()
-        .recipient_id;
+    let rid = receive_witness(&mut wallet_b, &online_b, 66, PROXY_URL).await;
     let map = HashMap::from([(
         asset_id.clone(),
         vec![recipient(&rid, 66, Some(2000), PROXY_URL)],
     )]);
-    let (signed, txid) = begin_send(&mut wallet_a, &online_a, map).await;
-    let bytes = get_consignment_from(PROXY_URL, &txid).await.0;
-    let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
-    let signed_tx = Psbt::from_str(&signed).unwrap().extract_tx().unwrap();
-    assert!(
-        consignment.modify_bundle(RgbTxid::from_str(&txid).unwrap(), |b| b.tx =
-            signed_tx.clone())
-    );
-    wallet_a
-        .post_consignment(
-            PROXY_URL,
-            rid.clone(),
-            &save(&consignment),
-            txid.clone(),
-            None,
-        )
-        .await
-        .unwrap();
+    // a donation embeds the signed TX in the consignment, which the recipient broadcasts
+    begin_end(&mut wallet_a, &online_a, map, true, None).await;
 
-    // nobody else broadcasts the TX
     refresh(&mut wallet_b, &online_b).await;
-    let transfer = transfer_of(&wallet_b, &rid);
-    assert_eq!(transfer.status, TransferStatus::WaitingConfirmations);
-    assert_eq!(transfer.txid, Some(txid));
+    assert_eq!(
+        transfer_of(&wallet_b, &rid).status,
+        TransferStatus::WaitingConfirmations
+    );
     settle(&mut wallet_b, &online_b, std::slice::from_ref(&rid)).await;
     assert_eq!(wallet_b.get_asset_balance(asset_id).unwrap().settled, 66);
 }

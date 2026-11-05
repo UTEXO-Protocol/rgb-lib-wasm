@@ -34,16 +34,26 @@ fn any() -> JsValue {
 }
 
 fn endpoints() -> JsValue {
-    serde_wasm_bindgen::to_value(&vec!["rpc://127.0.0.1"]).unwrap()
+    serde_wasm_bindgen::to_value(&vec!["rpc://127.0.0.1:3000/json-rpc"]).unwrap()
 }
 
 fn err(e: JsValue) -> String {
     e.as_string().unwrap()
 }
 
+async fn online(wallet: &WasmWallet) -> JsValue {
+    let options = js_sys::JSON::parse(
+        r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:8094/regtest/api"}},
+        "skipConsistencyCheck":true,"proxyAuthKeys":{}}"#,
+    )
+    .unwrap();
+    wallet.go_online(options).await.unwrap()
+}
+
 #[wasm_bindgen_test]
-fn witness_receive_takes_number_bigint_and_string() {
+async fn witness_receive_takes_number_bigint_and_string() {
     let wallet = wallet();
+    let online = online(&wallet).await;
     let exp = now_secs() + 100_000;
     for v in [
         JsValue::from_f64(exp as f64),
@@ -51,19 +61,73 @@ fn witness_receive_takes_number_bigint_and_string() {
         JsValue::from_str(&exp.to_string()),
     ] {
         let data = wallet
-            .witness_receive(None, any(), v, endpoints(), 1)
+            .witness_receive(online.clone(), None, any(), v, endpoints(), 1, None)
+            .await
             .unwrap();
         let data: ReceiveData = serde_wasm_bindgen::from_value(data).unwrap();
         assert_eq!(data.expiration_timestamp, exp);
+        assert_eq!(data.public_key.len(), 64);
     }
 }
 
 #[wasm_bindgen_test]
-fn receive_rejects_malformed_expiration() {
-    let e = err(wallet()
-        .witness_receive(None, any(), JsValue::from_str("soon"), endpoints(), 1)
+async fn receive_rejects_malformed_expiration() {
+    let wallet = wallet();
+    let e = err(wallet
+        .witness_receive(
+            JsValue::NULL,
+            None,
+            any(),
+            JsValue::from_str("soon"),
+            endpoints(),
+            1,
+            None,
+        )
+        .await
         .unwrap_err());
     assert!(e.starts_with("Invalid expiration timestamp:"), "{e}");
+}
+
+#[wasm_bindgen_test]
+async fn receive_takes_an_optional_online_and_an_encryption() {
+    let wallet = wallet();
+    let exp = JsValue::from_f64((now_secs() + 100_000) as f64);
+    // the invoice is reserved on the proxy, so the wallet needs to be online
+    for online in [JsValue::NULL, JsValue::UNDEFINED] {
+        let e = err(wallet
+            .witness_receive(online, None, any(), exp.clone(), endpoints(), 1, None)
+            .await
+            .unwrap_err());
+        assert_eq!(e, "The Online object is needed to perform this operation");
+    }
+    let online = online(&wallet).await;
+    let e = err(wallet
+        .witness_receive(
+            online.clone(),
+            None,
+            any(),
+            exp.clone(),
+            endpoints(),
+            1,
+            Some("Sometimes".to_string()),
+        )
+        .await
+        .unwrap_err());
+    assert_eq!(e, "Invalid encryption: Sometimes");
+    for encryption in ["Required", "Unsupported", "Optional"] {
+        wallet
+            .witness_receive(
+                online.clone(),
+                None,
+                any(),
+                exp.clone(),
+                endpoints(),
+                1,
+                Some(encryption.to_string()),
+            )
+            .await
+            .unwrap();
+    }
 }
 
 #[wasm_bindgen_test]
