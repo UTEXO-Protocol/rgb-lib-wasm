@@ -7,6 +7,8 @@ pub enum AssetSchema {
     Nia = 1,
     /// IFA schema
     Ifa = 4,
+    /// BFA schema
+    Bfa = 5,
 }
 
 impl fmt::Display for AssetSchema {
@@ -22,6 +24,7 @@ impl TryFrom<String> for AssetSchema {
         Ok(match &schema_id[..] {
             SCHEMA_ID_NIA => AssetSchema::Nia,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
+            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -36,12 +39,13 @@ impl TryFrom<SchemaId> for AssetSchema {
 }
 
 impl AssetSchema {
-    pub(crate) const VALUES: [Self; NUM_KNOWN_SCHEMAS] = [Self::Nia, Self::Ifa];
+    pub(crate) const VALUES: [Self; NUM_KNOWN_SCHEMAS] = [Self::Nia, Self::Ifa, Self::Bfa];
 
     fn from_schema_id_str(schema_id: String) -> Result<Self, Error> {
         Ok(match &schema_id[..] {
             SCHEMA_ID_NIA => AssetSchema::Nia,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
+            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -63,6 +67,7 @@ impl AssetSchema {
         match self {
             Self::Nia => NonInflatableAsset::schema_rules(),
             Self::Ifa => InflatableFungibleAsset::schema_rules(),
+            Self::Bfa => BridgedFungibleAsset::schema_rules(),
         }
     }
 
@@ -70,6 +75,7 @@ impl AssetSchema {
         match self {
             Self::Nia => NonInflatableAsset::schema_definition(),
             Self::Ifa => InflatableFungibleAsset::schema_definition(),
+            Self::Bfa => BridgedFungibleAsset::schema_definition(),
         }
     }
 
@@ -84,6 +90,7 @@ impl From<AssetSchema> for SchemaId {
         match asset_schema {
             AssetSchema::Ifa => SchemaId::from_str(SCHEMA_ID_IFA).unwrap(),
             AssetSchema::Nia => SchemaId::from_str(SCHEMA_ID_NIA).unwrap(),
+            AssetSchema::Bfa => SchemaId::from_str(SCHEMA_ID_BFA).unwrap(),
         }
     }
 }
@@ -237,6 +244,8 @@ pub enum Assignment {
     NonFungible,
     /// Inflation right
     InflationRight(u64),
+    /// Mint right
+    MintRight,
     /// Any assignment
     Any,
 }
@@ -250,6 +259,7 @@ impl Assignment {
                 Self::InflationRight(amt.as_u64())
             }
             AllocatedState::Data(_) => Self::NonFungible,
+            AllocatedState::Void if opout.ty == OS_MINT => Self::MintRight,
             _ => unreachable!(),
         }
     }
@@ -260,6 +270,7 @@ impl Assignment {
             Self::Fungible(amt) => assignments.fungible += amt,
             Self::NonFungible => assignments.non_fungible = true,
             Self::InflationRight(amt) => assignments.inflation += amt,
+            Self::MintRight => assignments.mint += 1,
             _ => unreachable!("when using this method we should know the assignment type"),
         }
     }
@@ -280,6 +291,30 @@ impl Assignment {
             *amt
         } else {
             0
+        }
+    }
+}
+
+/// The main transition of an outgoing operation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TypeOfTransition {
+    /// Inflation transition (issuing new tokens)
+    Inflate = 2,
+    /// Transfer transition (moving existing tokens)
+    Transfer = 1,
+    /// Burn transition (burning existing tokens)
+    Burn = 3,
+    /// Mint transition (minting assets backed by tokens locked on the external chain)
+    Mint = 4,
+}
+
+impl TypeOfTransition {
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            Self::Inflate => "inflate",
+            Self::Transfer => "transfer",
+            Self::Burn => "burn",
+            Self::Mint => "mint",
         }
     }
 }

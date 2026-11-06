@@ -36,6 +36,10 @@ pub struct WalletSnapshot {
     pub(crate) received_consignment_meta: HashMap<String, super::ReceivedConsignmentMeta>,
     /// Signed TXs released by the sender proxy keyed by recipient_id.
     pub received_signed_txs: HashMap<String, Vec<u8>>,
+    /// Received mints keyed by recipient_id.
+    pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
+    /// Scanned EVM blocks of the received mints keyed by recipient_id.
+    pub mint_scanned_blocks: HashMap<String, HashMap<String, u64>>,
     /// Encoded RGB store (base64).
     pub rgb_store: String,
     /// Pinned derivation index per keychain for address reuse.
@@ -222,6 +226,7 @@ mod tests {
             .consignment_bytes
             .insert("asset-id".to_owned(), vec![1, 2, 3, 4]);
         transfer_artifact.signed_psbt = Some("signed-psbt".to_owned());
+        transfer_artifact.fascia = Some(vec![7, 8]);
         let snapshot = WalletSnapshot {
             sequence: 1,
             db: InMemoryDb::new(),
@@ -240,6 +245,20 @@ mod tests {
                 },
             )]),
             received_signed_txs: HashMap::from([("rid".to_owned(), vec![6])]),
+            received_mints: HashMap::from([(
+                "rid".to_owned(),
+                super::super::ReceivedMint {
+                    opid: "opid".to_owned(),
+                    amount: 1,
+                    after_block: 2,
+                    evm_chain_id: 3,
+                    bridge_contract: "bridge".to_owned(),
+                },
+            )]),
+            mint_scanned_blocks: HashMap::from([(
+                "rid".to_owned(),
+                HashMap::from([("opid".to_owned(), 4)]),
+            )]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
         };
@@ -260,6 +279,7 @@ mod tests {
             restored_artifact.signed_psbt.as_deref(),
             Some("signed-psbt")
         );
+        assert_eq!(restored_artifact.fascia, Some(vec![7, 8]));
 
         assert_eq!(
             restored_snapshot.received_consignments,
@@ -272,6 +292,11 @@ mod tests {
         assert_eq!(
             restored_snapshot.received_signed_txs,
             snapshot.received_signed_txs
+        );
+        assert_eq!(restored_snapshot.received_mints, snapshot.received_mints);
+        assert_eq!(
+            restored_snapshot.mint_scanned_blocks,
+            snapshot.mint_scanned_blocks
         );
 
         let restored = deserialize_stock(&restored_snapshot.rgb_store).expect("deserialize stock");

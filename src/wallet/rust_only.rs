@@ -157,7 +157,7 @@ impl Wallet {
                 beneficiaries.push(seal);
 
                 match schema {
-                    AssetSchema::Nia | AssetSchema::Ifa => {
+                    AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa => {
                         asset_transition_builder = asset_transition_builder.add_fungible_state(
                             assignment_name.clone(),
                             seal,
@@ -404,6 +404,34 @@ impl Wallet {
                     reject_list_url,
                 }
             }
+            AssetSchema::Bfa => {
+                let contract = runtime.contract_wrapper::<BridgedFungibleAsset>(contract_id)?;
+                let spec = contract.spec();
+                let media_idx = if let Some(attachment) = contract.contract_terms().media {
+                    Some(self.get_or_insert_media(
+                        hex::encode(attachment.digest),
+                        attachment.ty.to_string(),
+                    )?)
+                } else {
+                    None
+                };
+                // the DB keeps only a reject list URL
+                let reject_list_url = match contract.reject_list() {
+                    Some(RejectListLocation::Url(url)) => Some(url.to_string()),
+                    _ => None,
+                };
+                LocalAssetData {
+                    name: spec.name().to_string(),
+                    precision: spec.precision.into(),
+                    ticker: Some(spec.ticker().to_string()),
+                    details: spec.details().map(|d| d.to_string()),
+                    media_idx,
+                    initial_supply: 0,
+                    max_supply: None,
+                    known_circulating_supply: None,
+                    reject_list_url,
+                }
+            }
         };
 
         self.add_asset_to_db(
@@ -516,6 +544,9 @@ pub async fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
 /// transaction ID. The fallback resolver uses witness data from the consignment itself.
 ///
 /// Returns a `ValidateConsignmentResult` with validity status, warnings, and error details.
+///
+/// The mints in a BFA history are checked only online: a consignment that holds one gives the
+/// `external_anchors` error.
 #[cfg(feature = "esplora")]
 pub fn validate_consignment_offchain(
     consignment_bytes: &[u8],
@@ -580,6 +611,12 @@ pub fn validate_consignment_offchain(
             warnings: None,
             error: Some("resolver".to_string()),
             details: Some(e.to_string()),
+        }),
+        Err(ValidationError::ExternalAnchorsPending(count)) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("external_anchors".to_string()),
+            details: Some(format!("{count} mint event(s) to check online")),
         }),
         Err(e) => Ok(ValidateConsignmentResult {
             valid: false,

@@ -61,6 +61,10 @@ pub enum Error {
     #[error("The given PSBT cannot be finalized")]
     CannotFinalizePsbt,
 
+    /// Cannot use BFA schema on mainnet
+    #[error("Cannot use BFA schema on mainnet")]
+    CannotUseBfaOnMainnet,
+
     /// Cannot use IFA schema on mainnet
     #[error("Cannot use IFA schema on mainnet")]
     CannotUseIfaOnMainnet,
@@ -70,6 +74,15 @@ pub enum Error {
     DuplicateProxyAuthKey {
         /// Error details
         details: String,
+    },
+
+    /// The EVM RPC endpoint is on a chain other than the configured one
+    #[error("EVM chain ID mismatch: expected {expected}, the RPC endpoint is on {actual}")]
+    EvmChainIdMismatch {
+        /// Configured chain ID
+        expected: u64,
+        /// Chain ID reported by the EVM RPC endpoint
+        actual: u64,
     },
 
     /// The provided file is empty
@@ -153,8 +166,9 @@ pub enum Error {
     #[error("Invalid proxy auth signature")]
     InvalidProxyAuthSignature,
 
-    /// The recipient proxy refused the transfer as the invoice has expired, or the invoice
-    /// expiration has passed before the transfer could be created
+    /// The recipient proxy refused the transfer as the invoice has expired, the invoice expiration
+    /// has passed before the transfer could be created, or it leaves too little time for a mint
+    /// lock
     #[error("Invoice expired")]
     InvoiceExpired,
 
@@ -274,6 +288,13 @@ pub enum Error {
     #[error("Invalid consignment")]
     InvalidConsignment,
 
+    /// The provided burn reason is invalid
+    #[error("Invalid burn reason: {details}")]
+    InvalidBurnReason {
+        /// Error details
+        details: String,
+    },
+
     /// The provided asset details is invalid
     #[error("Invalid details: {details}")]
     InvalidDetails {
@@ -300,6 +321,22 @@ pub enum Error {
     /// The provided expiration is invalid
     #[error("Invalid expiration")]
     InvalidExpiration,
+
+    /// The provided EVM contract address is invalid
+    #[error("Invalid EVM contract address: {details}")]
+    InvalidEvmContractAddress {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided EVM RPC URL is invalid, the endpoint cannot be reached or it does not serve
+    /// what confirming mint events needs (the latest finalized block and the logs of the whole
+    /// chain history)
+    #[error("Invalid EVM RPC URL: {details}")]
+    InvalidEvmRpcUrl {
+        /// Error details
+        details: String,
+    },
 
     /// The provided fee rate is invalid
     #[error("Invalid fee rate: {details}")]
@@ -451,6 +488,31 @@ pub enum Error {
         txid: String,
     },
 
+    /// A mint cannot spend the last mint right of the wallet, which would be left unable to mint
+    #[error("Cannot mint with the last mint right")]
+    LastMintRight,
+
+    /// No confirmed mint event for the mint operation was found on the EVM chain (yet): it may
+    /// still be, e.g. once the lock is made or finalized
+    #[error("Mint event for operation {opid} not found on the EVM chain")]
+    MintEventNotFound {
+        /// ID of the mint operation
+        opid: String,
+    },
+
+    /// No mint event for the mint operation was found within the blocks scanned for it after the
+    /// one the mint commits to, all of them finalized: the mint will never be confirmed
+    #[error(
+        "Mint event for operation {opid} not found within {max_scan_blocks} blocks from the one \
+         the mint commits to"
+    )]
+    MintEventOutOfScanWindow {
+        /// ID of the mint operation
+        opid: String,
+        /// Number of blocks scanned for the mint event
+        max_scan_blocks: u64,
+    },
+
     /// The signed PSBT of a transfer is missing, so the transfer has failed
     #[error("Signed PSBT not found for transfer with TXID: {txid}, the transfer has failed")]
     MissingTransferArtifacts {
@@ -465,9 +527,20 @@ pub enum Error {
         details: String,
     },
 
+    /// Cannot burn an asset with zero amount
+    #[error("Burn request with zero amount")]
+    NoBurnAmount,
+
     /// No consignment found
     #[error("No consignment found")]
     NoConsignment,
+
+    /// No EVM RPC URL is configured for the chain
+    #[error("No EVM RPC URL configured for chain ID {chain_id}")]
+    NoEvmRpcUrl {
+        /// EVM chain ID
+        chain_id: u64,
+    },
 
     /// Cannot inflate an asset with unknown o zero amounts
     #[error("Inflation request with no amounts or zero amounts")]
@@ -476,6 +549,10 @@ pub enum Error {
     /// Cannot issue an asset without knowing the amounts
     #[error("Issuance request with no provided amounts")]
     NoIssuanceAmounts,
+
+    /// Cannot issue an asset with zero mint rights
+    #[error("Issuance request with zero mint rights")]
+    NoMintRights,
 
     /// Cannot create a wallet with no supported schemas
     #[error("Cannot create a wallet with no supported schemas")]
@@ -572,6 +649,10 @@ pub enum Error {
         schema_id: String,
     },
 
+    /// The transfer has expired
+    #[error("Transfer expired")]
+    TransferExpired,
+
     /// The detected transfer is unknown
     #[error("Unknown transfer: {txid}")]
     UnknownTransfer {
@@ -584,6 +665,20 @@ pub enum Error {
     UnsupportedBackupVersion {
         /// Backup version
         version: String,
+    },
+
+    /// The schema doesn't support burn transitions
+    #[error("Burn not supported")]
+    UnsupportedBurn {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
+    /// The schema doesn't support mint transitions
+    #[error("Mint not supported")]
+    UnsupportedMint {
+        /// Asset schema
+        asset_schema: AssetSchema,
     },
 
     /// The schema doesn't support inflation
