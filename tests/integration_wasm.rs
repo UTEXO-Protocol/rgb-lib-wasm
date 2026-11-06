@@ -36,28 +36,6 @@ fn transport_endpoint() -> String {
     format!("rpc://{}", PROXY_URL.trim_start_matches("http://"))
 }
 
-async fn fund_and_sync(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, amount: &str) {
-    let addr = wallet.get_address().unwrap();
-    fund_address(&addr, amount).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-}
-
-async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, num: u8) {
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-}
-
 #[wasm_bindgen_test]
 async fn test_no_receive_on_pending_send_input() {
     let transport = transport_endpoint();
@@ -71,18 +49,7 @@ async fn test_no_receive_on_pending_send_input() {
         .unwrap();
 
     // issue an NIA asset on a UTXO with not enough bitcoins for a send
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    create_utxos(&mut wallet, &online, false, Some(1), Some(330)).await;
     let asset = wallet
         .issue_asset_nia(
             "PSI".to_string(),
@@ -93,18 +60,7 @@ async fn test_no_receive_on_pending_send_input() {
         .unwrap();
 
     // create 1 UTXO with no allocations, to be used as additional bitcoin input
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    create_utxos(&mut wallet, &online, false, Some(1), Some(5000)).await;
 
     let colored: HashSet<Outpoint> = wallet
         .list_unspents(None, false, true)
@@ -248,18 +204,7 @@ async fn test_no_receive_on_pending_send_input() {
     .unwrap();
 
     // an expired send fails with no index
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    create_utxos(&mut wallet, &online, false, Some(1), Some(5000)).await;
     let txid = wallet
         .send_begin(
             online.clone(),
@@ -302,18 +247,7 @@ async fn test_no_inflate_end_after_expiration() {
     fund_and_sync(&mut wallet, &online, "1.0").await;
 
     // issue IFA inflation rights on a UTXO with not enough bitcoins for an inflation
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    create_utxos(&mut wallet, &online, false, Some(1), Some(330)).await;
     let asset = wallet
         .issue_asset_ifa(
             "EXP".to_string(),
@@ -326,18 +260,7 @@ async fn test_no_inflate_end_after_expiration() {
         .unwrap();
 
     // create 1 UTXO with no allocations, to be used as additional bitcoin input
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    create_utxos(&mut wallet, &online, false, Some(1), Some(5000)).await;
 
     let colored: HashSet<Outpoint> = wallet
         .list_unspents(None, false, true)
@@ -439,7 +362,7 @@ async fn test_full_wallet_flow() {
     assert!(!txs.is_empty());
     assert!(txs[0].received > 0);
 
-    create_utxos(&mut wallet, &online, 7).await;
+    create_utxos(&mut wallet, &online, true, Some(7), None).await;
 
     let nia = wallet
         .issue_asset_nia("TEST".to_string(), "Test NIA".to_string(), 0, vec![1000])
@@ -495,7 +418,7 @@ async fn test_full_wallet_flow() {
     let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
-    create_utxos(&mut wallet_b, &online_b, 5).await;
+    create_utxos(&mut wallet_b, &online_b, true, Some(5), None).await;
 
     let recv_b = witness_rcv(
         &mut wallet_b,
@@ -622,12 +545,11 @@ async fn test_full_wallet_flow() {
         );
     }
 
-    // Mine the ACK so sender can see it
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    // The recipient broadcasts the TX with the ACK
+    mine_until_confirmed(&send_result.txid).await;
     wallet.sync(online.clone()).await.unwrap();
 
-    // Sender refreshes: sees ACK, broadcasts TX → WaitingConfirmations
+    // Sender refreshes, sees the ACK and rebroadcasts the TX. State is WaitingConfirmations.
     // This is the exact flow that failed with "signed PSBT not found in transfer artifacts"
     let send_refresh = wallet
         .refresh(online.clone(), None, vec![], false)
@@ -737,8 +659,7 @@ async fn test_full_wallet_flow() {
         .unwrap();
     assert!(!btc_txid.is_empty());
 
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    mine_until_confirmed(&btc_txid).await;
     wallet.sync(online.clone()).await.unwrap();
 
     let btc_after = wallet.get_btc_balance(None, true).unwrap();
@@ -780,8 +701,7 @@ async fn test_full_wallet_flow() {
         .unwrap();
     assert_eq!(inflation.expiration_timestamp, None);
 
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    mine_until_confirmed(&inflate_result.txid).await;
     wallet.sync(online.clone()).await.unwrap();
 
     let ifa_assets = wallet.list_assets(vec![AssetSchema::Ifa]).unwrap();
@@ -865,8 +785,7 @@ async fn test_full_wallet_flow() {
         );
     }
 
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    mine_until_confirmed(&ifa_send.txid).await;
     wallet.sync(online.clone()).await.unwrap();
 
     // Sender refreshes: must see the ACK and leave WaitingCounterparty
@@ -932,8 +851,7 @@ async fn test_full_wallet_flow() {
         .unwrap();
     assert!(!drain_txid.is_empty());
 
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    mine_until_confirmed(&drain_txid).await;
     wallet.sync(online.clone()).await.unwrap();
     wallet_b.sync(online_b.clone()).await.unwrap();
 
@@ -1211,6 +1129,14 @@ async fn test_full_wallet_flow() {
         !deleted,
         "No failed transfers to delete should return false"
     );
+}
+
+#[wasm_bindgen_test]
+#[should_panic(
+    expected = "TX 0000000000000000000000000000000000000000000000000000000000000000 not confirmed"
+)]
+async fn mine_until_confirmed_panics_with_txid() {
+    mine_until_confirmed("0000000000000000000000000000000000000000000000000000000000000000").await;
 }
 
 #[wasm_bindgen_test]

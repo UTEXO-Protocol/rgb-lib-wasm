@@ -32,21 +32,6 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     }
 }
 
-async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8) {
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-}
-
 async fn new_wallet() -> (Wallet, Online) {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
@@ -56,7 +41,7 @@ async fn new_wallet() -> (Wallet, Online) {
 async fn sender() -> (Wallet, Online) {
     let (mut wallet, online) = new_wallet().await;
     fund_and_sync(&mut wallet, &online, "1.0").await;
-    create_utxos(&mut wallet, &online, 10).await;
+    create_utxos(&mut wallet, &online, true, Some(10), None).await;
     (wallet, online)
 }
 
@@ -204,7 +189,7 @@ async fn blind_receive_locates_payment() {
     let asset_id = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
-    create_utxos(&mut wallet_b, &online_b, 1).await;
+    create_utxos(&mut wallet_b, &online_b, true, Some(1), None).await;
 
     let rid = blind_rcv(
         &mut wallet_b,
@@ -249,7 +234,7 @@ async fn receive_refuses_consignment_without_terminals() {
     let asset_id = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
-    create_utxos(&mut wallet_b, &online_b, 1).await;
+    create_utxos(&mut wallet_b, &online_b, true, Some(1), None).await;
 
     let rid = blind_rcv(
         &mut wallet_b,

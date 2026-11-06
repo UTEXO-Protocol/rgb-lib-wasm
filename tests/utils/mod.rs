@@ -1,3 +1,4 @@
+use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{
     AssetFilter, IndexerConfig, Online, OnlineOptions, ReceiveData, Recipient, Transfer, Wallet,
     WitnessData,
@@ -6,6 +7,7 @@ use rgb_lib_wasm::{Assignment, Encryption, Error, TransferStatus};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::str::FromStr;
 use wasm_bindgen::JsValue;
 
 pub const REGTEST_HELPER_URL: &str = "http://127.0.0.1:8080";
@@ -24,6 +26,8 @@ pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
 const DURATION_RCV_TRANSFER: u64 = 86400;
 #[allow(dead_code)]
 const DURATION_SEND_TRANSFER: u64 = 3600;
+#[allow(dead_code)]
+const CONFIRM_ATTEMPTS: u32 = 30;
 
 pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
     OnlineOptions {
@@ -138,6 +142,23 @@ pub async fn wait_for_esplora_sync() {
         sleep_ms(500).await;
     }
     panic!("Esplora did not sync to height {} within 60s", target);
+}
+
+/// Mine until esplora reports `txid` confirmed. A block misses a TX that has not reached the
+/// mining node.
+#[allow(dead_code)]
+pub async fn mine_until_confirmed(txid: &str) {
+    let url = format!("{ESPLORA_URL}/tx/{txid}/status");
+    for _ in 0..CONFIRM_ATTEMPTS {
+        mine_blocks(1).await;
+        wait_for_esplora_sync().await;
+        let status = reqwest::get(&url).await.unwrap().text().await.unwrap();
+        if status.contains("\"confirmed\":true") {
+            return;
+        }
+        sleep_ms(1000).await;
+    }
+    panic!("TX {txid} not confirmed after {CONFIRM_ATTEMPTS} blocks");
 }
 
 pub async fn sleep_ms(ms: u32) {
@@ -419,8 +440,39 @@ pub async fn rpc_post(url: &str, method: &str, params: serde_json::Value) -> ser
 #[allow(dead_code)]
 pub async fn fund_and_sync(wallet: &mut Wallet, online: &Online, amount: &str) {
     let addr = wallet.get_address().unwrap();
-    fund_address(&addr, amount).await;
-    wait_for_esplora_sync().await;
+    let txid = fund_address(&addr, amount).await;
+    mine_until_confirmed(&txid).await;
+    wallet.sync(online.clone()).await.unwrap();
+}
+
+#[allow(dead_code)]
+pub fn txid_of(signed: &str) -> String {
+    Psbt::from_str(signed)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string()
+}
+
+#[allow(dead_code)]
+pub async fn create_utxos(
+    wallet: &mut Wallet,
+    online: &Online,
+    up_to: bool,
+    num: Option<u8>,
+    size: Option<u32>,
+) {
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), up_to, num, size, 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let txid = txid_of(&signed);
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_until_confirmed(&txid).await;
     wallet.sync(online.clone()).await.unwrap();
 }
 
@@ -468,7 +520,7 @@ pub async fn refresh(wallet: &mut Wallet, online: &Online) {
 
 #[allow(dead_code)]
 pub async fn settle(wallet: &mut Wallet, online: &Online, recipient_ids: &[String]) {
-    for _ in 0..5 {
+    for _ in 0..CONFIRM_ATTEMPTS {
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
         wallet.sync(online.clone()).await.unwrap();
@@ -481,9 +533,9 @@ pub async fn settle(wallet: &mut Wallet, online: &Online, recipient_ids: &[Strin
         }
         sleep_ms(1000).await;
     }
-    let statuses: Vec<_> = recipient_ids
+    let states: Vec<_> = recipient_ids
         .iter()
-        .map(|r| transfer_of(wallet, r).status)
+        .map(|r| transfer_of(wallet, r))
         .collect();
-    panic!("transfers did not settle: {statuses:?}");
+    panic!("transfers did not settle: {states:?}");
 }

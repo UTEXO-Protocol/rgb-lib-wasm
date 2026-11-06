@@ -46,28 +46,6 @@ fn transport_endpoint() -> String {
     format!("rpc://{}", PROXY_URL.trim_start_matches("http://"))
 }
 
-async fn fund_and_sync(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, amount: &str) {
-    let addr = wallet.get_address().unwrap();
-    fund_address(&addr, amount).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-}
-
-async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, num: u8) {
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-}
-
 /// Simulate a browser page reload through the production restore API.
 async fn simulate_reload(wallet: Wallet, wd: &WalletData) -> Wallet {
     wallet.flush().await.unwrap();
@@ -193,11 +171,7 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     );
     let mut funded = Wallet::new(wd1.clone()).unwrap();
     let online = funded.go_online(go_online_options(false)).await.unwrap();
-    let addr = funded.get_address().unwrap();
-    fund_address(&addr, "1.0").await;
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
-    funded.sync(online.clone()).await.unwrap();
+    fund_and_sync(&mut funded, &online, "1.0").await;
     let funded_balance = funded.get_btc_balance(None, true).unwrap();
     assert!(funded_balance.vanilla.settled > 0);
 
@@ -241,7 +215,7 @@ async fn test_persistence_across_reload() {
 
     // Fund, create UTXOs, and issue asset — all in one session
     fund_and_sync(&mut wallet, &online, "1.0").await;
-    create_utxos(&mut wallet, &online, 7).await;
+    create_utxos(&mut wallet, &online, true, Some(7), None).await;
 
     let nia = wallet
         .issue_asset_nia(
@@ -281,7 +255,7 @@ async fn test_persistence_across_reload() {
     let mut wallet_b = Wallet::new(wd_b).unwrap();
     let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
-    create_utxos(&mut wallet_b, &online_b, 5).await;
+    create_utxos(&mut wallet_b, &online_b, true, Some(5), None).await;
 
     let transport = transport_endpoint();
     let recv_b = witness_rcv(
@@ -363,11 +337,10 @@ async fn test_persistence_across_reload() {
         );
     }
 
-    mine_blocks(1).await;
-    wait_for_esplora_sync().await;
+    mine_until_confirmed(&send_result.txid).await;
     wallet.sync(online.clone()).await.unwrap();
 
-    // Sender (reloaded) refreshes: sees ACK, broadcasts — needs signed PSBT from IDB
+    // The reloaded sender sees the ACK and rebroadcasts the TX. It needs the signed PSBT from IDB.
     let send_refresh = wallet
         .refresh(online.clone(), None, vec![], false)
         .await
@@ -453,8 +426,8 @@ async fn test_received_contract_survives_reload() {
 
     fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
-    create_utxos(&mut wallet_a, &online_a, 5).await;
-    create_utxos(&mut wallet_b, &online_b, 5).await;
+    create_utxos(&mut wallet_a, &online_a, true, Some(5), None).await;
+    create_utxos(&mut wallet_b, &online_b, true, Some(5), None).await;
 
     let asset = wallet_a
         .issue_asset_nia(
@@ -554,7 +527,7 @@ async fn test_initiated_send_completes_after_reload() {
     let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_a, &online_a, "1.0").await;
-    create_utxos(&mut wallet_a, &online_a, 5).await;
+    create_utxos(&mut wallet_a, &online_a, true, Some(5), None).await;
     let asset = wallet_a
         .issue_asset_nia("LDKF".to_string(), "LDK Funding".to_string(), 0, vec![1000])
         .unwrap();

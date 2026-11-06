@@ -33,37 +33,6 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     }
 }
 
-async fn create_utxos(
-    wallet: &mut Wallet,
-    online: &Online,
-    up_to: bool,
-    num: Option<u8>,
-    size: Option<u32>,
-) {
-    let unsigned = wallet
-        .create_utxos_begin(online.clone(), up_to, num, size, 1, true)
-        .await
-        .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
-    let txid = txid_of(&signed);
-    wallet
-        .create_utxos_end(online.clone(), signed, true)
-        .await
-        .unwrap();
-    // A block can miss the TX before it reaches the mining node: mine until it confirms.
-    let status = format!("{ESPLORA_URL}/tx/{txid}/status");
-    for _ in 0..20 {
-        mine_blocks(1).await;
-        wait_for_esplora_sync().await;
-        let res = reqwest::get(&status).await.unwrap().text().await.unwrap();
-        if res.contains("\"confirmed\":true") {
-            break;
-        }
-        sleep_ms(500).await;
-    }
-    wallet.sync(online.clone()).await.unwrap();
-}
-
 async fn new_wallet() -> (Wallet, Online) {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
@@ -699,14 +668,6 @@ async fn pending_send(
     (wallet, online, rcv, rcv_online, asset_id, rid, signed, idx)
 }
 
-fn txid_of(signed: &str) -> String {
-    Psbt::from_str(signed)
-        .unwrap()
-        .unsigned_tx
-        .compute_txid()
-        .to_string()
-}
-
 async fn settled_send(encryption: Encryption) {
     let (mut wallet, online, mut rcv, rcv_online, asset_id, rid, signed, _) =
         pending_send(Some(encryption)).await;
@@ -1290,4 +1251,12 @@ async fn proxy_draining() {
     let res = end(&mut wallet, &online, &signed).await;
     clear_rpc_hooks();
     assert!(matches!(res, Err(Error::ProxyDraining)));
+}
+
+#[wasm_bindgen_test]
+#[should_panic(
+    expected = "TX 0000000000000000000000000000000000000000000000000000000000000000 not confirmed"
+)]
+async fn mine_until_confirmed_panics_with_txid() {
+    mine_until_confirmed("0000000000000000000000000000000000000000000000000000000000000000").await;
 }
