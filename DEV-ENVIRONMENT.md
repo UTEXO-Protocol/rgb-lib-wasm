@@ -4,14 +4,16 @@ Development and CI infrastructure for rgb-lib-wasm integration tests.
 
 ## Architecture
 
-Integration tests run in a headless Firefox browser (via wasm-pack/wasm-bindgen-test) against a local regtest Bitcoin network. The test environment consists of 7 Docker services:
+Integration tests run in a headless Firefox browser (via wasm-pack/wasm-bindgen-test) against a local regtest Bitcoin network. The test environment consists of 9 Docker services:
 
 The WASM tests (running in headless Firefox) communicate with all services over HTTP:
 
 - **esplora** (:8094) — Block explorer and indexer. Bundles its own internal bitcoind for block indexing.
 - **bitcoind** (:18443) — Primary Bitcoin Core node. Connected to esplora's bitcoind via p2p (:18444) so both see the same chain.
 - **regtest-helper** (:8080) — Lightweight HTTP server that wraps bitcoind RPC for mining, funding, and status checks.
-- **RGB proxy** (:3000) — Consignment relay for RGB transfers between wallets.
+- **RGB proxy** (:3000): rgb-proxy-server 0.4.0 (proxy protocol 1.0), the relay for RGB transfers between wallets. It answers the browser with CORS headers itself.
+- **RGB proxy B** (:3010): a second 0.4.0 relay, used by the batch and receive tests.
+- **RGB proxy auth** (:3020): a 0.4.0 relay that only accepts calls signed with the key of `PROXY_AUTH_PUBKEYS`, used by the proxy authentication test.
 - **vss-cors-proxy** (:8082) — Nginx reverse proxy that adds CORS headers, forwarding to the VSS server.
 - **vss-server** (:8080 internal) — Versioned Storage Service for cloud backups. Not browser-accessible directly (no CORS).
 - **vss-postgres** (:5432 internal) — PostgreSQL database backing the VSS server.
@@ -31,7 +33,9 @@ Esplora bundles its own bitcoind for block indexing. Our primary bitcoind handle
 | bitcoind | 18443 | `http://127.0.0.1:18443` | Bitcoin Core RPC |
 | esplora | 8094 | `http://127.0.0.1:8094/regtest/api` | Block explorer / indexer API |
 | esplora (electrum) | 50004 | — | Not used (WASM can't do TCP) |
-| RGB proxy | 3000 | `http://127.0.0.1:3000/json-rpc` | RGB consignment relay |
+| RGB proxy | 3000 | `http://127.0.0.1:3000/json-rpc` | RGB consignment relay (0.4.0) |
+| RGB proxy B | 3010 | `http://127.0.0.1:3010/json-rpc` | Second relay for the batch and receive tests (0.4.0) |
+| RGB proxy auth | 3020 | `http://127.0.0.1:3020/json-rpc` | Relay with proxy authentication (0.4.0) |
 | regtest-helper | 8080 | `http://127.0.0.1:8080` | Mining / funding helper |
 | VSS server | 8081 | `http://127.0.0.1:8081` | VSS direct (not browser-accessible) |
 | VSS CORS proxy | 8082 | `http://127.0.0.1:8082/vss` | VSS via nginx CORS proxy |
@@ -47,7 +51,7 @@ bash regtest.sh start
 ```
 
 This will:
-1. Start all 7 Docker containers
+1. Start all 9 Docker containers
 2. Wait for each service to become healthy
 3. Connect the two bitcoind nodes as peers
 4. Mine 111 initial blocks (required for coinbase maturity)
@@ -78,12 +82,17 @@ bash tests/regtest.sh stop         # Stop all services
 # Unit tests (no Docker needed)
 cargo test --lib
 
-# WASM key and wallet tests (no Docker needed)
+# WASM key and proof of work tests (no Docker needed)
 wasm-pack test --headless --firefox --release -- --test keys_wasm
-wasm-pack test --headless --firefox --release -- --test wallet_wasm
+WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --firefox --release -- --test pow_wasm
+
+# proof of work time at the highest difficulty (slow, not in CI)
+WASM_BINDGEN_TEST_TIMEOUT=3600 wasm-pack test --headless --firefox --release -- --test pow_wasm -- --nocapture --include-ignored pow_max_difficulty_time
 
 # Integration tests (Docker required)
 cd tests && bash regtest.sh start && cd ..
+wasm-pack test --headless --firefox --release -- --test wallet_wasm
+wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 wasm-pack test --headless --firefox --release -- --test integration_wasm
 cd tests && bash regtest.sh stop
 ```
@@ -114,10 +123,10 @@ Runs 94 native unit tests (database, crypto, backup, VSS encryption).
 
 ```yaml
 wasm-pack test --headless --firefox --release -- --test keys_wasm
-wasm-pack test --headless --firefox --release -- --test wallet_wasm
+WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --firefox --release -- --test pow_wasm
 ```
 
-11 tests covering key generation/restoration and wallet creation. No Docker needed.
+Key generation, key restoration and proof of work. No Docker needed.
 
 ### 4. `integration-tests` — Full end-to-end
 
@@ -128,7 +137,7 @@ This job:
 4. Mines 111 initial blocks
 5. Waits for esplora sync
 6. Waits for VSS server readiness
-7. Runs the integration test suite
+7. Runs the wallet, binding, integration, receive and send tests
 
 The integration test covers: fund wallet, sync, create UTXOs, issue NIA/IFA, two-wallet RGB send, BTC send, fee estimation, IFA inflation, drain, backup/restore, VSS backup/restore, blind/witness receive.
 
@@ -136,23 +145,7 @@ The integration test covers: fund wallet, sync, create UTXOs, issue NIA/IFA, two
 
 ### `tests/docker-compose.ci.yml`
 
-Standalone compose file for CI. Contains all 7 services with their own build contexts. Used by GitHub Actions where the upstream rgb-lib repo is not available.
-
-### `tests/compose.override.yml`
-
-Override file for local development. Layers on top of the upstream `rgb-lib/dev/tests/compose.yaml`:
-
-- Adds `regtest-helper` (custom service for mining/funding via HTTP)
-- Removes profile restrictions on `esplora`, `vss-postgres`, `vss-server` (upstream puts these in named profiles)
-- Adds `vss-cors-proxy` (nginx CORS reverse proxy)
-
-The `regtest.sh` script combines both files:
-
-```bash
-docker compose -f $UPSTREAM_COMPOSE -f $GENERATED_OVERRIDE up -d $SERVICES
-```
-
-The override file path is dynamically generated via `sed` to resolve absolute paths for the build contexts.
+Compose file of the whole stack, used both locally and by GitHub Actions. It holds all 9 services with their own build contexts, and `regtest.sh` runs it alone under the compose project name `rgb-lib-wasm`. The three proxies run `ghcr.io/rgb-tools/rgb-proxy-server:0.4.0` with `MAX_POW_DIFFICULTY: 0`, so the tests need no proof of work; `proxy-auth` also sets `PROXY_AUTH_PUBKEYS`.
 
 ### `tests/vss-server/Dockerfile`
 

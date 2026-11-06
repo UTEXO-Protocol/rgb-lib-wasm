@@ -29,6 +29,7 @@
 
 pub(crate) mod api;
 pub(crate) mod database;
+pub(crate) mod encryption;
 pub(crate) mod error;
 pub mod keys;
 pub mod utils;
@@ -39,7 +40,7 @@ pub use bdk_wallet::bitcoin;
 pub use rgbinvoice::RgbTransport;
 pub use rgbstd::{
     ChainNet, ContractId, Txid as RgbTxid,
-    containers::{ConsignmentExt, Fascia, FileContent, PubWitness, Transfer as RgbTransfer},
+    containers::{ConsignmentExt, Fascia, FileContent, Transfer as RgbTransfer},
     indexers::AnyResolver,
     persistence::UpdateRes,
     schema::SchemaId,
@@ -48,12 +49,25 @@ pub use rgbstd::{
 };
 
 pub use crate::{
-    database::enums::{AssetSchema, Assignment, TransferStatus, TransportType},
+    database::enums::{AssetSchema, Assignment, Encryption, TransferStatus, TransportType},
     error::Error,
     keys::{generate_keys, restore_keys},
     utils::BitcoinNetwork,
     wallet::{RecipientType, TransactionType, TransferKind, Wallet},
 };
+
+#[cfg(feature = "esplora")]
+#[doc(hidden)]
+pub use crate::encryption::solve_pow;
+
+#[cfg(test)]
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
 
 #[cfg(feature = "esplora")]
 use std::{
@@ -66,7 +80,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::Hash,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Read, Write},
     panic,
     path::{Path, PathBuf},
     str::FromStr,
@@ -74,7 +88,7 @@ use std::{
     time::Duration,
 };
 
-use crate::database::memory_db::ActiveValue;
+use crate::database::{memory_db::ActiveValue, rgb_store::MemRgbStore};
 use amplify::{Wrapper, bmap, confinement::Confined, s};
 #[cfg(feature = "esplora")]
 use base64::{Engine as _, engine::general_purpose};
@@ -110,21 +124,32 @@ use bdk_wallet::{
     },
     coin_selection::InsufficientFunds,
 };
-use chacha20poly1305::{
-    Key, KeyInit, XChaCha20Poly1305,
-    aead::{generic_array::GenericArray, stream},
-};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use ed25519_dalek::SigningKey;
+#[cfg(feature = "esplora")]
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+#[cfg(feature = "esplora")]
+use hkdf::Hkdf;
+#[cfg(feature = "esplora")]
+use hmac::{Mac, SimpleHmac};
 use psrgbt::{RgbOutExt, RgbPsbtExt};
-use rand::{Rng, distr::Alphanumeric};
+use rand::{Rng, TryRng, distr::Alphanumeric, rngs::SysRng};
+#[cfg(feature = "esplora")]
+use reqwest::{Client as RestClient, header::CONTENT_TYPE, multipart};
 use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
     Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, Opout, OutputSeal,
-    OwnedFraction, Precision, Schema, SecretSeal, Transition, TransitionType, TypeSystem,
-    containers::{BuilderSeal, Kit, ValidContract, ValidKit, ValidTransfer},
-    contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder},
+    OwnedFraction, Precision, Schema, SecretSeal, Transition, TransitionType,
+    containers::{BuilderSeal, ValidConsignment, ValidContract, ValidTransfer},
+    contract::{
+        AllocatedState, ContractBuilder, ContractData, FilteredContractState, IssuerWrapper,
+        TransitionBuilder,
+    },
     info::{ContractInfo, SchemaInfo},
     invoice::{InvoiceState, Pay2Vout},
-    persistence::{MemContract, MemContractState, StashReadProvider, Stock, fs::FsBinStore},
+    persistence::{
+        ContractAssignments, ContractStateSnapshot, RetrievedSpvProofs, RgbStore, Stock,
+    },
     rgbcore::commit_verify::Conceal,
     stl::{
         AssetSpec, Attachment, ContractTerms, Details, MediaType, Name, RejectListUrl,
@@ -132,13 +157,14 @@ use rgbstd::{
     },
     txout::{BlindSeal, CloseMethod, ExplicitSeal},
     validation::{
-        ResolveWitness, Scripts, Status, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
+        ResolveWitness, SchemaDefinition, SchemaRules, WitnessOrdProvider, WitnessResolverError,
+        WitnessStatus,
     },
 };
 #[cfg(feature = "esplora")]
 use rgbstd::{
     Assign, KnownTransition,
-    containers::Consignment,
+    containers::{Consignment, WitnessBundle},
     contract::SchemaWrapper,
     daggy::Walker,
     txout::TxPtr,
@@ -149,14 +175,22 @@ use schemata::{IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION};
 use schemata::{InflatableFungibleAsset, NonInflatableAsset};
 use scrypt::{
     Params, Scrypt,
-    password_hash::{PasswordHasher, Salt, SaltString, rand_core::OsRng},
+    password_hash::{
+        PasswordHasher, Salt, SaltString,
+        rand_core::{OsRng, RngCore},
+    },
 };
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+#[cfg(feature = "esplora")]
+use sha2::Sha512;
+use sha2::{Digest, Sha256};
 use slog::{Drain, Logger, debug, error, info, o, warn};
-use strict_encoding::{DecodeError, DeserializeError, FieldName};
+use strict_encoding::{DecodeError, DeserializeError, FieldName, StrictSerialize};
 use time::OffsetDateTime;
 use typenum::consts::U32;
+#[cfg(feature = "esplora")]
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
 use crate::database::{
     DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
@@ -173,8 +207,19 @@ use crate::utils::INDEXER_PARALLEL_REQUESTS;
 use crate::utils::{OffchainResolverWasm, PreFetchResolver};
 #[cfg(feature = "esplora")]
 use crate::{
-    api::proxy::GetConsignmentResponse,
+    api::proxy_v1::{
+        AckTransferData, GetAckResponse, GetConsignmentResponse, InvoiceStatus, JsonRpcError,
+        JsonRpcResponse, PostAckResponse, PostConsignmentData, ProxyClient, ProxyTransferState,
+        ServerInfoResponse, get_ack_message, list_transfers_message, map_proxy_error,
+        post_consignment_message, post_media_message, pow_difficulty_required,
+        prepare_ack_auth_message, prepare_invoice_auth_message, transfer_retrieved_message,
+    },
     database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
+    encryption::{
+        decode_hash_hex, decrypt_blob, derive_shared, ed25519_from_seed, encrypt_blob, invoice_id,
+        sha256_digest, sign_ed25519, solve_pow as solve_pow_nonce, transfer_id, verify_ed25519,
+        verifying_key_from_bytes,
+    },
     error::IndexerError,
     utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},
     wallet::{AssignmentsCollection, Indexer},
@@ -182,7 +227,7 @@ use crate::{
 use crate::{
     database::{
         LocalRgbAllocation, LocalTransportEndpoint, LocalUnspent, TransferData,
-        enums::{ColoringType, RecipientTypeFull, WalletTransactionType},
+        enums::{ColoringType, RecipientTypeFull, TransportEndpointKind, WalletTransactionType},
     },
     error::InternalError,
     utils::{

@@ -264,8 +264,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </div>
     <div class="field-row">
       <div>
-        <label for="recv-duration">Duration (seconds, optional)</label>
-        <input id="recv-duration" type="number" placeholder="Leave empty for default" />
+        <label for="recv-duration">Expires in (seconds)</label>
+        <input id="recv-duration" type="number" placeholder="86400" />
       </div>
       <div>
         <label for="recv-min-conf">Min confirmations</label>
@@ -332,7 +332,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     </p>
     <div>
       <label for="send-rgb-recipient-map">Recipient Map (JSON)</label>
-      <textarea id="send-rgb-recipient-map" rows="6" placeholder='{"assetId": [{"recipientId": "invoice...", "witnessData": {"amountSat": 1000, "blinding": null}, "amount": 100, "transportEndpoints": ["rpc://127.0.0.1:3000/json-rpc"]}]}'></textarea>
+      <textarea id="send-rgb-recipient-map" rows="6" placeholder='{"assetId": [{"recipientId": "invoice...", "witnessData": {"amountSat": 1000, "blinding": null}, "amount": 100, "transportEndpoints": ["rpc://127.0.0.1:3000/json-rpc"], "publicKey": "invoice pk", "encryption": "Required", "expirationTimestamp": 1700000000}]}'></textarea>
     </div>
     <div class="field-row">
       <div>
@@ -536,6 +536,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       return type;
     }
 
+    // the sender's own proxy, where the recipients post their ACK
+    function senderEndpoint() {
+      return parseEndpoints()[0] ?? 'rpc://127.0.0.1:3000/json-rpc';
+    }
+
     function parseEndpoints() {
       return document.getElementById('recv-endpoints').value
         .split(',')
@@ -560,7 +565,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
         const url = document.getElementById('setup-indexer-url').value.trim();
         log('Auto setup: going online (' + url + ')...', 'log-warn');
-        state.online = await state.wallet.goOnline(true, url);
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
         log('Online', 'log-ok');
 
         enableBtns(walletBtns);
@@ -622,7 +627,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('setup-indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.goOnline(true, url);
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
         enableBtns(onlineBtns);
         showResult('setup-output', 'setup-result', 'Online!\n\n' + json(state.online));
         log('Online: ' + url, 'log-ok');
@@ -780,16 +785,16 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     // =======================================================================
     // Blind Receive
     // =======================================================================
-    document.getElementById('btn-blind-receive').addEventListener('click', () => {
+    document.getElementById('btn-blind-receive').addEventListener('click', async () => {
       if (!requireWallet('recv-output', 'recv-result')) return;
       const assetId = optionalString('recv-asset-id');
       const assignment = buildAssignment();
-      const duration = optionalInt('recv-duration');
+      const expiration = Math.floor(Date.now() / 1000) + (optionalInt('recv-duration') ?? 86400);
       const endpoints = parseEndpoints();
       const minConf = parseInt(document.getElementById('recv-min-conf').value, 10) || 1;
       try {
         log('blindReceive...', 'log-warn');
-        const data = state.wallet.blindReceive(assetId, assignment, duration, endpoints, minConf);
+        const data = await state.wallet.blindReceive(state.online, assetId, assignment, expiration, endpoints, minConf, null);
         showJson('recv-output', 'recv-result', data);
         log('blindReceive OK', 'log-ok');
       } catch (e) {
@@ -801,16 +806,16 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     // =======================================================================
     // Witness Receive
     // =======================================================================
-    document.getElementById('btn-witness-receive').addEventListener('click', () => {
+    document.getElementById('btn-witness-receive').addEventListener('click', async () => {
       if (!requireWallet('recv-output', 'recv-result')) return;
       const assetId = optionalString('recv-asset-id');
       const assignment = buildAssignment();
-      const duration = optionalInt('recv-duration');
+      const expiration = Math.floor(Date.now() / 1000) + (optionalInt('recv-duration') ?? 86400);
       const endpoints = parseEndpoints();
       const minConf = parseInt(document.getElementById('recv-min-conf').value, 10) || 1;
       try {
         log('witnessReceive...', 'log-warn');
-        const data = state.wallet.witnessReceive(assetId, assignment, duration, endpoints, minConf);
+        const data = await state.wallet.witnessReceive(state.online, assetId, assignment, expiration, endpoints, minConf, null);
         showJson('recv-output', 'recv-result', data);
         log('witnessReceive OK', 'log-ok');
       } catch (e) {
@@ -839,9 +844,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const minConf = parseInt(document.getElementById('send-rgb-min-conf').value, 10) || 1;
       try {
         log('sendBegin (RGB)...', 'log-warn');
-        const unsignedPsbt = await state.wallet.sendBegin(
-          state.online, recipientMap, donation, BigInt(feeRate), minConf
-        );
+        const unsignedPsbt = (await state.wallet.sendBegin(
+          state.online, recipientMap, donation, BigInt(feeRate), minConf,
+          Math.floor(Date.now() / 1000) + 3600, senderEndpoint(), null, false
+        )).psbt;
         document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
         showResult('send-rgb-output', 'send-rgb-result', 'Unsigned PSBT created. Proceed to Sign.');
         log('sendBegin OK', 'log-ok');
@@ -906,9 +912,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
         log('send RGB (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.sendBegin(
-          state.online, recipientMap, donation, BigInt(feeRate), minConf
-        );
+        const unsignedPsbt = (await state.wallet.sendBegin(
+          state.online, recipientMap, donation, BigInt(feeRate), minConf,
+          Math.floor(Date.now() / 1000) + 3600, senderEndpoint(), null, false
+        )).psbt;
         document.getElementById('send-rgb-unsigned-psbt').value = unsignedPsbt;
 
         log('send RGB (auto) sign...', 'log-warn');

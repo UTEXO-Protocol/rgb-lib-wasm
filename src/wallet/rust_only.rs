@@ -387,9 +387,10 @@ impl Wallet {
                 };
                 let initial_supply = contract.total_issued_supply().into();
                 let max_supply = contract.max_supply().into();
-                let known_circulating_supply = IfaWrapper::with(valid_transfer.contract_data())
-                    .total_issued_supply()
-                    .into();
+                let known_circulating_supply =
+                    IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
+                        .total_issued_supply()
+                        .into();
                 let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
                 LocalAssetData {
                     name,
@@ -426,50 +427,36 @@ impl Wallet {
         asset_transfer_dir.join(CONSIGNMENT_FILE)
     }
 
-    /// Post a consignment to the proxy server.
-    ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
-    #[cfg(feature = "esplora")]
-    pub async fn post_consignment(
-        &self,
-        proxy_url: &str,
-        recipient_id: String,
-        consignment_bytes: &[u8],
-        txid: String,
-        vout: Option<u32>,
+    /// The consignment bytes of a pending send, for tests.
+    #[doc(hidden)]
+    pub fn send_consignment_bytes(&self, txid: &str, asset_id: &str) -> Option<Vec<u8>> {
+        self.transfer_artifacts
+            .get(txid)
+            .and_then(|a| a.consignment_bytes.get(asset_id).cloned())
+    }
+
+    /// Replace the consignment bytes of a pending send, for tests. [`Wallet::send_end`] then
+    /// hashes, encrypts and posts the replaced bytes.
+    #[doc(hidden)]
+    pub fn set_send_consignment_bytes(
+        &mut self,
+        txid: &str,
+        asset_id: &str,
+        bytes: Vec<u8>,
     ) -> Result<(), Error> {
-        info!(self.logger, "Posting consignment...");
-        let consignment_res = self
-            .wasm_proxy_client
-            .post_consignment(
-                proxy_url,
-                recipient_id.clone(),
-                consignment_bytes,
-                txid.clone(),
-                vout,
-            )
-            .await?;
-        debug!(
-            self.logger,
-            "Consignment POST response: {:?}", consignment_res
-        );
-
-        if let Some(err) = consignment_res.error {
-            if err.code == -101 {
-                return Err(Error::RecipientIDAlreadyUsed);
-            }
-            return Err(Error::InvalidTransportEndpoint {
-                details: format!("proxy error: {}", err.message),
-            });
-        }
-        if consignment_res.result.is_none() {
-            return Err(Error::InvalidTransportEndpoint {
-                details: s!("invalid result"),
-            });
-        }
-
-        info!(self.logger, "Post consignment completed");
+        let artifacts =
+            self.transfer_artifacts
+                .get_mut(txid)
+                .ok_or_else(|| Error::UnknownTransfer {
+                    txid: txid.to_string(),
+                })?;
+        let entry = artifacts
+            .consignment_bytes
+            .get_mut(asset_id)
+            .ok_or_else(|| Error::Internal {
+                details: s!("missing consignment bytes"),
+            })?;
+        *entry = bytes;
         Ok(())
     }
 
@@ -485,100 +472,6 @@ impl Wallet {
         let height = self.indexer().get_tx_height(&txid).await?;
         info!(self.logger, "Get TX height completed");
         Ok(height)
-    }
-
-    /// Accept an RGB transfer by retrieving and validating its consignment from a proxy server.
-    ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
-    #[cfg(feature = "esplora")]
-    pub async fn accept_transfer(
-        &mut self,
-        online: Online,
-        txid: String,
-        vout: u32,
-        consignment_endpoint: RgbTransport,
-        blinding: u64,
-    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
-        info!(self.logger, "Accepting transfer...");
-        self.check_online(online)?;
-        let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
-        let proxy_url = TransportEndpoint::try_from(consignment_endpoint)?.endpoint;
-
-        let consignment_res = self
-            ._get_consignment_async(&proxy_url, txid.clone())
-            .await?;
-        let consignment_bytes = general_purpose::STANDARD
-            .decode(consignment_res.consignment)
-            .map_err(InternalError::from)?;
-        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-
-        let schema_id = consignment.schema_id().to_string();
-        let asset_schema: AssetSchema = schema_id.try_into()?;
-        self.check_schema_support(&asset_schema)?;
-        debug!(
-            self.logger,
-            "Got consignment for asset with {} schema", asset_schema
-        );
-
-        let mut runtime = self.rgb_runtime()?;
-
-        let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
-        runtime.store_secret_seal(graph_seal)?;
-
-        let chain_resolver = self
-            .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
-            .await
-            .map_err(|e| Error::Network {
-                details: e.to_string(),
-            })?;
-        let resolver = crate::utils::OffchainResolverWasm {
-            witness_id,
-            consignment: &consignment,
-            fallback: &chain_resolver,
-        };
-
-        debug!(self.logger, "Validating consignment...");
-        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
-        let validation_config = ValidationConfig {
-            chain_net: self.chain_net(),
-            trusted_typesystem,
-            ..Default::default()
-        };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger, "Consignment is invalid: {}", e);
-                return Err(Error::InvalidConsignment);
-            }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger, "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-        };
-        let validity = valid_consignment.validation_status().validity();
-        debug!(self.logger, "Consignment validity: {:?}", validity);
-
-        let valid_contract = valid_consignment.clone().into_valid_contract();
-        runtime
-            .import_contract(valid_contract, &resolver)
-            .expect("failure importing validated contract");
-
-        let received_rgb_assignments =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
-
-        runtime.accept_transfer(valid_consignment, &resolver)?;
-        drop(runtime);
-        self.flush().await?;
-
-        info!(self.logger, "Accept transfer completed");
-        Ok((
-            consignment,
-            received_rgb_assignments.into_values().collect(),
-        ))
     }
 
     /// Update RGB witnesses.
@@ -613,7 +506,7 @@ impl Wallet {
 /// unsupported protocol version.
 #[cfg(feature = "esplora")]
 pub async fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
-    crate::utils::check_proxy_async(proxy_url).await
+    crate::utils::check_proxy(proxy_url).await.map(|_| ())
 }
 
 /// Validate a consignment using the witness bundled in the consignment (offchain).
@@ -636,16 +529,14 @@ pub fn validate_consignment_offchain(
     let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
     let chain_net: ChainNet = bitcoin_network.into();
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-    let trusted_typesystem = asset_schema.types();
+    let schema_rules = asset_schema.schema_rules();
 
     let mut cache = HashMap::new();
     for bw in consignment.bundled_witnesses() {
-        if let Some(tx) = bw.pub_witness.tx().cloned() {
-            cache.insert(
-                bw.witness_id(),
-                WitnessStatus::Resolved(tx, WitnessOrd::Tentative),
-            );
-        }
+        cache.insert(
+            bw.witness_id(),
+            WitnessStatus::Resolved(bw.tx.clone(), WitnessOrd::Tentative),
+        );
     }
     let wasm_resolver = crate::utils::PreFetchResolver::new(cache, chain_net);
     let resolver = crate::utils::OffchainResolverWasm {
@@ -656,11 +547,13 @@ pub fn validate_consignment_offchain(
 
     let validation_config = ValidationConfig {
         chain_net,
-        trusted_typesystem,
         ..Default::default()
     };
 
-    match consignment.clone().validate(&resolver, &validation_config) {
+    match consignment
+        .clone()
+        .validate(&schema_rules, &resolver, &validation_config)
+    {
         Ok(valid_consignment) => {
             let status = valid_consignment.validation_status();
             Ok(ValidateConsignmentResult {
@@ -686,6 +579,12 @@ pub fn validate_consignment_offchain(
             valid: false,
             warnings: None,
             error: Some("resolver".to_string()),
+            details: Some(e.to_string()),
+        }),
+        Err(e) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("unexpected".to_string()),
             details: Some(e.to_string()),
         }),
     }

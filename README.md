@@ -114,14 +114,13 @@ in-memory wallet state intact and can be retried. Snapshots carry a monotonic
 sequence, and IndexedDB rejects stale writes so an earlier automatic save cannot
 overwrite a later explicit flush.
 
-Lightning-specific `consume_fascia`, `color_psbt_and_consume`, and
-`accept_transfer` operations await this durable commit before returning
-success.
+Lightning-specific `consume_fascia` and `color_psbt_and_consume` operations
+await this durable commit before returning success.
 
 ### Going online
 
 ```javascript
-const online = await wallet.goOnline(true, 'http://localhost:8094/regtest/api');
+const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
 await wallet.sync(online);
 ```
 
@@ -156,10 +155,17 @@ const recipientMap = {
     witnessData: { amountSat: 1000, blinding: null },
     amount: 100,
     transportEndpoints: ['rpc://localhost:3000/json-rpc'],
+    // from the invoice: its `pk` and `enc` fields and its expiration
+    publicKey: invoiceData.publicKey,
+    encryption: invoiceData.encryption,
+    expirationTimestamp: invoiceData.expirationTimestamp,
   }]
 };
-const psbt = await wallet.sendBegin(online, recipientMap, false, 1n, 1);
-const signed = wallet.signPsbt(psbt);
+// the sender's own proxy, where the recipients post their ACK and get the signed TX from
+const senderEndpoint = 'rpc://localhost:3000/json-rpc';
+const begin = await wallet.sendBegin(online, recipientMap, false, 1n, 1, Math.floor(Date.now() / 1000) + 3600, senderEndpoint, null, false);
+// begin: { psbt, batchTransferIdx, details }; dryRun = true saves nothing and gives batchTransferIdx null
+const signed = wallet.signPsbt(begin.psbt);
 const result = await wallet.sendEnd(online, signed, false);
 // result: { txid, batchTransferIdx }
 ```
@@ -176,11 +182,13 @@ const txid = await wallet.sendBtcEnd(online, signed, false);
 
 ```javascript
 // Blind receive (UTXO-based)
-const blind = wallet.blindReceive(null, 'Any', null, ['rpc://localhost:3000/json-rpc'], 1);
-// blind: { invoice, recipientId, expirationTimestamp, ... }
+// The wallet reserves the invoice on its proxies, so it takes the Online object. The last argument
+// is the encryption preference ('Required' by default, 'Unsupported' or 'Optional').
+const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+// blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey }
 
 // Witness receive (address-based)
-const witness = wallet.witnessReceive(null, { Fungible: 100 }, null, ['rpc://localhost:3000/json-rpc'], 1);
+const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
 ```
 
 ### Parsing invoices
@@ -326,15 +334,15 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `listTransfers(assetId?)` | no | List RGB transfers |
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions |
-| `goOnline(skipCheck, indexerUrl)` | yes | Connect to an Esplora indexer |
+| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer |
 | `sync(online)` | yes | Sync wallet with indexer |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
 | `issueAssetIfa(...)` | no | Issue an Inflatable Fungible Asset |
-| `blindReceive(...)` | no | Create a blind receive invoice |
-| `witnessReceive(...)` | no | Create a witness receive invoice |
-| `sendBegin(...)` | yes | Prepare RGB send PSBT |
+| `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
+| `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
+| `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
 | `sendEnd(online, psbt, skipSync)` | yes | Broadcast RGB send PSBT |
 | `sendBtcBegin(...)` | yes | Prepare BTC send PSBT |
 | `sendBtcEnd(online, psbt, skipSync)` | yes | Broadcast BTC send PSBT |
@@ -374,11 +382,15 @@ cargo test --lib
 
 # WASM unit tests (headless Firefox)
 wasm-pack test --headless --firefox --release -- --test keys_wasm
-wasm-pack test --headless --firefox --release -- --test wallet_wasm
+WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --firefox --release -- --test pow_wasm
 
 # Integration tests (requires regtest Docker services)
 cd tests && bash regtest.sh start
-cd .. && wasm-pack test --headless --firefox --release -- --test integration_wasm
+cd .. && wasm-pack test --headless --firefox --release -- --test wallet_wasm
+wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
+wasm-pack test --headless --firefox --release -- --test integration_wasm
+wasm-pack test --headless --firefox --release -- --test receive_wasm
+wasm-pack test --headless --firefox --release -- --test send_wasm
 cd tests && bash regtest.sh stop
 ```
 

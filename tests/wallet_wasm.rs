@@ -2,9 +2,12 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+mod utils;
+
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
+use utils::{PROXY_URL, go_online_options, transport_endpoint};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -132,26 +135,36 @@ fn test_wallet_queries_fresh() {
     let _info = wallet.backup_info().unwrap();
 }
 
-/// Tests receive operations: witness_receive (works offline), list_transfers
+fn rcv_expiration() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64 + 86400
+}
+
+/// Tests receive operations: witness_receive (needs the proxy), list_transfers
 /// after receive, and error cases for invalid asset IDs.
 /// Note: blind_receive requires funded UTXOs so it's tested in integration_wasm.
 #[wasm_bindgen_test]
-fn test_receive_and_transfers() {
+async fn test_receive_and_transfers() {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
 
     // witness_receive: success
+    let expiration = rcv_expiration();
     let recv = wallet
         .witness_receive(
+            Some(online.clone()),
             None,
             Assignment::Any,
-            None,
-            vec!["rpc://127.0.0.1".into()],
+            expiration,
+            vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
         )
+        .await
         .unwrap();
     assert!(!recv.invoice.is_empty());
+    assert_eq!(recv.public_key.len(), 64);
     assert!(!recv.recipient_id.is_empty());
-    assert!(recv.expiration_timestamp.is_some());
+    assert_eq!(recv.expiration_timestamp, expiration);
 
     // list_transfers: should have a pending transfer from witness_receive
     let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
@@ -165,16 +178,24 @@ fn test_receive_and_transfers() {
             .any(|t| t.status == TransferStatus::WaitingCounterparty),
         "Should have WaitingCounterparty transfer"
     );
+    let transfer = transfers
+        .iter()
+        .find(|t| t.recipient_id == Some(recv.recipient_id.clone()))
+        .unwrap();
+    assert_eq!(transfer.expiration_timestamp, Some(expiration));
 
     // witness_receive: invalid asset
     let err = wallet
         .witness_receive(
+            Some(online.clone()),
             Some("nonexistent_asset_id".into()),
             Assignment::Fungible(100),
-            None,
-            vec!["rpc://127.0.0.1".into()],
+            rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
         )
+        .await
         .unwrap_err();
     assert!(format!("{:?}", err).contains("AssetNotFound"));
     // Note: blind_receive requires funded UTXOs even for error paths,
@@ -189,7 +210,24 @@ fn test_receive_and_transfers() {
     assert_eq!(data.network, BitcoinNetwork::Regtest);
     assert_eq!(data.assignment, Assignment::Any);
     assert!(!data.transport_endpoints.is_empty());
-    assert_eq!(data.expiration_timestamp, recv.expiration_timestamp);
+    assert_eq!(data.expiration_timestamp, Some(expiration as i64));
+    assert_eq!(data.public_key, Some(recv.public_key.clone()));
+    assert_eq!(data.encryption, rgb_lib_wasm::Encryption::Required);
+
+    // witness_receive: without being online
+    let err = wallet
+        .witness_receive(
+            None,
+            None,
+            Assignment::Any,
+            rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{:?}", err).contains("OnlineNeeded"));
 
     // Invoice: invalid string should fail
     assert!(Invoice::new("not-a-valid-invoice".to_string()).is_err());
@@ -198,8 +236,9 @@ fn test_receive_and_transfers() {
 /// Tests error paths and backup: invalid PSBT, issue without UTXOs,
 /// nonexistent asset balance, backup/restore round-trip
 #[wasm_bindgen_test]
-fn test_errors_and_backup() {
+async fn test_errors_and_backup() {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
 
     // sign_psbt: invalid PSBT
     assert!(
@@ -228,12 +267,15 @@ fn test_errors_and_backup() {
     // backup/restore round-trip: use witness_receive to create state
     let _recv = wallet
         .witness_receive(
+            Some(online),
             None,
             Assignment::Any,
-            None,
-            vec!["rpc://127.0.0.1".into()],
+            rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
         )
+        .await
         .unwrap();
 
     let password = "test_pass_123";

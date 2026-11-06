@@ -143,7 +143,7 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-number">3</span>
       <span class="step-title">Go Online</span>
       <p>Connect the wallet to an Esplora indexer. Returns an Online object used by subsequent operations.</p>
-      <code class="snippet">const online = await wallet.goOnline(true, "http://127.0.0.1:8094/regtest/api");</code>
+      <code class="snippet">const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: "http://127.0.0.1:8094/regtest/api" } }, skipConsistencyCheck: true, proxyAuthKeys: {} });</code>
     </div>
 
     <div class="step">
@@ -175,7 +175,7 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-title">Receive Assets</span>
       <p>Generate a blind or witness receive to accept incoming RGB transfers.</p>
       <code class="snippet">const receive = await wallet.blindReceive(
-  null, null, null, ["transportEndpoints"], 1
+  online, null, null, Math.floor(Date.now() / 1000) + 86400, ["transportEndpoints"], 1, null
 );</code>
     </div>
   </div>
@@ -302,7 +302,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 4: Go online
         log('[4/12] Going online...', 'log-info');
-        const online = await wallet.goOnline(true, ESPLORA_API);
+        const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: ESPLORA_API } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
         state.online = online;
         append('[4/12] Wallet online (Esplora connected)');
         log('[4/12] Online', 'log-ok');
@@ -336,13 +336,13 @@ bash tests/regtest.sh stop</pre>
 
         // Step 9: Blind receive
         log('[9/12] Creating blind receive...', 'log-info');
-        const blindRecv = await wallet.blindReceive(null, null, null, [PROXY_URL], 1);
+        const blindRecv = await wallet.blindReceive(online, null, null, Math.floor(Date.now() / 1000) + 86400, [PROXY_URL], 1, null);
         append('[9/12] Blind receive invoice: ' + blindRecv.invoice.substring(0, 40) + '...');
         log('[9/12] Blind receive created', 'log-ok');
 
         // Step 10: Witness receive
         log('[10/12] Creating witness receive...', 'log-info');
-        const witnessRecv = await wallet.witnessReceive(null, null, null, [PROXY_URL], 1);
+        const witnessRecv = await wallet.witnessReceive(online, null, null, Math.floor(Date.now() / 1000) + 86400, [PROXY_URL], 1, null);
         append('[10/12] Witness receive invoice: ' + witnessRecv.invoice.substring(0, 40) + '...');
         log('[10/12] Witness receive created', 'log-ok');
 

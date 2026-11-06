@@ -20,9 +20,26 @@ services:
       - bitcoind
 
   proxy:
-    image: ghcr.io/rgb-tools/rgb-proxy-server:0.3.0
+    image: ghcr.io/rgb-tools/rgb-proxy-server:0.4.0
+    environment:
+      MAX_POW_DIFFICULTY: 0
     ports:
       - "3000:3000"
+
+  proxy-b:
+    image: ghcr.io/rgb-tools/rgb-proxy-server:0.4.0
+    environment:
+      MAX_POW_DIFFICULTY: 0
+    ports:
+      - "3010:3000"
+
+  proxy-auth:
+    image: ghcr.io/rgb-tools/rgb-proxy-server:0.4.0
+    environment:
+      MAX_POW_DIFFICULTY: 0
+      PROXY_AUTH_PUBKEYS: 0738ae88b5bfc7f915b809937573aa51d3bf00cce2edb5795b99f682d4065f07
+    ports:
+      - "3020:3000"
 
   regtest-helper:
     build:

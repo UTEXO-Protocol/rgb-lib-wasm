@@ -41,7 +41,7 @@ impl esplora_client::Sleeper for WasmSleeper {
 }
 
 #[cfg(feature = "esplora")]
-const PROXY_PROTOCOL_VERSION: &str = "0.2";
+const PROXY_V1_PROTOCOL_VERSION: &str = "1.0";
 
 /// Supported Bitcoin networks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -459,28 +459,43 @@ pub(crate) fn calculate_descriptor_from_xpub(
     Ok(format!("tr({key})"))
 }
 
+/// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
+/// expiration it keeps the data awaiting retrieval. A proxy not advertising it is considered to
+/// grant none.
 #[cfg(feature = "esplora")]
-pub(crate) async fn check_proxy_async(proxy_url: &str) -> Result<(), Error> {
-    use crate::api::proxy::WasmProxyClient;
-    let client = WasmProxyClient::new()?;
-    let mut err_details = s!("unable to connect to proxy");
-    if let Ok(server_info) = client.get_info(proxy_url).await {
-        if let Some(info) = server_info.result {
-            if info.protocol_version == *PROXY_PROTOCOL_VERSION {
-                return Ok(());
-            } else {
-                return Err(Error::InvalidProxyProtocol {
-                    version: info.protocol_version,
-                });
-            }
-        }
-        if let Some(err) = server_info.error {
-            err_details = err.message;
+pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
+    info.retention_grace_secs
+        .as_ref()
+        .and_then(|grace| grace.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// The max number of media per transfer advertised by a proxy (`max_media`), `None` if it doesn't
+/// advertise a valid one.
+#[cfg(feature = "esplora")]
+pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
+    info.max_media.as_ref().and_then(|max| max.parse().ok())
+}
+
+/// Check that the proxy at `proxy_url` runs the supported protocol version, returning its info.
+#[cfg(feature = "esplora")]
+pub(crate) async fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, Error> {
+    let proxy_client = ProxyClient::new(proxy_url)?;
+    let server_info = proxy_client.get_info().await?;
+    if let Some(info) = server_info.result {
+        if info.protocol_version == *PROXY_V1_PROTOCOL_VERSION {
+            return Ok(info);
+        } else {
+            return Err(Error::InvalidProxyProtocol {
+                version: info.protocol_version,
+            });
         }
     }
-    Err(Error::Proxy {
-        details: err_details,
-    })
+    let details = match server_info.error {
+        Some(err) => err.message,
+        None => s!("proxy response has neither result nor error"),
+    };
+    Err(Error::Proxy { details })
 }
 
 #[cfg(feature = "esplora")]
@@ -553,22 +568,24 @@ impl ResolveWitness for DumbResolver {
     }
 }
 
+pub(crate) type MemStock = Stock<MemRgbStore>;
+
 /// Wrapper for the RGB stock.
 /// On drop, the stock is saved back to the shared RefCell for persistence across calls.
 pub(crate) struct RgbRuntime {
     /// The RGB stock
-    pub(crate) stock: Stock,
+    pub(crate) stock: MemStock,
     /// The wallet directory
     wallet_dir: PathBuf,
     /// Shared storage for persisting the stock back on drop (WASM in-memory persistence)
-    shared_stock: Option<std::rc::Rc<std::cell::RefCell<Option<Stock>>>>,
+    shared_stock: Option<std::rc::Rc<std::cell::RefCell<Option<MemStock>>>>,
 }
 
 impl RgbRuntime {
     pub(crate) fn with_shared_stock(
-        stock: Stock,
+        stock: MemStock,
         wallet_dir: PathBuf,
-        shared: std::rc::Rc<std::cell::RefCell<Option<Stock>>>,
+        shared: std::rc::Rc<std::cell::RefCell<Option<MemStock>>>,
     ) -> Self {
         Self {
             stock,
@@ -582,10 +599,10 @@ impl RgbRuntime {
         &mut self,
         contract: ValidTransfer,
         resolver: &R,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         self.stock
             .accept_transfer(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -593,7 +610,7 @@ impl RgbRuntime {
         &mut self,
         fascia: Fascia,
         witness_ord: Option<WitnessOrd>,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         struct FasciaResolver {
             witness_id: RgbTxid,
             witness_ord: WitnessOrd,
@@ -612,45 +629,46 @@ impl RgbRuntime {
 
         self.stock
             .consume_fascia(fascia, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn contracts(&self) -> Result<Vec<ContractInfo>, InternalError> {
-        Ok(self
-            .stock
+    pub(crate) fn contracts(&self) -> Result<Vec<ContractInfo>, Error> {
+        self.stock
             .contracts()
-            .map_err(InternalError::from)?
-            .collect())
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
     pub(crate) fn contract_wrapper<C: IssuerWrapper>(
         &self,
         contract_id: ContractId,
-    ) -> Result<C::Wrapper<MemContract<&MemContractState>>, InternalError> {
+    ) -> Result<C::Wrapper<ContractStateSnapshot>, Error> {
         self.stock
             .contract_wrapper::<C>(contract_id)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn contracts_assigning(
         &self,
         outputs: impl IntoIterator<Item = impl Into<OutPoint>>,
-    ) -> Result<BTreeSet<ContractId>, InternalError> {
+    ) -> Result<BTreeSet<ContractId>, Error> {
         Ok(FromIterator::from_iter(
             self.stock
                 .contracts_assigning(outputs)
-                .map_err(InternalError::from)?,
+                .map_err(Error::from)?,
         ))
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn genesis(&self, contract_id: ContractId) -> Result<&Genesis, InternalError> {
+    pub(crate) fn genesis(&self, contract_id: ContractId) -> Result<Genesis, Error> {
         self.stock
-            .as_stash_provider()
-            .genesis(contract_id)
-            .map_err(InternalError::from)
+            .as_store()
+            .genesis(contract_id)?
+            .ok_or_else(|| Error::Internal {
+                details: format!("genesis {contract_id} not found"),
+            })
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -658,14 +676,29 @@ impl RgbRuntime {
         &mut self,
         contract: ValidContract,
         resolver: &R,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         self.stock
             .import_contract(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
-    pub(crate) fn import_kit(&mut self, kit: ValidKit) -> Result<Status, InternalError> {
-        self.stock.import_kit(kit).map_err(InternalError::from)
+    pub(crate) fn import_schema_definition(
+        &mut self,
+        schema_def: SchemaDefinition,
+    ) -> Result<(), Error> {
+        self.stock
+            .import_schema_definition(schema_def)
+            .map_err(Error::from)
+    }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn consignment_data<const TRANSFER: bool>(
+        &self,
+        consignment: &ValidConsignment<TRANSFER>,
+    ) -> Result<ContractData<FilteredContractState>, Error> {
+        self.stock
+            .consignment_data(consignment)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -673,35 +706,31 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         outpoints: impl IntoIterator<Item = impl Into<OutPoint>>,
-    ) -> Result<HashMap<OutputSeal, HashMap<Opout, AllocatedState>>, InternalError> {
+    ) -> Result<ContractAssignments, Error> {
         self.stock
             .contract_assignments_for(contract_id, outpoints)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn contract_schema(
-        &self,
-        contract_id: ContractId,
-    ) -> Result<&Schema, InternalError> {
+    pub(crate) fn contract_schema(&self, contract_id: ContractId) -> Result<Schema, Error> {
         self.stock
-            .as_stash_provider()
-            .contract_schema(contract_id)
-            .map_err(InternalError::from)
+            .as_store()
+            .contract_schema(contract_id)?
+            .ok_or_else(|| Error::Internal {
+                details: format!("schema for contract {contract_id} not found"),
+            })
     }
 
-    pub(crate) fn schemata(&self) -> Result<Vec<SchemaInfo>, InternalError> {
-        Ok(self
-            .stock
+    pub(crate) fn schemata(&self) -> Result<Vec<SchemaInfo>, Error> {
+        self.stock
             .schemata()
-            .map_err(InternalError::from)?
-            .collect())
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
-    pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<bool, InternalError> {
-        self.stock
-            .store_secret_seal(seal)
-            .map_err(InternalError::from)
+    pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<(), Error> {
+        self.stock.store_secret_seal(seal).map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -711,10 +740,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         witness_id: Option<RgbTxid>,
-    ) -> Result<RgbTransfer, InternalError> {
+    ) -> Result<RgbTransfer, Error> {
         self.stock
-            .transfer(contract_id, outputs, secret_seals, [], witness_id)
-            .map_err(InternalError::from)
+            .transfer(contract_id, outputs, secret_seals, [], witness_id, None)
+            .map(|(consignment, _)| consignment)
+            .map_err(Error::from)
     }
 
     #[cfg(feature = "esplora")]
@@ -724,10 +754,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         witness_id: Option<RgbTxid>,
-    ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
+    ) -> Result<(RgbTransfer, OpoutsDagData), Error> {
         self.stock
-            .transfer_with_dag(contract_id, outputs, secret_seals, [], witness_id)
-            .map_err(InternalError::from)
+            .transfer_with_dag(contract_id, outputs, secret_seals, [], witness_id, None)
+            .map(|(consignment, dag, _)| (consignment, dag))
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -737,10 +768,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         fascia: &Fascia,
-    ) -> Result<RgbTransfer, InternalError> {
+    ) -> Result<RgbTransfer, Error> {
         self.stock
-            .transfer_from_fascia(contract_id, outputs, secret_seals, [], fascia)
-            .map_err(InternalError::from)
+            .transfer_from_fascia(contract_id, outputs, secret_seals, [], fascia, None)
+            .map(|(consignment, _)| consignment)
+            .map_err(Error::from)
     }
 
     #[cfg(feature = "esplora")]
@@ -750,10 +782,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         fascia: &Fascia,
-    ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
+    ) -> Result<(RgbTransfer, OpoutsDagData), Error> {
         self.stock
-            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, [], fascia)
-            .map_err(InternalError::from)
+            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, [], fascia, None)
+            .map(|(consignment, dag, _)| (consignment, dag))
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -761,10 +794,10 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         transition_name: impl Into<FieldName>,
-    ) -> Result<TransitionBuilder, InternalError> {
+    ) -> Result<TransitionBuilder, Error> {
         self.stock
             .transition_builder(contract_id, transition_name)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -772,10 +805,10 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         transition_type: TransitionType,
-    ) -> Result<TransitionBuilder, InternalError> {
+    ) -> Result<TransitionBuilder, Error> {
         self.stock
             .transition_builder_raw(contract_id, transition_type)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -784,10 +817,10 @@ impl RgbRuntime {
         resolver: &R,
         after_height: u32,
         force_witnesses: Vec<RgbTxid>,
-    ) -> Result<UpdateRes, InternalError> {
+    ) -> Result<UpdateRes, Error> {
         self.stock
             .update_witnesses(resolver, after_height, force_witnesses)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -795,7 +828,7 @@ impl RgbRuntime {
         &mut self,
         witness_id: RgbTxid,
         witness_ord: WitnessOrd,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         self.stock.upsert_witness(witness_id, witness_ord)?;
         Ok(())
     }
@@ -804,14 +837,14 @@ impl RgbRuntime {
 impl Drop for RgbRuntime {
     fn drop(&mut self) {
         if let Some(shared) = self.shared_stock.take() {
-            let stock = std::mem::replace(&mut self.stock, Stock::in_memory());
+            let stock = std::mem::take(&mut self.stock);
             *shared.borrow_mut() = Some(stock);
         }
     }
 }
 
 pub(crate) fn load_rgb_runtime(_wallet_dir: PathBuf) -> Result<RgbRuntime, Error> {
-    let stock = Stock::in_memory();
+    let stock = MemStock::default();
     Ok(RgbRuntime {
         stock,
         wallet_dir: PathBuf::new(),
@@ -905,7 +938,7 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolverWasm<'_, '_, TRANS
         self.consignment
             .bundled_witnesses()
             .find(|bw| bw.witness_id() == witness_id)
-            .and_then(|p| p.pub_witness.tx().cloned())
+            .map(|p| p.tx.clone())
             .map_or_else(
                 || self.fallback.resolve_witness(witness_id),
                 |tx| Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
@@ -1350,5 +1383,94 @@ mod tests {
         let keys = fresh_keys();
         let result = str_to_xpub(&keys.xpub, BdkNetwork::Testnet);
         assert!(result.is_ok());
+    }
+
+    #[cfg(all(feature = "esplora", not(target_arch = "wasm32")))]
+    mod check_proxy_tests {
+        use super::*;
+
+        #[test]
+        fn test_check_proxy_json_rpc_error() {
+            // server returns HTTP 200 with result=null and a JSON-RPC error field
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":null,"error":{"code":-32601,"message":"method not found"}}"#,
+                )
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details == "method not found")
+            );
+            mock.assert();
+        }
+
+        #[test]
+        fn test_check_proxy_invalid_body_error_details() {
+            // server returns HTTP 200 with a body that is not a JSON-RPC response: the transport
+            // error (body decoding) must be reported, not the generic connection message
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body("not json")
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details.starts_with("error decoding response body"))
+            );
+            mock.assert();
+        }
+
+        #[test]
+        fn test_check_proxy_connection_error_details() {
+            // bind then drop a listener to get a port that refuses connections: the transport error
+            // (connection refused) must be reported, not the generic connection message
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let result = block_on(check_proxy(&format!("http://127.0.0.1:{port}")));
+            let expected = format!("error sending request for url (http://127.0.0.1:{port}/");
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details.starts_with(&expected))
+            );
+        }
+
+        #[test]
+        fn test_check_proxy_version() {
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"0.4.0","uptime":1,"max_media":"3"}}"#,
+                )
+                .create();
+            let info = block_on(check_proxy(&server.url())).unwrap();
+            assert_eq!(proxy_max_media(&info), Some(3));
+            assert_eq!(proxy_retention_grace(&info), 0);
+            mock.assert();
+
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"0.2","version":"0.3.0","uptime":1}}"#,
+                )
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::InvalidProxyProtocol { version }) if version == "0.2")
+            );
+            mock.assert();
+        }
     }
 }
