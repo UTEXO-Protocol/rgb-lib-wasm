@@ -4,7 +4,7 @@ Development and CI infrastructure for rgb-lib-wasm integration tests.
 
 ## Architecture
 
-Integration tests run in a headless Firefox browser (via wasm-pack/wasm-bindgen-test) against a local regtest Bitcoin network. The test environment consists of 9 Docker services:
+Integration tests run in a headless Firefox browser (via wasm-pack/wasm-bindgen-test) against a local regtest Bitcoin network. The test environment consists of 10 Docker services:
 
 The WASM tests (running in headless Firefox) communicate with all services over HTTP:
 
@@ -14,6 +14,7 @@ The WASM tests (running in headless Firefox) communicate with all services over 
 - **RGB proxy** (:3000): rgb-proxy-server 0.4.0 (proxy protocol 1.0), the relay for RGB transfers between wallets. It answers the browser with CORS headers itself.
 - **RGB proxy B** (:3010): a second 0.4.0 relay, used by the batch and receive tests.
 - **RGB proxy auth** (:3020): a 0.4.0 relay that only accepts calls signed with the key of `PROXY_AUTH_PUBKEYS`, used by the proxy authentication test.
+- **anvil** (:8545): local EVM node for BFA validation.
 - **vss-cors-proxy** (:8082) — Nginx reverse proxy that adds CORS headers, forwarding to the VSS server.
 - **vss-server** (:8080 internal) — Versioned Storage Service for cloud backups. Not browser-accessible directly (no CORS).
 - **vss-postgres** (:5432 internal) — PostgreSQL database backing the VSS server.
@@ -36,6 +37,7 @@ Esplora bundles its own bitcoind for block indexing. Our primary bitcoind handle
 | RGB proxy | 3000 | `http://127.0.0.1:3000/json-rpc` | RGB consignment relay (0.4.0) |
 | RGB proxy B | 3010 | `http://127.0.0.1:3010/json-rpc` | Second relay for the batch and receive tests (0.4.0) |
 | RGB proxy auth | 3020 | `http://127.0.0.1:3020/json-rpc` | Relay with proxy authentication (0.4.0) |
+| anvil | 8545 | `http://127.0.0.1:8545` | Local EVM node for BFA validation |
 | regtest-helper | 8080 | `http://127.0.0.1:8080` | Mining / funding helper |
 | VSS server | 8081 | `http://127.0.0.1:8081` | VSS direct (not browser-accessible) |
 | VSS CORS proxy | 8082 | `http://127.0.0.1:8082/vss` | VSS via nginx CORS proxy |
@@ -51,7 +53,7 @@ bash regtest.sh start
 ```
 
 This will:
-1. Start all 9 Docker containers
+1. Start all 10 Docker containers
 2. Wait for each service to become healthy
 3. Connect the two bitcoind nodes as peers
 4. Mine 111 initial blocks (required for coinbase maturity)
@@ -94,6 +96,9 @@ cd tests && bash regtest.sh start && cd ..
 wasm-pack test --headless --firefox --release -- --test wallet_wasm
 wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 wasm-pack test --headless --firefox --release -- --test integration_wasm
+WASM_BINDGEN_TEST_TIMEOUT=1800 wasm-pack test --headless --firefox --release --lib -- test_bfa::
+WASM_BINDGEN_TEST_TIMEOUT=1800 wasm-pack test --headless --firefox --release --lib -- test_burn::
+WASM_BINDGEN_TEST_TIMEOUT=3600 wasm-pack test --headless --firefox --release --lib -- test_mint::
 cd tests && bash regtest.sh stop
 ```
 
@@ -137,7 +142,7 @@ This job:
 4. Mines 111 initial blocks
 5. Waits for esplora sync
 6. Waits for VSS server readiness
-7. Runs the wallet, binding, integration, receive and send tests
+7. Runs the wallet, binding, integration, receive, send and BFA tests
 
 The integration test covers: fund wallet, sync, create UTXOs, issue NIA/IFA, two-wallet RGB send, BTC send, fee estimation, IFA inflation, drain, backup/restore, VSS backup/restore, blind/witness receive.
 
@@ -145,7 +150,7 @@ The integration test covers: fund wallet, sync, create UTXOs, issue NIA/IFA, two
 
 ### `tests/docker-compose.ci.yml`
 
-Compose file of the whole stack, used both locally and by GitHub Actions. It holds all 9 services with their own build contexts, and `regtest.sh` runs it alone under the compose project name `rgb-lib-wasm`. The three proxies run `ghcr.io/rgb-tools/rgb-proxy-server:0.4.0` with `MAX_POW_DIFFICULTY: 0`, so the tests need no proof of work; `proxy-auth` also sets `PROXY_AUTH_PUBKEYS`.
+Compose file of the whole stack, used both locally and by GitHub Actions. It holds all 10 services with their own build contexts, and `regtest.sh` runs it alone under the compose project name `rgb-lib-wasm`. The three proxies run `ghcr.io/rgb-tools/rgb-proxy-server:0.4.0` with `MAX_POW_DIFFICULTY: 0`, so the tests need no proof of work; `proxy-auth` also sets `PROXY_AUTH_PUBKEYS`.
 
 ### `tests/vss-server/Dockerfile`
 
