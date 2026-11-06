@@ -885,7 +885,14 @@ impl WasmInvoice {
     /// Return the parsed invoice data as a JS object.
     #[wasm_bindgen(js_name = "invoiceData")]
     pub fn invoice_data(&self) -> Result<JsValue, JsValue> {
-        to_js(&self.inner.invoice_data())
+        // to_js keeps JS maps because refresh has integer keys. These keys are strings.
+        let serializer = serde_wasm_bindgen::Serializer::new()
+            .serialize_large_number_types_as_bigints(true)
+            .serialize_maps_as_objects(true);
+        self.inner
+            .invoice_data()
+            .serialize(&serializer)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Return the original invoice string.

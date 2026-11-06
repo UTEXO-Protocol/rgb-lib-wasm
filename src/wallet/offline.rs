@@ -590,11 +590,12 @@ impl Invoice {
             asset_id,
             assignment,
             assignment_name,
-            expiration_timestamp: decoded.expiry,
+            expiration_timestamp: decoded.expiry.map(|t| t as u64),
             transport_endpoints,
             network,
             public_key: decoded.public_key,
             encryption: Encryption::from(decoded.encryption),
+            unknown_query_params: decoded.unknown_query.into_iter().collect(),
         };
 
         Ok(Invoice {
@@ -615,7 +616,7 @@ impl Invoice {
 }
 
 /// The data of an RGB invoice.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct InvoiceData {
     /// ID of the receive operation (blinded UTXO or Bitcoin script)
@@ -631,13 +632,15 @@ pub struct InvoiceData {
     /// Bitcoin network
     pub network: BitcoinNetwork,
     /// Invoice expiration
-    pub expiration_timestamp: Option<i64>,
+    pub expiration_timestamp: Option<u64>,
     /// Transport endpoints
     pub transport_endpoints: Vec<String>,
     /// Recipient's Ed25519 public key (hex-encoded), from the invoice `pk` field (if present)
     pub public_key: Option<String>,
     /// Consignment/media encryption preference, from the invoice `enc` field
     pub encryption: Encryption,
+    /// Unknown query parameters carried by the invoice
+    pub unknown_query_params: HashMap<String, String>,
 }
 
 /// Data for operations that require the wallet to be online.
@@ -3686,9 +3689,18 @@ mod receive_expiration_tests {
             public_key
         );
         assert_eq!(transfer.recipient_encryption, Encryption::Optional);
-        let invoice_data = Invoice::new(data.invoice_string).unwrap().invoice_data();
-        assert_eq!(invoice_data.expiration_timestamp, Some(exp));
+        let invoice_data = Invoice::new(format!("{}&foo=bar&baz=qux", data.invoice_string))
+            .unwrap()
+            .invoice_data();
+        assert_eq!(invoice_data.expiration_timestamp, u64::try_from(exp).ok());
         assert_eq!(invoice_data.public_key, Some(public_key));
         assert_eq!(invoice_data.encryption, Encryption::Optional);
+        assert_eq!(
+            invoice_data.unknown_query_params,
+            HashMap::from([
+                ("foo".to_string(), "bar".to_string()),
+                ("baz".to_string(), "qux".to_string()),
+            ])
+        );
     }
 }
