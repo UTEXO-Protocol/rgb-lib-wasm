@@ -272,10 +272,12 @@ async fn begin_end() {
     assert!(!res.details.is_donation);
     assert!(!res.details.fascia.is_empty());
 
-    assert_eq!(
-        end(&mut wallet, &online, &signed).await,
-        Ok((txid.clone(), idx))
-    );
+    let ended = wallet
+        .send_end(online.clone(), signed.to_string(), false)
+        .await
+        .unwrap();
+    assert_eq!((ended.txid, ended.batch_transfer_idx), (txid.clone(), idx));
+    assert_eq!(ended.entropy, res.details.entropy);
     let saved = sends(&wallet, &txid);
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].status, TransferStatus::WaitingCounterparty);
