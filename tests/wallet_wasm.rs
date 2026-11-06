@@ -210,7 +210,7 @@ async fn test_receive_and_transfers() {
     assert_eq!(data.network, BitcoinNetwork::Regtest);
     assert_eq!(data.assignment, Assignment::Any);
     assert!(!data.transport_endpoints.is_empty());
-    assert_eq!(data.expiration_timestamp, Some(expiration as i64));
+    assert_eq!(data.expiration_timestamp, Some(expiration));
     assert_eq!(data.public_key, Some(recv.public_key.clone()));
     assert_eq!(data.encryption, rgb_lib_wasm::Encryption::Required);
 
