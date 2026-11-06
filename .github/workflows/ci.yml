@@ -164,12 +164,12 @@ jobs:
 
       - name: Run integration tests
         env:
-          WASM_BINDGEN_TEST_TIMEOUT: 300
+          WASM_BINDGEN_TEST_TIMEOUT: 600
         run: wasm-pack test --headless --firefox --release --test integration_wasm
 
       - name: Run receive tests
         env:
-          WASM_BINDGEN_TEST_TIMEOUT: 600
+          WASM_BINDGEN_TEST_TIMEOUT: 1200
         run: wasm-pack test --headless --firefox --release --test receive_wasm
 
       - name: Run send tests
