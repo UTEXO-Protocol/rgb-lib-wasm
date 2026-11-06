@@ -457,6 +457,29 @@ impl Wallet {
         &self.online_data.as_ref().unwrap().indexer
     }
 
+    /// Fetch the status of each witness from the indexer.
+    pub(crate) async fn prefetch_witnesses(
+        &self,
+        witness_ids: impl IntoIterator<Item = RgbTxid>,
+    ) -> Result<PreFetchResolver, Error> {
+        let mut cache = HashMap::new();
+        for witness_id in witness_ids {
+            let txid = Txid::from_str(&witness_id.to_string()).map_err(|_| Error::InvalidTxid)?;
+            let status = match self.indexer().get_tx_with_status(&txid).await? {
+                Some((tx, block_height, block_time)) => {
+                    let witness_ord = block_height
+                        .zip(block_time)
+                        .and_then(|(h, t)| WitnessPos::bitcoin(NonZeroU32::new(h)?, t as i64))
+                        .map_or(WitnessOrd::Tentative, WitnessOrd::Mined);
+                    WitnessStatus::Resolved(tx, witness_ord)
+                }
+                None => WitnessStatus::Unresolved,
+            };
+            cache.insert(witness_id, status);
+        }
+        Ok(PreFetchResolver::new(cache, self.chain_net()))
+    }
+
     fn _check_fee_rate(&self, fee_rate: u64) -> Result<FeeRate, Error> {
         if fee_rate < MIN_FEE_RATE {
             return Err(Error::InvalidFeeRate {
@@ -2213,11 +2236,16 @@ impl Wallet {
             }
         };
 
-        let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
+        let chain_resolver = self
+            .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
+            .await
+            .map_err(|e| Error::Network {
+                details: e.to_string(),
+            })?;
         let resolver = OffchainResolverWasm {
             witness_id,
             consignment: &consignment,
-            fallback: &wasm_resolver,
+            fallback: &chain_resolver,
         };
 
         debug!(self.logger, "Validating consignment...");
@@ -2457,10 +2485,8 @@ impl Wallet {
                     }
                 }
 
-                let wasm_resolver_import =
-                    WasmResolver::from_consignment(&consignment, self.chain_net());
                 runtime
-                    .import_contract(valid_contract.clone(), &wasm_resolver_import)
+                    .import_contract(valid_contract.clone(), &chain_resolver)
                     .expect("failure importing received contract");
                 debug!(self.logger, "Contract registered");
                 self.save_new_asset_internal(
@@ -2701,8 +2727,9 @@ impl Wallet {
                 self.database.update_txo(txo)?;
             }
 
-            // accept consignment using WasmResolver
-            let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
+            let wasm_resolver = self
+                .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
+                .await?;
             let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
             let validation_config = ValidationConfig {
                 chain_net: self.chain_net(),
