@@ -204,7 +204,7 @@ use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
 #[cfg(feature = "esplora")]
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(feature = "esplora")]
-use crate::utils::{OffchainResolverWasm, WasmResolver};
+use crate::utils::{OffchainResolverWasm, PreFetchResolver};
 #[cfg(feature = "esplora")]
 use crate::{
     api::proxy_v1::{

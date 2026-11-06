@@ -506,6 +506,21 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
     Some(Indexer::EsploraAsync(Box::new(client)))
 }
 
+#[cfg(feature = "esplora")]
+pub(crate) fn check_indexer_network(
+    bitcoin_network: BitcoinNetwork,
+    genesis_hash: &str,
+) -> Result<(), Error> {
+    let chain_net: ChainNet = bitcoin_network.into();
+    let expected = BlockHash::from_byte_array(chain_net.chain_hash().to_bytes());
+    if expected.to_string() != genesis_hash {
+        return Err(Error::InvalidIndexer {
+            details: WitnessResolverError::WrongChainNet.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn convert_time_fmt_error(cause: time::error::Format) -> io::Error {
     io::Error::other(cause)
 }
@@ -867,58 +882,7 @@ pub(crate) async fn fetch_esplora_broadcast_async(
 
 /// Pre-fetched witness resolver for wasm32.
 ///
-/// Resolves witness transactions from a cache populated from consignment bundles.
-#[cfg(feature = "esplora")]
-pub(crate) struct WasmResolver {
-    witness_cache: HashMap<RgbTxid, WitnessStatus>,
-    chain_net: ChainNet,
-}
-
-#[cfg(feature = "esplora")]
-impl WasmResolver {
-    /// Build resolver by pre-fetching all witness IDs from a consignment.
-    pub(crate) fn from_consignment<const TRANSFER: bool>(
-        consignment: &Consignment<TRANSFER>,
-        chain_net: ChainNet,
-    ) -> Self {
-        let mut cache = HashMap::new();
-        for bw in consignment.bundled_witnesses() {
-            let wid = bw.witness_id();
-            cache.insert(
-                wid,
-                WitnessStatus::Resolved(bw.tx.clone(), WitnessOrd::Tentative),
-            );
-        }
-        Self {
-            witness_cache: cache,
-            chain_net,
-        }
-    }
-}
-
-#[cfg(feature = "esplora")]
-impl ResolveWitness for WasmResolver {
-    fn resolve_witness(&self, witness_id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
-        self.witness_cache
-            .get(&witness_id)
-            .cloned()
-            .ok_or(WitnessResolverError::ResolverIssue(
-                Some(witness_id),
-                s!("witness not found in cache"),
-            ))
-    }
-    fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
-        if self.chain_net == chain_net {
-            Ok(())
-        } else {
-            Err(WitnessResolverError::WrongChainNet)
-        }
-    }
-}
-
-/// Pre-fetched witness resolver for update_witnesses in wasm32.
-///
-/// Resolves witness transactions from a cache pre-populated via async esplora queries.
+/// Resolves witness transactions from a pre-populated cache.
 #[cfg(feature = "esplora")]
 pub(crate) struct PreFetchResolver {
     witness_cache: HashMap<RgbTxid, WitnessStatus>,
@@ -957,12 +921,12 @@ impl ResolveWitness for PreFetchResolver {
 
 /// Offchain resolver variant for wasm32.
 ///
-/// Checks the consignment first for the specific witness ID, then falls back to WasmResolver.
+/// Checks the consignment first for the specific witness ID, then falls back to PreFetchResolver.
 #[cfg(feature = "esplora")]
 pub(crate) struct OffchainResolverWasm<'a, 'cons, const TRANSFER: bool> {
     pub(crate) witness_id: RgbTxid,
     pub(crate) consignment: &'cons Consignment<TRANSFER>,
-    pub(crate) fallback: &'a WasmResolver,
+    pub(crate) fallback: &'a PreFetchResolver,
 }
 
 #[cfg(feature = "esplora")]

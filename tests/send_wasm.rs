@@ -617,6 +617,11 @@ async fn batch_donation_success() {
     ]);
     let (_, signed, txid) = begin(&mut wallet, &online, map, true, false).await;
     end(&mut wallet, &online, &signed).await.unwrap();
+    // a donation cannot be ended twice
+    assert_eq!(
+        end(&mut wallet, &online, &signed).await,
+        Err(Error::CannotEndTransfer { txid: txid.clone() })
+    );
     assert!(
         sends(&wallet, &txid)
             .iter()

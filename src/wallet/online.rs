@@ -14,6 +14,9 @@ pub(crate) const UTXO_NUM: u8 = 5;
 
 pub(crate) const MIN_FEE_RATE: u64 = 1;
 
+// how long an operation with no expiration of its own (an inflation) keeps its inputs reserved
+pub(crate) const DURATION_SEND_TRANSFER: i64 = 3600;
+
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
@@ -220,6 +223,8 @@ pub(crate) struct TransferArtifacts {
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
     pub(crate) signed_psbt: Option<String>,
+    pub(crate) inputs: Vec<Outpoint>,
+    pub(crate) expiration: i64,
 }
 
 impl TransferArtifacts {
@@ -788,6 +793,29 @@ impl Wallet {
         &self.online_data.as_ref().unwrap().indexer
     }
 
+    /// Fetch the status of each witness from the indexer.
+    pub(crate) async fn prefetch_witnesses(
+        &self,
+        witness_ids: impl IntoIterator<Item = RgbTxid>,
+    ) -> Result<PreFetchResolver, Error> {
+        let mut cache = HashMap::new();
+        for witness_id in witness_ids {
+            let txid = Txid::from_str(&witness_id.to_string()).map_err(|_| Error::InvalidTxid)?;
+            let status = match self.indexer().get_tx_with_status(&txid).await? {
+                Some((tx, block_height, block_time)) => {
+                    let witness_ord = block_height
+                        .zip(block_time)
+                        .and_then(|(h, t)| WitnessPos::bitcoin(NonZeroU32::new(h)?, t as i64))
+                        .map_or(WitnessOrd::Tentative, WitnessOrd::Mined);
+                    WitnessStatus::Resolved(tx, witness_ord)
+                }
+                None => WitnessStatus::Unresolved,
+            };
+            cache.insert(witness_id, status);
+        }
+        Ok(PreFetchResolver::new(cache, self.chain_net()))
+    }
+
     fn _check_fee_rate(&self, fee_rate: u64) -> Result<FeeRate, Error> {
         if fee_rate < MIN_FEE_RATE {
             return Err(Error::InvalidFeeRate {
@@ -869,9 +897,16 @@ impl Wallet {
     }
 
     fn _fail_batch_transfer(
-        &self,
+        &mut self,
         batch_transfer: &DbBatchTransfer,
     ) -> Result<DbBatchTransfer, Error> {
+        if let Some(artifacts) = batch_transfer
+            .txid
+            .as_ref()
+            .and_then(|txid| self.transfer_artifacts.get_mut(txid))
+        {
+            artifacts.inputs.clear();
+        }
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         updated_batch_transfer.expiration = ActiveValue::Set(Some(now().unix_timestamp()));
@@ -881,7 +916,7 @@ impl Wallet {
     }
 
     fn _fail_batch_transfer_if_no_endpoints(
-        &self,
+        &mut self,
         batch_transfer: &DbBatchTransfer,
         transfer_transport_endpoints_data: &[(DbTransferTransportEndpoint, DbTransportEndpoint)],
     ) -> Result<Option<DbBatchTransfer>, Error> {
@@ -1733,13 +1768,15 @@ impl Wallet {
 
         let utxos = self.database.get_unspent_txos(db_data.txos.clone())?;
 
-        let unspents = self.database.get_rgb_allocations(
+        let mut unspents = self.database.get_rgb_allocations(
             utxos,
             Some(db_data.colorings.clone()),
             Some(db_data.batch_transfers.clone()),
             Some(db_data.asset_transfers.clone()),
             Some(db_data.transfers.clone()),
         )?;
+        let reserved = self.get_reserved_outpoints()?;
+        unspents.retain(|u| !reserved.contains(&u.utxo.outpoint()));
 
         let input_unspents = self.get_input_unspents(&unspents)?;
 
@@ -1765,12 +1802,13 @@ impl Wallet {
             crate::utils::build_indexer(&indexer_url).ok_or_else(|| Error::InvalidIndexer {
                 details: s!("failed to build esplora async client"),
             })?;
-        indexer
+        let genesis_hash = indexer
             .block_hash(0)
             .await
             .map_err(|_| Error::InvalidIndexer {
                 details: s!("not a valid esplora server"),
             })?;
+        crate::utils::check_indexer_network(self.bitcoin_network(), &genesis_hash)?;
         indexer.populate_tx_cache(&self.bdk_wallet);
         let online_data = OnlineData {
             id: online.id,
@@ -2569,6 +2607,21 @@ impl Wallet {
         batch_info.operation_secret_key = operation_secret_key;
         batch_info.sender_transport_endpoint = sender_transport_endpoint;
         let info = batch_info.clone();
+        // reserve all inputs, also the ones with no allocations, until the operation ends, fails or
+        // expires
+        let artifacts = self
+            .transfer_artifacts
+            .get_mut(&final_txid)
+            .expect("set by _prepare_rgb_psbt_wasm");
+        artifacts.inputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.into())
+            .collect();
+        artifacts.expiration = info
+            .expiration_timestamp
+            .unwrap_or_else(|| now().unix_timestamp() + DURATION_SEND_TRANSFER);
 
         let batch_transfer_idx = if dry_run {
             None
@@ -3454,11 +3507,16 @@ impl Wallet {
             ReceiveMatcher::Witness(..) => None,
         };
 
-        let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
+        let chain_resolver = self
+            .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
+            .await
+            .map_err(|e| Error::Network {
+                details: e.to_string(),
+            })?;
         let resolver = OffchainResolverWasm {
             witness_id,
             consignment: &consignment,
-            fallback: &wasm_resolver,
+            fallback: &chain_resolver,
         };
 
         debug!(self.logger, "Validating consignment...");
@@ -3630,10 +3688,8 @@ impl Wallet {
                     }
                 }
 
-                let wasm_resolver_import =
-                    WasmResolver::from_consignment(&consignment, self.chain_net());
                 runtime
-                    .import_contract(valid_contract.clone(), &wasm_resolver_import)
+                    .import_contract(valid_contract.clone(), &chain_resolver)
                     .expect("failure importing received contract");
                 debug!(self.logger, "Contract registered");
                 self.save_new_asset_internal(
@@ -4203,8 +4259,9 @@ impl Wallet {
                 self.database.update_txo(txo)?;
             }
 
-            // accept consignment using WasmResolver
-            let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
+            let wasm_resolver = self
+                .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
+                .await?;
             let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
             let validation_config = ValidationConfig {
                 chain_net: self.chain_net(),
@@ -4420,7 +4477,7 @@ impl Wallet {
     /// The TX is not on-chain (the confirmations are checked before this on every refresh): past
     /// the broadcast deadline plus the confirmation margin the transfer is failed.
     fn fail_if_past_deadline(
-        &self,
+        &mut self,
         batch_transfer: &DbBatchTransfer,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         if confirmation_deadline_passed(batch_transfer) {
@@ -5167,7 +5224,16 @@ impl Wallet {
 
         // release the RGB stock so the backup can snapshot it
         drop(runtime);
-        if !dry_run {
+        if dry_run {
+            // a dry run reserves nothing: send_end reserves the inputs once it saves the transfer
+            let txid = Psbt::from_str(&begin_data.psbt)?
+                .unsigned_tx
+                .compute_txid()
+                .to_string();
+            if let Some(artifacts) = self.transfer_artifacts.get_mut(&txid) {
+                artifacts.inputs.clear();
+            }
+        } else {
             self.update_backup_info(false)?;
             self.trigger_auto_backup();
         }
@@ -5544,6 +5610,14 @@ impl Wallet {
         post_result?;
         // keep the signed PSBT for the refresh
         artifacts.signed_psbt = Some(signed_psbt.clone());
+        if artifacts.inputs.is_empty() {
+            artifacts.inputs = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .map(|i| i.previous_output.into())
+                .collect();
+        }
 
         let batch_transfer_idx = if info_contents.donation {
             // Broadcast immediately for donations
@@ -5913,10 +5987,17 @@ impl Wallet {
             .compute_txid()
             .to_string();
 
-        let artifacts = self
+        // an expired inflation no longer reserves its inputs, so it cannot be ended
+        let expiration = self
             .transfer_artifacts
-            .remove(&txid)
-            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
+            .get(&txid)
+            .ok_or(Error::UnknownTransfer { txid: txid.clone() })?
+            .expiration;
+        if now().unix_timestamp() >= expiration {
+            return Err(Error::CannotEndTransfer { txid });
+        }
+
+        let artifacts = self.transfer_artifacts.remove(&txid).unwrap();
         let info_contents = artifacts.batch_info.ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
         })?;
@@ -6110,7 +6191,13 @@ mod go_online_tests {
     #[test]
     fn go_online_stores_proxy_auth_keys() {
         let mut wallet = make_test_wallet(false);
-        let block_hash = |_: &str| ("200 OK", "00".repeat(32).into_bytes());
+        // the regtest genesis hash, so the network check passes
+        let block_hash = |_: &str| {
+            (
+                "200 OK",
+                b"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206".to_vec(),
+            )
+        };
         let url = fake_esplora(block_hash);
         let other_url = fake_esplora(block_hash);
         let seed1 = "11".repeat(32);
@@ -6410,6 +6497,7 @@ mod send_end_tests {
             consignment_bytes: asset_infos.keys().map(|k| (k.clone(), vec![1])).collect(),
             asset_infos,
             signed_psbt: None,
+            ..Default::default()
         }
     }
 

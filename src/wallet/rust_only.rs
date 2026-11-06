@@ -309,15 +309,16 @@ impl Wallet {
         Ok(())
     }
 
-    /// Return `true` if a batch transfer with the given `txid` exists and is not `Initiated` or `Failed`.
-    /// This means the broadcast already happened.
+    /// Return `true` if the batch transfer with this `txid` was ended by `send_end`.
+    /// Its status is then neither `Initiated` nor `Failed`, so the broadcast already happened.
+    /// Use it to detect a replay of `send_end` after a reload.
     pub fn is_batch_transfer_sent(&self, txid: &str) -> Result<bool, Error> {
         let batch_transfers = self.database.iter_batch_transfers()?;
         Ok(batch_transfers.iter().any(|bt| {
             bt.txid.as_deref() == Some(txid)
                 && !matches!(
                     bt.status,
-                    TransferStatus::Failed | TransferStatus::Initiated
+                    TransferStatus::Initiated | TransferStatus::Failed
                 )
         }))
     }
@@ -489,32 +490,7 @@ impl Wallet {
         info!(self.logger, "Updating witnesses...");
         self.check_online(online)?;
 
-        let mut cache = HashMap::new();
-        for witness_id in &force_witnesses {
-            let txid_str = witness_id.to_string();
-            let txid = Txid::from_str(&txid_str).map_err(|_| Error::InvalidTxid)?;
-            if let Some((tx, block_height, block_time)) =
-                self.indexer().get_tx_with_status(&txid).await?
-            {
-                let witness_ord = match block_height.zip(block_time) {
-                    Some((h, t)) => {
-                        if let Some(height) = NonZeroU32::new(h) {
-                            if let Some(pos) = WitnessPos::bitcoin(height, t as i64) {
-                                WitnessOrd::Mined(pos)
-                            } else {
-                                WitnessOrd::Tentative
-                            }
-                        } else {
-                            WitnessOrd::Tentative
-                        }
-                    }
-                    None => WitnessOrd::Tentative,
-                };
-                cache.insert(*witness_id, WitnessStatus::Resolved(tx, witness_ord));
-            }
-        }
-
-        let resolver = crate::utils::PreFetchResolver::new(cache, self.chain_net());
+        let resolver = self.prefetch_witnesses(force_witnesses.clone()).await?;
         let update_res =
             self.rgb_runtime()?
                 .update_witnesses(&resolver, after_height, force_witnesses)?;
@@ -555,7 +531,14 @@ pub fn validate_consignment_offchain(
     let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
     let schema_rules = asset_schema.schema_rules();
 
-    let wasm_resolver = crate::utils::WasmResolver::from_consignment(&consignment, chain_net);
+    let mut cache = HashMap::new();
+    for bw in consignment.bundled_witnesses() {
+        cache.insert(
+            bw.witness_id(),
+            WitnessStatus::Resolved(bw.tx.clone(), WitnessOrd::Tentative),
+        );
+    }
+    let wasm_resolver = crate::utils::PreFetchResolver::new(cache, chain_net);
     let resolver = crate::utils::OffchainResolverWasm {
         witness_id,
         consignment: &consignment,
@@ -661,6 +644,35 @@ mod tests {
         let deserialized: ValidateConsignmentResult = serde_json::from_str(&json).unwrap();
         assert!(!deserialized.valid);
         assert_eq!(deserialized.error.unwrap(), "invalid");
+    }
+
+    #[test]
+    fn batch_transfer_sent_only_after_send_end() {
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+        // send_begin saves the send as Initiated
+        let idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::Initiated),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!wallet.is_batch_transfer_sent(txid).unwrap());
+
+        // send_end moves it to WaitingCounterparty
+        wallet
+            .database
+            .update_batch_transfer(&mut DbBatchTransferActMod {
+                idx: ActiveValue::Set(idx),
+                status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(wallet.is_batch_transfer_sent(txid).unwrap());
     }
 
     #[test]

@@ -170,7 +170,7 @@ impl super::Wallet {
         Ok(())
     }
 
-    /// Restores wallet and RGB state from a backup payload. `restore_backup` and `vss_restore_backup` share it.
+    /// Restore the wallet and the RGB stock from a backup payload. Both restore paths use it.
     fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
         let payload: WalletBackupPayload =
             serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
@@ -622,12 +622,99 @@ mod tests {
         refresh_fails_transfer_without_signed_psbt_impl(Some("rgb:test-asset"));
     }
 
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_skips_and_fail_transfers_fails_expired_initiated_sends() {
+        use crate::database::enums::TransferStatus;
+        use crate::database::memory_db::{ActiveValue, DbBatchTransferActMod};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::online::{
+            OnlineData, RefreshFilter, RefreshTransferStatus, TransferArtifacts,
+        };
+        use crate::wallet::{Online, Outpoint};
+
+        let indexer_url = "http://127.0.0.1:1";
+        let mut wallet = make_test_wallet(false);
+        let (proxy, _mock) = ack_proxy();
+        let mut seeded = vec![];
+        for (txid, expiration) in [("1".repeat(64), 1), ("2".repeat(64), i64::MAX)] {
+            let asset_id = format!("rgb:{}", &txid[..1]);
+            let batch_idx =
+                seed_acknowledged_transfer(&mut wallet, &txid, Some(&asset_id), &proxy.url());
+            let batch_transfer = wallet
+                .database
+                .get_db_data(false)
+                .unwrap()
+                .batch_transfers
+                .into_iter()
+                .find(|t| t.idx == batch_idx)
+                .unwrap();
+            let mut updated: DbBatchTransferActMod = batch_transfer.into();
+            updated.status = ActiveValue::Set(TransferStatus::Initiated);
+            updated.expiration = ActiveValue::Set(Some(expiration));
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+            let input = Outpoint {
+                txid: txid.clone(),
+                vout: 0,
+            };
+            wallet.transfer_artifacts.insert(
+                txid,
+                TransferArtifacts {
+                    inputs: vec![input.clone()],
+                    ..Default::default()
+                },
+            );
+            seeded.push((batch_idx, input));
+        }
+        let [(expired_idx, _), (pending_idx, pending_input)] = <[_; 2]>::try_from(seeded).unwrap();
+
+        wallet.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let filter = vec![RefreshFilter {
+            status: RefreshTransferStatus::WaitingCounterparty,
+            incoming: false,
+        }];
+        let result = rt
+            .block_on(wallet.refresh(online.clone(), None, filter, true))
+            .unwrap();
+        assert!(result.is_empty());
+
+        assert!(
+            rt.block_on(wallet.fail_transfers(online, None, false, true))
+                .unwrap()
+        );
+        let statuses: Vec<(i32, TransferStatus)> = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .iter()
+            .map(|t| (t.idx, t.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (expired_idx, TransferStatus::Failed),
+                (pending_idx, TransferStatus::Initiated)
+            ]
+        );
+        assert_eq!(
+            wallet.get_reserved_outpoints().unwrap(),
+            vec![pending_input]
+        );
+    }
+
     // The backup, which VSS shares, and the IndexedDB snapshot carry the transfer artifacts and
     // the data of the proxy v1 flow.
     #[test]
     fn vss_restore_payload_keeps_transfer_artifacts() {
-        // vss_restore_backup shares restore_payload with restore_backup, so this
-        // exercises the exact code the VSS path runs on the downloaded backup.
+        // vss_restore_backup uses restore_payload, so this covers the VSS path.
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::offline::ReceivedConsignmentMeta;

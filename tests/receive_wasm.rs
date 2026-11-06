@@ -10,8 +10,8 @@ use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::utils::script_buf_from_recipient_id;
 use rgb_lib_wasm::wallet::{DatabaseType, Online, Recipient, Wallet, WalletData};
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, TransferKind,
-    TransferStatus, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, RgbTxid, TransferKind,
+    TransferStatus, bitcoin::Amount, generate_keys,
 };
 use utils::*;
 
@@ -374,4 +374,87 @@ async fn donation_receive_broadcasts_signed_tx() {
     );
     settle(&mut wallet_b, &online_b, std::slice::from_ref(&rid)).await;
     assert_eq!(wallet_b.get_asset_balance(asset_id).unwrap().settled, 66);
+}
+
+// The witness that pays the receiver is on chain, but a witness in its history is not: the
+// consignment is refused and the asset is not imported.
+#[wasm_bindgen_test]
+async fn receive_refuses_history_witness_not_on_chain() {
+    let (mut wallet_a, online_a) = sender().await;
+    let asset_id = issue(&wallet_a);
+    let (mut wallet_b, online_b) = sender().await;
+    let rid_b = receive_witness(&mut wallet_b, &online_b, 200, PROXY_URL).await;
+    let map = HashMap::from([(
+        asset_id.clone(),
+        vec![recipient(&rid_b, 200, Some(2000), PROXY_URL)],
+    )]);
+    let (_, w1) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
+    settle(&mut wallet_b, &online_b, std::slice::from_ref(&rid_b)).await;
+    assert_eq!(
+        wallet_b
+            .get_asset_balance(asset_id.clone())
+            .unwrap()
+            .settled,
+        200
+    );
+
+    // B sends to C, but changes the A to B witness in the consignment: same commitment and
+    // inputs, one sat less, so a txid that is not on chain
+    let (mut wallet_c, online_c) = new_wallet().await;
+    let rid_c = receive_witness(&mut wallet_c, &online_c, 100, PROXY_URL).await;
+    let map = HashMap::from([(
+        asset_id.clone(),
+        vec![recipient(&rid_c, 100, Some(2000), PROXY_URL)],
+    )]);
+    let unsigned = wallet_b
+        .send_begin(
+            online_b.clone(),
+            map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt;
+    let signed = wallet_b.sign_psbt(unsigned, None).unwrap();
+    let w2 = Psbt::from_str(&signed)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let bytes = wallet_b.send_consignment_bytes(&w2, &asset_id).unwrap();
+    let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
+    assert!(
+        consignment.modify_bundle(RgbTxid::from_str(&w1).unwrap(), |bw| {
+            let out = bw.tx.output.iter_mut().max_by_key(|o| o.value).unwrap();
+            out.value = Amount::from_sat(out.value.to_sat() - 1);
+        })
+    );
+    wallet_b
+        .set_send_consignment_bytes(&w2, &asset_id, save(&consignment))
+        .unwrap();
+    wallet_b
+        .send_end(online_b.clone(), signed, false)
+        .await
+        .unwrap();
+
+    refresh(&mut wallet_c, &online_c).await;
+    assert_eq!(
+        transfer_of(&wallet_c, &rid_c).status,
+        TransferStatus::Failed
+    );
+    assert!(
+        wallet_c
+            .list_assets(vec![AssetSchema::Nia])
+            .unwrap()
+            .nia
+            .unwrap_or_default()
+            .is_empty(),
+        "C must not import the asset"
+    );
 }

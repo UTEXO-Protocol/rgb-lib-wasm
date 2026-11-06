@@ -1367,11 +1367,13 @@ impl Wallet {
             .iter_mut()
             .for_each(|u| u.rgb_allocations.retain(|a| !a.status.failed()));
         let max_allocs = max_allocations.unwrap_or(self.max_allocations_per_utxo() - 1);
+        let reserved = self.get_reserved_outpoints()?;
         Ok(mut_unspents
             .iter()
             .filter(|u| u.utxo.exists)
             .filter(|u| !u.utxo.pending_witness)
             .filter(|u| !exclude_utxos.contains(&u.utxo.outpoint()))
+            .filter(|u| !reserved.contains(&u.utxo.outpoint()))
             .filter(|u| {
                 (u.rgb_allocations.len() as u32) + u.pending_blinded <= max_allocs
                     && !u.rgb_allocations.iter().any(|a| {
@@ -1396,6 +1398,27 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// Return the inputs of the transfers that can still fail (Initiated, waiting for the
+    /// counterparty or for the broadcast), and of the inflations that are begun and not expired.
+    pub(crate) fn get_reserved_outpoints(&self) -> Result<Vec<Outpoint>, Error> {
+        let now = now().unix_timestamp();
+        let waiting: HashMap<String, bool> = self
+            .database
+            .iter_batch_transfers()?
+            .into_iter()
+            .filter_map(|bt| Some((bt.txid.clone()?, bt.is_fallible())))
+            .collect();
+        Ok(self
+            .transfer_artifacts
+            .iter()
+            .filter(|(txid, a)| match waiting.get(*txid) {
+                Some(waiting) => *waiting,
+                None => a.batch_info.is_some() && now < a.expiration,
+            })
+            .flat_map(|(_, a)| a.inputs.clone())
+            .collect())
+    }
+
     pub(crate) fn get_utxo(
         &self,
         exclude_utxos: &[Outpoint],

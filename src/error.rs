@@ -42,16 +42,16 @@ pub enum Error {
     #[error("Batch transfer cannot be deleted")]
     CannotDeleteBatchTransfer,
 
-    /// The transfer has already failed or progressed, so it cannot be ended again
+    /// Cannot estimate fees
+    #[error("Cannot estimate fees")]
+    CannotEstimateFees,
+
+    /// The transfer has failed, expired or progressed, so it cannot be ended
     #[error("Transfer cannot be ended: {txid}")]
     CannotEndTransfer {
         /// Transfer TXID
         txid: String,
     },
-
-    /// Cannot estimate fees
-    #[error("Cannot estimate fees")]
-    CannotEstimateFees,
 
     /// Requested batch transfer cannot be failed
     #[error("Batch transfer cannot be set to failed status")]
