@@ -196,7 +196,8 @@ const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Mat
 ```javascript
 const invoice = new WasmInvoice(invoiceString);
 const data = invoice.invoiceData();
-// data: { recipientId, assetSchema, assetId, assignment, network, expirationTimestamp, transportEndpoints }
+// data: { recipientId, assetSchema, assetId, assignment, assignmentName, network, expirationTimestamp, transportEndpoints, publicKey, encryption, unknownQueryParams }
+// expirationTimestamp is a BigInt and unknownQueryParams is a plain object
 const str = invoice.invoiceString(); // original string
 ```
 
