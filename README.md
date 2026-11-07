@@ -346,7 +346,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `listTransfers(assetId?)` | no | List RGB transfers |
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions |
-| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmRpcUrls` option maps an EVM chain ID to an RPC URL, for BFA |
+| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA |
 | `sync(online)` | yes | Sync wallet with indexer |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
@@ -367,9 +367,9 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
-| `mintBegin(online, assetId, recipient, feeRate, minConf, senderEndpoint)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient |
+| `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
-| `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match, or null |
+| `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
