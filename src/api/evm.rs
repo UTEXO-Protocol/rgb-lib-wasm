@@ -1,10 +1,9 @@
 use super::*;
 
 use reqwest::StatusCode;
-use std::cell::RefCell;
 
-/// keccak256("FundsIn(address,uint256,uint64)")
-const FUNDS_IN_TOPIC: &str = "0xf1a18caea297591892fc07ea412a5e617d8e51e1155912d8871793e1d4e70f87";
+/// Selector of `getFundsInBlock(uint256,uint256)` on a bridge contract (`MinimalBridge`)
+const FUNDS_IN_BLOCK_SELECTOR: &str = "0x2ce06e2d";
 
 /// Selector of `length()` on a reject list contract (`IRgbRejectList`)
 pub(crate) const REJECT_LIST_LENGTH_SELECTOR: &str = "0x1f7b6d32";
@@ -12,8 +11,6 @@ pub(crate) const REJECT_LIST_LENGTH_SELECTOR: &str = "0x1f7b6d32";
 pub(crate) const REJECT_LIST_ENTRIES_SELECTOR: &str = "0x17b937e6";
 /// Maximum number of reject list entries requested with a single `entries` call
 const REJECT_LIST_PAGE_SIZE: u64 = 1000;
-/// Maximum number of blocks whose logs are requested with a single `eth_getLogs` call
-const LOGS_BLOCK_RANGE: u64 = 1000;
 /// Number of times a JSON-RPC request is sent again when it fails for a temporary reason
 const RPC_RETRIES: u32 = 2;
 /// Pause before a JSON-RPC request is sent again, multiplied by the number of the retry
@@ -21,21 +18,18 @@ const RPC_RETRIES: u32 = 2;
 const RPC_RETRY_PAUSE: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const RPC_RETRY_PAUSE: Duration = Duration::from_millis(10);
-/// Maximum number of blocks scanned for a mint event after the block the mint commits to
-const MAX_MINT_SCAN_BLOCKS: u64 = 500_000;
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static MOCK_MAX_MINT_SCAN_BLOCKS: RefCell<Option<u64>> = const { RefCell::new(None) };
-}
-
-/// Maximum number of blocks scanned for a mint event (see [`MAX_MINT_SCAN_BLOCKS`]).
-pub(crate) fn max_mint_scan_blocks() -> u64 {
-    #[cfg(test)]
-    if let Some(max_scan_blocks) = MOCK_MAX_MINT_SCAN_BLOCKS.with_borrow(|m| *m) {
-        return max_scan_blocks;
-    }
-    MAX_MINT_SCAN_BLOCKS
+/// The status of the lock confirming a mint, which has to be included on the external chain
+/// before the block the mint commits to (`before_block`), as recorded by the bridge contract as of
+/// the latest finalized block (see [`EvmClient::mint_lock_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MintLockStatus {
+    /// The lock is recorded, included before `before_block`
+    Confirmed,
+    /// No lock is recorded yet, but one may still be included before `before_block`
+    Pending,
+    /// The lock is recorded, but not included before `before_block`, or none is and the blocks
+    /// before `before_block` are all finalized: the mint will never be confirmed
+    Expired,
 }
 
 const NO_PARAMS: [u8; 0] = [];
@@ -44,39 +38,6 @@ const NO_PARAMS: [u8; 0] = [];
 pub(crate) struct EvmClient {
     client: reqwest::Client,
     rpc_url: String,
-}
-
-/// A single log entry returned by `eth_getLogs`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EvmLog {
-    /// Indexed topic hashes (topic[0] = event signature hash).
-    pub topics: Vec<String>,
-    /// ABI-encoded non-indexed parameters.
-    pub data: String,
-    /// Block number (hex).
-    pub block_number: Option<String>,
-}
-
-/// Decoded FundsIn event from the bridge contract.
-#[derive(Debug)]
-pub(crate) struct FundsInEvent {
-    /// Locked amount.
-    pub amount: u64,
-    /// RGB operation ID (32 bytes).
-    pub operation_id: [u8; 32],
-    /// Block the event was emitted in, if reported by the node.
-    pub block_number: Option<u64>,
-}
-
-impl FundsInEvent {
-    /// Whether this event commits to `opid` with the exact `amount` and follows `after_block`.
-    /// An event with no block number never confirms.
-    pub(crate) fn confirms(&self, opid: &OpId, amount: u64, after_block: u64) -> bool {
-        OpId::from(self.operation_id) == *opid
-            && self.amount == amount
-            && self.block_number.is_some_and(|block| block > after_block)
-    }
 }
 
 fn strip_hex_prefix<'a>(value: &'a str, what: &str) -> Result<&'a str, Error> {
@@ -205,52 +166,6 @@ fn decode_reject_list_entries(data: &str) -> Result<Vec<RejectListEntry>, Error>
     Ok(entries)
 }
 
-impl EvmLog {
-    /// Parse this log as a FundsIn event.
-    ///
-    /// Return `None` if the topic does not match or if the amount does not fit in a `u64`.
-    pub fn as_funds_in(&self) -> Result<Option<FundsInEvent>, Error> {
-        let Some(topic0) = self.topics.first() else {
-            return Ok(None);
-        };
-        if !topic0.eq_ignore_ascii_case(FUNDS_IN_TOPIC) {
-            return Ok(None);
-        }
-        let block_number = self
-            .block_number
-            .as_deref()
-            .map(parse_block_number)
-            .transpose()?;
-        // event FundsIn(address indexed sender, uint256 indexed operationId, uint64 amount)
-        let [_, _, operation_id_topic] = self.topics.as_slice() else {
-            return Err(Error::Network {
-                details: format!(
-                    "unexpected FundsIn topic count: {} (expected 3)",
-                    self.topics.len()
-                ),
-            });
-        };
-        let data_hex = strip_hex_prefix(&self.data, "ABI data")?;
-        if data_hex.len() != 64 {
-            return Err(Error::Network {
-                details: format!(
-                    "unexpected FundsIn ABI payload size: {} hex chars (expected 64)",
-                    data_hex.len()
-                ),
-            });
-        }
-        let operation_id = abi_word(operation_id_topic, 0)?;
-        let Some(amount) = abi_word_u64(&self.data, 0)? else {
-            return Ok(None);
-        };
-        Ok(Some(FundsInEvent {
-            amount,
-            operation_id,
-            block_number,
-        }))
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct RpcRequest<P: Serialize> {
     jsonrpc: &'static str,
@@ -281,18 +196,6 @@ struct CallObject {
 #[derive(Debug, Deserialize)]
 struct BlockHeader {
     number: String,
-    #[serde(default)]
-    timestamp: Option<String>,
-}
-
-/// Filter object for `eth_getLogs`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LogFilter {
-    address: String,
-    from_block: String,
-    to_block: String,
-    topics: Vec<Option<String>>,
 }
 
 impl EvmClient {
@@ -353,12 +256,37 @@ impl EvmClient {
         }
     }
 
+    fn rpc_error(method: &str, err: RpcError) -> Error {
+        Error::Network {
+            details: format!("{method} error {}: {}", err.code, err.message),
+        }
+    }
+
+    fn null_result(method: &str) -> Error {
+        Error::Network {
+            details: format!("{method} returned null result"),
+        }
+    }
+
     /// Call a JSON-RPC method. Fail if it reports an error or no result.
     async fn rpc<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &'static str,
         params: P,
     ) -> Result<R, Error> {
+        self.try_rpc(method, params)
+            .await?
+            .map_err(|err| Self::rpc_error(method, err))?
+            .ok_or_else(|| Self::null_result(method))
+    }
+
+    /// Call a JSON-RPC method. Return the error it reports apart from the other failures, and
+    /// its result, which can be null.
+    async fn try_rpc<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &'static str,
+        params: P,
+    ) -> Result<Result<Option<R>, RpcError>, Error> {
         let body = RpcRequest {
             jsonrpc: "2.0",
             method,
@@ -371,13 +299,9 @@ impl EvmClient {
             .json()
             .await
             .map_err(Self::req_err)?;
-        if let Some(err) = resp.error {
-            return Err(Error::Network {
-                details: format!("{method} error {}: {}", err.code, err.message),
-            });
-        }
-        resp.result.ok_or_else(|| Error::Network {
-            details: format!("{method} returned null result"),
+        Ok(match resp.error {
+            Some(err) => Err(err),
+            None => Ok(resp.result),
         })
     }
 
@@ -389,7 +313,8 @@ impl EvmClient {
         )
     }
 
-    async fn block_number(&self) -> Result<u64, Error> {
+    /// Number of the latest block (`eth_blockNumber`).
+    pub(crate) async fn block_number(&self) -> Result<u64, Error> {
         parse_block_number(&self.rpc::<_, String>("eth_blockNumber", NO_PARAMS).await?)
     }
 
@@ -401,187 +326,127 @@ impl EvmClient {
         parse_block_number(&header.number)
     }
 
-    /// The `FundsIn` logs for `opid` emitted by `contract` from `from_block` to `to_block`.
-    ///
-    /// A node error is returned apart, so that the caller can retry with a smaller range. An
-    /// HTTP 413 is such an error too, whatever its body. An error with HTTP 429, 401 or 403 is a
-    /// failure instead, as a smaller range is refused too.
-    async fn get_logs(
-        &self,
-        contract: &EvmAddress,
-        opid: &OpId,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<Result<Vec<EvmLog>, RpcError>, Error> {
-        let body = RpcRequest {
-            jsonrpc: "2.0",
-            method: "eth_getLogs",
-            params: [LogFilter {
-                address: contract.to_string(),
-                from_block: format!("0x{from_block:x}"),
-                to_block: format!("0x{to_block:x}"),
-                topics: vec![
-                    Some(FUNDS_IN_TOPIC.to_string()),
-                    None,
-                    Some(format!("0x{}", hex::encode(opid.to_byte_array()))),
-                ],
-            }],
-            id: 1,
-        };
-        let resp = self.post(&body).await?;
-        let status = resp.status();
-        if status == StatusCode::PAYLOAD_TOO_LARGE {
-            let text = resp.text().await.unwrap_or_default();
-            let details: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            return Ok(Err(RpcError {
-                code: status.as_u16().into(),
-                message: format!(
-                    "(HTTP {status}) {}",
-                    details.chars().take(200).collect::<String>()
-                ),
-            }));
-        }
-        let resp: RpcResponse<Vec<EvmLog>> = resp.json().await.map_err(Self::req_err)?;
-        if let Some(err) = resp.error {
-            if matches!(
-                status,
-                StatusCode::TOO_MANY_REQUESTS | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ) {
-                return Err(Error::Network {
-                    details: format!(
-                        "eth_getLogs error {} (HTTP {status}): {}",
-                        err.code, err.message
-                    ),
-                });
-            }
-            return Ok(Err(err));
-        }
-        resp.result.map(Ok).ok_or_else(|| Error::Network {
-            details: s!("eth_getLogs returned null result"),
-        })
-    }
-
-    /// Check that the node serves the latest finalized block and the logs of the oldest blocks.
-    /// Fail with [`Error::InvalidEvmRpcUrl`] if it does not.
+    /// Check that the node serves what confirming mints needs: the latest finalized block and the
+    /// contract state as of it. Fail with [`Error::InvalidEvmRpcUrl`] if it does not.
     pub(crate) async fn check_mint_support(&self) -> Result<(), Error> {
-        self.finalized_block_number()
+        let finalized_block =
+            self.finalized_block_number()
+                .await
+                .map_err(|e| Error::InvalidEvmRpcUrl {
+                    details: format!("cannot get the latest finalized block: {e}"),
+                })?;
+        self.eth_call(&EvmAddress::default(), s!("0x"), finalized_block)
             .await
             .map_err(|e| Error::InvalidEvmRpcUrl {
-                details: format!("cannot get the latest finalized block: {e}"),
+                details: format!(
+                    "cannot read the state as of the latest finalized block, an endpoint keeping \
+                     it is needed: {e}"
+                ),
             })?;
-        let logs_error = |details: String| Error::InvalidEvmRpcUrl {
-            details: format!(
-                "cannot get the logs of the oldest blocks, an endpoint serving the whole log \
-                 history is needed: {details}"
-            ),
-        };
-        match self
-            .get_logs(&EvmAddress::default(), &OpId::from([0u8; 32]), 0, 0)
-            .await
-        {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => Err(logs_error(format!(
-                "eth_getLogs error {}: {}",
-                err.code, err.message
-            ))),
-            Err(e) => Err(logs_error(e.to_string())),
-        }
+        Ok(())
     }
 
-    /// Whether `contract` emitted a `FundsIn` event for `opid` with the exact `amount`, after
-    /// `after_block` and up to `last_block`.
-    pub(crate) async fn find_funds_in(
+    /// The block the lock of `amount` with ID `lock_id` was included in, as recorded by the bridge
+    /// contract at `contract` as of `block`, if any.
+    ///
+    /// An address with no code (calling it returns no data) or a contract without the function
+    /// (calling it reverts) cannot have recorded any lock.
+    async fn funds_in_block(
         &self,
         contract: &EvmAddress,
-        opid: &OpId,
+        lock_id: &LockId,
         amount: u64,
-        after_block: u64,
-        last_block: u64,
-    ) -> Result<bool, Error> {
-        Ok(self
-            .find_funds_in_block(contract, opid, amount, after_block, after_block, last_block)
-            .await?
-            .is_some())
-    }
-
-    /// The block of the first `FundsIn` event for `opid` with the exact `amount` after
-    /// `scanned_block` and up to `last_block` that follows `after_block`, if any.
-    /// A log range that the node refuses is halved and requested again.
-    async fn find_funds_in_block(
-        &self,
-        contract: &EvmAddress,
-        opid: &OpId,
-        amount: u64,
-        after_block: u64,
-        scanned_block: u64,
-        last_block: u64,
+        block: u64,
     ) -> Result<Option<u64>, Error> {
-        let mut block_range = LOGS_BLOCK_RANGE;
-        let mut from_block = scanned_block.saturating_add(1);
-        while from_block <= last_block {
-            let to_block = min(from_block.saturating_add(block_range - 1), last_block);
-            let logs = match self.get_logs(contract, opid, from_block, to_block).await? {
-                Ok(logs) => logs,
-                Err(_) if to_block > from_block => {
-                    block_range = (to_block - from_block).div_ceil(2);
-                    continue;
-                }
-                Err(err) => {
-                    return Err(Error::Network {
-                        details: format!("eth_getLogs error {}: {}", err.code, err.message),
-                    });
-                }
-            };
-            for log in logs {
-                if let Some(event) = log.as_funds_in()?
-                    && event.confirms(opid, amount, after_block)
-                {
-                    return Ok(event.block_number);
-                }
-            }
-            let Some(next_block) = to_block.checked_add(1) else {
-                break;
-            };
-            from_block = next_block;
-        }
-        Ok(None)
-    }
-
-    /// Timestamp of the block including a `FundsIn` event for `opid` with the exact `amount`
-    /// after `after_block`, finalized or not, if any.
-    pub(crate) async fn funds_in_inclusion(
-        &self,
-        contract: &EvmAddress,
-        opid: &OpId,
-        amount: u64,
-        after_block: u64,
-    ) -> Result<Option<u64>, Error> {
-        let latest_block = self.block_number().await?;
-        let Some(block) = self
-            .find_funds_in_block(
-                contract,
-                opid,
-                amount,
-                after_block,
-                after_block,
-                latest_block,
-            )
-            .await?
-        else {
+        let data = format!(
+            "{FUNDS_IN_BLOCK_SELECTOR}{}{amount:064x}",
+            hex::encode(lock_id.to_byte_array())
+        );
+        let Some(result) = self.eth_call_unless_reverted(contract, data, block).await? else {
             return Ok(None);
         };
-        Ok(Some(self.block_timestamp(block).await?))
+        if result == "0x" {
+            return Ok(None);
+        }
+        // compare the exact hex length: trailing data is refused
+        if strip_hex_prefix(&result, "ABI data")?.len() != 64 {
+            return Err(abi_error("unexpected getFundsInBlock result size"));
+        }
+        // the record is the block plus one, zero means there is none
+        let block_plus_one = abi_word_u64(&result, 0)?
+            .ok_or_else(|| abi_error("lock block doesn't fit in a u64"))?;
+        Ok(block_plus_one.checked_sub(1))
     }
 
-    /// Timestamp of the block with the given number.
-    pub(crate) async fn block_timestamp(&self, block: u64) -> Result<u64, Error> {
-        let header: BlockHeader = self
-            .rpc("eth_getBlockByNumber", (format!("0x{block:x}"), false))
-            .await?;
-        let timestamp = header.timestamp.ok_or_else(|| Error::Network {
-            details: format!("the node reports no timestamp for block {block}"),
-        })?;
-        parse_quantity(&timestamp, "block timestamp")
+    /// The status of the lock of `amount` with ID `lock_id`, which has to be included before
+    /// `before_block`, as recorded by the bridge contract at `contract` as of the latest finalized
+    /// block.
+    pub(crate) async fn mint_lock_status(
+        &self,
+        contract: &EvmAddress,
+        lock_id: &LockId,
+        amount: u64,
+        before_block: u64,
+    ) -> Result<MintLockStatus, Error> {
+        let finalized_block = self.finalized_block_number().await?;
+        Ok(
+            match self
+                .funds_in_block(contract, lock_id, amount, finalized_block)
+                .await?
+            {
+                Some(block) if block < before_block => MintLockStatus::Confirmed,
+                Some(_) => MintLockStatus::Expired,
+                // a lock not recorded as of the finalized block can only be included after it
+                None if finalized_block.saturating_add(1) >= before_block => {
+                    MintLockStatus::Expired
+                }
+                None => MintLockStatus::Pending,
+            },
+        )
+    }
+
+    /// Whether the bridge contract at `contract` records, as of the latest block, a lock of
+    /// `amount` with ID `lock_id` included before `before_block`, finalized or not.
+    pub(crate) async fn mint_lock_recorded(
+        &self,
+        contract: &EvmAddress,
+        lock_id: &LockId,
+        amount: u64,
+        before_block: u64,
+    ) -> Result<bool, Error> {
+        let latest_block = self.block_number().await?;
+        Ok(matches!(
+            self.funds_in_block(contract, lock_id, amount, latest_block).await?,
+            Some(block) if block < before_block
+        ))
+    }
+
+    /// The parameters of an `eth_call` of `contract` with `data` as of `block`.
+    fn call_params(contract: &EvmAddress, data: String, block: u64) -> (CallObject, String) {
+        let call = CallObject {
+            to: contract.to_string(),
+            data,
+        };
+        (call, format!("0x{block:x}"))
+    }
+
+    /// Call `contract` with `data` as of `block`. Return `None` if the call reverts.
+    async fn eth_call_unless_reverted(
+        &self,
+        contract: &EvmAddress,
+        data: String,
+        block: u64,
+    ) -> Result<Option<String>, Error> {
+        let method = "eth_call";
+        match self
+            .try_rpc(method, Self::call_params(contract, data, block))
+            .await?
+        {
+            Ok(result) => result.map(Some).ok_or_else(|| Self::null_result(method)),
+            // nodes report a revert with this message, then the reason if there is one
+            Err(err) if err.message.starts_with("execution reverted") => Ok(None),
+            Err(err) => Err(Self::rpc_error(method, err)),
+        }
     }
 
     async fn eth_call(
@@ -590,11 +455,8 @@ impl EvmClient {
         data: String,
         block: u64,
     ) -> Result<String, Error> {
-        let call = CallObject {
-            to: contract.to_string(),
-            data,
-        };
-        self.rpc("eth_call", (call, format!("0x{block:x}"))).await
+        self.rpc("eth_call", Self::call_params(contract, data, block))
+            .await
     }
 
     /// Length of the reject list at `contract` as of `block`. Return `None` if there is no
@@ -667,93 +529,85 @@ impl EvmClient {
     }
 }
 
-/// A resolver of mint events. It scans only `max_scan_blocks` blocks after the block each mint
-/// commits to. The minter chooses that block, so without a limit a scan can cover the whole chain.
-/// The scan of a terminal mint resumes after the last finalized block of the previous scan.
-pub(crate) struct MintAnchorResolver<'a> {
-    client: &'a EvmClient,
-    terminal_opids: &'a HashSet<OpId>,
-    /// Last finalized block scanned without the event, by terminal mint
-    scanned_blocks: RefCell<HashMap<OpId, u64>>,
-    max_scan_blocks: u64,
-    exhausted: RefCell<HashSet<OpId>>,
+/// A claim resolver over the lock statuses fetched from an [`EvmClient`]. It records the mints
+/// that will never be confirmed (see [`MintLockStatus::Expired`]).
+///
+/// [`ResolveClaim`] is synchronous and the browser can only fetch asynchronously, so the statuses
+/// of the claims are fetched first.
+pub(crate) struct MintClaimResolver {
+    chain_id: u64,
+    /// Lock statuses, by lock ID, amount and `before_block`
+    statuses: HashMap<(LockId, u64, u64), MintLockStatus>,
+    /// Operation IDs of the mints that will never be confirmed
+    expired: HashSet<OpId>,
 }
 
-impl<'a> MintAnchorResolver<'a> {
-    pub(crate) fn new(
-        client: &'a EvmClient,
-        terminal_opids: &'a HashSet<OpId>,
-        scanned_blocks: HashMap<OpId, u64>,
-        max_scan_blocks: u64,
-    ) -> Self {
-        Self {
-            client,
-            terminal_opids,
-            scanned_blocks: RefCell::new(scanned_blocks),
-            max_scan_blocks,
-            exhausted: RefCell::new(HashSet::new()),
+impl MintClaimResolver {
+    /// Fetch the lock status of each of `claims` from the bridge at `location`. Fetch none when
+    /// the node is on another chain, which the claim resolution then reports.
+    pub(crate) async fn fetch(
+        client: &EvmClient,
+        location: &BridgeLocation,
+        claims: &[Claim],
+    ) -> Result<Self, Error> {
+        let BridgeLocation::Evm(EvmContract { chain_id, address }) = location;
+        let mut resolver = Self {
+            chain_id: client.chain_id().await?,
+            statuses: HashMap::new(),
+            expired: HashSet::new(),
+        };
+        if resolver.chain_id != *chain_id {
+            return Ok(resolver);
         }
+        for claim in claims {
+            let Claim::Lock {
+                opid,
+                amount,
+                before_block,
+                ..
+            } = claim;
+            let lock_id = LockId::from(claim);
+            let status = client
+                .mint_lock_status(address, &lock_id, *amount, *before_block)
+                .await?;
+            if status == MintLockStatus::Expired {
+                resolver.expired.insert(*opid);
+            }
+            resolver
+                .statuses
+                .insert((lock_id, *amount, *before_block), status);
+        }
+        Ok(resolver)
     }
 
-    /// The last finalized block scanned without the event, by terminal mint.
-    pub(crate) fn scanned_blocks(&self) -> HashMap<OpId, u64> {
-        self.scanned_blocks.borrow().clone()
+    /// Whether the mint with the given operation ID will never be confirmed.
+    ///
+    /// A mint that is not confirmed but not expired may still be, once its lock is made or
+    /// finalized.
+    pub(crate) fn is_expired(&self, opid: &OpId) -> bool {
+        self.expired.contains(opid)
+    }
+}
+
+impl ResolveClaim for MintClaimResolver {
+    fn evm_chain_id(&self) -> Result<u64, ClaimResolverError> {
+        Ok(self.chain_id)
     }
 
-    /// Whether a finalized `FundsIn` event confirms the mint within the limit.
-    pub(crate) async fn is_confirmed(
+    fn is_confirmed(
         &self,
-        contract: &EvmAddress,
+        _location: &BridgeLocation,
         claim: &Claim,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, ClaimResolverError> {
         let Claim::Lock {
-            opid,
             amount,
-            before_block: after_block,
+            before_block,
             ..
         } = claim;
-        let terminal = self.terminal_opids.contains(opid);
-        // finalized blocks cannot be reorged, so a scanned block is not scanned again
-        let scanned_block = self
-            .scanned_blocks
-            .borrow()
-            .get(opid)
-            .filter(|_| terminal)
-            .copied()
-            .unwrap_or(*after_block)
-            .max(*after_block);
-        let finalized_block = self.client.finalized_block_number().await?;
-        let limit_block = after_block.saturating_add(self.max_scan_blocks);
-        let last_block = min(finalized_block, limit_block);
-        if self
-            .client
-            .find_funds_in_block(
-                contract,
-                opid,
-                *amount,
-                *after_block,
-                scanned_block,
-                last_block,
-            )
-            .await?
-            .is_some()
-        {
-            return Ok(true);
-        }
-        if terminal {
-            self.scanned_blocks
-                .borrow_mut()
-                .insert(*opid, scanned_block.max(last_block));
-        }
-        if last_block == limit_block {
-            self.exhausted.borrow_mut().insert(*opid);
-        }
-        Ok(false)
-    }
-
-    /// Whether the mint has no event in any block within the limit, all of them finalized.
-    pub(crate) fn is_exhausted(&self, opid: &OpId) -> bool {
-        self.exhausted.borrow().contains(opid)
+        self.statuses
+            .get(&(LockId::from(claim), *amount, *before_block))
+            .map(|status| *status == MintLockStatus::Confirmed)
+            .ok_or_else(|| ClaimResolverError::ResolverIssue(s!("claim not fetched")))
     }
 }
 
@@ -838,49 +692,12 @@ pub(crate) mod tests {
         )
     }
 
-    fn mock_get_logs(
-        server: &mut mockito::Server,
-        from_block: u64,
-        to_block: u64,
-        body: &str,
-    ) -> mockito::Mock {
-        mock_rpc(
-            server,
-            &format!(
-                r#"{{"method":"eth_getLogs","params":[{{"address":"{CONTRACT}","fromBlock":"0x{from_block:x}","toBlock":"0x{to_block:x}","topics":["{FUNDS_IN_TOPIC}",null,"0x{}"]}}]}}"#,
-                "00".repeat(32)
-            ),
-            body,
-        )
-    }
-
-    /// The topics of a `FundsIn` event for the operation ID made of `opid_byte`.
-    fn funds_in_topics(opid_byte: u8) -> Vec<String> {
-        vec![
-            FUNDS_IN_TOPIC.to_string(),
-            format!("0x{}{}", "00".repeat(12), "aa".repeat(20)),
-            format!("0x{}", format!("{opid_byte:02x}").repeat(32)),
-        ]
-    }
-
-    /// A `FundsIn` log (JSON) for the all-zeros operation ID in `block`.
-    fn funds_in_log(amount: u64, block: u64) -> String {
-        format!(
-            r#"{{"topics":{:?},"data":"0x{amount:064x}","blockNumber":"0x{block:x}"}}"#,
-            funds_in_topics(0)
-        )
-    }
-
     /// A nonzero contract address, as the node expects it.
     const CONTRACT: &str = "0x00000000000000000000000000000000000000b1";
 
     fn contract() -> EvmAddress {
         EvmAddress::from_str(CONTRACT).unwrap()
     }
-
-    const NO_LOGS: &str = r#""result":[]"#;
-    const RANGE_TOO_LARGE: &str =
-        r#""error":{"code":-32005,"message":"query exceeds max block range"}"#;
 
     #[test]
     fn reject_list_entries_decode() {
@@ -950,74 +767,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn funds_in_layout() {
-        let opid_bytes: [u8; 32] = std::array::from_fn(|i| i as u8);
-        let mut topics = funds_in_topics(0);
-        topics[2] = format!("0x{}", hex::encode(opid_bytes));
-        let log = EvmLog {
-            topics,
-            data: format!("0x{:064x}", 7u64),
-            block_number: Some(s!("0x10")),
-        };
-        let event = log.as_funds_in().unwrap().unwrap();
-        assert_eq!(OpId::from(event.operation_id), OpId::from(opid_bytes));
-        assert_eq!(event.amount, 7);
-        assert_eq!(event.block_number, Some(16));
-
-        // another event
-        let log = EvmLog {
-            topics: vec![format!("0x{}", "11".repeat(32))],
-            data: s!("0x"),
-            block_number: None,
-        };
-        assert!(log.as_funds_in().unwrap().is_none());
-
-        // no indexed operation ID
-        let log = EvmLog {
-            topics: funds_in_topics(0)[..2].to_vec(),
-            data: format!("0x{:064x}", 7u64),
-            block_number: None,
-        };
-        assert!(log.as_funds_in().is_err());
-
-        // data other than one amount word
-        let log = EvmLog {
-            topics: funds_in_topics(0),
-            data: format!("0x{}{:064x}", "00".repeat(32), 7u64),
-            block_number: None,
-        };
-        assert!(log.as_funds_in().is_err());
-
-        // an amount over u64::MAX never matches
-        let log = EvmLog {
-            topics: funds_in_topics(0),
-            data: format!("0x{}1{}", "0".repeat(47), "0".repeat(16)),
-            block_number: None,
-        };
-        assert!(log.as_funds_in().unwrap().is_none());
-
-        assert!(parse_block_number("10").is_err());
-    }
-
-    #[test]
-    fn funds_in_confirms() {
-        let log = EvmLog {
-            topics: funds_in_topics(0),
-            data: format!("0x{:064x}", 7u64),
-            block_number: Some(s!("0x10")),
-        };
-        let event = log.as_funds_in().unwrap().unwrap();
-        let opid = OpId::from([0u8; 32]);
-        assert!(event.confirms(&opid, 7, 15));
-        // not after the anchor block
-        assert!(!event.confirms(&opid, 7, 16));
-        // a wrong amount
-        assert!(!event.confirms(&opid, 8, 15));
-        // another operation
-        assert!(!event.confirms(&OpId::from([1u8; 32]), 7, 15));
-    }
-
-    #[test]
     fn chain_id() {
         let mut server = mockito::Server::new();
         let mock = mock_rpc(
@@ -1040,117 +789,6 @@ pub(crate) mod tests {
         let result = block_on(EvmClient::new(&server.url()).chain_id());
         assert!(
             matches!(result, Err(Error::Network { ref details }) if details == "eth_chainId error -32601: not found")
-        );
-    }
-
-    #[test]
-    fn find_funds_in() {
-        let opid = OpId::from([0u8; 32]);
-        let address = contract();
-        let find = |last: u64, logs: &[String]| {
-            let mut server = mockito::Server::new();
-            let logs_mock = mock_get_logs(
-                &mut server,
-                17,
-                last,
-                &format!(r#""result":[{}]"#, logs.join(",")),
-            );
-            let found =
-                block_on(EvmClient::new(&server.url()).find_funds_in(&address, &opid, 7, 16, last))
-                    .unwrap();
-            logs_mock.assert();
-            found
-        };
-        // the matching event in a finalized block
-        assert!(find(0x20, &[funds_in_log(7, 0x11)]));
-        // a wrong amount before the right one does not hide it
-        assert!(find(0x20, &[funds_in_log(8, 0x11), funds_in_log(7, 0x12)]));
-        // a wrong amount
-        assert!(!find(0x20, &[funds_in_log(8, 0x11)]));
-        // no event
-        assert!(!find(0x20, &[]));
-
-        // the last block is not past the anchor block: no log is requested
-        let mut server = mockito::Server::new();
-        let get_logs = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJsonString(s!(
-                r#"{"method":"eth_getLogs"}"#
-            )))
-            .expect(0)
-            .create();
-        assert!(
-            !block_on(EvmClient::new(&server.url()).find_funds_in(&address, &opid, 7, 16, 16))
-                .unwrap()
-        );
-        get_logs.assert();
-    }
-
-    #[test]
-    fn find_funds_in_shrinks_refused_range() {
-        let opid = OpId::from([0u8; 32]);
-        let address = contract();
-
-        // the refused range is halved
-        let find = |server: &mockito::Server, last: u64| {
-            block_on(EvmClient::new(&server.url()).find_funds_in(&address, &opid, 7, 16, last))
-        };
-        let mut server = mockito::Server::new();
-        let refused = mock_get_logs(&mut server, 17, 20, RANGE_TOO_LARGE);
-        let ranges =
-            [(17, 18), (19, 20)].map(|(from, to)| mock_get_logs(&mut server, from, to, NO_LOGS));
-        assert!(!find(&server, 20).unwrap());
-        refused.assert();
-        ranges.iter().for_each(|r| r.assert());
-
-        // a range refused with an HTTP 413 is halved too, whatever the answer body
-        let mut server = mockito::Server::new();
-        let refused = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJsonString(format!(
-                r#"{{"method":"eth_getLogs","params":[{{"fromBlock":"0x{:x}","toBlock":"0x{:x}"}}]}}"#,
-                17, 24
-            )))
-            .with_status(413)
-            .with_body("<html>413 Request Entity Too Large</html>")
-            .expect(1)
-            .create();
-        let ranges =
-            [(17, 20), (21, 24)].map(|(from, to)| mock_get_logs(&mut server, from, to, NO_LOGS));
-        assert!(!find(&server, 24).unwrap());
-        refused.assert();
-        ranges.iter().for_each(|r| r.assert());
-
-        // a request refused whatever its range (rate limited, or not authorized) is reported
-        // at once, without halving the range
-        for status in [429, 401, 403] {
-            let mut server = mockito::Server::new();
-            let refused = server
-                .mock("POST", "/")
-                .match_body(mockito::Matcher::PartialJsonString(s!(
-                    r#"{"method":"eth_getLogs"}"#
-                )))
-                .with_status(status)
-                .with_body(
-                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32011,"message":"limited"}}"#,
-                )
-                .expect(1)
-                .create();
-            let result = find(&server, 32);
-            assert!(
-                matches!(result, Err(Error::Network { ref details }) if details.starts_with("eth_getLogs error -32011 (HTTP")),
-                "{result:?}"
-            );
-            refused.assert();
-        }
-
-        // a refused single block gives the node error
-        let mut server = mockito::Server::new();
-        let _refused = [(17, 18), (17, 17)]
-            .map(|(from, to)| mock_get_logs(&mut server, from, to, RANGE_TOO_LARGE));
-        let result = find(&server, 18);
-        assert!(
-            matches!(result, Err(Error::Network { ref details }) if details == "eth_getLogs error -32005: query exceeds max block range")
         );
     }
 
@@ -1374,165 +1012,265 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn bounded_resolver() {
-        let opid = OpId::from([0u8; 32]);
-        let anchor = |after_block: u64| Claim::Lock {
-            opid,
-            witness_id: RgbTxid::from_byte_array([1u8; 32]),
-            amount: 7,
-            before_block: after_block,
-        };
-        let resolve = |server: &mockito::Server, after_block: u64| {
-            let client = EvmClient::new(&server.url());
-            let terminal_opids = HashSet::new();
-            let resolver = MintAnchorResolver::new(&client, &terminal_opids, HashMap::new(), 10);
-            let confirmed =
-                block_on(resolver.is_confirmed(&contract(), &anchor(after_block))).unwrap();
-            (confirmed, resolver.is_exhausted(&opid))
-        };
-
-        // the scan stops at the limit, even if more blocks are finalized: with no event within it,
-        // the mint is exhausted
-        let mut server = mockito::Server::new();
-        let _finalized = mock_finalized_block(&mut server, 1020);
-        let range = mock_get_logs(&mut server, 17, 26, NO_LOGS);
-        assert_eq!(resolve(&server, 16), (false, true));
-        range.assert();
-
-        // with a limit past the finalized block, the scan stops at the finalized block: the event
-        // may still be in a later block within the limit, so the mint is not exhausted
-        let mut server = mockito::Server::new();
-        let _finalized = mock_finalized_block(&mut server, 20);
-        let range = mock_get_logs(&mut server, 17, 20, NO_LOGS);
-        assert_eq!(resolve(&server, 16), (false, false));
-        range.assert();
-
-        // an event within the limit confirms the mint
-        let mut server = mockito::Server::new();
-        let _finalized = mock_finalized_block(&mut server, 1020);
-        let range = mock_get_logs(
-            &mut server,
-            17,
-            26,
-            &format!(r#""result":[{}]"#, funds_in_log(7, 26)),
-        );
-        assert_eq!(resolve(&server, 16), (true, false));
-        range.assert();
-
-        // the limit does not overflow: an anchor past the finalized block is not exhausted
-        let mut server = mockito::Server::new();
-        let _finalized = mock_finalized_block(&mut server, 0x10);
-        let get_logs = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJsonString(s!(
-                r#"{"method":"eth_getLogs"}"#
-            )))
-            .expect(0)
-            .create();
-        assert_eq!(resolve(&server, u64::MAX), (false, false));
-        get_logs.assert();
-    }
-
-    #[test]
-    fn mint_anchor_resolver_resumes_scan() {
-        let opid = OpId::from([0u8; 32]);
-        let terminal_opids = HashSet::from([opid]);
-        let anchor = Claim::Lock {
-            opid,
-            witness_id: RgbTxid::from_byte_array([1u8; 32]),
-            amount: 7,
-            before_block: 16,
-        };
-        let resolve = |server: &mockito::Server, scanned_block: u64| {
-            let client = EvmClient::new(&server.url());
-            let resolver = MintAnchorResolver::new(
-                &client,
-                &terminal_opids,
-                HashMap::from([(opid, scanned_block)]),
-                10,
-            );
-            let confirmed = block_on(resolver.is_confirmed(&contract(), &anchor)).unwrap();
-            (
-                confirmed,
-                resolver.scanned_blocks()[&opid],
-                resolver.is_exhausted(&opid),
-            )
-        };
-
-        // the scan resumes after the scanned block and stops at the finalized one
-        let mut server = mockito::Server::new();
-        let _finalized = mock_finalized_block(&mut server, 22);
-        let range = mock_get_logs(&mut server, 21, 22, NO_LOGS);
-        assert_eq!(resolve(&server, 20), (false, 22, false));
-        range.assert();
-
-        // the next scan resumes from there and stops at the limit: the mint is exhausted
-        let mut server = mockito::Server::new();
-        let _finalized = mock_finalized_block(&mut server, 1020);
-        let range = mock_get_logs(&mut server, 23, 26, NO_LOGS);
-        assert_eq!(resolve(&server, 22), (false, 26, true));
-        range.assert();
-
-        // an event in the last block within the limit confirms the mint
-        let mut server = mockito::Server::new();
-        let _finalized = mock_finalized_block(&mut server, 1020);
-        let range = mock_get_logs(
-            &mut server,
-            23,
-            26,
-            &format!(r#""result":[{}]"#, funds_in_log(7, 26)),
-        );
-        assert_eq!(resolve(&server, 22), (true, 22, false));
-        range.assert();
-    }
-
-    #[test]
     fn check_mint_support() {
-        // the finalized block is asked, then the logs of block 0 if it is served
-        let check = |finalized: &str, logs: &str, logs_hits: usize| {
+        // the finalized block is asked, then the state at it if there is one
+        let check = |finalized: &str, call: &str, call_hits: usize| {
             let mut server = mockito::Server::new();
             let finalized = mock_rpc(
                 &mut server,
                 r#"{"method":"eth_getBlockByNumber","params":["finalized",false]}"#,
                 finalized,
             );
-            let logs = server
+            let call = server
                 .mock("POST", "/")
                 .match_body(mockito::Matcher::PartialJsonString(s!(
-                    r#"{"method":"eth_getLogs","params":[{"fromBlock":"0x0","toBlock":"0x0"}]}"#
+                    r#"{"method":"eth_call","params":[{"data":"0x"},"0x10"]}"#
                 )))
-                .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,{logs}}}"#))
-                .expect(logs_hits)
+                .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,{call}}}"#))
+                .expect(call_hits)
                 .create();
             let result = block_on(EvmClient::new(&server.url()).check_mint_support());
             finalized.assert();
-            logs.assert();
+            call.assert();
             result
         };
         let finalized = r#""result":{"number":"0x10"}"#;
-        // no finalized block
+        let no_code = r#""result":"0x""#;
         let result = check(
             r#""error":{"code":-32602,"message":"invalid block tag"}"#,
-            NO_LOGS,
+            no_code,
             0,
         );
         assert!(
-            matches!(result, Err(Error::InvalidEvmRpcUrl { ref details }) if details.starts_with("cannot get the latest finalized block")),
+            matches!(result, Err(Error::InvalidEvmRpcUrl { ref details }) if details.contains("cannot get the latest finalized block")),
             "{result:?}"
         );
-        // only the logs of recent blocks
         let result = check(
             finalized,
-            r#""error":{"code":-32602,"message":"Archive requests require a personal token"}"#,
+            r#""error":{"code":-32000,"message":"missing trie node"}"#,
             1,
         );
         assert!(
             matches!(result, Err(Error::InvalidEvmRpcUrl { ref details })
-                if details.starts_with("cannot get the logs of the oldest blocks")
-                    && details.ends_with("Archive requests require a personal token")),
+                if details.contains("cannot read the state") && details.ends_with("missing trie node")),
             "{result:?}"
         );
-        // serving both
-        check(finalized, NO_LOGS, 1).unwrap();
+        check(finalized, no_code, 1).unwrap();
+    }
+
+    /// The `getFundsInBlock` call data for the lock with ID `lock_id` and `amount`.
+    fn funds_in_call(lock_id: &LockId, amount: u64) -> String {
+        format!(
+            "{FUNDS_IN_BLOCK_SELECTOR}{}{amount:064x}",
+            hex::encode(lock_id.to_byte_array())
+        )
+    }
+
+    /// Mock an `eth_call` at `block` with the given call `data`, expected `hits` times.
+    fn mock_eth_call_hits(
+        server: &mut mockito::Server,
+        block: u64,
+        data: &str,
+        result: &str,
+        hits: usize,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"method":"eth_call","params":[{{"data":"{data}"}},"0x{block:x}"]}}"#
+            )))
+            .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{result}"}}"#))
+            .expect(hits)
+            .create()
+    }
+
+    #[test]
+    fn funds_in_block() {
+        let contract = EvmAddress::default();
+        let lock_id = LockId::from([1u8; 32]);
+        let funds_in_block = |result: &str| {
+            let mut server = mockito::Server::new();
+            let call =
+                mock_eth_call_hits(&mut server, 0x10, &funds_in_call(&lock_id, 7), result, 1);
+            let block = block_on(
+                EvmClient::new(&server.url()).funds_in_block(&contract, &lock_id, 7, 0x10),
+            );
+            call.assert();
+            block
+        };
+
+        // the record is the block plus one
+        assert_eq!(
+            funds_in_block(&format!("0x{:064x}", 0x12)).unwrap(),
+            Some(0x11)
+        );
+        assert_eq!(funds_in_block(&format!("0x{:064x}", 1)).unwrap(), Some(0));
+        // zero means there is no record
+        assert_eq!(funds_in_block(&format!("0x{:064x}", 0)).unwrap(), None);
+        // an address with no code has no records
+        assert_eq!(funds_in_block("0x").unwrap(), None);
+        // a revert means no record, another error is an error
+        let call_error = |error: &str| {
+            let mut server = mockito::Server::new();
+            let call = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJsonString(s!(
+                    r#"{"method":"eth_call"}"#
+                )))
+                .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"error":{error}}}"#))
+                .create();
+            let block = block_on(
+                EvmClient::new(&server.url()).funds_in_block(&contract, &lock_id, 7, 0x10),
+            );
+            call.assert();
+            block
+        };
+        assert_eq!(
+            call_error(r#"{"code":3,"message":"execution reverted"}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            call_error(r#"{"code":-32000,"message":"execution reverted: paused"}"#).unwrap(),
+            None
+        );
+        assert!(call_error(r#"{"code":-32000,"message":"missing trie node"}"#).is_err());
+        // a result that is not a single word is refused
+        assert!(funds_in_block(&format!("0x{:062x}", 1)).is_err());
+        assert!(funds_in_block(&format!("0x{:064x}{:064x}", 1, 0)).is_err());
+        // a block that does not fit in a u64 is refused
+        assert!(funds_in_block(&format!("0x{}1{}", "0".repeat(47), "0".repeat(16))).is_err());
+    }
+
+    #[test]
+    fn mint_lock_status() {
+        let contract = EvmAddress::default();
+        let lock_id = LockId::from([1u8; 32]);
+        // the status of the lock, with the given record as of the finalized block 0x20
+        let status = |record: u64, before_block: u64| {
+            let mut server = mockito::Server::new();
+            let _finalized = mock_finalized_block(&mut server, 0x20);
+            let call = mock_eth_call_hits(
+                &mut server,
+                0x20,
+                &funds_in_call(&lock_id, 7),
+                &format!("0x{record:064x}"),
+                1,
+            );
+            let status = block_on(EvmClient::new(&server.url()).mint_lock_status(
+                &contract,
+                &lock_id,
+                7,
+                before_block,
+            ))
+            .unwrap();
+            call.assert();
+            status
+        };
+
+        // a lock in block 0x11 confirms the mint only if that is before the block
+        assert_eq!(status(0x12, 0x12), MintLockStatus::Confirmed);
+        assert_eq!(status(0x12, 0x11), MintLockStatus::Expired);
+        // with no lock as of block 0x20, a lock can only be in block 0x21 or later
+        assert_eq!(status(0, 0x22), MintLockStatus::Pending);
+        assert_eq!(status(0, 0x21), MintLockStatus::Expired);
+        assert_eq!(status(0, 0x10), MintLockStatus::Expired);
+    }
+
+    #[test]
+    fn is_confirmed_reads_finalized_record() {
+        let location = BridgeLocation::Evm(EvmContract {
+            chain_id: 31337,
+            address: EvmAddress::default(),
+        });
+        let opid = OpId::from([0u8; 32]);
+        let witness_id = RgbTxid::from_byte_array([1u8; 32]);
+        let claim_in = |witness_id: RgbTxid, amount: u64, before_block: u64| Claim::Lock {
+            opid,
+            witness_id,
+            amount,
+            before_block,
+        };
+        let claim = |amount: u64, before_block: u64| claim_in(witness_id, amount, before_block);
+        let lock_id = LockId::with(opid, witness_id);
+        let other_witness_id = RgbTxid::from_byte_array([2u8; 32]);
+        let claims = [
+            claim(7, 0x30),
+            claim(8, 0x30),
+            claim_in(other_witness_id, 7, 0x30),
+            claim(7, 0x11),
+        ];
+        // the lock of 7 recorded in block 0x11, read as of the finalized block 0x20
+        let mut server = mockito::Server::new();
+        let chain_id = mock_rpc(
+            &mut server,
+            r#"{"method":"eth_chainId"}"#,
+            r#""result":"0x7a69""#,
+        );
+        let _finalized = mock_finalized_block(&mut server, 0x20);
+        let record = mock_eth_call_hits(
+            &mut server,
+            0x20,
+            &funds_in_call(&lock_id, 7),
+            &format!("0x{:064x}", 0x12),
+            2,
+        );
+        let no_record = mock_eth_call_hits(
+            &mut server,
+            0x20,
+            &funds_in_call(&lock_id, 8),
+            &format!("0x{:064x}", 0),
+            1,
+        );
+        let other_tx_no_record = mock_eth_call_hits(
+            &mut server,
+            0x20,
+            &funds_in_call(&LockId::with(opid, other_witness_id), 7),
+            &format!("0x{:064x}", 0),
+            1,
+        );
+        let client = EvmClient::new(&server.url());
+        let resolver = block_on(MintClaimResolver::fetch(&client, &location, &claims)).unwrap();
+        assert!(resolver.is_confirmed(&location, &claims[0]).unwrap());
+        // the record is keyed by the amount too
+        assert!(!resolver.is_confirmed(&location, &claims[1]).unwrap());
+        // and by the witness TX
+        assert!(!resolver.is_confirmed(&location, &claims[2]).unwrap());
+        // the lock must be in a block before the one the claim commits to
+        assert!(!resolver.is_confirmed(&location, &claims[3]).unwrap());
+        assert!(resolver.is_expired(&opid));
+        chain_id.assert();
+        record.assert();
+        no_record.assert();
+        other_tx_no_record.assert();
+        // a claim not fetched is an issue
+        assert!(matches!(
+            resolver.is_confirmed(&location, &claim(9, 0x30)),
+            Err(ClaimResolverError::ResolverIssue(_))
+        ));
+
+        // a node on another chain reads no record
+        let mut server = mockito::Server::new();
+        let _chain_id = mock_rpc(
+            &mut server,
+            r#"{"method":"eth_chainId"}"#,
+            r#""result":"0x1""#,
+        );
+        let no_call = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJsonString(s!(
+                r#"{"method":"eth_call"}"#
+            )))
+            .expect(0)
+            .create();
+        let client = EvmClient::new(&server.url());
+        let resolver = block_on(MintClaimResolver::fetch(&client, &location, &claims)).unwrap();
+        assert!(matches!(
+            CheckedClaimResolver::with(&resolver, location),
+            Err(ClaimResolverError::WrongChainId {
+                expected: 31337,
+                actual: 1
+            })
+        ));
+        no_call.assert();
     }
 }

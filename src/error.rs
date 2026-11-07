@@ -262,6 +262,14 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided external chain block, before which the lock of a mint has to be included,
+    /// leaves no block for it
+    #[error("Invalid before block: {details}")]
+    InvalidBeforeBlock {
+        /// Error details
+        details: String,
+    },
+
     /// Keys derived from the provided data do not match
     #[error("Invalid bitcoin keys")]
     InvalidBitcoinKeys,
@@ -329,9 +337,16 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided EVM chain configuration is invalid (see `OnlineOptions::evm_chains`)
+    #[error("Invalid EVM chain: {details}")]
+    InvalidEvmChain {
+        /// Error details
+        details: String,
+    },
+
     /// The provided EVM RPC URL is invalid, the endpoint cannot be reached or it does not serve
-    /// what confirming mint events needs (the latest finalized block and the logs of the whole
-    /// chain history)
+    /// what confirming mint locks needs (the latest finalized block and the contract state as of
+    /// it)
     #[error("Invalid EVM RPC URL: {details}")]
     InvalidEvmRpcUrl {
         /// Error details
@@ -492,25 +507,23 @@ pub enum Error {
     #[error("Cannot mint with the last mint right")]
     LastMintRight,
 
-    /// No confirmed mint event for the mint operation was found on the EVM chain (yet): it may
-    /// still be, e.g. once the lock is made or finalized
-    #[error("Mint event for operation {opid} not found on the EVM chain")]
-    MintEventNotFound {
+    /// The lock of the mint operation was not included on the external chain before the block the
+    /// mint commits to, and never will be: the mint will never be confirmed
+    #[error("Lock for mint operation {opid} not included before block {before_block}")]
+    MintLockExpired {
         /// ID of the mint operation
         opid: String,
+        /// External chain block the lock had to be included before
+        before_block: u64,
     },
 
-    /// No mint event for the mint operation was found within the blocks scanned for it after the
-    /// one the mint commits to, all of them finalized: the mint will never be confirmed
-    #[error(
-        "Mint event for operation {opid} not found within {max_scan_blocks} blocks from the one \
-         the mint commits to"
-    )]
-    MintEventOutOfScanWindow {
+    /// No confirmed mint lock committing to the mint operation and to the TX including it (see
+    /// [`ReceivedMint::lock_id`](crate::wallet::ReceivedMint::lock_id)) was found on the external
+    /// chain (yet): it may still be, e.g. once the lock is made or finalized
+    #[error("Lock for mint operation {opid} not found on the external chain")]
+    MintLockNotFound {
         /// ID of the mint operation
         opid: String,
-        /// Number of blocks scanned for the mint event
-        max_scan_blocks: u64,
     },
 
     /// The signed PSBT of a transfer is missing, so the transfer has failed
@@ -948,6 +961,24 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<ClaimResolverError> for Error {
+    fn from(e: ClaimResolverError) -> Self {
+        match e {
+            ClaimResolverError::WrongChainId { expected, actual } => {
+                Error::EvmChainIdMismatch { expected, actual }
+            }
+            ClaimResolverError::Unconfirmed(opid) => Error::MintLockNotFound {
+                opid: opid.to_string(),
+            },
+            ClaimResolverError::ResolverIssue(details) => Error::Network { details },
+            // only the claims the validation asks about are resolved
+            e @ ClaimResolverError::Validation(_) => Error::Internal {
+                details: format!("unexpected claim resolution error: {e}"),
+            },
+        }
+    }
+}
+
 impl From<InternalError> for Error {
     fn from(e: InternalError) -> Self {
         Error::Internal {
@@ -999,5 +1030,38 @@ mod tests {
                 details: s!("Stock err: AbsentValidWitness")
             }
         );
+    }
+
+    #[test]
+    fn claim_resolver_errors_map() {
+        let e: Error = ClaimResolverError::WrongChainId {
+            expected: 1,
+            actual: 2,
+        }
+        .into();
+        assert_eq!(
+            e,
+            Error::EvmChainIdMismatch {
+                expected: 1,
+                actual: 2
+            }
+        );
+        let opid = OpId::from([1u8; 32]);
+        let e: Error = ClaimResolverError::Unconfirmed(opid).into();
+        assert_eq!(
+            e,
+            Error::MintLockNotFound {
+                opid: opid.to_string()
+            }
+        );
+        let e: Error = ClaimResolverError::ResolverIssue(s!("down")).into();
+        assert_eq!(
+            e,
+            Error::Network {
+                details: s!("down")
+            }
+        );
+        let e: Error = ClaimResolverError::Validation(ValidationError::UnknownClaim).into();
+        assert!(matches!(e, Error::Internal { .. }));
     }
 }
