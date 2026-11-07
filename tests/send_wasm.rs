@@ -209,11 +209,16 @@ async fn begin_end() {
     wallet.backup("pw").unwrap();
     assert!(!wallet.backup_info().unwrap());
 
-    // a dry run saves nothing
-    let (res, _, txid) = begin(&mut wallet, &online, map.clone(), false, true).await;
+    // a dry run saves no transfer
+    let (res, dry_signed, txid) = begin(&mut wallet, &online, map.clone(), false, true).await;
     assert_eq!(res.batch_transfer_idx, None);
     assert!(sends(&wallet, &txid).is_empty());
     assert!(!wallet.backup_info().unwrap());
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    assert_eq!(
+        saved.send_btc_end(saved_online, dry_signed, true).await,
+        Err(Error::WrongOperation { txid: txid.clone() })
+    );
 
     // the operation expires at least the margin before the earliest invoice
     let early_rid = blind_rcv(

@@ -38,6 +38,14 @@ pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
     }
 }
 
+/// Load what the wallet saved in IndexedDB as a second wallet, with no flush.
+#[allow(dead_code)]
+pub async fn saved_wallet(wallet: &Wallet) -> (Wallet, Online) {
+    let mut saved = Wallet::restore(wallet.get_wallet_data()).await.unwrap();
+    let online = saved.go_online(go_online_options(true)).await.unwrap();
+    (saved, online)
+}
+
 #[allow(dead_code)]
 pub fn default_rcv_expiration() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64 + DURATION_RCV_TRANSFER
