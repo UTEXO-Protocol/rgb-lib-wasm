@@ -755,7 +755,7 @@ impl RgbRuntime {
         secret_seals: impl AsRef<[SecretSeal]>,
         opids: impl IntoIterator<Item = OpId>,
         witness_id: Option<RgbTxid>,
-    ) -> Result<(RgbTransfer, OpoutsDagData), Error> {
+    ) -> Result<(RgbTransfer, OpsDag), Error> {
         self.stock
             .transfer_with_dag(contract_id, outputs, secret_seals, opids, witness_id, None)
             .map(|(consignment, dag, _)| (consignment, dag))
@@ -783,10 +783,11 @@ impl RgbRuntime {
         contract_id: ContractId,
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
+        opids: impl IntoIterator<Item = OpId>,
         fascia: &Fascia,
-    ) -> Result<(RgbTransfer, OpoutsDagData), Error> {
+    ) -> Result<(RgbTransfer, OpsDag), Error> {
         self.stock
-            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, [], fascia, None)
+            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, opids, fascia, None)
             .map(|(consignment, dag, _)| (consignment, dag))
             .map_err(Error::from)
     }

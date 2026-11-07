@@ -704,13 +704,14 @@ impl<'a> MintAnchorResolver<'a> {
     pub(crate) async fn is_confirmed(
         &self,
         contract: &EvmAddress,
-        anchor: &ExternalAnchor,
+        claim: &Claim,
     ) -> Result<bool, Error> {
-        let ExternalAnchor::MintEvent {
+        let Claim::Lock {
             opid,
             amount,
-            after_block,
-        } = anchor;
+            before_block: after_block,
+            ..
+        } = claim;
         let terminal = self.terminal_opids.contains(opid);
         // finalized blocks cannot be reorged, so a scanned block is not scanned again
         let scanned_block = self
@@ -1375,10 +1376,11 @@ pub(crate) mod tests {
     #[test]
     fn bounded_resolver() {
         let opid = OpId::from([0u8; 32]);
-        let anchor = |after_block: u64| ExternalAnchor::MintEvent {
+        let anchor = |after_block: u64| Claim::Lock {
             opid,
+            witness_id: RgbTxid::from_byte_array([1u8; 32]),
             amount: 7,
-            after_block,
+            before_block: after_block,
         };
         let resolve = |server: &mockito::Server, after_block: u64| {
             let client = EvmClient::new(&server.url());
@@ -1435,10 +1437,11 @@ pub(crate) mod tests {
     fn mint_anchor_resolver_resumes_scan() {
         let opid = OpId::from([0u8; 32]);
         let terminal_opids = HashSet::from([opid]);
-        let anchor = ExternalAnchor::MintEvent {
+        let anchor = Claim::Lock {
             opid,
+            witness_id: RgbTxid::from_byte_array([1u8; 32]),
             amount: 7,
-            after_block: 16,
+            before_block: 16,
         };
         let resolve = |server: &mockito::Server, scanned_block: u64| {
             let client = EvmClient::new(&server.url());

@@ -61,9 +61,9 @@ pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_IFA: &str =
-    "rgb:sch:Y2a6SW4rY3gRwLE40OxILhwOyL2FR9ppte790oLbIe0#athena-paul-horizon";
+    "rgb:sch:A2n9kPNWtXUqwQJyXfY8yGHKyEPZgvrNYYYPGhXawOk#graph-salute-retro";
 pub(crate) const SCHEMA_ID_BFA: &str =
-    "rgb:sch:Ryl5eQZ3IHrU05e3AWdQZJR4FB5GvxZPy96cwhJiApc#amazon-norway-harris";
+    "rgb:sch:3I0xZVEQnQxYVk7vDnh5uNtQyUfsmThw6dX9n_Gvb5o#mama-swing-album";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct LocalAssetData {
@@ -1766,6 +1766,12 @@ impl Wallet {
         })
     }
 
+    fn _check_unicode_ticker(&self, ticker: String) -> Result<UnicodeTicker, Error> {
+        UnicodeTicker::try_from(ticker).map_err(|e| Error::InvalidTicker {
+            details: e.to_string(),
+        })
+    }
+
     fn _get_total_issue_amount(&self, amounts: &[u64], allow_empty: bool) -> Result<u64, Error> {
         if amounts.is_empty() && !allow_empty {
             return Err(Error::NoIssuanceAmounts);
@@ -2289,20 +2295,21 @@ impl Wallet {
         let created_at = now().unix_timestamp();
         let text = RicardianContract::default();
         let terms = self.new_asset_terms(text, None);
-        let spec = AssetSpec {
-            ticker: self._check_ticker(ticker.clone())?,
-            name: self._check_name(name.clone())?,
-            details: None,
-            precision: self._check_precision(precision)?,
-        };
+        let bfa_ticker = self._check_unicode_ticker(ticker.clone())?;
+        let bfa_name = self._check_name(name.clone())?;
+        let bfa_precision = self._check_precision(precision)?;
 
         let mut builder = ContractBuilder::with(
             Identity::default(),
             BridgedFungibleAsset::schema_rules(),
             self.chain_net(),
         )
-        .add_global_state("spec", spec.clone())
-        .expect("invalid spec")
+        .add_global_state("ticker", bfa_ticker)
+        .expect("invalid ticker")
+        .add_global_state("name", bfa_name)
+        .expect("invalid name")
+        .add_global_state("precision", bfa_precision)
+        .expect("invalid precision")
         .add_global_state("terms", terms)
         .expect("invalid terms")
         .add_global_state(
