@@ -245,7 +245,14 @@ async fn test_receive_and_transfers() {
 
     // Invoice: BFA assignments
     let bfa_invoice = |state: &str, name: Option<&str>| {
-        let mut invoice = format!("rgb:~/{BFA_SCHEMA_ID}/{state}/{}", recv.recipient_id);
+        // the invoice carries the schema ID without its prefix and mnemonic
+        let schema_id = rgb_lib_wasm::SchemaId::from(AssetSchema::Bfa).to_string();
+        let schema_id = schema_id
+            .trim_start_matches("rgb:sch:")
+            .split('#')
+            .next()
+            .unwrap();
+        let mut invoice = format!("rgb:~/{schema_id}/{state}/{}", recv.recipient_id);
         if let Some(name) = name {
             invoice.push_str(&format!("?assignment_name={name}"));
         }
@@ -273,7 +280,6 @@ async fn test_receive_and_transfers() {
 }
 
 /// The BFA schema ID as an invoice carries it
-const BFA_SCHEMA_ID: &str = "Ryl5eQZ3IHrU05e3AWdQZJR4FB5GvxZPy96cwhJiApc";
 /// The amount 100 as an invoice carries it
 const AMOUNT_100: &str = "BF";
 

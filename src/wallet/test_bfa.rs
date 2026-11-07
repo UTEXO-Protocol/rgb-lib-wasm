@@ -208,9 +208,19 @@ async fn bfa_issue_list_and_backup() {
         Err(Error::InvalidEvmContractAddress { .. })
     ));
 
+    let ticker = s("₿FA");
     let bfa = wallet
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 2, 2, CHAIN_ID, s(BRIDGE), None)
+        .issue_asset_bfa(
+            ticker.clone(),
+            s("Bridged"),
+            2,
+            2,
+            CHAIN_ID,
+            s(BRIDGE),
+            None,
+        )
         .unwrap();
+    assert_eq!(bfa.ticker, ticker);
     assert_eq!(bfa.initial_supply, 0);
     assert_eq!(bfa.balance.settled, 0);
     let listed = wallet.list_assets(vec![]).unwrap().bfa.unwrap();
@@ -238,6 +248,7 @@ async fn bfa_issue_list_and_backup() {
         .unwrap();
     assert_eq!(restored_bfa.len(), 1);
     assert_eq!(restored_bfa[0].asset_id, bfa.asset_id);
+    assert_eq!(restored_bfa[0].ticker, ticker);
     assert_eq!(mint_rights(&mut restored, &bfa.asset_id), 2);
 }
 
@@ -421,9 +432,9 @@ pub(super) async fn bfa_with_units(
 ) -> (String, OpId) {
     let bfa = wallet
         .issue_asset_bfa(
-            s("BFA"),
+            s("₿FA"),
             s("Bridged"),
-            0,
+            2,
             2,
             CHAIN_ID,
             s(bridge),
@@ -481,10 +492,13 @@ async fn bfa_send_receive_waits_for_funds_in() {
     assert_eq!((a_balance.settled, a_balance.spendable), (70, 70));
     let b_balance = b.get_asset_balance(asset_id.clone()).unwrap();
     assert_eq!((b_balance.settled, b_balance.spendable), (30, 30));
+    let b_bfa = b.list_assets(vec![]).unwrap().bfa.unwrap().remove(0);
+    assert_eq!(b_bfa.asset_id, asset_id);
     assert_eq!(
-        b.list_assets(vec![]).unwrap().bfa.unwrap()[0].asset_id,
-        asset_id
+        (b_bfa.ticker.as_str(), b_bfa.name.as_str(), b_bfa.precision),
+        ("₿FA", "Bridged", 2)
     );
+    assert_eq!(b_bfa.details, None);
 
     // a witness receive of the backed units
     let receive = witness_rcv(
