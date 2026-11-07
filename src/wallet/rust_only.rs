@@ -199,11 +199,8 @@ impl Wallet {
                 .map_err(InternalError::from)?;
         }
 
-        for (contract_id, transition) in all_transitions {
-            for opout in transition.inputs() {
-                psbt.set_rgb_contract_consumer(contract_id, opout, transition.id())
-                    .map_err(InternalError::from)?;
-            }
+        // pushing a transition also sets it as the consumer of all of its inputs
+        for transition in all_transitions.into_values() {
             psbt.push_rgb_transition(transition)
                 .map_err(InternalError::from)?;
         }
@@ -406,7 +403,6 @@ impl Wallet {
             }
             AssetSchema::Bfa => {
                 let contract = runtime.contract_wrapper::<BridgedFungibleAsset>(contract_id)?;
-                let spec = contract.spec();
                 let media_idx = if let Some(attachment) = contract.contract_terms().media {
                     Some(self.get_or_insert_media(
                         hex::encode(attachment.digest),
@@ -421,10 +417,10 @@ impl Wallet {
                     _ => None,
                 };
                 LocalAssetData {
-                    name: spec.name().to_string(),
-                    precision: spec.precision.into(),
-                    ticker: Some(spec.ticker().to_string()),
-                    details: spec.details().map(|d| d.to_string()),
+                    name: contract.name().to_string(),
+                    precision: contract.precision().into(),
+                    ticker: Some(contract.ticker().to_string()),
+                    details: contract.details().map(|d| d.to_string()),
                     media_idx,
                     initial_supply: 0,
                     max_supply: None,
@@ -612,11 +608,11 @@ pub fn validate_consignment_offchain(
             error: Some("resolver".to_string()),
             details: Some(e.to_string()),
         }),
-        Err(ValidationError::ExternalAnchorsPending(count)) => Ok(ValidateConsignmentResult {
+        Err(ValidationError::PendingClaims(count)) => Ok(ValidateConsignmentResult {
             valid: false,
             warnings: None,
             error: Some("external_anchors".to_string()),
-            details: Some(format!("{count} mint event(s) to check online")),
+            details: Some(format!("{count} mint claim(s) to check online")),
         }),
         Err(e) => Ok(ValidateConsignmentResult {
             valid: false,

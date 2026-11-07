@@ -52,9 +52,9 @@ pub use rgbstd::{
 };
 pub use rgbstd::{
     Opout,
-    containers::{AnchorResolverError, ResolveAnchor},
+    containers::{ClaimResolverError, LockId, ResolveClaim},
     stl::{BridgeLocation, EvmAddress, EvmContract},
-    validation::ExternalAnchor,
+    validation::Claim,
 };
 
 pub use crate::{
@@ -163,7 +163,7 @@ use rgbstd::{
     rgbcore::commit_verify::Conceal,
     stl::{
         AssetSpec, Attachment, BurnReason, ContractTerms, Details, MediaType, Name,
-        RejectListLocation, RejectListUrl, RicardianContract, Ticker,
+        RejectListLocation, RejectListUrl, RicardianContract, Ticker, UnicodeTicker,
     },
     txout::{BlindSeal, CloseMethod, ExplicitSeal},
     validation::{
@@ -176,9 +176,8 @@ use rgbstd::{
     Assign, AssignmentType, KnownTransition, OpId,
     containers::{Consignment, PendingConsignment, WitnessBundle},
     contract::SchemaWrapper,
-    daggy::Walker,
     txout::TxPtr,
-    validation::{OpoutsDagData, Validity, Warning},
+    validation::{OpsDag, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
 use schemata::{

@@ -2,13 +2,16 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
-use crate::wallet::{AssetFilter, Online, Outpoint, Transfer, Wallet, WalletData};
+use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbOutExt, RgbTransfer,
     TS_BURN, TransferKind, TransferStatus, wallet::rust_only::validate_consignment_offchain,
 };
 use amplify::confinement::{Confined, U32};
 use bdk_wallet::bitcoin::psbt::Psbt;
+use rgbstd::{KnownTransition, schema::TransitionType};
+use schemata::{TS_TRANSFER, TS_TRANSFER_INFLATION};
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use strict_encoding::StrictDeserialize;
 
@@ -50,6 +53,51 @@ fn burns(wallet: &Wallet, asset_id: &str) -> Vec<(TransferKind, Option<String>)>
         .into_iter()
         .filter(|t| t.kind == TransferKind::Burn)
         .map(|t| (t.kind, t.burn_reason))
+        .collect()
+}
+
+/// The known transitions of the bundle of `txid` in `consignment`.
+fn known_transitions<'c>(consignment: &'c RgbTransfer, txid: &str) -> Vec<&'c KnownTransition> {
+    consignment
+        .bundles
+        .iter()
+        .find(|wb| wb.tx.compute_txid().to_string() == txid)
+        .unwrap()
+        .bundle
+        .known_transitions
+        .iter()
+        .collect()
+}
+
+/// Check that the burn of `txid` spends only the split of a transfer in its bundle.
+fn assert_burn_split(consignment: &RgbTransfer, txid: &str) {
+    let transitions = known_transitions(consignment, txid);
+    let of_type = |ty: TransitionType| {
+        transitions
+            .iter()
+            .filter(|kt| kt.transition.transition_type == ty)
+            .collect::<Vec<_>>()
+    };
+    let (burns, transfers) = (of_type(TS_BURN), of_type(TS_TRANSFER));
+    assert_eq!((burns.len(), transfers.len()), (1, 1));
+    assert!(
+        burns[0]
+            .transition
+            .inputs
+            .iter()
+            .all(|i| i.op == transfers[0].opid)
+    );
+    assert_eq!(consignment.terminal_ops(), BTreeSet::from([burns[0].opid]));
+}
+
+fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment> {
+    wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .flat_map(|u| u.rgb_allocations)
+        .filter(|a| a.asset_id.as_deref() == Some(asset_id))
+        .map(|a| a.assignment)
         .collect()
 }
 
@@ -97,6 +145,7 @@ async fn ifa_burn_with_and_without_reason_settles() {
             .valid
     );
     let consignment = RgbTransfer::load(&bytes[..]).unwrap();
+    assert_burn_split(&consignment, &res.txid);
     let witness_bundle = consignment
         .bundles
         .iter()
@@ -108,13 +157,6 @@ async fn ifa_burn_with_and_without_reason_settles() {
             .input
             .iter()
             .all(|i| !i.witness.is_empty())
-    );
-    assert!(
-        witness_bundle
-            .bundle
-            .known_transitions
-            .iter()
-            .any(|kt| kt.transition.transition_type == TS_BURN)
     );
     assert!(bytes.windows(32).any(|w| w == [0xab; 32]));
     let unspents = wallet.list_unspents(None, false, true).unwrap();
@@ -218,6 +260,7 @@ async fn bfa_burn_settles_and_keeps_send_receive() {
         validate_consignment_offchain(bytes, &res.txid, BitcoinNetwork::Regtest).unwrap();
     assert!(!validated.valid);
     assert_eq!(validated.error.as_deref(), Some("external_anchors"));
+    assert_burn_split(&RgbTransfer::load(&bytes[..]).unwrap(), &res.txid);
 
     let begin = a
         .burn_begin(a_online.clone(), asset_id.clone(), 20, None, 1, 1, true)
@@ -418,4 +461,84 @@ async fn burn_begin_reserves_inputs_until_end_or_fail() {
     let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
     wallet.burn_end(online.clone(), signed).await.unwrap();
     assert!(wallet.get_reserved_outpoints().unwrap().is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn ifa_send_moves_inflation_rights() {
+    let (mut a, a_online, asset_id, _) = ifa(3).await;
+    let (mut b, b_online) =
+        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 2).await;
+    let send_to_b = async |a: &mut Wallet, b: &mut Wallet, assignments: Vec<Assignment>| {
+        let mut recipients = vec![];
+        for assignment in assignments {
+            let receive = blind_rcv(
+                b,
+                &b_online,
+                None,
+                Assignment::Any,
+                default_rcv_expiration(),
+                vec![transport_endpoint(PROXY_URL)],
+            )
+            .await
+            .unwrap();
+            recipients.push(Recipient {
+                assignment: assignment.clone(),
+                ..recipient(
+                    &receive.recipient_id,
+                    assignment.main_amount(),
+                    None,
+                    PROXY_URL,
+                )
+            });
+        }
+        let begin = a
+            .send_begin(
+                a_online.clone(),
+                HashMap::from([(asset_id.clone(), recipients)]),
+                false,
+                1,
+                1,
+                default_send_expiration(),
+                Some(transport_endpoint(PROXY_URL)),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let signed = a.sign_psbt(begin.psbt, None).unwrap();
+        let txid = a
+            .send_end(a_online.clone(), signed, false)
+            .await
+            .unwrap()
+            .txid;
+        let bytes = &a.transfer_artifacts[&txid].consignment_bytes[&asset_id];
+        let consignment = RgbTransfer::load(&bytes[..]).unwrap();
+        let mut types: Vec<_> = known_transitions(&consignment, &txid)
+            .iter()
+            .map(|kt| kt.transition.transition_type)
+            .collect();
+        types.sort();
+        settle_both(a, &a_online, b, &b_online).await;
+        types
+    };
+
+    // the transfer moves the asset, a transfer of inflation rights moves the rights
+    let types = send_to_b(
+        &mut a,
+        &mut b,
+        vec![Assignment::Fungible(66), Assignment::InflationRight(30)],
+    )
+    .await;
+    assert_eq!(types, vec![TS_TRANSFER_INFLATION, TS_TRANSFER]);
+    let b_assignments = assignments(&mut b, &asset_id);
+    assert!(b_assignments.contains(&Assignment::Fungible(66)));
+    assert!(b_assignments.contains(&Assignment::InflationRight(30)));
+    assert_eq!(balance(&a, &asset_id).0, 934);
+    assert!(assignments(&mut a, &asset_id).contains(&Assignment::InflationRight(70)));
+
+    // a send of rights only has no main transfer
+    let types = send_to_b(&mut a, &mut b, vec![Assignment::InflationRight(20)]).await;
+    assert_eq!(types, vec![TS_TRANSFER_INFLATION]);
+    assert_eq!(balance(&a, &asset_id).0, 934);
+    assert!(assignments(&mut b, &asset_id).contains(&Assignment::InflationRight(20)));
 }
