@@ -289,7 +289,13 @@ pub fn spy_rpc() {
                 } catch (e) {
                     method = null;
                 }
-                if (method === null) return orig();
+                if (method === null) {
+                    const reason = globalThis.__rgbBroadcastRejection;
+                    if (!reason || !url.endsWith('/tx')) return orig();
+                    const resp = new Response(reason, { status: 400 });
+                    Object.defineProperty(resp, 'url', { value: url });
+                    return resp;
+                }
                 globalThis.__rgbCalls.push({ url, method, params });
                 const hook = globalThis.__rgbHooks.find(
                     (h) => url.includes(h.url) && h.method === method,
@@ -355,9 +361,27 @@ pub fn rpc_fail(url_part: &str, method: &str) {
     );
 }
 
+/// Make the indexer reject TX broadcasts with `reason`, until [`clear_rpc_hooks`].
+#[allow(dead_code)]
+pub fn reject_broadcasts(reason: &str) {
+    spy_rpc();
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__rgbBroadcastRejection".into(),
+        &reason.into(),
+    )
+    .unwrap();
+}
+
 /// Remove the hooks and forget the calls seen so far.
 #[allow(dead_code)]
 pub fn clear_rpc_hooks() {
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__rgbBroadcastRejection".into(),
+        &JsValue::UNDEFINED,
+    )
+    .unwrap();
     if let Ok(hooks) = js_sys::Reflect::get(&js_sys::global(), &"__rgbHooks".into()) {
         if !hooks.is_undefined() {
             js_sys::Reflect::set(&hooks, &"length".into(), &0.into()).unwrap();

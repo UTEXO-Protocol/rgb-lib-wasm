@@ -8,10 +8,12 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::utils::script_buf_from_recipient_id;
-use rgb_lib_wasm::wallet::{DatabaseType, Online, Recipient, Wallet, WalletData};
+use rgb_lib_wasm::wallet::{
+    Balance, DatabaseType, Online, ReceiveData, Recipient, Wallet, WalletData,
+};
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, FileContent, RgbTransfer, RgbTxid, TransferKind,
-    TransferStatus, bitcoin::Amount, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, Error, FileContent, RgbTransfer, RgbTxid,
+    TransferKind, TransferStatus, bitcoin::Amount, generate_keys,
 };
 use utils::*;
 
@@ -457,4 +459,220 @@ async fn receive_refuses_history_witness_not_on_chain() {
             .is_empty(),
         "C must not import the asset"
     );
+}
+
+// Each refresh fails to post the ACK and leaves nothing behind, so the receive counts once when
+// the ACK goes through.
+#[wasm_bindgen_test]
+async fn ack_failure_no_duplicate_colorings() {
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet);
+    let (mut rcv, rcv_online) = sender().await;
+    let data = blind_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(66),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    let rid = data.recipient_id;
+    let idx = data.batch_transfer_idx;
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    begin_end(&mut wallet, &online, map, false, None).await;
+
+    clear_rpc_hooks();
+    rpc_fail(PROXY_URL, "ack.post");
+    for _ in 0..3 {
+        let res = rcv
+            .refresh(rcv_online.clone(), None, vec![], false)
+            .await
+            .unwrap();
+        assert!(matches!(res[&idx].failure, Some(Error::Proxy { .. })));
+        assert_eq!(res[&idx].updated_status, None);
+        assert_eq!(
+            transfer_of(&rcv, &rid).status,
+            TransferStatus::WaitingCounterparty
+        );
+    }
+    assert_eq!(rpc_count("consignment.get"), 1);
+
+    assert!(rcv.rgb_contract_ids().unwrap().is_empty());
+    assert!(matches!(
+        rcv.get_asset_balance(asset_id.clone()),
+        Err(Error::AssetNotFound { .. })
+    ));
+    assert!(
+        rcv.list_unspents(None, false, true)
+            .unwrap()
+            .iter()
+            .all(|u| u.rgb_allocations.is_empty())
+    );
+
+    clear_rpc_hooks();
+    let res = rcv
+        .refresh(rcv_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(res[&idx].failure, None);
+    assert_eq!(
+        res[&idx].updated_status,
+        Some(TransferStatus::WaitingConfirmations)
+    );
+    assert_eq!(rpc_count("consignment.get"), 0);
+    assert_eq!(
+        rcv.get_asset_balance(asset_id).unwrap(),
+        Balance {
+            settled: 0,
+            future: 66,
+            spendable: 0,
+        }
+    );
+
+    // A fail goes on after a fee rejection and keeps nothing of the receive.
+    let (mut wallet, online, asset_id, mut rcv, rcv_online, data) =
+        witness_receive_of_empty_recipient().await;
+    let rid = data.recipient_id;
+    let txid = donate_to(&mut wallet, &online, &asset_id, &mut rcv, &rcv_online, &rid).await;
+    reject_broadcasts("min relay fee not met");
+    let res = rcv
+        .fail_transfers(
+            rcv_online.clone(),
+            Some(data.batch_transfer_idx),
+            false,
+            false,
+        )
+        .await;
+    clear_rpc_hooks();
+    assert_eq!(res, Ok(true));
+    let transfer = transfer_of(&rcv, &rid);
+    assert_eq!(transfer.status, TransferStatus::Failed);
+    assert!(transfer.assignments.is_empty());
+    assert!(rcv.rgb_contract_ids().unwrap().is_empty());
+    assert_only_btc_received(&mut rcv, &txid);
+}
+
+// A sender with an asset and a recipient that has a witness receive and no colorable UTXO.
+async fn witness_receive_of_empty_recipient()
+-> (Wallet, Online, String, Wallet, Online, ReceiveData) {
+    let (wallet, online) = sender().await;
+    let asset_id = issue(&wallet);
+    let (mut rcv, rcv_online) = new_wallet().await;
+    // the vanilla funds make the wallet report the lack of allocation slots
+    fund_and_sync(&mut rcv, &rcv_online, "0.1").await;
+    let data = witness_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(66),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    (wallet, online, asset_id, rcv, rcv_online, data)
+}
+
+// The sender pays the receive with a donation, which it broadcasts at once.
+async fn donate_to(
+    wallet: &mut Wallet,
+    online: &Online,
+    asset_id: &str,
+    rcv: &mut Wallet,
+    rcv_online: &Online,
+    rid: &str,
+) -> String {
+    let map = HashMap::from([(
+        asset_id.to_string(),
+        vec![recipient(rid, 66, Some(2000), PROXY_URL)],
+    )]);
+    let (_, txid) = begin_end(wallet, online, map, true, None).await;
+    // esplora indexes the mempool with a delay
+    for _ in 0..60 {
+        rcv.sync(rcv_online.clone()).await.unwrap();
+        let unspents = rcv.list_unspents(None, false, true).unwrap();
+        if unspents.iter().any(|u| u.utxo.outpoint.txid == txid) {
+            return txid;
+        }
+        sleep_ms(500).await;
+    }
+    panic!("the wallet did not see the donation");
+}
+
+fn assert_only_btc_received(rcv: &mut Wallet, txid: &str) {
+    let unspents = rcv.list_unspents(None, false, true).unwrap();
+    let unspent = unspents
+        .iter()
+        .find(|u| u.utxo.outpoint.txid == txid)
+        .unwrap();
+    assert!(unspent.rgb_allocations.is_empty());
+    assert!(
+        rcv.list_assets(vec![])
+            .unwrap()
+            .nia
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+// A blind receive needs a colorable UTXO that is not flagged as pending witness.
+async fn blind_receive_result(rcv: &mut Wallet, online: &Online) -> Result<ReceiveData, Error> {
+    blind_rcv(
+        rcv,
+        online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+}
+
+#[wasm_bindgen_test]
+async fn witness_receive_cleanup_payment_after_fail() {
+    let (mut wallet, online, asset_id, mut rcv, rcv_online, data) =
+        witness_receive_of_empty_recipient().await;
+    let rid = data.recipient_id;
+    let idx = data.batch_transfer_idx;
+    assert_eq!(
+        rcv.fail_transfers(rcv_online.clone(), Some(idx), false, false)
+            .await,
+        Ok(true)
+    );
+
+    let txid = donate_to(&mut wallet, &online, &asset_id, &mut rcv, &rcv_online, &rid).await;
+
+    assert_only_btc_received(&mut rcv, &txid);
+    refresh(&mut rcv, &rcv_online).await;
+    assert_eq!(transfer_of(&rcv, &rid).status, TransferStatus::Failed);
+    blind_receive_result(&mut rcv, &rcv_online).await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn witness_receive_cleanup_payment_before_refusal() {
+    let (mut wallet, online, asset_id, mut rcv, rcv_online, data) =
+        witness_receive_of_empty_recipient().await;
+    let rid = data.recipient_id;
+
+    let txid = donate_to(&mut wallet, &online, &asset_id, &mut rcv, &rcv_online, &rid).await;
+    assert!(matches!(
+        blind_receive_result(&mut rcv, &rcv_online).await,
+        Err(Error::InsufficientAllocationSlots)
+    ));
+
+    rpc_hook(
+        PROXY_URL,
+        "consignment.get",
+        "const c = res.result.consignment; \
+         res.result.consignment = c.slice(0, -8) + (c.endsWith('AAAAAAAA') ? 'BBBBBBBB' : 'AAAAAAAA'); \
+         return res;",
+    );
+    refresh(&mut rcv, &rcv_online).await;
+    clear_rpc_hooks();
+
+    assert_eq!(transfer_of(&rcv, &rid).status, TransferStatus::Failed);
+    assert_only_btc_received(&mut rcv, &txid);
+    blind_receive_result(&mut rcv, &rcv_online).await.unwrap();
 }
