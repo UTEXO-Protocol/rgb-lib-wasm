@@ -115,13 +115,14 @@ use bdk_wallet::{
         secp256k1::Secp256k1,
     },
     chain::{CanonicalizationParams, ChainPosition},
-    descriptor::Segwitv0,
+    descriptor::{IntoWalletDescriptor, Segwitv0},
     keys::{
         DerivableKey, DescriptorKey,
         DescriptorKey::{Public, Secret},
         ExtendedKey, GeneratableKey,
         bip39::{Language, Mnemonic, WordCount},
     },
+    signer::SignersContainer,
 };
 #[cfg(feature = "esplora")]
 use bdk_wallet::{
@@ -184,13 +185,6 @@ use schemata::{
     BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN, TS_MINT,
 };
 use schemata::{BridgedFungibleAsset, InflatableFungibleAsset, NonInflatableAsset};
-use scrypt::{
-    Params, Scrypt,
-    password_hash::{
-        PasswordHasher, Salt, SaltString,
-        rand_core::{OsRng, RngCore},
-    },
-};
 use serde::de::{self, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(feature = "esplora")]
@@ -201,7 +195,6 @@ use strict_encoding::{
     DecodeError, DeserializeError, FieldName, StrictDeserialize, StrictSerialize,
 };
 use time::OffsetDateTime;
-use typenum::consts::U32;
 #[cfg(feature = "esplora")]
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 

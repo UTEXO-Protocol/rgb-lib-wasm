@@ -253,9 +253,12 @@ async fn test_persistence_across_reload() {
         .unwrap();
     assert_eq!(nia.balance.settled, 1000);
     let asset_id = nia.asset_id.clone();
+    let btc_balance = wallet.get_btc_balance(None, true).unwrap();
 
     // Reload
     let mut wallet = simulate_reload(wallet, &wd_a).await;
+    // No sync yet, so the balance comes from the BDK changeset only
+    assert_eq!(wallet.get_btc_balance(None, true).unwrap(), btc_balance);
     let online = wallet.go_online(go_online_options(true)).await.unwrap();
     wallet.sync(online.clone()).await.unwrap();
 
@@ -394,6 +397,7 @@ async fn test_persistence_across_reload() {
     .unwrap();
 
     // Backup
+    let btc_balance = wallet.get_btc_balance(None, true).unwrap();
     let password = "persist_test_pw";
     let backup_bytes = wallet.backup(password).unwrap();
     assert!(!backup_bytes.is_empty());
@@ -407,6 +411,11 @@ async fn test_persistence_across_reload() {
     fresh_wallet
         .restore_backup(&backup_bytes, password)
         .unwrap();
+    // No sync yet, so the balance comes from the BDK changeset only
+    assert_eq!(
+        fresh_wallet.get_btc_balance(None, true).unwrap(),
+        btc_balance
+    );
 
     // Verify restore worked in memory
     let transfers_after_restore = fresh_wallet

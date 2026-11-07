@@ -8,17 +8,18 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use bdk_wallet::bitcoin::hashes::{Hash as _, sha256::Hash as Sha256};
 use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1, SecretKey, SignOnly};
-use chacha20poly1305_010::{Key, KeyInit, XChaCha20Poly1305, aead::stream};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use hkdf::Hkdf;
 use prost::Message as ProstMessage; // trait (for .decode() etc.)
 use serde::{Deserialize, Serialize};
 use sha2::Sha256 as HkdfSha256;
 
 use crate::Error;
+use crate::encryption::chunk_nonce;
 use crate::error::InternalError;
 
 // --- Protobuf types (matching vss-server proto) ---
@@ -255,7 +256,7 @@ impl WasmVssClient {
 const BACKUP_BUFFER_LEN_ENCRYPT: usize = 239;
 const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
-/// 19-byte nonce for streaming XChaCha20Poly1305 (EncryptorBE32).
+/// 19-byte nonce prefix for chunked XChaCha20Poly1305.
 ///
 /// Public because external consumers of [`encrypt_data`]/[`decrypt_data`] (e.g. the
 /// rgb-lightning-node wasm-sdk VSS KV store) build [`VssEncryptionMetadata`] by hand
@@ -318,7 +319,7 @@ fn derive_encryption_key(
         .map_err(|e| Error::Internal {
             details: format!("HKDF expansion failed: {e}"),
         })?;
-    Ok(Key::clone_from_slice(&key_bytes))
+    Ok(key_bytes.into())
 }
 
 /// Encrypt `data` for VSS storage. `info` domain-separates the derived key via
@@ -334,33 +335,22 @@ pub fn encrypt_data(
     let key = derive_encryption_key(signing_key, metadata, info)?;
     let aead = XChaCha20Poly1305::new(&key);
     let nonce = metadata.nonce_bytes()?;
-    let nonce = chacha20poly1305_010::aead::generic_array::GenericArray::from_slice(&nonce);
 
-    let mut stream_encryptor = stream::EncryptorBE32::from_aead(aead, nonce);
+    let (chunks, last) = data.as_chunks::<BACKUP_BUFFER_LEN_ENCRYPT>();
     let mut encrypted = Vec::new();
-    let mut buffer = [0u8; BACKUP_BUFFER_LEN_ENCRYPT];
-    let mut reader = std::io::Cursor::new(data);
-
-    loop {
-        let read_count = reader.read(&mut buffer).map_err(|e| Error::Internal {
-            details: format!("Read error: {e}"),
-        })?;
-        if read_count == BACKUP_BUFFER_LEN_ENCRYPT {
-            let ciphertext = stream_encryptor
-                .encrypt_next(buffer.as_slice())
+    for (position, (chunk, is_last)) in chunks
+        .iter()
+        .map(|c| (c.as_slice(), false))
+        .chain([(last, true)])
+        .enumerate()
+    {
+        let chunk_nonce = XNonce::from(chunk_nonce(&nonce, position as u32, is_last));
+        encrypted.extend(
+            aead.encrypt(&chunk_nonce, chunk)
                 .map_err(|e| Error::Internal {
                     details: format!("Encryption error: {e}"),
-                })?;
-            encrypted.extend(ciphertext);
-        } else {
-            let ciphertext = stream_encryptor
-                .encrypt_last(&buffer[..read_count])
-                .map_err(|e| Error::Internal {
-                    details: format!("Encryption error: {e}"),
-                })?;
-            encrypted.extend(ciphertext);
-            break;
-        }
+                })?,
+        );
     }
     Ok(encrypted)
 }
@@ -376,35 +366,23 @@ pub fn decrypt_data(
     let key = derive_encryption_key(signing_key, metadata, info)?;
     let aead = XChaCha20Poly1305::new(&key);
     let nonce = metadata.nonce_bytes()?;
-    let nonce = chacha20poly1305_010::aead::generic_array::GenericArray::from_slice(&nonce);
 
-    let mut stream_decryptor = stream::DecryptorBE32::from_aead(aead, nonce);
+    let (chunks, last) = encrypted.as_chunks::<BACKUP_BUFFER_LEN_DECRYPT>();
+    let last = (!last.is_empty()).then_some((last, true));
     let mut decrypted = Vec::new();
-    let mut buffer = [0u8; BACKUP_BUFFER_LEN_DECRYPT];
-    let mut reader = std::io::Cursor::new(encrypted);
-
-    loop {
-        let read_count = reader.read(&mut buffer).map_err(|e| Error::Internal {
-            details: format!("Read error: {e}"),
-        })?;
-        if read_count == BACKUP_BUFFER_LEN_DECRYPT {
-            let cleartext = stream_decryptor
-                .decrypt_next(buffer.as_slice())
+    for (position, (chunk, is_last)) in chunks
+        .iter()
+        .map(|c| (c.as_slice(), false))
+        .chain(last)
+        .enumerate()
+    {
+        let chunk_nonce = XNonce::from(chunk_nonce(&nonce, position as u32, is_last));
+        decrypted.extend(
+            aead.decrypt(&chunk_nonce, chunk)
                 .map_err(|_| Error::VssError {
                     details: "Decryption failed: wrong signing key or corrupted data".to_string(),
-                })?;
-            decrypted.extend(cleartext);
-        } else if read_count == 0 {
-            break;
-        } else {
-            let cleartext = stream_decryptor
-                .decrypt_last(&buffer[..read_count])
-                .map_err(|_| Error::VssError {
-                    details: "Decryption failed: wrong signing key or corrupted data".to_string(),
-                })?;
-            decrypted.extend(cleartext);
-            break;
-        }
+                })?,
+        );
     }
     Ok(decrypted)
 }
@@ -695,9 +673,14 @@ mod tests {
             .collect();
         let key = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
+        let mut encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
         let decrypted = decrypt_data(&encrypted, &key, &metadata, None).unwrap();
         assert_eq!(decrypted, data);
+
+        // Each chunk has its own nonce, so swapped chunks fail.
+        let (first, rest) = encrypted.split_at_mut(BACKUP_BUFFER_LEN_DECRYPT);
+        first.swap_with_slice(&mut rest[..BACKUP_BUFFER_LEN_DECRYPT]);
+        assert!(decrypt_data(&encrypted, &key, &metadata, None).is_err());
     }
 
     #[test]

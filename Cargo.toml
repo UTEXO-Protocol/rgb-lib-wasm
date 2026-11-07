@@ -16,10 +16,10 @@ description = "RGB wallet library (WASM-only)"
 members = [".", "bindings/wasm"]
 
 [dependencies]
-base64 = { version = "0.22.1", default-features = false, features = [
+base64 = { version = "0.23.1", default-features = false, features = [
     "std",
 ] }
-bdk_wallet = { version = "=2.0.0", default-features = false, features = [
+bdk_wallet = { version = "=3.2.0", default-features = false, features = [
     "keys-bip39",
     "std",
 ] }
@@ -30,11 +30,6 @@ bdk_esplora = { version = "0.22.3", optional = true, default-features = false, f
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = [
     "alloc",
 ] }
-# VSS and backup need the AEAD stream API of chacha20poly1305 0.10
-chacha20poly1305_010 = { package = "chacha20poly1305", version = "0.10.1", default-features = false, features = [
-    "alloc",
-    "stream",
-] }
 ed25519-dalek = { version = "3", default-features = false }
 hkdf = { version = "0.13", default-features = false }
 hmac = { version = "0.13", default-features = false }
@@ -44,7 +39,6 @@ x25519-dalek = { version = "3", default-features = false, features = [
     "static_secrets",
 ] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
-generic-array = "=0.14.7"  # temporary pin while waiting for chacha20poly1305 update
 esplora-client = { version = "0.12", default-features = false, features = [
     "async-https",
 ] }
@@ -60,10 +54,7 @@ reqwest = { version = "0.13", optional = true, default-features = false, feature
 ] }
 rexie = "0.6"
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
-scrypt = { version = "0.11.0", default-features = false, features = [
-    "simple",
-    "std",
-] }
+scrypt = { version = "0.12.0", default-features = false, features = ["phc"] }
 serde = { version = "^1.0", default-features = false, features = [
     "derive",
 ] }
@@ -73,7 +64,6 @@ serde_json = { version = "^1.0", default-features = false, features = [
 slog = { version = "2.8.2", default-features = false }
 thiserror = { version = "2.0", default-features = false }
 time = { version = "0.3.55", default-features = false, features = ["macros", "formatting", "wasm-bindgen"] }
-typenum = { version = "1.19.0", default-features = false }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [

@@ -22,14 +22,13 @@ pub struct Keys {
 
 /// Generate a set of [`Keys`] for the given Bitcoin network.
 pub fn generate_keys(bitcoin_network: BitcoinNetwork) -> Keys {
-    let bdk_network = BdkNetwork::from(bitcoin_network);
     let mnemonic = Mnemonic::generate((WordCount::Words12, Language::English))
         .expect("to be able to generate a new mnemonic");
     let xkey: ExtendedKey = mnemonic
         .clone()
         .into_extended_key()
         .expect("a valid key should have been provided");
-    let xpub = &xkey.into_xpub(bdk_network, &Secp256k1::new());
+    let xpub = &xkey.into_xpub(bitcoin_network.into(), &Secp256k1::new());
     let mnemonic_str = mnemonic.to_string();
     let (account_xpub_vanilla, account_xpub_colored) =
         get_account_xpubs(bitcoin_network, &mnemonic_str).unwrap();
@@ -45,7 +44,6 @@ pub fn generate_keys(bitcoin_network: BitcoinNetwork) -> Keys {
 
 /// Recreate a set of [`Keys`] from the given mnemonic phrase.
 pub fn restore_keys(bitcoin_network: BitcoinNetwork, mnemonic: String) -> Result<Keys, Error> {
-    let bdk_network = BdkNetwork::from(bitcoin_network);
     let (account_xpub_vanilla, account_xpub_colored) =
         get_account_xpubs(bitcoin_network, &mnemonic)?;
     let mnemonic_parsed = Mnemonic::parse_in(Language::English, &mnemonic)?;
@@ -53,7 +51,7 @@ pub fn restore_keys(bitcoin_network: BitcoinNetwork, mnemonic: String) -> Result
         .clone()
         .into_extended_key()
         .expect("a valid key should have been provided");
-    let xpub = &xkey.into_xpub(bdk_network, &Secp256k1::new());
+    let xpub = &xkey.into_xpub(bitcoin_network.into(), &Secp256k1::new());
     let master_fingerprint = xpub.fingerprint().to_string();
     Ok(Keys {
         mnemonic,
