@@ -19,6 +19,8 @@ pub const PROXY_AUTH_URL: &str = "http://127.0.0.1:3020/json-rpc";
 pub const PROXY_AUTH_SEED: &str =
     "c01959890b0f215ff37637c58762a4eab0a2ec8be09c6a8436034c8f34b1c07e";
 pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
+#[allow(dead_code)]
+pub const EVM_RPC_URL: &str = "http://127.0.0.1:8545";
 
 #[allow(dead_code)]
 const DURATION_RCV_TRANSFER: u64 = 86400;
@@ -32,6 +34,7 @@ pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
         },
         skip_consistency_check,
         proxy_auth_keys: HashMap::new(),
+        evm_rpc_urls: HashMap::new(),
     }
 }
 

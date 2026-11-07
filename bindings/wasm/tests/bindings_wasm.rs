@@ -8,6 +8,10 @@ use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
 use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet};
 
 fn wallet() -> WasmWallet {
+    wallet_with_schemas(vec![AssetSchema::Nia])
+}
+
+fn wallet_with_schemas(supported_schemas: Vec<AssetSchema>) -> WasmWallet {
     let keys = generate_keys(BitcoinNetwork::Regtest);
     let wd = WalletData {
         data_dir: "/tmp/rgb_bindings_test".to_string(),
@@ -19,7 +23,7 @@ fn wallet() -> WasmWallet {
         mnemonic: Some(keys.mnemonic),
         master_fingerprint: keys.master_fingerprint,
         vanilla_keychain: None,
-        supported_schemas: vec![AssetSchema::Nia],
+        supported_schemas,
         reuse_addresses: false,
     };
     WasmWallet::new(&serde_json::to_string(&wd).unwrap()).unwrap()
@@ -138,7 +142,7 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
 
 #[wasm_bindgen_test]
 async fn go_online_reads_options_object() {
-    let wallet = wallet();
+    let wallet = wallet_with_schemas(vec![AssetSchema::Bfa]);
     let options = js_sys::JSON::parse(
         r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:1"}},"skipConsistencyCheck":true,
         "proxyAuthKeys":{"rpc://127.0.0.1:3000/json-rpc":"not hex"}}"#,
@@ -146,4 +150,21 @@ async fn go_online_reads_options_object() {
     .unwrap();
     let e = err(wallet.go_online(options).await.unwrap_err());
     assert!(e.starts_with("Invalid proxy authentication key"), "{e}");
+
+    let options = |chain_id: &str| {
+        js_sys::JSON::parse(&format!(
+            r#"{{"indexerConfig":{{"Esplora":{{"url":"http://127.0.0.1:8094/regtest/api"}}}},
+            "skipConsistencyCheck":true,"proxyAuthKeys":{{}},
+            "evmRpcUrls":{{"{chain_id}":"http://127.0.0.1:8545"}}}}"#
+        ))
+        .unwrap()
+    };
+    wallet.go_online(options("31337")).await.unwrap();
+    let e = err(wallet.go_online(options("1")).await.unwrap_err());
+    assert!(e.starts_with("EVM chain ID mismatch"), "{e}");
+}
+
+#[wasm_bindgen_test]
+fn get_received_mint_is_null_when_unknown() {
+    assert!(wallet().get_received_mint("unknown").unwrap().is_null());
 }

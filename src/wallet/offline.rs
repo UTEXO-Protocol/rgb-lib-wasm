@@ -37,7 +37,7 @@ pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
 #[cfg(feature = "esplora")]
 pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
 
-pub(crate) const NUM_KNOWN_SCHEMAS: usize = 2;
+pub(crate) const NUM_KNOWN_SCHEMAS: usize = 3;
 
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
@@ -48,7 +48,12 @@ const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
+pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
+pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
+pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
+pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
+pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
 #[cfg(feature = "esplora")]
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
@@ -57,6 +62,8 @@ pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
 pub(crate) const SCHEMA_ID_IFA: &str =
     "rgb:sch:Y2a6SW4rY3gRwLE40OxILhwOyL2FR9ppte790oLbIe0#athena-paul-horizon";
+pub(crate) const SCHEMA_ID_BFA: &str =
+    "rgb:sch:Ryl5eQZ3IHrU05e3AWdQZJR4FB5GvxZPy96cwhJiApc#amazon-norway-harris";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct LocalAssetData {
@@ -325,6 +332,80 @@ impl AssetIFA {
     }
 }
 
+/// A Bridged Fungible Asset.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct AssetBFA {
+    /// ID of the asset
+    pub asset_id: String,
+    /// Ticker of the asset
+    pub ticker: String,
+    /// Name of the asset
+    pub name: String,
+    /// Details of the asset
+    pub details: Option<String>,
+    /// Precision, also known as divisibility, of the asset
+    pub precision: u8,
+    /// Initial issued supply
+    pub initial_supply: u64,
+    /// Timestamp of asset genesis
+    pub timestamp: i64,
+    /// Timestamp of asset import
+    pub added_at: i64,
+    /// Current balance of the asset
+    pub balance: Balance,
+    /// Asset media attachment
+    pub media: Option<Media>,
+    /// Reject list URL
+    pub reject_list_url: Option<String>,
+}
+
+impl AssetBFA {
+    pub(crate) fn get_asset_details(
+        wallet: &Wallet,
+        asset: &DbAsset,
+        transfers: Option<Vec<DbTransfer>>,
+        asset_transfers: Option<Vec<DbAssetTransfer>>,
+        batch_transfers: Option<Vec<DbBatchTransfer>>,
+        colorings: Option<Vec<DbColoring>>,
+        txos: Option<Vec<DbTxo>>,
+        medias: Option<Vec<DbMedia>>,
+    ) -> Result<AssetBFA, Error> {
+        let media = {
+            let medias = if let Some(m) = medias {
+                m
+            } else {
+                wallet.database.iter_media()?
+            };
+            medias
+                .iter()
+                .find(|m| Some(m.idx) == asset.media_idx)
+                .map(|m| Media::from_db_media(m, wallet.get_media_dir()))
+        };
+        let balance = wallet.database.get_asset_balance(
+            asset.id.clone(),
+            transfers,
+            asset_transfers,
+            batch_transfers,
+            colorings,
+            txos,
+        )?;
+        Ok(AssetBFA {
+            asset_id: asset.id.clone(),
+            ticker: asset.ticker.clone().unwrap(),
+            name: asset.name.clone(),
+            details: asset.details.clone(),
+            precision: asset.precision,
+            initial_supply: asset.initial_supply.parse::<u64>().unwrap(),
+            timestamp: asset.timestamp,
+            added_at: asset.added_at,
+            balance,
+            media,
+            reject_list_url: asset.reject_list_url.clone(),
+        })
+    }
+}
+
 /// List of RGB assets, grouped by asset schema.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -333,6 +414,8 @@ pub struct Assets {
     pub nia: Option<Vec<AssetNIA>>,
     /// List of IFA assets
     pub ifa: Option<Vec<AssetIFA>>,
+    /// List of BFA assets
+    pub bfa: Option<Vec<AssetBFA>>,
 }
 
 /// A balance.
@@ -569,6 +652,21 @@ impl Invoice {
                     }
                 }
             }
+            Some(AssetSchema::Bfa) => {
+                match (decoded.assignment_state, assignment_name.as_deref()) {
+                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
+                        Assignment::Fungible(v.value())
+                    }
+                    (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
+                    (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
+                    (None, None) => Assignment::Any,
+                    (_, _) => {
+                        return Err(Error::InvalidInvoice {
+                            details: s!("invalid assignment"),
+                        });
+                    }
+                }
+            }
         };
         let recipient_id = decoded.beneficiary.to_string();
         let transport_endpoints: Vec<String> =
@@ -724,6 +822,23 @@ pub struct Recipient {
     pub expiration_timestamp: Option<u64>,
 }
 
+/// A mint received by the wallet, as checked by it: what its sender has to lock on the external
+/// chain for the mint to complete.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct ReceivedMint {
+    /// ID of the mint operation, which the lock has to commit to
+    pub opid: String,
+    /// Amount minted, which the lock has to match
+    pub amount: u64,
+    /// External chain block the lock has to follow
+    pub after_block: u64,
+    /// EIP-155 chain ID of the EVM chain the asset's bridge contract lives on
+    pub evm_chain_id: u64,
+    /// Address of the asset's bridge contract, where the lock has to be made
+    pub bridge_contract: String,
+}
+
 /// The information needed to receive RGB assets in witness mode.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -863,6 +978,8 @@ pub struct Transfer {
     pub invoice_string: Option<String>,
     /// Consignment path
     pub consignment_path: Option<String>,
+    /// Hex-encoded 32-byte reason of a burn transfer, if any
+    pub burn_reason: Option<String>,
 }
 
 impl Transfer {
@@ -890,6 +1007,7 @@ impl Transfer {
             sender_transport_endpoint,
             invoice_string: x.invoice_string.clone(),
             consignment_path: td.consignment_path,
+            burn_reason: x.burn_reason.clone(),
         }
     }
 }
@@ -932,6 +1050,10 @@ pub enum TransferKind {
     Send,
     /// An inflation transfer
     Inflation,
+    /// A burn transfer
+    Burn,
+    /// A mint transfer
+    Mint,
 }
 
 /// A wallet unspent.
@@ -1065,8 +1187,6 @@ pub struct Wallet {
     /// Pinned derivation index per keychain for address reuse.
     pub(crate) reuse_address_index: HashMap<KeychainKind, u32>,
     #[cfg(feature = "esplora")]
-    pub(crate) wasm_proxy_client: crate::api::proxy::WasmProxyClient,
-    #[cfg(feature = "esplora")]
     pub(crate) online_data: Option<OnlineData>,
     /// In-memory storage for transfer artifacts (replaces filesystem on wasm32).
     /// Key: txid
@@ -1082,6 +1202,10 @@ pub struct Wallet {
     /// Signed TX released by the sender proxy. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
+    /// Received mints, as checked, keyed by recipient_id
+    pub(crate) received_mints: HashMap<String, ReceivedMint>,
+    /// Last finalized EVM block scanned for each terminal mint, keyed by recipient_id and opid
+    pub(crate) mint_scanned_blocks: HashMap<String, HashMap<String, u64>>,
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent in-memory RGB stock.
@@ -1188,10 +1312,13 @@ impl Wallet {
         if supported_schemas.is_empty() {
             return Err(Error::NoSupportedSchemas);
         }
-        if wdata.bitcoin_network == BitcoinNetwork::Mainnet
-            && supported_schemas.contains(&AssetSchema::Ifa)
-        {
-            return Err(Error::CannotUseIfaOnMainnet);
+        if wdata.bitcoin_network == BitcoinNetwork::Mainnet {
+            if supported_schemas.contains(&AssetSchema::Ifa) {
+                return Err(Error::CannotUseIfaOnMainnet);
+            }
+            if supported_schemas.contains(&AssetSchema::Bfa) {
+                return Err(Error::CannotUseBfaOnMainnet);
+            }
         }
         let mut runtime = load_rgb_runtime(wallet_dir.clone())?;
         let known_schemas = runtime.schemata()?;
@@ -1206,8 +1333,6 @@ impl Wallet {
 
         // RGB-LIB setup
         let database = crate::database::memory_db::InMemoryDb::new();
-        #[cfg(feature = "esplora")]
-        let wasm_proxy_client = crate::api::proxy::WasmProxyClient::new()?;
 
         info!(logger, "New wallet completed");
         Ok(Wallet {
@@ -1221,8 +1346,6 @@ impl Wallet {
             bdk_database,
             reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
-            wasm_proxy_client,
-            #[cfg(feature = "esplora")]
             online_data: None,
             #[cfg(feature = "esplora")]
             transfer_artifacts: HashMap::new(),
@@ -1232,6 +1355,8 @@ impl Wallet {
             received_consignment_meta: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
+            received_mints: HashMap::new(),
+            mint_scanned_blocks: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: {
@@ -1556,6 +1681,17 @@ impl Wallet {
         })
     }
 
+    fn _check_contract_address(&self, contract_address: String) -> Result<EvmAddress, Error> {
+        if !contract_address.starts_with("0x") {
+            return Err(Error::InvalidEvmContractAddress {
+                details: s!("address must start with 0x"),
+            });
+        }
+        EvmAddress::from_str(&contract_address).map_err(|e| Error::InvalidEvmContractAddress {
+            details: e.to_string(),
+        })
+    }
+
     fn _check_name(&self, name: String) -> Result<Name, Error> {
         Name::try_from(name).map_err(|e| Error::InvalidName {
             details: e.to_string(),
@@ -1566,6 +1702,19 @@ impl Wallet {
         Precision::try_from(precision).map_err(|_| Error::InvalidPrecision {
             details: s!("precision is too high"),
         })
+    }
+
+    pub(crate) fn check_burn_reason(&self, burn_reason: String) -> Result<BurnReason, Error> {
+        let bytes = hex::decode(burn_reason).map_err(|e| Error::InvalidBurnReason {
+            details: format!("not a hex string: {e}"),
+        })?;
+        let bytes: [u8; 32] =
+            bytes
+                .try_into()
+                .map_err(|bytes: Vec<u8>| Error::InvalidBurnReason {
+                    details: format!("expected 32 bytes, got {}", bytes.len()),
+                })?;
+        Ok(BurnReason::from(Bytes32::from(bytes)))
     }
 
     fn _check_reject_list_url(&self, opid_reject_url: String) -> Result<RejectListUrl, Error> {
@@ -2055,6 +2204,176 @@ impl Wallet {
         Ok(asset)
     }
 
+    /// Issue a new RGB BFA asset with the provided `ticker`, `name`, `precision` and
+    /// `mint_rights`, then return it.
+    ///
+    /// The asset is bridged from the bridge contract at `contract_address` on the EVM chain with
+    /// the given `chain_id`. The optional `reject_list_address` is a reject list contract on the
+    /// same chain.
+    ///
+    /// A BFA genesis issues no units. Each mint right goes on its own UTXO.
+    pub fn issue_asset_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+    ) -> Result<AssetBFA, Error> {
+        info!(
+            self.logger,
+            "Issuing BFA asset with ticker '{}' name '{}' precision '{}' mint rights '{}'...",
+            ticker,
+            name,
+            precision,
+            mint_rights,
+        );
+
+        let asset_schema = &AssetSchema::Bfa;
+
+        self.check_schema_support(asset_schema)?;
+
+        if mint_rights == 0 {
+            return Err(Error::NoMintRights);
+        }
+
+        let db_data = self.database.get_db_data(false)?;
+
+        let mut unspents: Vec<LocalUnspent> = self.database.get_rgb_allocations(
+            self.database.get_unspent_txos(db_data.txos.clone())?,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        unspents.retain(|u| {
+            !(u.rgb_allocations
+                .iter()
+                .any(|a| !a.incoming && a.status.waiting_counterparty()))
+        });
+
+        let created_at = now().unix_timestamp();
+        let text = RicardianContract::default();
+        let terms = self.new_asset_terms(text, None);
+        let spec = AssetSpec {
+            ticker: self._check_ticker(ticker.clone())?,
+            name: self._check_name(name.clone())?,
+            details: None,
+            precision: self._check_precision(precision)?,
+        };
+
+        let mut builder = ContractBuilder::with(
+            Identity::default(),
+            BridgedFungibleAsset::schema_rules(),
+            self.chain_net(),
+        )
+        .add_global_state("spec", spec.clone())
+        .expect("invalid spec")
+        .add_global_state("terms", terms)
+        .expect("invalid terms")
+        .add_global_state(
+            RGB_GLOBAL_BRIDGE_LOCATION,
+            BridgeLocation::Evm(EvmContract {
+                chain_id,
+                address: self._check_contract_address(contract_address)?,
+            }),
+        )
+        .expect("invalid bridgeLocation");
+        if let Some(reject_list_address) = reject_list_address {
+            builder = builder
+                .add_global_state(
+                    RGB_GLOBAL_REJECT_LIST,
+                    RejectListLocation::Evm(EvmContract {
+                        chain_id,
+                        address: self._check_contract_address(reject_list_address)?,
+                    }),
+                )
+                .expect("invalid rejectList");
+        }
+
+        let mut issue_utxos: Vec<DbTxo> = vec![];
+        let mut exclude_outpoints: Vec<Outpoint> = vec![];
+        for _ in 0..mint_rights {
+            let utxo = self.get_utxo(&exclude_outpoints, Some(&unspents), false, Some(0))?;
+            exclude_outpoints.push(utxo.outpoint());
+            issue_utxos.push(utxo.clone());
+
+            builder = builder
+                .add_rights(RGB_STATE_MINT_RIGHT, self.get_builder_seal(utxo))
+                .expect("invalid mintRight");
+        }
+        debug!(self.logger, "Assigning mint rights: {issue_utxos:?}");
+
+        let mut runtime = self.rgb_runtime()?;
+        let validated_contract = builder.issue_contract().expect("failure issuing contract");
+        let asset_id = validated_contract.contract_id().to_string();
+        runtime
+            .import_contract(validated_contract.clone(), &DumbResolver)
+            .expect("failure importing issued contract");
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
+
+        let asset_data = LocalAssetData {
+            name,
+            precision,
+            ticker: Some(ticker),
+            details: None,
+            media_idx: None,
+            initial_supply: 0,
+            max_supply: None,
+            known_circulating_supply: None,
+            reject_list_url: None,
+        };
+        let asset = self.add_asset_to_db(
+            asset_id.clone(),
+            asset_schema,
+            Some(created_at),
+            created_at,
+            asset_data,
+        )?;
+        let batch_transfer = DbBatchTransferActMod {
+            status: ActiveValue::Set(TransferStatus::Settled),
+            expiration: ActiveValue::Set(None),
+            created_at: ActiveValue::Set(created_at),
+            min_confirmations: ActiveValue::Set(0),
+            ..Default::default()
+        };
+        let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
+        let asset_transfer = DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(true),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            asset_id: ActiveValue::Set(Some(asset_id)),
+            ..Default::default()
+        };
+        let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
+        let transfer = DbTransferActMod {
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            incoming: ActiveValue::Set(true),
+            ..Default::default()
+        };
+        self.database.set_transfer(transfer)?;
+        for utxo in issue_utxos {
+            let db_coloring = DbColoringActMod {
+                txo_idx: ActiveValue::Set(utxo.idx),
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                r#type: ActiveValue::Set(ColoringType::Issue),
+                assignment: ActiveValue::Set(Assignment::MintRight),
+                ..Default::default()
+            };
+            self.database.set_coloring(db_coloring)?;
+        }
+
+        let asset = AssetBFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
+
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+
+        info!(self.logger, "Issue asset BFA completed");
+        Ok(asset)
+    }
+
     /// Finalize a PSBT, optionally providing BDK sign options to tweak the behavior of the
     /// finalizer.
     pub fn finalize_psbt(
@@ -2208,6 +2527,35 @@ impl Wallet {
         Ok(transfers_changed)
     }
 
+    /// Get the details of the mint received on the provided `recipient_id`, once the wallet has
+    /// checked it: what the lock on the external chain has to match for the mint to complete.
+    ///
+    /// Returns `None` if no mint checked by the wallet pays `recipient_id`, or if it failed.
+    pub fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, Error> {
+        info!(self.logger, "Getting received mint...");
+        // a failed receive has nothing left to lock for
+        let db_data = self.database.get_db_data(false)?;
+        let failed = db_data.transfers.iter().any(|t| {
+            t.recipient_id.as_deref() == Some(&recipient_id)
+                && db_data
+                    .asset_transfers
+                    .iter()
+                    .find(|at| at.idx == t.asset_transfer_idx)
+                    .and_then(|at| {
+                        db_data
+                            .batch_transfers
+                            .iter()
+                            .find(|bt| bt.idx == at.batch_transfer_idx)
+                    })
+                    .is_some_and(|bt| t.incoming && bt.status == TransferStatus::Failed)
+        });
+        info!(self.logger, "Get received mint completed");
+        if failed {
+            return Ok(None);
+        }
+        Ok(self.received_mints.get(&recipient_id).cloned())
+    }
+
     /// Return the [`Metadata`] of the RGB asset with the given ID.
     pub fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, Error> {
         info!(self.logger, "Getting metadata for asset '{}'...", asset_id);
@@ -2294,6 +2642,7 @@ impl Wallet {
         let assets = self.database.iter_assets()?;
         let mut nia = None;
         let mut ifa = None;
+        let mut bfa = None;
         for schema in filter_asset_schemas {
             match schema {
                 AssetSchema::Nia => {
@@ -2336,11 +2685,31 @@ impl Wallet {
                             .collect::<Result<Vec<AssetIFA>, Error>>()?,
                     );
                 }
+                AssetSchema::Bfa => {
+                    bfa = Some(
+                        assets
+                            .iter()
+                            .filter(|a| a.schema == schema)
+                            .map(|a| {
+                                AssetBFA::get_asset_details(
+                                    self,
+                                    a,
+                                    transfers.clone(),
+                                    asset_transfers.clone(),
+                                    batch_transfers.clone(),
+                                    colorings.clone(),
+                                    txos.clone(),
+                                    medias.clone(),
+                                )
+                            })
+                            .collect::<Result<Vec<AssetBFA>, Error>>()?,
+                    );
+                }
             }
         }
 
         info!(self.logger, "List assets completed");
-        Ok(Assets { nia, ifa })
+        Ok(Assets { nia, ifa, bfa })
     }
 
     pub(crate) fn sync_if_requested(
@@ -2468,6 +2837,11 @@ impl Wallet {
                     RecipientTypeFull::Witness { .. } => TransferKind::ReceiveWitness,
                 }
             }
+        } else if asset_transfer.transition_type == Some(TypeOfTransition::Mint) {
+            TransferKind::Mint
+        } else if transfer.recipient_id.is_none() {
+            // a burn is the only outgoing transfer without a recipient
+            TransferKind::Burn
         } else if filtered_coloring.clone().count() > 0
             && filtered_coloring
                 .clone()
@@ -2507,7 +2881,10 @@ impl Wallet {
         };
         let change_utxo = match kind {
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => None,
-            TransferKind::Send | TransferKind::Inflation => {
+            TransferKind::Send
+            | TransferKind::Inflation
+            | TransferKind::Burn
+            | TransferKind::Mint => {
                 let change_txo_idx: Vec<i32> = filtered_coloring
                     .filter(|c| c.r#type == ColoringType::Change)
                     .map(|c| c.txo_idx)
@@ -2524,12 +2901,16 @@ impl Wallet {
         };
 
         let consignment_path = match (&kind, batch_transfer.status) {
-            (TransferKind::Send | TransferKind::Inflation, _) => {
-                Some(self.get_send_consignment_path(
-                    &asset_transfer.asset_id.clone().unwrap(),
-                    &batch_transfer.txid.clone().unwrap(),
-                ))
-            }
+            (
+                TransferKind::Send
+                | TransferKind::Inflation
+                | TransferKind::Burn
+                | TransferKind::Mint,
+                _,
+            ) => Some(self.get_send_consignment_path(
+                &asset_transfer.asset_id.clone().unwrap(),
+                &batch_transfer.txid.clone().unwrap(),
+            )),
             (
                 TransferKind::ReceiveBlind | TransferKind::ReceiveWitness,
                 TransferStatus::WaitingCounterparty,
@@ -2830,7 +3211,7 @@ impl Wallet {
             let detected_assignment = match (&assignment, schema) {
                 (
                     Assignment::Fungible(amt),
-                    Some(AssetSchema::Nia) | Some(AssetSchema::Ifa) | None,
+                    Some(AssetSchema::Nia) | Some(AssetSchema::Ifa) | Some(AssetSchema::Bfa) | None,
                 ) => {
                     invoice_builder = invoice_builder.set_amount_raw(*amt);
                     invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_ASSET_OWNER);
@@ -3307,6 +3688,8 @@ impl Wallet {
             received_consignments: self.received_consignments.clone(),
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
+            received_mints: self.received_mints.clone(),
+            mint_scanned_blocks: self.mint_scanned_blocks.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
         })
@@ -3430,6 +3813,8 @@ impl Wallet {
         self.received_consignments = snapshot.received_consignments;
         self.received_consignment_meta = snapshot.received_consignment_meta;
         self.received_signed_txs = snapshot.received_signed_txs;
+        self.received_mints = snapshot.received_mints;
+        self.mint_scanned_blocks = snapshot.mint_scanned_blocks;
 
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
@@ -3503,8 +3888,6 @@ pub(crate) mod address_reuse_tests {
             bdk_database,
             reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
-            wasm_proxy_client: crate::api::proxy::WasmProxyClient::new().unwrap(),
-            #[cfg(feature = "esplora")]
             online_data: None,
             #[cfg(feature = "esplora")]
             transfer_artifacts: HashMap::new(),
@@ -3514,6 +3897,8 @@ pub(crate) mod address_reuse_tests {
             received_consignment_meta: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
+            received_mints: HashMap::new(),
+            mint_scanned_blocks: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),

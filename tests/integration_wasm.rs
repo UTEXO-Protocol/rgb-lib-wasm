@@ -6,6 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
+use psrgbt::RgbOutExt;
 use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
 };
@@ -762,12 +763,19 @@ async fn test_full_wallet_flow() {
         .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
         .await
         .unwrap();
+    let inflate_entropy = Psbt::from_str(&unsigned_inflate)
+        .unwrap()
+        .outputs
+        .iter()
+        .find_map(|o| o.mpc_entropy())
+        .unwrap();
     let signed_inflate = wallet.sign_psbt(unsigned_inflate, None).unwrap();
     let inflate_result = wallet
         .inflate_end(online.clone(), signed_inflate)
         .await
         .unwrap();
     assert!(!inflate_result.txid.is_empty());
+    assert_eq!(inflate_result.entropy, inflate_entropy);
     let inflation = wallet
         .list_transfers(
             AssetFilter::Id(ifa.asset_id.clone()),
@@ -797,6 +805,10 @@ async fn test_full_wallet_flow() {
             || ifa_after.balance.spendable > ifa_balance_before,
         "IFA balance should increase after inflation, got: {:?}",
         ifa_after.balance,
+    );
+    assert_eq!(
+        ifa_after.known_circulating_supply,
+        ifa.known_circulating_supply + 500
     );
 
     // Two-wallet IFA send: wallet A → wallet B via a blank blinded invoice.

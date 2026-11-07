@@ -43,6 +43,8 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_consignment_meta:
         std::collections::HashMap<String, super::ReceivedConsignmentMeta>,
     pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
+    /// Received mints, keyed by recipient_id.
+    pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -183,6 +185,8 @@ impl super::Wallet {
             received_consignments: payload.received_consignments,
             received_consignment_meta: payload.received_consignment_meta,
             received_signed_txs: payload.received_signed_txs,
+            received_mints: payload.received_mints,
+            mint_scanned_blocks: Default::default(),
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
         };
@@ -311,6 +315,7 @@ impl super::Wallet {
             received_consignments: self.received_consignments.clone(),
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
+            received_mints: self.received_mints.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())

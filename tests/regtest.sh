@@ -3,7 +3,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE="docker compose -p rgb-lib-wasm -f $SCRIPT_DIR/docker-compose.ci.yml"
-SERVICES="bitcoind esplora proxy proxy-b proxy-auth regtest-helper vss-postgres vss-server vss-cors-proxy"
+SERVICES="bitcoind esplora proxy proxy-b proxy-auth anvil regtest-helper vss-postgres vss-server vss-cors-proxy"
 
 case "$1" in
     start)
@@ -68,6 +68,7 @@ case "$1" in
         echo "  RGB proxy:       http://127.0.0.1:3000/json-rpc"
         echo "  RGB proxy B:     http://127.0.0.1:3010/json-rpc"
         echo "  RGB proxy auth:  http://127.0.0.1:3020/json-rpc"
+        echo "  anvil:           http://127.0.0.1:8545"
         echo "  regtest-helper:  http://127.0.0.1:8080"
         echo "  VSS server:      http://127.0.0.1:8081 (direct), http://127.0.0.1:8082 (CORS proxy)"
         ;;
