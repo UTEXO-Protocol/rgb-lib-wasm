@@ -19,14 +19,6 @@ pub(crate) const MIN_FEE_RATE: u64 = 1;
 // how long an operation with no expiration of its own (an inflation) keeps its inputs reserved
 pub(crate) const DURATION_SEND_TRANSFER: i64 = 3600;
 
-/// Minimum time, in seconds, the recipient's invoice must have left when a mint begins, to leave
-/// time for the lock on the external chain
-pub(crate) const MIN_MINT_LOCK_WINDOW_SECS: u32 = 3600;
-/// How much older, in seconds, than the invoice the block a received mint commits to can be
-pub(crate) const MINT_AFTER_BLOCK_GRACE_SECS: i64 = 3600;
-/// How long, in seconds, past its deadline a mint whose lock was included by then is waited for
-pub(crate) const MINT_FINALITY_GRACE_SECS: i64 = 86400;
-
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
@@ -291,8 +283,23 @@ pub(crate) struct InfoAssetTransfer {
     assignments_spent: TxoAssignments,
     main_transition: TypeOfTransition,
     burn_reason: Option<BurnReason>,
-    /// External chain block a mint commits to
-    after_block: Option<u64>,
+    /// External chain block the lock of a mint has to be included before
+    before_block: Option<u64>,
+}
+
+/// The outcome of [`Wallet::_resolve_claims`].
+enum ClaimsResolution {
+    /// The consignment has no claims to resolve
+    NoClaims,
+    /// No usable EVM RPC endpoint for the chain of the bridge: retry later
+    Retry,
+    /// The claims were resolved, except the `unconfirmed` ones
+    Resolved {
+        evm_client: EvmClient,
+        chain_id: u64,
+        address: EvmAddress,
+        unconfirmed: Vec<OpId>,
+    },
 }
 
 /// In-memory storage for transfer artifacts (replaces filesystem directories).
@@ -836,22 +843,49 @@ pub struct OnlineOptions {
     /// The keys stay in memory. Going online again replaces them.
     /// `refresh` uses these keys, so keep a correct key for every endpoint a pending transfer needs.
     pub proxy_auth_keys: HashMap<String, String>,
-    /// RPC URL of an EVM node per EIP-155 chain ID, for BFA operations.
+    /// EVM chains to be used for mint operations on bridged assets, by their EIP-155 chain ID.
     ///
-    /// When the wallet supports BFA, each URL must be on its chain and serve the latest finalized
-    /// block and the logs of the whole chain history. Else [`Error::InvalidEvmRpcUrl`] is
-    /// returned: nodes with only the logs of recent blocks are not supported.
-    #[serde(default, deserialize_with = "deserialize_evm_rpc_urls")]
-    pub evm_rpc_urls: HashMap<u64, String>,
+    /// Minting a bridged asset, or receiving a mint of it, needs its chain here. Else
+    /// [`Error::NoEvmRpcUrl`] is returned. Going online checks that each endpoint is on its chain
+    /// and serves the latest finalized block and the contract state at it. Else
+    /// [`Error::InvalidEvmRpcUrl`] is returned. It also checks the mint lock blocks of each chain
+    /// ([`Error::InvalidEvmChain`]).
+    ///
+    /// Only used when the wallet supports the [`AssetSchema::Bfa`] schema.
+    #[serde(default, deserialize_with = "deserialize_evm_chains")]
+    pub evm_chains: HashMap<u64, EvmChain>,
 }
 
-/// Read the chain IDs of [`OnlineOptions::evm_rpc_urls`] from object keys, which are strings.
-fn deserialize_evm_rpc_urls<'de, D: Deserializer<'de>>(
+/// An EVM chain mint operations use, see [`OnlineOptions::evm_chains`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct EvmChain {
+    /// URL of the EVM JSON-RPC endpoint connected to the chain.
+    ///
+    /// The wallet trusts this endpoint to report locks and reject lists faithfully. A false
+    /// report makes it refuse a valid mint or accept an invalid one. Use an endpoint you trust.
+    pub rpc_url: String,
+    /// Minimum number of blocks after the latest block that the `before_block` of a mint must be
+    /// (see [`Wallet::mint_begin`]). It leaves time for the lock. Received mints skip this check.
+    ///
+    /// A value below 2 acts as 2. It must be at most
+    /// [`max_mint_lock_blocks`](EvmChain::max_mint_lock_blocks), else going online fails with
+    /// [`Error::InvalidEvmChain`].
+    pub min_mint_lock_blocks: u64,
+    /// Maximum number of blocks after the latest block that the `before_block` of a mint can be.
+    ///
+    /// A received mint further than this is refused, unless its lock is already recorded. Minting
+    /// refuses it too (see [`Wallet::mint_begin`]). A value below 2 refuses every mint.
+    pub max_mint_lock_blocks: u64,
+}
+
+/// Read the chain IDs of [`OnlineOptions::evm_chains`] from object keys, which are strings.
+fn deserialize_evm_chains<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<HashMap<u64, String>, D::Error> {
-    HashMap::<String, String>::deserialize(deserializer)?
+) -> Result<HashMap<u64, EvmChain>, D::Error> {
+    HashMap::<String, EvmChain>::deserialize(deserializer)?
         .into_iter()
-        .map(|(chain_id, url)| Ok((chain_id.parse().map_err(de::Error::custom)?, url)))
+        .map(|(chain_id, chain)| Ok((chain_id.parse().map_err(de::Error::custom)?, chain)))
         .collect()
 }
 
@@ -905,8 +939,8 @@ pub(crate) struct OnlineData {
     pub(crate) indexer_url: String,
     indexer: Indexer,
     pub(crate) proxy_auth_keys: HashMap<String, [u8; 32]>,
-    // EVM RPC URLs by chain ID, checked when going online
-    evm_rpc_urls: HashMap<u64, String>,
+    // EVM chains by chain ID, checked when going online
+    evm_chains: HashMap<u64, EvmChain>,
 }
 
 impl OnlineData {
@@ -931,7 +965,7 @@ impl OnlineData {
             indexer_url: indexer_url.to_string(),
             indexer: crate::utils::build_indexer(indexer_url).unwrap(),
             proxy_auth_keys: HashMap::new(),
-            evm_rpc_urls: HashMap::new(),
+            evm_chains: HashMap::new(),
         }
     }
 }
@@ -1981,7 +2015,7 @@ impl Wallet {
                 // a test mint, with no invoice, pays outputs of the wallet like an inflation
                 #[cfg(test)]
                 let own_outputs = transfer_info.main_transition == TypeOfTransition::Mint
-                    && recipient.invoice_expiration.is_none();
+                    && recipient.transport_endpoints.is_empty();
                 #[cfg(not(test))]
                 let own_outputs = false;
                 let recipient_type = if own_outputs
@@ -2263,7 +2297,7 @@ impl Wallet {
             indexer_url,
             indexer,
             proxy_auth_keys,
-            evm_rpc_urls: HashMap::new(),
+            evm_chains: HashMap::new(),
         };
         Ok((online, online_data))
     }
@@ -2273,10 +2307,20 @@ impl Wallet {
     /// See [`OnlineOptions`] for details on the available options.
     pub async fn go_online(&mut self, online_options: OnlineOptions) -> Result<Online, Error> {
         info!(self.logger, "Going online...");
-        let mut evm_rpc_urls = online_options.evm_rpc_urls.clone();
+        let mut evm_chains = online_options.evm_chains.clone();
         if self.supports_schema(&AssetSchema::Bfa) {
-            for (chain_id, evm_rpc_url) in &evm_rpc_urls {
-                let evm_client = EvmClient::new(evm_rpc_url);
+            for (chain_id, evm_chain) in &evm_chains {
+                // with a higher minimum than maximum, no block could be committed to when minting
+                if evm_chain.min_mint_lock_blocks > evm_chain.max_mint_lock_blocks {
+                    return Err(Error::InvalidEvmChain {
+                        details: format!(
+                            "chain ID {chain_id}: min_mint_lock_blocks ({}) is greater than \
+                             max_mint_lock_blocks ({})",
+                            evm_chain.min_mint_lock_blocks, evm_chain.max_mint_lock_blocks
+                        ),
+                    });
+                }
+                let evm_client = EvmClient::new(&evm_chain.rpc_url);
                 let actual = evm_client
                     .chain_id()
                     .await
@@ -2292,7 +2336,7 @@ impl Wallet {
                 evm_client.check_mint_support().await?;
             }
         } else {
-            evm_rpc_urls.clear();
+            evm_chains.clear();
         }
         let online = if let Some(online_data) = &self.online_data {
             let online = Online {
@@ -2311,7 +2355,7 @@ impl Wallet {
                     indexer_config: _,         // unchanged here
                     skip_consistency_check: _, // no effect
                     proxy_auth_keys,
-                    evm_rpc_urls: _, // set below
+                    evm_chains: _, // set below
                 } = &online_options;
                 let proxy_auth_keys = parse_proxy_auth_keys(proxy_auth_keys)?;
                 self.online_data.as_mut().unwrap().proxy_auth_keys = proxy_auth_keys;
@@ -2322,7 +2366,7 @@ impl Wallet {
             self.online_data = Some(online_data);
             online
         };
-        self.online_data.as_mut().unwrap().evm_rpc_urls = evm_rpc_urls;
+        self.online_data.as_mut().unwrap().evm_chains = evm_chains;
         info!(self.logger, "Go online completed");
         Ok(online)
     }
@@ -2887,7 +2931,7 @@ impl Wallet {
                 }
             }
             if transfer_info.main_transition == TypeOfTransition::Mint {
-                let after_block = transfer_info.after_block.ok_or(Error::Internal {
+                let before_block = transfer_info.before_block.ok_or(Error::Internal {
                     details: s!("mint transfer is missing the external chain block"),
                 })?;
                 let minted: u64 = transfer_info
@@ -2899,7 +2943,7 @@ impl Wallet {
                 asset_transition_builder = asset_transition_builder
                     .add_global_state(RGB_GLOBAL_ISSUED_SUPPLY, Amount::from(minted))
                     .unwrap()
-                    .add_metadata("beforeBlock", rgbstd::stl::BlockNumber::from(after_block))
+                    .add_metadata("beforeBlock", rgbstd::stl::BlockNumber::from(before_block))
                     .unwrap();
             }
 
@@ -3273,67 +3317,76 @@ impl Wallet {
         }))
     }
 
-    fn _evm_client(&self, chain_id: u64) -> Option<EvmClient> {
-        self.online_data
-            .as_ref()
-            .unwrap()
-            .evm_rpc_urls
-            .get(&chain_id)
-            .map(|url| EvmClient::new(url))
+    fn _evm_chain(&self, chain_id: u64) -> Option<&EvmChain> {
+        self.online_data.as_ref().unwrap().evm_chains.get(&chain_id)
     }
 
-    /// Confirm the external anchors of a consignment on the EVM chain of its bridge.
+    fn _evm_client(&self, chain_id: u64) -> Option<EvmClient> {
+        self._evm_chain(chain_id)
+            .map(|evm_chain| EvmClient::new(&evm_chain.rpc_url))
+    }
+
+    /// Confirm the claims of a consignment that have a lock recorded by its bridge as of the
+    /// latest finalized block of the external chain, included before the block they commit to.
     ///
-    /// Return the ID of a mint that is not confirmed yet, if any. Without an EVM RPC URL for the
-    /// chain, no mint is confirmed. A mint with no event within [`max_mint_scan_blocks`] blocks
-    /// after the block it commits to gives [`Error::MintEventOutOfScanWindow`].
-    async fn _resolve_anchors(
+    /// Return the claims not confirmed yet. A claim whose lock will never be confirmed gives
+    /// [`Error::MintLockExpired`]. Without a usable EVM RPC endpoint for the chain, return
+    /// [`ClaimsResolution::Retry`].
+    async fn _resolve_claims(
         &self,
         pending: &mut PendingConsignment<true>,
-        terminal_opids: &HashSet<OpId>,
-        scanned_blocks: &mut HashMap<OpId, u64>,
-    ) -> Result<Option<OpId>, Error> {
+    ) -> Result<ClaimsResolution, Error> {
         let claims: Vec<Claim> = pending.pending().unresolved_claims().cloned().collect();
-        let Some(Claim::Lock { opid, .. }) = claims.first() else {
-            return Ok(None);
-        };
-        let BridgeLocation::Evm(EvmContract { chain_id, address }) =
-            BridgedFungibleAsset::bridge_location(&pending.consignment().genesis).map_err(|e| {
-                Error::Internal {
-                    details: format!("unexpected bridge location error: {e:?}"),
-                }
+        if claims.is_empty() {
+            return Ok(ClaimsResolution::NoClaims);
+        }
+        let location = BridgedFungibleAsset::bridge_location(&pending.consignment().genesis)
+            .map_err(|e| Error::Internal {
+                details: format!("unexpected bridge location error: {e:?}"),
             })?;
+        let BridgeLocation::Evm(EvmContract { chain_id, address }) = location.clone();
         let Some(evm_client) = self._evm_client(chain_id) else {
-            warn!(self.logger, "No EVM RPC URL for chain ID {chain_id}");
-            return Ok(Some(*opid));
+            warn!(
+                self.logger,
+                "Cannot resolve mint locks: no EVM RPC URL configured for chain ID {chain_id}, \
+                 will retry"
+            );
+            return Ok(ClaimsResolution::Retry);
         };
-        let resolver = MintAnchorResolver::new(
-            &evm_client,
-            terminal_opids,
-            std::mem::take(scanned_blocks),
-            max_mint_scan_blocks(),
-        );
+        let resolver = MintClaimResolver::fetch(&evm_client, &location, &claims).await?;
+        let checked = match CheckedClaimResolver::with(&resolver, location) {
+            Ok(checked) => checked,
+            Err(ClaimResolverError::WrongChainId { expected, actual }) => {
+                warn!(
+                    self.logger,
+                    "Cannot resolve mint locks: the EVM RPC endpoint configured for chain ID \
+                     {expected} is on chain ID {actual}, will retry"
+                );
+                return Ok(ClaimsResolution::Retry);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut unconfirmed = vec![];
         for claim in &claims {
-            let Claim::Lock { opid, .. } = claim;
-            let confirmed = resolver.is_confirmed(&address, claim).await?;
-            *scanned_blocks = resolver.scanned_blocks();
-            if !confirmed {
-                if resolver.is_exhausted(opid) {
-                    return Err(Error::MintEventOutOfScanWindow {
+            match pending.resolve_claim(&checked, claim) {
+                Ok(()) => {}
+                Err(ClaimResolverError::Unconfirmed(opid)) if resolver.is_expired(&opid) => {
+                    let Claim::Lock { before_block, .. } = claim;
+                    return Err(Error::MintLockExpired {
                         opid: opid.to_string(),
-                        max_scan_blocks: max_mint_scan_blocks(),
+                        before_block: *before_block,
                     });
                 }
-                return Ok(Some(*opid));
+                Err(ClaimResolverError::Unconfirmed(opid)) => unconfirmed.push(opid),
+                Err(e) => return Err(e.into()),
             }
-            pending
-                .pending()
-                .resolve_claim(claim)
-                .map_err(|e| Error::Internal {
-                    details: format!("unexpected claim resolution error: {e}"),
-                })?;
         }
-        Ok(None)
+        Ok(ClaimsResolution::Resolved {
+            evm_client,
+            chain_id,
+            address,
+            unconfirmed,
+        })
     }
 
     async fn _get_reject_list_async(
@@ -3549,7 +3602,6 @@ impl Wallet {
         self.received_consignments.remove(recipient_id);
         self.received_consignment_meta.remove(recipient_id);
         self.received_signed_txs.remove(recipient_id);
-        self.mint_scanned_blocks.remove(recipient_id);
     }
 
     async fn _refuse_consignment_async(
@@ -3877,8 +3929,83 @@ impl Wallet {
         ))
     }
 
+    /// Fetch the media of a contract from the proxy and check it against the contract. Return
+    /// `false` if it is missing or does not match.
+    #[allow(clippy::too_many_arguments)]
+    async fn _contract_media_verified(
+        &self,
+        runtime: &RgbRuntime,
+        valid_contract: &ValidContract,
+        asset_schema: AssetSchema,
+        data: &ProxyReceiveData,
+        recipient_seed: &[u8],
+        seed: &[u8; 32],
+        sender_vk: &VerifyingKey,
+    ) -> Result<bool, Error> {
+        let mut attachments = vec![];
+        match asset_schema {
+            AssetSchema::Nia => {
+                let contract_data = runtime.consignment_data(valid_contract)?;
+                let contract = NiaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+            }
+            AssetSchema::Ifa => {
+                let contract_data = runtime.consignment_data(valid_contract)?;
+                let contract = IfaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+            }
+            AssetSchema::Bfa => {
+                let contract_data = runtime.consignment_data(valid_contract)?;
+                let contract = BfaWrapper::with(contract_data);
+                if let Some(attachment) = contract.contract_terms().media {
+                    attachments.push(attachment)
+                }
+            }
+        };
+        for attachment in attachments {
+            let digest = hex::encode(attachment.digest);
+            // on wasm32, skip media file storage (no filesystem): the media is fetched
+            // and checked against the digest in the contract
+            let derived = derive_shared(&ed25519_from_seed(seed), sender_vk)?;
+            let media_id = derived.media_id(&digest);
+            let media_res = ProxyClient::new(&data.proxy_url)?
+                .get_media(&data.transfer_id, &media_id)
+                .await?;
+            let Some(media_b64) = media_res.result else {
+                error!(
+                    self.logger,
+                    "Cannot find the media file but the contract defines one"
+                );
+                return Ok(false);
+            };
+            // also checks the plaintext against the digest in the contract
+            if Self::decrypt_payload_with_shared_key(
+                &media_b64,
+                data.recipient_encryption,
+                recipient_seed,
+                &data.sender_pubkey,
+                &digest,
+            )
+            .is_err()
+            {
+                error!(
+                    self.logger,
+                    "Attached file has a different hash than the one in the contract"
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Validate what a consignment pays and its history. `None` means refuse the consignment.
     /// `mint_transfer` is the transfer of a mint, which must pay what its invoice requests.
+    /// The history is checked against the reject list only when `check_reject_list` is true.
+    #[allow(clippy::too_many_arguments)]
     async fn _check_received_consignment(
         &self,
         runtime: &RgbRuntime,
@@ -3887,6 +4014,7 @@ impl Wallet {
         asset_schema: AssetSchema,
         asset_id: &str,
         mint_transfer: Option<&DbTransfer>,
+        check_reject_list: bool,
     ) -> Result<Option<(ValidConsignment<true>, HashMap<Opout, Assignment>)>, Error> {
         let valid_consignment = pending.finalize();
         let validation_status = valid_consignment.validation_status();
@@ -3895,6 +4023,7 @@ impl Wallet {
 
         let received = receiving.clone();
         let reject_list_source = match asset_schema {
+            _ if !check_reject_list => None,
             AssetSchema::Ifa => {
                 let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.to_string()) {
                     ass.reject_list_url
@@ -4359,21 +4488,20 @@ impl Wallet {
             .filter(|ab| ab.witness_id() == witness_id)
             .flat_map(|ab| ab.bundle.known_transitions.iter().map(|kt| kt.opid))
             .collect();
-        let received_mint = pending
+        let paying_claim = pending
             .pending()
             .unresolved_claims()
-            .find_map(|claim| {
+            .find(|Claim::Lock { opid, .. }| terminal_opids.contains(opid))
+            .cloned();
+        let received_mint = paying_claim
+            .as_ref()
+            .map(|claim| {
                 let Claim::Lock {
                     opid,
                     amount,
                     before_block,
                     ..
                 } = claim;
-                terminal_opids
-                    .contains(opid)
-                    .then_some((*opid, *amount, *before_block))
-            })
-            .map(|(opid, amount, after_block)| {
                 let BridgeLocation::Evm(EvmContract { chain_id, address }) =
                     BridgedFungibleAsset::bridge_location(&consignment.genesis).map_err(|e| {
                         Error::Internal {
@@ -4382,114 +4510,20 @@ impl Wallet {
                     })?;
                 Ok::<_, Error>(ReceivedMint {
                     opid: opid.to_string(),
-                    amount,
-                    after_block,
+                    lock_id: LockId::from(claim).to_string(),
+                    amount: *amount,
+                    before_block: *before_block,
                     evm_chain_id: chain_id,
                     bridge_contract: address.to_string(),
                 })
             })
             .transpose()?;
-        let mint_saved = self.received_mints.contains_key(&recipient_id);
-        if let Some(mint) = &received_mint {
-            // past its deadline a mint is waited for only if its lock was included by then
-            let now = now().unix_timestamp();
-            if let Some(deadline) = batch_transfer.expiration
-                && now > deadline
-                && !self._mint_in_finality_grace(mint, deadline, now).await
-            {
-                info!(self.logger, "Mint {} expired with no lock", mint.opid);
-                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
-            }
-            let Some(evm_client) = self._evm_client(mint.evm_chain_id) else {
-                warn!(
-                    self.logger,
-                    "No EVM RPC URL for chain ID {}, will retry", mint.evm_chain_id
-                );
-                return Ok(None);
-            };
-            // the mint follows the invoice, so the block it commits to cannot be much older
-            if !mint_saved {
-                let after_block_timestamp =
-                    evm_client.block_timestamp(mint.after_block).await? as i64;
-                if after_block_timestamp < batch_transfer.created_at - MINT_AFTER_BLOCK_GRACE_SECS {
-                    error!(
-                        self.logger,
-                        "Mint {} commits to a block before the invoice", mint.opid
-                    );
-                    return self
-                        ._refuse_consignment_async(
-                            data,
-                            &recipient_id,
-                            recipient_seed,
-                            updated_batch_transfer,
-                        )
-                        .await;
-                }
-            }
-        }
-        let mut scanned_blocks: HashMap<OpId, u64> = self
-            .mint_scanned_blocks
-            .get(&recipient_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|(opid, block)| OpId::from_str(opid).ok().map(|o| (o, *block)))
-            .collect();
-        let resolved = self
-            ._resolve_anchors(&mut pending, &terminal_opids, &mut scanned_blocks)
-            .await;
-        if received_mint.is_some() {
-            self.mint_scanned_blocks.insert(
-                recipient_id.clone(),
-                scanned_blocks
-                    .into_iter()
-                    .map(|(opid, block)| (opid.to_string(), block))
-                    .collect(),
-            );
-        }
-        match resolved {
-            Ok(Some(opid)) => {
-                warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
-                // check the mint once before the lock, so the user knows what to lock
-                if let Some(mint) = received_mint
-                    && !mint_saved
-                {
-                    let mut assumed = pending.clone();
-                    let unresolved: Vec<Claim> =
-                        assumed.pending().unresolved_claims().cloned().collect();
-                    for claim in &unresolved {
-                        assumed
-                            .pending()
-                            .resolve_claim(claim)
-                            .map_err(|e| Error::Internal {
-                                details: format!("unexpected claim resolution error: {e}"),
-                            })?;
-                    }
-                    let checked = self
-                        ._check_received_consignment(
-                            &runtime,
-                            assumed,
-                            &receiving,
-                            asset_schema,
-                            &asset_id,
-                            Some(transfer),
-                        )
-                        .await?;
-                    let Some(_) = checked else {
-                        return self
-                            ._refuse_consignment_async(
-                                data,
-                                &recipient_id,
-                                recipient_seed,
-                                updated_batch_transfer,
-                            )
-                            .await;
-                    };
-                    self.received_mints.insert(recipient_id, mint);
-                }
-                return Ok(None);
-            }
-            Ok(None) => {}
-            Err(e @ Error::MintEventOutOfScanWindow { .. }) => {
+        // a mint whose lock may be made completes whatever the wallet does: the reject list is
+        // not checked again for a mint already checked, nor for one whose lock is recorded
+        let checked_mint = self.received_mints.contains_key(&recipient_id);
+        let mut committed_mint = checked_mint;
+        match self._resolve_claims(&mut pending).await {
+            Err(e @ Error::MintLockExpired { .. }) => {
                 error!(self.logger, "{e}");
                 return self
                     ._refuse_consignment_async(
@@ -4501,6 +4535,135 @@ impl Wallet {
                     .await;
             }
             Err(e) => return Err(e),
+            Ok(ClaimsResolution::Retry) => return Ok(None),
+            Ok(ClaimsResolution::NoClaims) => {}
+            Ok(ClaimsResolution::Resolved {
+                evm_client,
+                chain_id,
+                address,
+                unconfirmed,
+            }) => {
+                let paying_opid = paying_claim.as_ref().map(|Claim::Lock { opid, .. }| *opid);
+                if let Some(opid) = &paying_opid
+                    && !unconfirmed.contains(opid)
+                {
+                    debug!(self.logger, "Mint lock already finalized");
+                    committed_mint = true;
+                }
+                if !unconfirmed.is_empty() {
+                    let others_unconfirmed =
+                        unconfirmed.iter().any(|opid| Some(*opid) != paying_opid);
+                    // check the mint once before the lock, so the user knows what to lock
+                    if let Some(mint) = &received_mint
+                        && let Some(claim) = &paying_claim
+                        && !checked_mint
+                        && !others_unconfirmed
+                    {
+                        if !committed_mint
+                            && evm_client
+                                .mint_lock_recorded(
+                                    &address,
+                                    &LockId::from(claim),
+                                    mint.amount,
+                                    mint.before_block,
+                                )
+                                .await?
+                        {
+                            debug!(self.logger, "Mint lock already recorded");
+                            committed_mint = true;
+                        }
+                        if !committed_mint {
+                            let max_mint_lock_blocks = self
+                                ._evm_chain(chain_id)
+                                .expect("configured along with the EVM RPC URL")
+                                .max_mint_lock_blocks;
+                            let latest_block = evm_client.block_number().await?;
+                            if mint.before_block > latest_block.saturating_add(max_mint_lock_blocks)
+                            {
+                                error!(
+                                    self.logger,
+                                    "Mint lock has to be included before block {}, more than {} \
+                                     blocks after the latest external chain block {}",
+                                    mint.before_block,
+                                    max_mint_lock_blocks,
+                                    latest_block
+                                );
+                                return self
+                                    ._refuse_consignment_async(
+                                        data,
+                                        &recipient_id,
+                                        recipient_seed,
+                                        updated_batch_transfer,
+                                    )
+                                    .await;
+                            }
+                        }
+                        let mut assumed = pending.clone();
+                        let unresolved: Vec<Claim> =
+                            assumed.pending().unresolved_claims().cloned().collect();
+                        for claim in &unresolved {
+                            assumed.pending().resolve_claim(claim).map_err(|e| {
+                                Error::Internal {
+                                    details: format!("unexpected claim resolution error: {e}"),
+                                }
+                            })?;
+                        }
+                        let checked = self
+                            ._check_received_consignment(
+                                &runtime,
+                                assumed,
+                                &receiving,
+                                asset_schema,
+                                &asset_id,
+                                Some(transfer),
+                                !committed_mint,
+                            )
+                            .await?;
+                        let Some((valid_consignment, _)) = checked else {
+                            return self
+                                ._refuse_consignment_async(
+                                    data,
+                                    &recipient_id,
+                                    recipient_seed,
+                                    updated_batch_transfer,
+                                )
+                                .await;
+                        };
+                        // the proxy can delete the media before the mint settles: verify it now
+                        if asset_transfer.asset_id.is_none()
+                            && self.database.check_asset_exists(asset_id.clone()).is_err()
+                            && !self
+                                ._contract_media_verified(
+                                    &runtime,
+                                    &valid_consignment.into_valid_contract(),
+                                    asset_schema,
+                                    data,
+                                    recipient_seed,
+                                    &seed,
+                                    &sender_vk,
+                                )
+                                .await?
+                        {
+                            return self
+                                ._refuse_consignment_async(
+                                    data,
+                                    &recipient_id,
+                                    recipient_seed,
+                                    updated_batch_transfer,
+                                )
+                                .await;
+                        }
+                        self.received_mints.insert(recipient_id, mint.clone());
+                    }
+                    info!(
+                        self.logger,
+                        "{} mint lock(s) not found or not confirmed on the external chain yet, \
+                         will retry",
+                        unconfirmed.len()
+                    );
+                    return Ok(None);
+                }
+            }
         }
         let Some((valid_consignment, received)) = self
             ._check_received_consignment(
@@ -4510,6 +4673,7 @@ impl Wallet {
                 asset_schema,
                 &asset_id,
                 received_mint.as_ref().map(|_| transfer),
+                !committed_mint,
             )
             .await?
         else {
@@ -4535,76 +4699,28 @@ impl Wallet {
                 debug!(self.logger, "Receiving unknown contract...");
                 let valid_contract = valid_consignment.clone().into_valid_contract();
 
-                let mut attachments = vec![];
-                match asset_schema {
-                    AssetSchema::Nia => {
-                        let contract_data = runtime.consignment_data(&valid_contract)?;
-                        let contract = NiaWrapper::with(contract_data);
-                        if let Some(attachment) = contract.contract_terms().media {
-                            attachments.push(attachment)
-                        }
-                    }
-                    AssetSchema::Ifa => {
-                        let contract_data = runtime.consignment_data(&valid_contract)?;
-                        let contract = IfaWrapper::with(contract_data);
-                        if let Some(attachment) = contract.contract_terms().media {
-                            attachments.push(attachment)
-                        }
-                    }
-                    AssetSchema::Bfa => {
-                        let contract_data = runtime.consignment_data(&valid_contract)?;
-                        let contract = BfaWrapper::with(contract_data);
-                        if let Some(attachment) = contract.contract_terms().media {
-                            attachments.push(attachment)
-                        }
-                    }
-                };
-                for attachment in attachments {
-                    let digest = hex::encode(attachment.digest);
-                    // on wasm32, skip media file storage (no filesystem): the media is fetched
-                    // and checked against the digest in the contract
-                    let derived = derive_shared(&ed25519_from_seed(&seed), &sender_vk)?;
-                    let media_id = derived.media_id(&digest);
-                    let media_res = ProxyClient::new(&data.proxy_url)?
-                        .get_media(&data.transfer_id, &media_id)
-                        .await?;
-                    let Some(media_b64) = media_res.result else {
-                        error!(
-                            self.logger,
-                            "Cannot find the media file but the contract defines one"
-                        );
-                        return self
-                            ._refuse_consignment_async(
-                                data,
-                                &recipient_id,
-                                recipient_seed,
-                                updated_batch_transfer,
-                            )
-                            .await;
-                    };
-                    // also checks the plaintext against the digest in the contract
-                    if Self::decrypt_payload_with_shared_key(
-                        &media_b64,
-                        data.recipient_encryption,
-                        recipient_seed,
-                        &data.sender_pubkey,
-                        &digest,
-                    )
-                    .is_err()
-                    {
-                        error!(
-                            self.logger,
-                            "Attached file has a different hash than the one in the contract"
-                        );
-                        return self
-                            ._refuse_consignment_async(
-                                data,
-                                &recipient_id,
-                                recipient_seed,
-                                updated_batch_transfer,
-                            )
-                            .await;
-                    }
+                // a checked mint has its media verified by the check
+                if !checked_mint
+                    && !self
+                        ._contract_media_verified(
+                            &runtime,
+                            &valid_contract,
+                            asset_schema,
+                            data,
+                            recipient_seed,
+                            &seed,
+                            &sender_vk,
+                        )
+                        .await?
+                {
+                    return self
+                        ._refuse_consignment_async(
+                            data,
+                            &recipient_id,
+                            recipient_seed,
+                            updated_batch_transfer,
+                        )
+                        .await;
                 }
 
                 runtime
@@ -5200,12 +5316,13 @@ impl Wallet {
                 .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
                 .and_then(|mut p| p.pending().resolve_all(&wasm_resolver).map(|_| p))
                 .map_err(|_| InternalError::Unexpected)?;
-            if let Some(opid) = self
-                ._resolve_anchors(&mut pending, &HashSet::new(), &mut HashMap::new())
-                .await?
-            {
-                warn!(self.logger, "Mint {opid} is not confirmed yet, will retry");
-                return Ok(None);
+            match self._resolve_claims(&mut pending).await? {
+                ClaimsResolution::NoClaims => {}
+                ClaimsResolution::Resolved { unconfirmed, .. } if unconfirmed.is_empty() => {}
+                _ => {
+                    warn!(self.logger, "Mint locks not confirmed yet, will retry");
+                    return Ok(None);
+                }
             }
             let valid_consignment = pending.finalize();
             let validation_status = valid_consignment.validation_status();
@@ -5651,6 +5768,11 @@ impl Wallet {
             }
             return Ok(TryFailBatchTransferOutcome::Refreshed);
         }
+        // the refresh above may have been the first to check a received mint: deny the fail, as
+        // a mint expires only by its lock, which may already be made
+        if incoming && self._is_mint(batch_transfer, db_data)? {
+            return Ok(TryFailBatchTransferOutcome::Denied);
+        }
         // the status didn't change: before failing an outgoing transfer make sure its TX is not
         // on-chain already (a recipient holding the TX may have broadcast it), in which case the
         // transfer progresses instead
@@ -5773,6 +5895,19 @@ impl Wallet {
                 return Err(Error::CannotFailBatchTransfer);
             }
 
+            // a mint expires by its lock, not by a timestamp: a sent one can be failed once its
+            // lock has expired, the refresh fails a received one
+            if self._is_mint(batch_transfer, &db_data)? {
+                if !batch_transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?
+                    && !no_asset_only
+                    && self._fail_expired_mint(batch_transfer).await?
+                {
+                    info!(self.logger, "Fail transfers completed");
+                    return Ok(true);
+                }
+                return Err(Error::CannotFailBatchTransfer);
+            }
+
             // a transfer waiting for the counterparty's broadcast can only be failed once it has
             // expired, since the TX may still be broadcast before then
             if batch_transfer.status == TransferStatus::WaitingBroadcast
@@ -5803,18 +5938,27 @@ impl Wallet {
             // fail all expired transfers in a fallible status; an outgoing one is expired once
             // its expiration has passed on the sender proxy's clock too, as the proxy may release
             // its TX until then
+            // a mint never expires by a timestamp: the refresh fails a received one, and a sent
+            // one is failed below once its lock has expired
             let mut expired_batch_transfers: Vec<DbBatchTransfer> = vec![];
+            let mut sent_mints = vec![];
             for t in db_data.batch_transfers.clone() {
-                // a mint whose lock was included by its deadline waits for the finality grace
-                let expired = if let Some(mint) = self._mint_of_batch(&t, &db_data)? {
-                    let deadline = t.expiration.unwrap_or(now);
-                    now > deadline && !self._mint_in_finality_grace(&mint, deadline, now).await
-                } else if t.incoming(&db_data.asset_transfers, &db_data.transfers)? {
+                if !t.is_fallible() {
+                    continue;
+                }
+                let incoming = t.incoming(&db_data.asset_transfers, &db_data.transfers)?;
+                if self._is_mint(&t, &db_data)? {
+                    if !incoming {
+                        sent_mints.push(t);
+                    }
+                    continue;
+                }
+                let expired = if incoming {
                     incoming_expired(&t, now)
                 } else {
                     expired_beyond_skew_margin(&t)
                 };
-                if expired && t.is_fallible() {
+                if expired {
                     expired_batch_transfers.push(t);
                 }
             }
@@ -5837,6 +5981,19 @@ impl Wallet {
                     transfers_changed = true;
                 }
             }
+            // a mint is always of an asset. A mint whose lock cannot be checked now is left for a
+            // later call
+            if !no_asset_only {
+                for batch_transfer in &sent_mints {
+                    match self._fail_expired_mint(batch_transfer).await {
+                        Ok(failed) => transfers_changed |= failed,
+                        Err(e) => warn!(
+                            self.logger,
+                            "Cannot check the lock of mint {}: {e}", batch_transfer.idx
+                        ),
+                    }
+                }
+            }
         }
 
         info!(self.logger, "Fail transfers completed");
@@ -5854,6 +6011,7 @@ impl Wallet {
         now_ts: i64,
         witness_recipients: &mut Vec<(ScriptBuf, u64)>,
         recipient_vout: &mut u32,
+        mint: bool,
     ) -> Result<LocalRecipient, Error> {
         self.check_transport_endpoints(&recipient.transport_endpoints)?;
         match (&recipient.assignment, schema) {
@@ -5918,16 +6076,28 @@ impl Wallet {
         })?;
         let recipient_vk = verifying_key_from_bytes(&public_key)?;
 
-        // a transfer cannot be created after the invoice expiration
-        let invoice_expiration =
-            recipient
-                .expiration_timestamp
-                .ok_or_else(|| Error::InvalidRecipientData {
-                    details: s!("missing invoice expiration"),
-                })? as i64;
-        if invoice_expiration <= now_ts {
-            return Err(Error::InvoiceExpired);
-        }
+        // a mint expires by the external chain block its lock has to be included before, never
+        // by a timestamp, so its recipient must have no expiration
+        let invoice_expiration = if mint {
+            if recipient.expiration_timestamp.is_some() {
+                return Err(Error::InvalidRecipientData {
+                    details: s!("a mint recipient cannot have an expiration"),
+                });
+            }
+            None
+        } else {
+            // a transfer cannot be created after the invoice expiration
+            let invoice_expiration =
+                recipient
+                    .expiration_timestamp
+                    .ok_or_else(|| Error::InvalidRecipientData {
+                        details: s!("missing invoice expiration"),
+                    })? as i64;
+            if invoice_expiration <= now_ts {
+                return Err(Error::InvoiceExpired);
+            }
+            Some(invoice_expiration)
+        };
 
         let local_recipient_data = match xchainnet_beneficiary.into_inner() {
             Beneficiary::BlindedSeal(secret_seal) => {
@@ -5974,7 +6144,7 @@ impl Wallet {
             transport_endpoints,
             public_key,
             encryption: recipient.encryption,
-            invoice_expiration: Some(invoice_expiration),
+            invoice_expiration,
         })
     }
 
@@ -6046,6 +6216,7 @@ impl Wallet {
                         now_ts,
                         &mut witness_recipients,
                         &mut recipient_vout,
+                        false,
                     )
                     .await?;
                 let invoice_expiration = local_recipient
@@ -6131,7 +6302,7 @@ impl Wallet {
                     assignments_spent: HashMap::new(),
                     main_transition,
                     burn_reason: None,
-                    after_block: None,
+                    before_block: None,
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -6928,7 +7099,7 @@ impl Wallet {
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Inflate,
             burn_reason: None,
-            after_block: None,
+            before_block: None,
         };
         let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> =
             BTreeMap::from([(asset_id.clone(), transfer_info)]);
@@ -7188,7 +7359,7 @@ impl Wallet {
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Burn,
             burn_reason,
-            after_block: None,
+            before_block: None,
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
         let mut rejected = HashSet::new();
@@ -7378,7 +7549,7 @@ impl Wallet {
             .ok_or(Error::Internal {
                 details: s!("not a mint transfer"),
             })?;
-        let after_block = transfer_info.after_block.ok_or(Error::Internal {
+        let before_block = transfer_info.before_block.ok_or(Error::Internal {
             details: s!("mint transfer is missing the external chain block"),
         })?;
         let contract_id = transfer_info.asset_info.contract_id;
@@ -7394,23 +7565,22 @@ impl Wallet {
             .bridge_location();
         Ok(ReceivedMint {
             opid: opid.to_string(),
+            lock_id: LockId::with(opid, fascia.witness_id()).to_string(),
             amount: transfer_info
                 .recipients
                 .iter()
                 .map(|r| r.assignment.main_amount())
                 .sum(),
-            after_block,
+            before_block,
             evm_chain_id: chain_id,
             bridge_contract: address.to_string(),
         })
     }
 
-    /// Whether the lock of `mint` was included on the external chain by `expiration`.
-    async fn _mint_lock_included_by(
-        &self,
-        mint: &ReceivedMint,
-        expiration: i64,
-    ) -> Result<bool, Error> {
+    /// Check that the bridge records a finalized lock for `mint`, included before the block the
+    /// mint commits to. Give [`Error::MintLockNotFound`] if there is none yet and
+    /// [`Error::MintLockExpired`] if there never will be.
+    async fn _check_mint_lock(&self, mint: &ReceivedMint) -> Result<(), Error> {
         let evm_client = self
             ._evm_client(mint.evm_chain_id)
             .ok_or(Error::NoEvmRpcUrl {
@@ -7419,36 +7589,46 @@ impl Wallet {
         let address = EvmAddress::from_str(&mint.bridge_contract).map_err(|e| Error::Internal {
             details: format!("invalid bridge contract address: {e}"),
         })?;
-        let opid = OpId::from_str(&mint.opid).map_err(|e| Error::Internal {
-            details: format!("invalid mint operation ID: {e}"),
+        let lock_id = LockId::from_str(&mint.lock_id).map_err(|e| Error::Internal {
+            details: format!("invalid lock ID: {e}"),
         })?;
-        Ok(evm_client
-            .funds_in_inclusion(&address, &opid, mint.amount, mint.after_block)
+        match evm_client
+            .mint_lock_status(&address, &lock_id, mint.amount, mint.before_block)
             .await?
-            .is_some_and(|timestamp| timestamp as i64 <= expiration))
+        {
+            MintLockStatus::Confirmed => Ok(()),
+            MintLockStatus::Pending => Err(Error::MintLockNotFound {
+                opid: mint.opid.clone(),
+            }),
+            MintLockStatus::Expired => Err(Error::MintLockExpired {
+                opid: mint.opid.clone(),
+                before_block: mint.before_block,
+            }),
+        }
     }
 
-    /// Whether an expired mint is still waited for: its lock was included by the expiration and
-    /// the finality grace has not passed yet.
-    async fn _mint_in_finality_grace(
-        &self,
-        mint: &ReceivedMint,
-        expiration: i64,
-        now: i64,
-    ) -> bool {
-        if now > expiration + MINT_FINALITY_GRACE_SECS {
-            return false;
-        }
-        match self._mint_lock_included_by(mint, expiration).await {
-            Ok(included) => included,
-            // the lock cannot be looked up: keep waiting until the grace passes
-            Err(e) => {
-                warn!(
-                    self.logger,
-                    "Cannot check the lock of expired mint {}: {e}", mint.opid
-                );
-                true
+    /// Fail a sent mint, not ended yet, if its lock has expired. Return whether it was failed.
+    async fn _fail_expired_mint(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<bool, Error> {
+        let txid = batch_transfer
+            .txid
+            .as_ref()
+            .expect("a pending mint has a TXID");
+        let artifacts = self.transfer_artifacts.get(txid).ok_or(Error::Internal {
+            details: s!("missing transfer artifacts of a pending mint"),
+        })?;
+        let mint = self._sent_mint(artifacts)?;
+        match self._check_mint_lock(&mint).await {
+            Err(Error::MintLockExpired { .. }) => {
+                info!(self.logger, "Mint lock expired, failing the transfer");
+                self._fail_batch_transfer(batch_transfer)?;
+                Ok(true)
             }
+            // a confirmed lock completes the mint at mint_end, a pending one may still
+            Ok(()) | Err(Error::MintLockNotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -7462,25 +7642,11 @@ impl Wallet {
             })
     }
 
-    /// The mint that a pending batch transfer waits for: a sent one before `mint_end`, or a
-    /// received one still waiting for the counterparty.
-    fn _mint_of_batch(
-        &self,
-        batch_transfer: &DbBatchTransfer,
-        db_data: &DbData,
-    ) -> Result<Option<ReceivedMint>, Error> {
-        if Self::_is_pending_mint(batch_transfer, db_data) {
-            let txid = batch_transfer.txid.as_ref().expect("checked");
-            return self
-                .transfer_artifacts
-                .get(txid)
-                .map(|artifacts| self._sent_mint(artifacts))
-                .transpose();
-        }
-        if !batch_transfer.status.waiting_counterparty()
-            || !batch_transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?
-        {
-            return Ok(None);
+    /// Whether the batch transfer is a mint: a sent one before `mint_end`, or a received one
+    /// that the wallet has checked. `fail_transfers` never fails a mint because of its expiration.
+    fn _is_mint(&self, batch_transfer: &DbBatchTransfer, db_data: &DbData) -> Result<bool, Error> {
+        if !batch_transfer.incoming(&db_data.asset_transfers, &db_data.transfers)? {
+            return Ok(Self::_is_pending_mint(batch_transfer, db_data));
         }
         let (_, transfer) = self.database.get_incoming_transfer(
             &batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?,
@@ -7488,22 +7654,32 @@ impl Wallet {
         Ok(transfer
             .recipient_id
             .as_ref()
-            .and_then(|r| self.received_mints.get(r))
-            .cloned())
+            .is_some_and(|r| self.received_mints.contains_key(r)))
     }
 
     /// Begin a BFA mint: spend one mint right to mint `recipient`'s amount, backed by a lock of
     /// tokens on the external chain.
     ///
-    /// The consignment is posted to the recipient before the PSBT is signed. The invoice must
-    /// leave at least one hour for the lock. The last mint right of the wallet is never spent.
+    /// The consignment is posted before the PSBT is signed, so the recipient can check the mint
+    /// before the lock is made. The last mint right of the wallet is never spent.
+    ///
+    /// The lock has to be included before `before_block`. A lock at or after it never confirms the
+    /// mint. The block must be at least [`EvmChain::min_mint_lock_blocks`] and at most
+    /// [`EvmChain::max_mint_lock_blocks`] after the latest block, and leave a block for the lock.
+    /// Else [`Error::InvalidBeforeBlock`] is returned.
+    ///
+    /// `before_block` is the only expiration of the mint. The `recipient` must have none, else
+    /// [`Error::InvalidRecipientData`] is returned. The mint expires once its lock can no longer
+    /// be included before `before_block`, as of the latest finalized block.
     ///
     /// Complete the mint with [`mint_end`](Wallet::mint_end) once the lock is finalized.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mint_begin(
         &mut self,
         online: Online,
         asset_id: String,
         recipient: Recipient,
+        before_block: u64,
         fee_rate: u64,
         min_confirmations: u8,
         sender_transport_endpoint: String,
@@ -7565,25 +7741,51 @@ impl Wallet {
                 now_ts,
                 &mut witness_recipients,
                 &mut 1,
+                true,
             )
             .await?;
-        // the lock has to be included by the invoice expiration: refuse one too close
-        let expiration = local_recipient
-            .invoice_expiration
-            .expect("set by _parse_recipient");
-        if expiration < now_ts + MIN_MINT_LOCK_WINDOW_SECS as i64 {
-            return Err(Error::InvoiceExpired);
-        }
 
-        // the lock can only follow the latest finalized block, so the transition commits to it
+        // the lock can only be included after the latest block: refuse a block that leaves no
+        // block for it, or one closer or further than configured. This block is the only
+        // expiration of the mint
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
         let BridgeLocation::Evm(EvmContract { chain_id, .. }) = runtime
             .contract_wrapper::<BridgedFungibleAsset>(contract_id)?
             .bridge_location();
-        let evm_client = self
-            ._evm_client(chain_id)
-            .ok_or(Error::NoEvmRpcUrl { chain_id })?;
-        let after_block = evm_client.finalized_block_number().await?;
+        let EvmChain {
+            rpc_url,
+            min_mint_lock_blocks,
+            max_mint_lock_blocks,
+        } = self
+            ._evm_chain(chain_id)
+            .ok_or(Error::NoEvmRpcUrl { chain_id })?
+            .clone();
+        let evm_client = EvmClient::new(&rpc_url);
+        let latest_block = evm_client.block_number().await?;
+        if before_block <= latest_block.saturating_add(1) {
+            return Err(Error::InvalidBeforeBlock {
+                details: format!(
+                    "the lock cannot be included before block {before_block}, the latest \
+                     external chain block being {latest_block}"
+                ),
+            });
+        }
+        if before_block < latest_block.saturating_add(min_mint_lock_blocks) {
+            return Err(Error::InvalidBeforeBlock {
+                details: format!(
+                    "block {before_block} is less than {min_mint_lock_blocks} blocks after the \
+                     latest external chain block {latest_block}"
+                ),
+            });
+        }
+        if before_block > latest_block.saturating_add(max_mint_lock_blocks) {
+            return Err(Error::InvalidBeforeBlock {
+                details: format!(
+                    "block {before_block} is more than {max_mint_lock_blocks} blocks after the \
+                     latest external chain block {latest_block}"
+                ),
+            });
+        }
 
         let transfer_info = InfoAssetTransfer {
             asset_info: AssetInfo {
@@ -7598,7 +7800,7 @@ impl Wallet {
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Mint,
             burn_reason: None,
-            after_block: Some(after_block),
+            before_block: Some(before_block),
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
         let mut rejected = HashSet::new();
@@ -7612,7 +7814,7 @@ impl Wallet {
                     &witness_recipients,
                     fee_rate_checked,
                     min_confirmations,
-                    Some(expiration),
+                    None,
                     None,
                     Some(operation_sk.to_bytes().to_vec()),
                     Some(sender_transport_endpoint.clone()),
@@ -7708,9 +7910,10 @@ impl Wallet {
     /// Complete the mint operation by broadcasting the provided PSBT and saving the transfer.
     ///
     /// The provided PSBT, prepared with the [`mint_begin`](Wallet::mint_begin) function, needs to
-    /// have already been signed. The lock on the external chain has to be finalized, otherwise
-    /// [`Error::MintEventNotFound`] is returned. Past the invoice expiration, the mint is
-    /// broadcast only if its lock was included by then, for up to 24 hours.
+    /// have already been signed. The bridge must record a finalized lock for the mint, included
+    /// before the block the mint commits to (see [`mint_begin`](Wallet::mint_begin)). Else
+    /// [`Error::MintLockNotFound`] is returned, or [`Error::MintLockExpired`] if there never will
+    /// be one. An expired mint is failed, which releases its inputs, before the error is returned.
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn mint_end(
@@ -7742,36 +7945,15 @@ impl Wallet {
         let consignment_bytes = artifacts.consignment_bytes.clone();
         let mint = self._sent_mint(artifacts)?;
 
-        // past the deadline the recipient may fail the transfer: broadcast only a mint whose lock
-        // was included by then, until the finality grace passes
-        let now = now().unix_timestamp();
-        let deadline = batch_transfer.expiration.unwrap_or(now);
-        if deadline < now
-            && (now > deadline + MINT_FINALITY_GRACE_SECS
-                || !self._mint_lock_included_by(&mint, deadline).await?)
-        {
-            return Err(Error::TransferExpired);
-        }
-
-        let evm_client = self
-            ._evm_client(mint.evm_chain_id)
-            .ok_or(Error::NoEvmRpcUrl {
-                chain_id: mint.evm_chain_id,
-            })?;
-        let opid = OpId::from_str(&mint.opid).expect("valid opid");
-        let address = EvmAddress::from_str(&mint.bridge_contract).expect("valid address");
-        let finalized_block = evm_client.finalized_block_number().await?;
-        if !evm_client
-            .find_funds_in(
-                &address,
-                &opid,
-                mint.amount,
-                mint.after_block,
-                finalized_block,
-            )
-            .await?
-        {
-            return Err(Error::MintEventNotFound { opid: mint.opid });
+        match self._check_mint_lock(&mint).await {
+            Ok(()) => {}
+            Err(e @ Error::MintLockExpired { .. }) => {
+                self._fail_batch_transfer(&batch_transfer)?;
+                self.update_backup_info(false)?;
+                self.trigger_auto_backup();
+                return Err(e);
+            }
+            Err(e) => return Err(e),
         }
 
         let mut runtime = self.rgb_runtime()?;
@@ -7811,7 +7993,7 @@ impl Wallet {
         online: Online,
         asset_id: String,
         amount: u64,
-        after_block: u64,
+        before_block: u64,
     ) -> Result<(String, OpId), Error> {
         let asset = self.database.check_asset_exists(asset_id.clone())?;
         let (fee_rate_checked, unspents, input_unspents, mut runtime) =
@@ -7858,7 +8040,7 @@ impl Wallet {
             assignments_spent: HashMap::new(),
             main_transition: TypeOfTransition::Mint,
             burn_reason: None,
-            after_block: Some(after_block),
+            before_block: Some(before_block),
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id, transfer_info)]);
         let PrepareTransferPsbtResult::Success(begin_data) = self
@@ -7971,7 +8153,7 @@ mod go_online_tests {
                 .iter()
                 .map(|(e, k)| (e.to_string(), k.to_string()))
                 .collect(),
-            evm_rpc_urls: HashMap::new(),
+            evm_chains: HashMap::new(),
         }
     }
 
@@ -8384,7 +8566,7 @@ mod send_end_tests {
             assignments_spent,
             main_transition,
             burn_reason: None,
-            after_block: None,
+            before_block: None,
         }
     }
 
@@ -10373,7 +10555,14 @@ mod bfa_tests {
         ];
         let mut wallet = make_test_wallet(false);
         let mut online_data = OnlineData::for_test(&server.url());
-        online_data.evm_rpc_urls = HashMap::from([(31337, server.url())]);
+        online_data.evm_chains = HashMap::from([(
+            31337,
+            EvmChain {
+                rpc_url: server.url(),
+                min_mint_lock_blocks: 2,
+                max_mint_lock_blocks: 10,
+            },
+        )]);
         wallet.online_data = Some(online_data);
         let source = RejectListSource::Evm(EvmContract {
             chain_id: 31337,
@@ -10407,7 +10596,7 @@ mod bfa_tests {
         assert_eq!(check(&[2]), HashSet::new());
 
         // a chain with no URL gives an error, not an empty list
-        wallet.online_data.as_mut().unwrap().evm_rpc_urls.clear();
+        wallet.online_data.as_mut().unwrap().evm_chains.clear();
         assert!(matches!(
             block_on(wallet._get_reject_list_async(&source)),
             Err(Error::NoEvmRpcUrl { chain_id: 31337 })
@@ -10568,6 +10757,7 @@ mod bfa_tests {
                 online.clone(),
                 id.to_string(),
                 recipient,
+                1000,
                 1,
                 1,
                 sender_endpoint.to_string(),
@@ -10582,7 +10772,7 @@ mod bfa_tests {
     fn go_online_refuses_node_without_mint_support() {
         use crate::api::evm::tests::{block_on, mock_finalized_block, mock_rpc};
 
-        // the node serves the chain and the finalized block, but not the logs of old blocks
+        // the node serves the chain and the finalized block, but not the state at it
         let mut server = mockito::Server::new();
         let _mocks = [
             mock_rpc(
@@ -10593,8 +10783,8 @@ mod bfa_tests {
             mock_finalized_block(&mut server, 0x10),
             mock_rpc(
                 &mut server,
-                r#"{"method":"eth_getLogs"}"#,
-                r#""error":{"code":-32602,"message":"Archive requests require a personal token"}"#,
+                r#"{"method":"eth_call","params":[{"data":"0x"},"0x10"]}"#,
+                r#""error":{"code":-32000,"message":"missing trie node"}"#,
             ),
         ];
         let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
@@ -10605,12 +10795,19 @@ mod bfa_tests {
             },
             skip_consistency_check: false,
             proxy_auth_keys: HashMap::new(),
-            evm_rpc_urls: HashMap::from([(31337, server.url())]),
+            evm_chains: HashMap::from([(
+                31337,
+                EvmChain {
+                    rpc_url: server.url(),
+                    min_mint_lock_blocks: 2,
+                    max_mint_lock_blocks: 10,
+                },
+            )]),
         }));
         assert!(
             matches!(result, Err(Error::InvalidEvmRpcUrl { ref details })
-                if details.starts_with("cannot get the logs of the oldest blocks")
-                    && details.ends_with("Archive requests require a personal token")),
+                if details.starts_with("cannot read the state")
+                    && details.ends_with("missing trie node")),
             "{result:?}"
         );
         assert!(wallet.online_data.is_none());
@@ -10642,20 +10839,29 @@ mod bfa_tests {
     }
 
     #[test]
-    fn online_options_read_evm_rpc_urls() {
+    fn online_options_read_evm_chains() {
         let options = |urls: &str| {
             serde_json::from_str::<OnlineOptions>(&format!(
                 r#"{{"indexer_config":{{"Esplora":{{"url":"u"}}}},"skip_consistency_check":true,
                 "proxy_auth_keys":{{}}{urls}}}"#
             ))
         };
+        let chain =
+            r#"{"rpc_url":"http://evm","min_mint_lock_blocks":2,"max_mint_lock_blocks":10}"#;
         assert_eq!(
-            options(r#","evm_rpc_urls":{"31337":"http://evm"}"#)
+            options(&format!(r#","evm_chains":{{"31337":{chain}}}"#))
                 .unwrap()
-                .evm_rpc_urls,
-            HashMap::from([(31337, s!("http://evm"))])
+                .evm_chains,
+            HashMap::from([(
+                31337,
+                EvmChain {
+                    rpc_url: s!("http://evm"),
+                    min_mint_lock_blocks: 2,
+                    max_mint_lock_blocks: 10,
+                }
+            )])
         );
-        assert!(options("").unwrap().evm_rpc_urls.is_empty());
-        assert!(options(r#","evm_rpc_urls":{"mainnet":"http://evm"}"#).is_err());
+        assert!(options("").unwrap().evm_chains.is_empty());
+        assert!(options(&format!(r#","evm_chains":{{"mainnet":{chain}}}"#)).is_err());
     }
 }

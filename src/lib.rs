@@ -174,7 +174,7 @@ use rgbstd::{
 #[cfg(feature = "esplora")]
 use rgbstd::{
     Assign, AssignmentType, KnownTransition, OpId,
-    containers::{Consignment, PendingConsignment, WitnessBundle},
+    containers::{CheckedClaimResolver, Consignment, PendingConsignment, WitnessBundle},
     contract::SchemaWrapper,
     txout::TxPtr,
     validation::{OpsDag, Validity, Warning},
@@ -213,7 +213,7 @@ use crate::utils::{OffchainResolverWasm, PreFetchResolver};
 #[cfg(feature = "esplora")]
 use crate::{
     api::{
-        evm::{EvmClient, MintAnchorResolver, max_mint_scan_blocks},
+        evm::{EvmClient, MintClaimResolver, MintLockStatus},
         proxy_v1::{
             AckTransferData, GetAckResponse, GetConsignmentResponse, InvoiceStatus, JsonRpcError,
             JsonRpcResponse, PostAckResponse, PostConsignmentData, ProxyClient, ProxyTransferState,
