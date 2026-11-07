@@ -802,16 +802,13 @@ pub(crate) enum InternalError {
     FromSlice(#[from] amplify::FromSliceError),
 
     #[error("Hash error: {0}")]
-    HashError(#[from] scrypt::password_hash::Error),
+    HashError(#[from] scrypt::password_hash::phc::Error),
 
     #[error("Hex decode error: {0}")]
     HexError(String),
 
     #[error("Infallible error: {0}")]
     Infallible(#[from] std::convert::Infallible),
-
-    #[error("No password hash returned")]
-    NoPasswordHashError,
 
     #[error("PSBT parse error: {0}")]
     PsbtParse(#[from] bdk_wallet::bitcoin::psbt::PsbtParseError),

@@ -203,8 +203,7 @@ pub async fn solve_pow(transfer_id: &str, pow_timestamp: &str, difficulty: u32) 
 }
 
 /// Build the 24-byte per-chunk nonce.
-#[cfg(feature = "esplora")]
-fn chunk_nonce(base: &[u8], counter: u32, is_final: bool) -> [u8; 24] {
+pub(crate) fn chunk_nonce(base: &[u8], counter: u32, is_final: bool) -> [u8; 24] {
     let mut nonce = [0u8; 24];
     nonce[..19].copy_from_slice(base);
     nonce[19..23].copy_from_slice(&counter.to_be_bytes());

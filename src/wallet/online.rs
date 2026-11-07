@@ -1028,7 +1028,22 @@ impl Wallet {
         if let Some(change) = change_script {
             tx_builder.drain_to(change);
         }
-        tx_builder.finish()
+        let mut psbt = tx_builder.finish()?;
+        self.add_non_witness_utxos(&mut psbt);
+        Ok(psbt)
+    }
+
+    /// Fill missing previous TXs on taproot inputs.
+    /// A separate signer needs them when its wallet has no chain data.
+    fn add_non_witness_utxos(&self, psbt: &mut Psbt) {
+        let tx_graph = self.bdk_wallet.tx_graph();
+        for (input, txin) in psbt.inputs.iter_mut().zip(&psbt.unsigned_tx.input) {
+            if input.non_witness_utxo.is_none()
+                && let Some(prev_tx) = tx_graph.get_tx(txin.previous_output.txid)
+            {
+                input.non_witness_utxo = Some(prev_tx.as_ref().clone());
+            }
+        }
     }
 
     pub(crate) fn get_script_pubkey(&self, address: &str) -> Result<ScriptBuf, Error> {
@@ -1398,7 +1413,7 @@ impl Wallet {
         }
         builder.drain_to(change_addr.clone());
 
-        let psbt = builder.finish().map_err(|e| match e {
+        let mut psbt = builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
                 needed,
                 available,
@@ -1413,6 +1428,7 @@ impl Wallet {
                 details: e.to_string(),
             },
         })?;
+        self.add_non_witness_utxos(&mut psbt);
 
         let btc_change = psbt
             .unsigned_tx
@@ -2643,7 +2659,9 @@ impl Wallet {
         }
 
         psbt.set_opret_host();
-        let entropy = OsRng.next_u64();
+        let entropy = SysRng
+            .try_next_u64()
+            .expect("OS randomness source unavailable");
         let opret_idx = psbt
             .unsigned_tx
             .output
@@ -6357,7 +6375,7 @@ impl Wallet {
             tx_builder.drain_to(change);
         }
 
-        let psbt = tx_builder.finish().map_err(|e| match e {
+        let mut psbt = tx_builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
                 needed,
                 available,
@@ -6372,6 +6390,7 @@ impl Wallet {
                 details: e.to_string(),
             },
         })?;
+        self.add_non_witness_utxos(&mut psbt);
 
         info!(self.logger, "Send BTC (begin) completed");
         Ok(psbt.to_string())
@@ -6446,7 +6465,7 @@ impl Wallet {
             tx_builder.unspendable(unspendable);
         }
 
-        let psbt = tx_builder.finish().map_err(|e| match e {
+        let mut psbt = tx_builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
                 needed,
                 available,
@@ -6461,6 +6480,7 @@ impl Wallet {
                 details: e.to_string(),
             },
         })?;
+        self.add_non_witness_utxos(&mut psbt);
 
         info!(self.logger, "Drain (begin) completed");
         Ok(psbt.to_string())
@@ -7752,6 +7772,82 @@ mod go_online_tests {
             assert_eq!(online_data.indexer_url, INDEXER_URL);
             assert_eq!(online_data.proxy_auth_keys, keys);
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod separate_signer_tests {
+    use bdk_wallet::bitcoin::{Transaction, TxIn, transaction::Version};
+
+    use super::*;
+    use crate::keys::generate_keys;
+    use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+
+    fn funded_wallet_and_signer() -> (Wallet, Wallet, OutPoint) {
+        let keys = generate_keys(BitcoinNetwork::Regtest);
+        let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
+        let signer = make_test_wallet_with_keys(keys, false);
+
+        let funding_tx = Transaction {
+            version: Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(100_000),
+                script_pubkey: wallet
+                    ._get_new_address(KeychainKind::External)
+                    .unwrap()
+                    .script_pubkey(),
+            }],
+        };
+        let outpoint = OutPoint::new(funding_tx.compute_txid(), 0);
+        wallet.bdk_wallet.apply_unconfirmed_txs([(funding_tx, 1)]);
+        (wallet, signer, outpoint)
+    }
+
+    fn assert_signed(signer: &Wallet, psbt: &Psbt) {
+        let signed = signer.sign_psbt(psbt.to_string(), None).unwrap();
+        let signed = Psbt::from_str(&signed).unwrap();
+        assert!(signed.inputs[0].final_script_witness.is_some());
+    }
+
+    #[test]
+    fn signer_without_chain_data_signs_split_tx() {
+        let (mut wallet, signer, outpoint) = funded_wallet_and_signer();
+        let recipient = wallet
+            ._get_new_address(KeychainKind::External)
+            .unwrap()
+            .script_pubkey();
+        let psbt = wallet
+            ._create_split_tx(
+                &[outpoint],
+                &vec![recipient],
+                1000,
+                FeeRate::from_sat_per_vb(1).unwrap(),
+            )
+            .unwrap();
+        assert_signed(&signer, &psbt);
+    }
+
+    #[test]
+    fn signer_without_chain_data_signs_rgb_psbt() {
+        let (mut wallet, signer, outpoint) = funded_wallet_and_signer();
+        let recipient = wallet
+            ._get_new_address(KeychainKind::External)
+            .unwrap()
+            .script_pubkey();
+        let (psbt, _) = wallet
+            ._prepare_psbt(
+                HashSet::from([outpoint]),
+                &vec![(recipient, 1000)],
+                FeeRate::from_sat_per_vb(1).unwrap(),
+                None,
+            )
+            .unwrap();
+        assert_signed(&signer, &psbt);
     }
 }
 

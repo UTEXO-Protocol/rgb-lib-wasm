@@ -1166,6 +1166,32 @@ pub struct WalletData {
 
 pub(crate) type BdkPersister = super::memory_store::MemoryStore<ChangeSet>;
 
+/// Build the colored and vanilla signers of a wallet from its descriptors.
+pub(crate) fn build_signers(
+    bdk_wallet: &BdkWallet,
+    desc_colored: &str,
+    desc_vanilla: &str,
+    network_kind: NetworkKind,
+) -> Result<[SignersContainer; 2], Error> {
+    let secp = bdk_wallet.secp_ctx();
+    let build = |desc: &str, keychain| -> Result<SignersContainer, Error> {
+        let (_, keymap) = desc
+            .into_wallet_descriptor(secp, network_kind)
+            .map_err(|e| Error::Internal {
+                details: e.to_string(),
+            })?;
+        Ok(SignersContainer::build(
+            keymap,
+            bdk_wallet.public_descriptor(keychain),
+            secp,
+        ))
+    };
+    Ok([
+        build(desc_colored, KeychainKind::External)?,
+        build(desc_vanilla, KeychainKind::Internal)?,
+    ])
+}
+
 pub(crate) type LoggerGuard = ();
 
 pub(crate) type RgbLibDb = crate::database::memory_db::InMemoryDb;
@@ -1183,6 +1209,8 @@ pub struct Wallet {
     pub(crate) database: Arc<RgbLibDb>,
     pub(crate) wallet_dir: PathBuf,
     pub(crate) bdk_wallet: PersistedWallet<BdkPersister>,
+    /// Colored and vanilla signers. They are empty for a watch-only wallet.
+    pub(crate) signers: [SignersContainer; 2],
     pub(crate) bdk_database: BdkPersister,
     /// Pinned derivation index per keychain for address reuse.
     pub(crate) reuse_address_index: HashMap<KeychainKind, u32>,
@@ -1290,22 +1318,25 @@ impl Wallet {
             (desc_colored, desc_vanilla, true)
         };
         let chain_net: ChainNet = wdata.bitcoin_network.into();
-        let mut wallet_params = BdkWallet::load()
+        let wallet_params = BdkWallet::load()
             .descriptor(KeychainKind::External, Some(desc_colored.clone()))
             .descriptor(KeychainKind::Internal, Some(desc_vanilla.clone()))
             .check_genesis_hash(BlockHash::from_byte_array(
                 chain_net.chain_hash().to_bytes(),
             ));
-        if !watch_only {
-            wallet_params = wallet_params.extract_keys();
-        }
         let mut bdk_database: BdkPersister = super::memory_store::MemoryStore::new();
         let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database)? {
             Some(wallet) => wallet,
-            None => BdkWallet::create(desc_colored, desc_vanilla)
+            None => BdkWallet::create(desc_colored.clone(), desc_vanilla.clone())
                 .network(bdk_network)
                 .create_wallet(&mut bdk_database)?,
         };
+        let signers = build_signers(
+            &bdk_wallet,
+            &desc_colored,
+            &desc_vanilla,
+            wdata.bitcoin_network.into(),
+        )?;
 
         // RGB setup
         let supported_schemas = wdata.supported_schemas;
@@ -1343,6 +1374,7 @@ impl Wallet {
             database: Arc::new(database),
             wallet_dir,
             bdk_wallet,
+            signers,
             bdk_database,
             reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
@@ -2397,8 +2429,9 @@ impl Wallet {
 
     fn _sign_psbt(&self, psbt: &mut Psbt, sign_options: Option<SignOptions>) -> Result<(), Error> {
         let sign_options = sign_options.unwrap_or_default();
+        let [colored, vanilla] = &self.signers;
         self.bdk_wallet
-            .sign(psbt, sign_options)
+            .sign_with_signers(psbt, &[colored, vanilla], sign_options)
             .map_err(InternalError::from)?;
         Ok(())
     }
@@ -3758,36 +3791,31 @@ impl Wallet {
             let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
             let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
 
-            let (desc_colored, desc_vanilla, watch_only) = if let Some(mnemonic) = &wdata.mnemonic {
-                let (dc, dv) = get_descriptors(
+            let (desc_colored, desc_vanilla) = if let Some(mnemonic) = &wdata.mnemonic {
+                get_descriptors(
                     wdata.bitcoin_network,
                     mnemonic,
                     wdata.vanilla_keychain,
                     xpub_btc,
                     xpub_rgb,
-                )?;
-                (dc, dv, false)
+                )?
             } else {
-                let (dc, dv) = get_descriptors_from_xpubs(
+                get_descriptors_from_xpubs(
                     wdata.bitcoin_network,
                     &wdata.master_fingerprint,
                     xpub_rgb,
                     xpub_btc,
                     wdata.vanilla_keychain,
-                )?;
-                (dc, dv, true)
+                )?
             };
 
             let chain_net: ChainNet = wdata.bitcoin_network.into();
-            let mut wallet_params = BdkWallet::load()
-                .descriptor(KeychainKind::External, Some(desc_colored.clone()))
-                .descriptor(KeychainKind::Internal, Some(desc_vanilla.clone()))
+            let wallet_params = BdkWallet::load()
+                .descriptor(KeychainKind::External, Some(desc_colored))
+                .descriptor(KeychainKind::Internal, Some(desc_vanilla))
                 .check_genesis_hash(BlockHash::from_byte_array(
                     chain_net.chain_hash().to_bytes(),
                 ));
-            if !watch_only {
-                wallet_params = wallet_params.extract_keys();
-            }
 
             match wallet_params.load_wallet(&mut self.bdk_database) {
                 Ok(Some(wallet)) => {
@@ -3855,10 +3883,17 @@ pub(crate) mod address_reuse_tests {
         )
         .unwrap();
         let mut bdk_database: BdkPersister = super::super::memory_store::MemoryStore::new();
-        let bdk_wallet = BdkWallet::create(desc_colored, desc_vanilla)
+        let bdk_wallet = BdkWallet::create(desc_colored.clone(), desc_vanilla.clone())
             .network(bdk_network)
             .create_wallet(&mut bdk_database)
             .unwrap();
+        let signers = build_signers(
+            &bdk_wallet,
+            &desc_colored,
+            &desc_vanilla,
+            bdk_network.into(),
+        )
+        .unwrap();
 
         let wd = WalletData {
             data_dir: ":memory:".to_string(),
@@ -3885,6 +3920,7 @@ pub(crate) mod address_reuse_tests {
             database: Arc::new(crate::database::memory_db::InMemoryDb::new()),
             wallet_dir: PathBuf::from(":memory:"),
             bdk_wallet,
+            signers,
             bdk_database,
             reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]

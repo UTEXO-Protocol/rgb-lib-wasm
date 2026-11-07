@@ -2,12 +2,8 @@
 
 use amplify::s;
 use base64::{Engine as _, engine::general_purpose};
-use chacha20poly1305_010::{KeyInit, XChaCha20Poly1305, aead::Aead};
-use generic_array::GenericArray;
-use scrypt::{
-    Scrypt,
-    password_hash::{PasswordHasher, Salt, SaltString, rand_core::OsRng},
-};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use scrypt::{Params, phc::Salt, scrypt};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
@@ -48,24 +44,28 @@ pub(crate) struct WalletBackupPayload {
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
-pub(crate) fn derive_key(
-    password: &str,
-    salt_b64: &str,
-) -> Result<GenericArray<u8, typenum::U32>, Error> {
+pub(crate) fn derive_key(password: &str, salt_b64: &str) -> Result<Key, Error> {
     let salt = Salt::from_b64(salt_b64).map_err(InternalError::from)?;
-    let password_hash = Scrypt
-        .hash_password_customized(
-            password.as_bytes(),
-            None,
-            None,
-            scrypt::Params::default(),
-            salt,
-        )
-        .map_err(InternalError::from)?;
-    let hash_output = password_hash
-        .hash
-        .ok_or(InternalError::NoPasswordHashError)?;
-    Ok(*GenericArray::from_slice(hash_output.as_bytes()))
+    let mut key = [0u8; 32];
+    scrypt(
+        password.as_bytes(),
+        salt.as_ref(),
+        &Params::RECOMMENDED,
+        &mut key,
+    )
+    .map_err(|e| Error::Internal {
+        details: e.to_string(),
+    })?;
+    Ok(key.into())
+}
+
+/// Generate a random base64 salt.
+fn generate_salt() -> Result<String, Error> {
+    let mut bytes = [0u8; Salt::RECOMMENDED_LENGTH];
+    getrandom::getrandom(&mut bytes).map_err(|e| Error::Internal {
+        details: format!("RNG unavailable: {e}"),
+    })?;
+    Ok(Salt::new(&bytes).map_err(InternalError::from)?.to_string())
 }
 
 /// Encrypt plaintext bytes using XChaCha20Poly1305.
@@ -73,22 +73,22 @@ pub(crate) fn encrypt_payload(
     plaintext: &[u8],
     password: &str,
 ) -> Result<(Vec<u8>, BackupPubData), Error> {
-    let salt = SaltString::generate(&mut OsRng);
-    let key = derive_key(password, salt.as_str())?;
+    let salt = generate_salt()?;
+    let key = derive_key(password, &salt)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce_bytes).map_err(|e| Error::Internal {
         details: format!("RNG unavailable: {e}"),
     })?;
-    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let nonce = XNonce::from(nonce_bytes);
 
     let cipher = XChaCha20Poly1305::new(&key);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| InternalError::AeadError(e.to_string()))?;
 
     let pub_data = BackupPubData {
-        salt: salt.to_string(),
+        salt,
         nonce: hex::encode(nonce_bytes),
         version: BACKUP_VERSION,
     };
@@ -109,11 +109,11 @@ pub(crate) fn decrypt_payload(
     let key = derive_key(password, &pub_data.salt)?;
     let nonce_bytes =
         hex::decode(&pub_data.nonce).map_err(|e| InternalError::HexError(e.to_string()))?;
-    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let nonce = XNonce::try_from(nonce_bytes.as_slice()).map_err(|_| Error::InvalidBackup)?;
 
     let cipher = XChaCha20Poly1305::new(&key);
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| Error::WrongPassword)
 }
 
@@ -349,6 +349,15 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_wrong_nonce_length_fails() {
+        let (ciphertext, mut pub_data) = encrypt_payload(b"data", "pw").unwrap();
+        pub_data.nonce = s!("00");
+
+        let result = decrypt_payload(&ciphertext, "pw", &pub_data);
+        assert!(matches!(result, Err(Error::InvalidBackup)));
+    }
+
+    #[test]
     fn unsupported_version_fails() {
         let plaintext = b"data";
         let (ciphertext, mut pub_data) = encrypt_payload(plaintext, "pw").unwrap();
@@ -394,12 +403,12 @@ mod tests {
 
     #[test]
     fn derive_key_deterministic() {
-        let salt = SaltString::generate(&mut OsRng);
-        let k1 = derive_key("password", salt.as_str()).unwrap();
-        let k2 = derive_key("password", salt.as_str()).unwrap();
+        let salt = generate_salt().unwrap();
+        let k1 = derive_key("password", &salt).unwrap();
+        let k2 = derive_key("password", &salt).unwrap();
         assert_eq!(k1, k2);
 
-        let k3 = derive_key("different", salt.as_str()).unwrap();
+        let k3 = derive_key("different", &salt).unwrap();
         assert_ne!(k1, k3);
     }
 
