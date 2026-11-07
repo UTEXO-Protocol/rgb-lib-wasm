@@ -2783,6 +2783,7 @@ impl Wallet {
             match tx.r#type {
                 WalletTransactionType::CreateUtxos => create_utxos_txids.push(tx.txid),
                 WalletTransactionType::Drain => drain_txids.push(tx.txid),
+                WalletTransactionType::SendBtc => {}
             }
         }
         let rgb_send_txids: Vec<String> = self
