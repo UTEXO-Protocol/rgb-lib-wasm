@@ -1107,6 +1107,16 @@ impl InMemoryDb {
         Ok(self.pending_witness_scripts.borrow().clone())
     }
 
+    pub(crate) fn iter_pending_witness_txos(&self) -> Result<Vec<DbTxo>, InternalError> {
+        Ok(self
+            .txos
+            .borrow()
+            .iter()
+            .filter(|t| t.pending_witness)
+            .cloned()
+            .collect())
+    }
+
     pub(crate) fn iter_transfers(&self) -> Result<Vec<DbTransfer>, InternalError> {
         Ok(self.transfers.borrow().clone())
     }

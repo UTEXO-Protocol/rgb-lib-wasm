@@ -126,7 +126,7 @@ fn min_txid() -> Txid {
 }
 
 /// In-memory implementation of `RgbStore`.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct MemRgbStore {
     tables: RefCell<Tables>,
     /// `None`: no transaction. `Some(None)`: read transaction.

@@ -412,6 +412,12 @@ pub(crate) enum TryFailBatchTransferOutcome {
     Denied,
 }
 
+/// The state a transfer's refresh changes, to restore when it fails.
+struct TransferSavepoint {
+    database: RgbLibDb,
+    stock: Option<MemRgbStore>,
+}
+
 /// Proxy context needed to receive (and decrypt) a consignment via a proxy server.
 #[derive(Clone)]
 pub(crate) struct ProxyReceiveData {
@@ -896,10 +902,164 @@ impl Wallet {
             .collect())
     }
 
+    fn _transfer_savepoint(&self) -> TransferSavepoint {
+        TransferSavepoint {
+            database: (*self.database).clone(),
+            stock: self
+                .rgb_stock
+                .borrow()
+                .as_ref()
+                .map(|s| s.as_store().clone()),
+        }
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
+    fn _rollback_transfer(&mut self, savepoint: TransferSavepoint) {
+        self.database = Arc::new(savepoint.database);
+        *self.rgb_stock.borrow_mut() = savepoint.stock.map(Stock::with);
+    }
+
+    /// Clear the pending witness flag of the TXOs at `outpoints` or that pay one of `scripts`.
+    fn _unflag_pending_witness_txos(
+        &self,
+        outpoints: &HashSet<Outpoint>,
+        scripts: &HashSet<ScriptBuf>,
+    ) -> Result<(), Error> {
+        for txo in self.database.iter_pending_witness_txos()? {
+            let outpoint = txo.outpoint();
+            let pays_script = || {
+                self.bdk_wallet
+                    .tx_graph()
+                    .get_txout(outpoint.clone().into())
+                    .is_some_and(|txout| scripts.contains(&txout.script_pubkey))
+            };
+            if !outpoints.contains(&outpoint) && !pays_script() {
+                continue;
+            }
+            let mut txo: DbTxoActMod = txo.into();
+            txo.pending_witness = ActiveValue::Set(false);
+            self.database.update_txo(txo)?;
+        }
+        Ok(())
+    }
+
+    /// Clear the pending witness flag of the TXOs of the witness receives of a failing batch.
+    fn _clean_failed_witness_receives(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<(), Error> {
+        let asset_transfers = self.database.iter_asset_transfers()?;
+        let transfers = self.database.iter_transfers()?;
+        if !batch_transfer.incoming(&asset_transfers, &transfers)? {
+            return Ok(());
+        }
+        let mut outpoints = HashSet::new();
+        let mut scripts = HashSet::new();
+        let batch_transfer_data = batch_transfer.get_transfers(&asset_transfers, &transfers)?;
+        for transfer in batch_transfer_data
+            .asset_transfers_data
+            .into_iter()
+            .flat_map(|atd| atd.transfers)
+        {
+            let vout = match transfer.recipient_type {
+                Some(RecipientTypeFull::Witness { vout }) => vout,
+                _ => continue,
+            };
+            if let (Some(txid), Some(vout)) = (&batch_transfer.txid, vout) {
+                outpoints.insert(Outpoint {
+                    txid: txid.clone(),
+                    vout,
+                });
+            }
+            if let Some(recipient_id) = transfer.recipient_id
+                && let Some(script) = script_buf_from_recipient_id(recipient_id)?
+            {
+                scripts.insert(script);
+            }
+        }
+        self._unflag_pending_witness_txos(&outpoints, &scripts)
+    }
+
+    /// Drop the pending witness state of the witness receives that are not pending anymore and
+    /// return the scripts still watched.
+    fn _reconcile_pending_witness(&self) -> Result<HashSet<String>, Error> {
+        let pending_witness_scripts = self.database.iter_pending_witness_scripts()?;
+        let pending_witness_txos = self.database.iter_pending_witness_txos()?;
+        if pending_witness_scripts.is_empty() && pending_witness_txos.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let db_data = self.database.get_db_data(false)?;
+        let mut pending_scripts = HashSet::new();
+        let mut pending_asset_transfers = HashSet::new();
+        for batch_transfer in &db_data.batch_transfers {
+            if !batch_transfer.status.pending()
+                || !batch_transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?
+            {
+                continue;
+            }
+            let batch_transfer_data =
+                batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+            for transfer in batch_transfer_data
+                .asset_transfers_data
+                .into_iter()
+                .flat_map(|atd| atd.transfers)
+            {
+                if !matches!(
+                    transfer.recipient_type,
+                    Some(RecipientTypeFull::Witness { .. })
+                ) {
+                    continue;
+                }
+                if let Some(recipient_id) = transfer.recipient_id
+                    && let Some(script) = script_buf_from_recipient_id(recipient_id)?
+                {
+                    pending_scripts.insert(script.to_hex_string());
+                    pending_asset_transfers.insert(transfer.asset_transfer_idx);
+                }
+            }
+        }
+
+        let mut kept_scripts = HashSet::new();
+        for pending_witness_script in pending_witness_scripts {
+            if pending_scripts.contains(&pending_witness_script.script) {
+                kept_scripts.insert(pending_witness_script.script);
+            } else {
+                self.database
+                    .del_pending_witness_script(pending_witness_script.script)?;
+            }
+        }
+
+        for txo in pending_witness_txos {
+            let has_pending_coloring = db_data.colorings.iter().any(|c| {
+                c.txo_idx == txo.idx
+                    && c.r#type == ColoringType::Receive
+                    && pending_asset_transfers.contains(&c.asset_transfer_idx)
+            });
+            let pays_pending_script = || {
+                self.bdk_wallet
+                    .tx_graph()
+                    .get_txout(txo.outpoint().into())
+                    .is_some_and(|txout| {
+                        pending_scripts.contains(&txout.script_pubkey.to_hex_string())
+                    })
+            };
+            if has_pending_coloring || pays_pending_script() {
+                continue;
+            }
+            let mut txo: DbTxoActMod = txo.into();
+            txo.pending_witness = ActiveValue::Set(false);
+            self.database.update_txo(txo)?;
+        }
+
+        Ok(kept_scripts)
+    }
+
     fn _fail_batch_transfer(
         &mut self,
         batch_transfer: &DbBatchTransfer,
     ) -> Result<DbBatchTransfer, Error> {
+        self._clean_failed_witness_receives(batch_transfer)?;
         if let Some(artifacts) = batch_transfer
             .txid
             .as_ref()
@@ -1875,6 +2035,8 @@ impl Wallet {
             })?;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
 
+        let pending_witness_scripts = self._reconcile_pending_witness()?;
+
         let db_txos = self.database.iter_txos()?;
 
         let db_outpoints: HashSet<String> = db_txos
@@ -1894,22 +2056,13 @@ impl Wallet {
             .filter(|u| !db_outpoints.contains(&u.outpoint.to_string()))
             .collect();
 
-        let pending_witness_scripts: Vec<String> = self
-            .database
-            .iter_pending_witness_scripts()?
-            .into_iter()
-            .map(|s| s.script)
-            .collect();
-
         for new_utxo in new_utxos.iter().cloned() {
             let mut new_db_utxo: DbTxoActMod = new_utxo.clone().into();
-            if !pending_witness_scripts.is_empty() {
-                let pending_witness_script = new_utxo.txout.script_pubkey.to_hex_string();
-                if pending_witness_scripts.contains(&pending_witness_script) {
-                    new_db_utxo.pending_witness = ActiveValue::Set(true);
-                    self.database
-                        .del_pending_witness_script(pending_witness_script)?;
-                }
+            let pending_witness_script = new_utxo.txout.script_pubkey.to_hex_string();
+            if pending_witness_scripts.contains(&pending_witness_script) {
+                new_db_utxo.pending_witness = ActiveValue::Set(true);
+                self.database
+                    .del_pending_witness_script(pending_witness_script)?;
             }
             self.database.set_txo(new_db_utxo.clone())?;
         }
@@ -2884,6 +3037,11 @@ impl Wallet {
                 return Err(e);
             }
         };
+        // a sync may have flagged a TXO paying the script of the refused receive
+        let scripts = script_buf_from_recipient_id(recipient_id.to_string())?
+            .into_iter()
+            .collect();
+        self._unflag_pending_witness_txos(&HashSet::new(), &scripts)?;
         self.clear_received_data(recipient_id);
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         Ok(Some(
@@ -3737,8 +3895,6 @@ impl Wallet {
 
         updated_batch_transfer.txid = ActiveValue::Set(Some(txid.clone()));
 
-        // a retry after a failed ACK saves the receive again: start from a clean state
-        self.database.del_coloring(asset_transfer.idx)?;
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
                 self.database
@@ -4570,14 +4726,18 @@ impl Wallet {
         for transfer in db_data.batch_transfers.clone().into_iter() {
             let mut failure = None;
             let mut updated_status = None;
+            let savepoint = self._transfer_savepoint();
             match self
                 ._refresh_transfer_async(&transfer, &mut db_data, &filter, skip_sync)
                 .await
             {
                 Ok(Some(updated_transfer)) => updated_status = Some(updated_transfer.status),
                 Err(e) => {
+                    // this error means the refresh failed the batch on purpose
                     if matches!(e, Error::MissingTransferArtifacts { .. }) {
                         updated_status = Some(TransferStatus::Failed);
+                    } else {
+                        self._rollback_transfer(savepoint);
                     }
                     failure = Some(e);
                 }
@@ -4659,11 +4819,16 @@ impl Wallet {
         } else {
             expired_beyond_skew_margin(batch_transfer)
         };
-        let updated_batch_transfer = match self
+        let savepoint = self._transfer_savepoint();
+        let refreshed = self
             ._refresh_transfer_async(batch_transfer, db_data, &[], true)
-            .await
-        {
+            .await;
+        let updated_batch_transfer = match refreshed {
             Err(Error::MinFeeNotMet { txid: _ }) | Err(Error::MaxFeeExceeded { txid: _ }) => {
+                // an outgoing transfer keeps the ACKs the refresh stored
+                if incoming {
+                    self._rollback_transfer(savepoint);
+                }
                 Ok(None)
             }
             // the sender proxy lost the operation or serves an invalid ACK signature: the
@@ -4674,6 +4839,7 @@ impl Wallet {
                     self.logger,
                     "Sender proxy cannot be relied upon, fail denied until the broadcast deadline"
                 );
+                self._rollback_transfer(savepoint);
                 return Ok(TryFailBatchTransferOutcome::Denied);
             }
             // a transfer that keeps failing to refresh would otherwise never be failed; once
@@ -4684,9 +4850,18 @@ impl Wallet {
                     self.logger,
                     "Failing expired transfer that failed to refresh: {e}"
                 );
+                // an outgoing transfer keeps the ACKs the refresh stored
+                if incoming {
+                    self._rollback_transfer(savepoint);
+                }
                 Ok(None)
             }
-            Err(e) => Err(e),
+            // the refresh failed the batch on purpose
+            Err(e @ Error::MissingTransferArtifacts { .. }) => Err(e),
+            Err(e) => {
+                self._rollback_transfer(savepoint);
+                Err(e)
+            }
             Ok(v) => Ok(v),
         }?;
         // if the status changed after the refresh, the transfer progressed
@@ -6263,6 +6438,7 @@ mod go_online_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod send_end_tests {
     use super::*;
+    use crate::utils::recipient_id_from_script_buf;
     use crate::wallet::offline::address_reuse_tests::make_test_wallet;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
@@ -6517,6 +6693,163 @@ mod send_end_tests {
                 pending_witness: ActiveValue::Set(false),
                 ..Default::default()
             })
+            .unwrap()
+    }
+
+    // A flagged TXO, as a sync or an accepted consignment leaves it.
+    fn seed_pending_witness_txo(wallet: &Wallet, txid: &str, vout: u32) -> i32 {
+        let idx = seed_txo(wallet, txid, vout);
+        let txo = DbTxoActMod {
+            idx: ActiveValue::Set(idx),
+            pending_witness: ActiveValue::Set(true),
+            ..Default::default()
+        };
+        wallet.database.update_txo(txo).unwrap();
+        idx
+    }
+
+    fn pending_witness(wallet: &Wallet, txo_idx: i32) -> bool {
+        wallet
+            .database
+            .iter_txos()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.idx == txo_idx)
+            .unwrap()
+            .pending_witness
+    }
+
+    fn new_script(wallet: &mut Wallet) -> ScriptBuf {
+        wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address
+            .script_pubkey()
+    }
+
+    // Make the wallet know a TX that pays `script` and return its TXID.
+    fn apply_tx_paying(wallet: &mut Wallet, script: ScriptBuf) -> String {
+        let tx = BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([2; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![bdk_wallet::bitcoin::TxOut {
+                value: BdkAmount::from_sat(1000),
+                script_pubkey: script,
+            }],
+        };
+        let txid = tx.compute_txid().to_string();
+        wallet.bdk_wallet.apply_unconfirmed_txs([(tx, 0)]);
+        txid
+    }
+
+    fn seed_witness_receive(
+        wallet: &Wallet,
+        txid: &str,
+        status: TransferStatus,
+        vout: Option<u32>,
+        script: &ScriptBuf,
+    ) -> i32 {
+        let batch_idx = seed_batch(wallet, txid, status, true, None);
+        let mut transfer: DbTransferActMod = batch_transfer_row(wallet, batch_idx).into();
+        transfer.recipient_type = ActiveValue::Set(Some(RecipientTypeFull::Witness { vout }));
+        transfer.recipient_id = ActiveValue::Set(Some(recipient_id_from_script_buf(
+            script.clone(),
+            BitcoinNetwork::Regtest,
+        )));
+        wallet.database.update_transfer(&mut transfer).unwrap();
+        batch_idx
+    }
+
+    // An incoming batch with a downloaded consignment that cannot be parsed, so the refresh
+    // changes the transfer and then posts a NACK to `proxy_url`.
+    fn seed_receive_with_consignment(wallet: &mut Wallet, proxy_url: &str, expiration: i64) -> i32 {
+        let txid = "33".repeat(32);
+        let status = TransferStatus::WaitingCounterparty;
+        let batch_idx = seed_batch(wallet, &txid, status, true, Some(expiration));
+        let mut batch = DbBatchTransferActMod {
+            idx: ActiveValue::Set(batch_idx),
+            operation_secret_key: ActiveValue::Set(Some(RECIPIENT_SEED.to_vec())),
+            ..Default::default()
+        };
+        wallet.database.update_batch_transfer(&mut batch).unwrap();
+        wallet
+            .save_transfer_transport_endpoint(
+                batch_transfer_row(wallet, batch_idx).idx,
+                &LocalTransportEndpoint {
+                    transport_type: TransportType::JsonRpc,
+                    endpoint: proxy_url.to_string(),
+                    used: false,
+                    usable: true,
+                },
+            )
+            .unwrap();
+        wallet
+            .received_consignments
+            .insert(s!("recipient"), b"garbage".to_vec());
+        wallet.received_consignment_meta.insert(
+            s!("recipient"),
+            ReceivedConsignmentMeta {
+                proxy_url: Some(proxy_url.to_string()),
+                transfer_id: Some(s!("transfer")),
+                sender_transport_endpoint: proxy_url.to_string(),
+                sender_pubkey: hex::encode(
+                    ed25519_from_seed(&OPERATION_SEED)
+                        .verifying_key()
+                        .to_bytes(),
+                ),
+                consignment_hash: "00".repeat(32),
+                batch: false,
+            },
+        );
+        batch_idx
+    }
+
+    // The receive of `seed_receive_with_consignment` is as it was seeded, with its download kept.
+    fn assert_receive_rolled_back(wallet: &Wallet, batch_idx: i32) {
+        assert_eq!(ttes_used(wallet, batch_idx), vec![false]);
+        let transfer = batch_transfer_row(wallet, batch_idx);
+        assert_eq!(transfer.consignment_hash, None);
+        assert_eq!(transfer.proxy_transfer_id, None);
+        let endpoints = wallet
+            .database
+            .get_transfer_transport_endpoints_data(transfer.idx)
+            .unwrap();
+        assert!(
+            endpoints
+                .iter()
+                .all(|(tte, _)| tte.kind != TransportEndpointKind::SenderProxy)
+        );
+        assert!(wallet.received_consignments.contains_key("recipient"));
+        assert!(wallet.received_consignment_meta.contains_key("recipient"));
+    }
+
+    fn set_expiration(wallet: &Wallet, batch_idx: i32, expiration: i64) {
+        let mut batch = DbBatchTransferActMod {
+            idx: ActiveValue::Set(batch_idx),
+            expiration: ActiveValue::Set(Some(expiration)),
+            ..Default::default()
+        };
+        wallet.database.update_batch_transfer(&mut batch).unwrap();
+    }
+
+    fn batch_transfer_row(wallet: &Wallet, batch_idx: i32) -> DbTransfer {
+        let db_data = wallet.database.get_db_data(false).unwrap();
+        db_data
+            .batch_transfers
+            .iter()
+            .find(|bt| bt.idx == batch_idx)
+            .unwrap()
+            .get_transfers(&db_data.asset_transfers, &db_data.transfers)
+            .unwrap()
+            .asset_transfers_data
+            .pop()
+            .unwrap()
+            .transfers
+            .pop()
             .unwrap()
     }
 
@@ -7390,9 +7723,61 @@ mod send_end_tests {
         updated.expiration = ActiveValue::Set(Some(now - 1000));
         updated.broadcast_deadline = ActiveValue::Set(Some(now - 1000));
         wallet.database.update_batch_transfer(&mut updated).unwrap();
-        let res = block_on(wallet.fail_transfers(online, Some(idx), false, true));
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(idx), false, true));
         assert_eq!(res, Ok(true));
         assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+
+        // a denied fail does not keep the valid ACK read before the invalid signature
+        let sign = |seed, id| {
+            let digest = Wallet::ack_digest(id, true, &"00".repeat(32));
+            hex::encode(sign_ed25519(&ed25519_from_seed(&seed), &digest))
+        };
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":null,"result":{{"acks":{{"transfer":true,"second":true}},"signatures":{{"transfer":"{}","second":"{}"}}}}}}"#,
+            sign(RECIPIENT_SEED, "transfer"),
+            sign([9; 32], "second"),
+        );
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(&mut server, "ack.get", &body);
+        let idx = seed_outgoing(
+            &wallet,
+            &"22".repeat(32),
+            TransferStatus::WaitingCounterparty,
+            Some(now + 1000),
+            None,
+            &server.url(),
+            None,
+        );
+        let first = wallet.database.iter_transfers().unwrap().pop().unwrap();
+        let second = wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(first.asset_transfer_idx),
+                incoming: ActiveValue::Set(false),
+                recipient_id: ActiveValue::Set(Some(s!("second"))),
+                proxy_transfer_id: ActiveValue::Set(Some(s!("second"))),
+                consignment_hash: ActiveValue::Set(Some("00".repeat(32))),
+                recipient_pubkey: ActiveValue::Set(Some(recipient_pubkey())),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .save_sender_transport_endpoint(second, &server.url())
+            .unwrap();
+
+        let res = block_on(wallet.fail_transfers(online, Some(idx), false, true));
+
+        assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+        let first = wallet
+            .database
+            .iter_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.idx == first.idx)
+            .unwrap();
+        assert_eq!(first.ack, None);
+        assert_eq!(first.ack_signature, None);
     }
 
     #[test]
@@ -7785,5 +8170,376 @@ mod send_end_tests {
         // the ACKs are polled on the sender proxy, not on the recipient one
         block_on(wallet.refresh(online, None, vec![], true)).unwrap();
         ack.assert();
+    }
+
+    #[test]
+    fn refresh_rolls_back_only_the_failed_transfer() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut nack_server = mockito::Server::new();
+        let _nack = rpc_mock(
+            &mut nack_server,
+            "ack.get",
+            &ack_get_body(RECIPIENT_SEED, false),
+        );
+        let mut ack_server = mockito::Server::new();
+        let _ack = rpc_mock(
+            &mut ack_server,
+            "ack.get",
+            &ack_get_body(RECIPIENT_SEED, true),
+        );
+        let expiration = Some(now().unix_timestamp() + 1000);
+        let status_before = TransferStatus::WaitingCounterparty;
+        let seed = |txid: &str, url: &str| {
+            seed_outgoing(&wallet, txid, status_before, expiration, None, url, None)
+        };
+        let first = seed(&"11".repeat(32), &nack_server.url());
+        let second = seed(&txid, &ack_server.url());
+        let third = seed(&"22".repeat(32), &nack_server.url());
+        wallet.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(psbt),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+
+        assert!(matches!(
+            res[&second].failure,
+            Some(Error::FailedBroadcast { .. })
+        ));
+        assert_eq!(status(&wallet, second), status_before);
+        let transfer = batch_transfer_row(&wallet, second);
+        assert_eq!(transfer.ack, None);
+        assert_eq!(transfer.ack_signature, None);
+        assert!(wallet.transfer_artifacts.contains_key(&txid));
+        for idx in [first, third] {
+            assert_eq!(res[&idx].failure, None);
+            assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+            assert_eq!(batch_transfer_row(&wallet, idx).ack, Some(false));
+        }
+    }
+
+    #[test]
+    fn refresh_rolls_back_a_receive_and_keeps_its_consignment() {
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(&mut server, "ack.post", "not valid json");
+        let expiration = now().unix_timestamp() + 3600;
+        let idx = seed_receive_with_consignment(&mut wallet, &server.url(), expiration);
+
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+
+        assert!(matches!(res[&idx].failure, Some(Error::Proxy { .. })));
+        assert_receive_rolled_back(&wallet, idx);
+    }
+
+    #[test]
+    fn fail_transfers_expired_send_with_failing_ack() {
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(&mut server, "ack.get", "not valid json");
+        let _clean = rpc_mock(&mut server, "ack.clean", TRUE_BODY);
+        let now = now().unix_timestamp();
+        let status_before = TransferStatus::WaitingCounterparty;
+        let seed = |txid: &str| {
+            seed_outgoing(
+                &wallet,
+                txid,
+                status_before,
+                Some(now + 1000),
+                None,
+                &server.url(),
+                None,
+            )
+        };
+        let single = seed(&"11".repeat(32));
+        let all = seed(&"22".repeat(32));
+
+        // before the expiration the error can be transient
+        let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
+        assert!(matches!(res[&single].failure, Some(Error::Proxy { .. })));
+        assert!(matches!(res[&all].failure, Some(Error::Proxy { .. })));
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(single), false, true));
+        assert!(matches!(res, Err(Error::Proxy { .. })));
+        let res = block_on(wallet.fail_transfers(online.clone(), None, false, true));
+        assert_eq!(res, Ok(false));
+        assert_eq!(status(&wallet, single), status_before);
+        assert_eq!(status(&wallet, all), status_before);
+
+        let expired = now - i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS) - 1;
+        set_expiration(&wallet, single, expired);
+        set_expiration(&wallet, all, expired);
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(single), false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, single), TransferStatus::Failed);
+        assert_eq!(status(&wallet, all), status_before);
+        let res = block_on(wallet.fail_transfers(online, None, false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, all), TransferStatus::Failed);
+    }
+
+    #[test]
+    fn fail_transfers_expired_receive_with_failing_ack() {
+        for all in [false, true] {
+            let (mut wallet, online) = setup();
+            let mut server = mockito::Server::new();
+            let _ack = rpc_mock(&mut server, "ack.post", "not valid json");
+            let now = now().unix_timestamp();
+            let idx = seed_receive_with_consignment(&mut wallet, &server.url(), now + 3600);
+            let target = (!all).then_some(idx);
+
+            // before the expiration the error can be transient
+            let res = block_on(wallet.fail_transfers(online.clone(), target, false, true));
+            if all {
+                assert_eq!(res, Ok(false));
+            } else {
+                assert!(matches!(res, Err(Error::Proxy { .. })));
+            }
+            assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+            assert_receive_rolled_back(&wallet, idx);
+
+            set_expiration(&wallet, idx, now - 1);
+            let res = block_on(wallet.fail_transfers(online, target, false, true));
+            assert_eq!(res, Ok(true));
+            assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+            assert_eq!(ttes_used(&wallet, idx), vec![false]);
+        }
+    }
+
+    // the ACKs stored by the refresh tell that the TX was released
+    #[test]
+    fn fail_transfers_keeps_acks_of_a_failed_broadcast() {
+        for rejection in ["", "min relay fee not met"] {
+            let (psbt, txid) = dummy_psbt();
+            let route = esplora_route(None);
+            let url = fake_esplora(move |path| {
+                if path.ends_with("/tx") {
+                    return ("400 Bad Request", rejection.as_bytes().to_vec());
+                }
+                route(path)
+            });
+            let (mut wallet, online) = setup_at(&url);
+            let mut server = mockito::Server::new();
+            let _ack = rpc_mock(&mut server, "ack.get", &ack_get_body(RECIPIENT_SEED, true));
+            let expired = now().unix_timestamp() - i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS) - 1;
+            let idx = seed_outgoing(
+                &wallet,
+                &txid,
+                TransferStatus::WaitingCounterparty,
+                Some(expired),
+                None,
+                &server.url(),
+                None,
+            );
+            wallet.transfer_artifacts.insert(
+                txid,
+                TransferArtifacts {
+                    signed_psbt: Some(psbt),
+                    ..artifacts(BTreeMap::new())
+                },
+            );
+
+            let res = block_on(wallet.fail_transfers(online, None, false, true));
+
+            assert_eq!(res, Ok(false));
+            assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+            assert_eq!(batch_transfer_row(&wallet, idx).ack, Some(true));
+        }
+    }
+
+    // the refresh fails a send that lost its signed TX, and the fail must not be rolled back
+    #[test]
+    fn fail_transfers_fails_a_send_missing_its_signed_tx() {
+        let (_, txid) = dummy_psbt();
+        let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(&mut server, "ack.get", &ack_get_body(RECIPIENT_SEED, true));
+        let expiration = Some(now().unix_timestamp() + 1000);
+        let status_before = TransferStatus::WaitingCounterparty;
+        let idx = seed_outgoing(
+            &wallet,
+            &txid,
+            status_before,
+            expiration,
+            None,
+            &server.url(),
+            None,
+        );
+
+        let res = block_on(wallet.fail_transfers(online.clone(), Some(idx), false, true));
+
+        assert!(matches!(res, Err(Error::MissingTransferArtifacts { .. })));
+        assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+
+        // a refresh keeps this fail too
+        let idx = seed_outgoing(
+            &wallet,
+            &"22".repeat(32),
+            status_before,
+            expiration,
+            None,
+            &server.url(),
+            None,
+        );
+
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+
+        assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+        assert!(matches!(
+            res[&idx].failure,
+            Some(Error::MissingTransferArtifacts { .. })
+        ));
+        assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+    }
+
+    // a witness receive whose consignment is refused releases the TXO that paid it
+    #[test]
+    fn refusing_a_consignment_clears_pending_witness_txo() {
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let _ack = rpc_mock(
+            &mut server,
+            "ack.post",
+            r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#,
+        );
+        let idx = seed_receive_with_consignment(
+            &mut wallet,
+            &server.url(),
+            now().unix_timestamp() + 3600,
+        );
+        let script = new_script(&mut wallet);
+        let rid = recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest);
+        let mut transfer: DbTransferActMod = batch_transfer_row(&wallet, idx).into();
+        transfer.recipient_type = ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
+        transfer.recipient_id = ActiveValue::Set(Some(rid.clone()));
+        wallet.database.update_transfer(&mut transfer).unwrap();
+        let consignment = wallet.received_consignments.remove("recipient").unwrap();
+        wallet
+            .received_consignments
+            .insert(rid.clone(), consignment);
+        let meta = wallet
+            .received_consignment_meta
+            .remove("recipient")
+            .unwrap();
+        wallet.received_consignment_meta.insert(rid, meta);
+        let txid = apply_tx_paying(&mut wallet, script);
+        let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+        let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
+
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+
+        assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+        assert!(!pending_witness(&wallet, paid_txo));
+        assert!(pending_witness(&wallet, unrelated_txo));
+    }
+
+    #[test]
+    fn fail_clears_pending_witness_txo() {
+        let (mut wallet, _) = setup();
+        let status_before = TransferStatus::WaitingCounterparty;
+
+        // the TXO an accepted consignment registered
+        let txid = "11".repeat(32);
+        let script = new_script(&mut wallet);
+        let by_outpoint = seed_witness_receive(&wallet, &txid, status_before, Some(0), &script);
+        let outpoint_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+
+        // the TXO a sync flagged before any consignment
+        let script = new_script(&mut wallet);
+        let by_script = seed_witness_receive(&wallet, "", status_before, None, &script);
+        let txid = apply_tx_paying(&mut wallet, script);
+        let script_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+
+        let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
+
+        for idx in [by_outpoint, by_script] {
+            let batch_transfer = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .into_iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap();
+            wallet._fail_batch_transfer(&batch_transfer).unwrap();
+        }
+
+        assert!(!pending_witness(&wallet, outpoint_txo));
+        assert!(!pending_witness(&wallet, script_txo));
+        assert!(pending_witness(&wallet, unrelated_txo));
+    }
+
+    #[test]
+    fn reconcile_follows_the_witness_receive_status() {
+        let (mut wallet, _) = setup();
+        let mut scripts = vec![];
+        let mut txos = vec![];
+        for (i, status) in [
+            TransferStatus::WaitingConfirmations,
+            TransferStatus::Failed,
+            TransferStatus::Settled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let txid = format!("{}{}", i + 1, i + 1).repeat(32);
+            let script = new_script(&mut wallet);
+            let idx = seed_witness_receive(&wallet, &txid, status, Some(0), &script);
+            let txo_idx = seed_pending_witness_txo(&wallet, &txid, 0);
+            wallet
+                .database
+                .set_coloring(DbColoringActMod {
+                    txo_idx: ActiveValue::Set(txo_idx),
+                    asset_transfer_idx: ActiveValue::Set(
+                        batch_transfer_row(&wallet, idx).asset_transfer_idx,
+                    ),
+                    r#type: ActiveValue::Set(ColoringType::Receive),
+                    assignment: ActiveValue::Set(Assignment::Fungible(1)),
+                    ..Default::default()
+                })
+                .unwrap();
+            scripts.push(script.to_hex_string());
+            txos.push(txo_idx);
+        }
+        // a receive paid before its consignment arrives has a TXO with no coloring
+        let script = new_script(&mut wallet);
+        seed_witness_receive(
+            &wallet,
+            "",
+            TransferStatus::WaitingCounterparty,
+            None,
+            &script,
+        );
+        let txid = apply_tx_paying(&mut wallet, script);
+        let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+        // the script of a deleted receive has no transfer
+        let deleted = new_script(&mut wallet).to_hex_string();
+        for script in scripts.iter().chain([&deleted]) {
+            wallet
+                .database
+                .set_pending_witness_script(DbPendingWitnessScriptActMod {
+                    script: ActiveValue::Set(script.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let kept = wallet._reconcile_pending_witness().unwrap();
+
+        assert_eq!(kept, HashSet::from([scripts[0].clone()]));
+        let rows: Vec<String> = wallet
+            .database
+            .iter_pending_witness_scripts()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.script)
+            .collect();
+        assert_eq!(rows, vec![scripts[0].clone()]);
+        assert!(pending_witness(&wallet, txos[0]));
+        assert!(pending_witness(&wallet, paid_txo));
+        assert!(!pending_witness(&wallet, txos[1]));
+        assert!(!pending_witness(&wallet, txos[2]));
     }
 }
