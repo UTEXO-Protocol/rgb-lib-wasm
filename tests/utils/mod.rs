@@ -34,7 +34,7 @@ pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
         },
         skip_consistency_check,
         proxy_auth_keys: HashMap::new(),
-        evm_rpc_urls: HashMap::new(),
+        evm_chains: HashMap::new(),
     }
 }
 

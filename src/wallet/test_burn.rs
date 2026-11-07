@@ -242,7 +242,8 @@ async fn bfa_burn_settles_and_keeps_send_receive() {
     let reject_list = new_evm_address();
     deploy_bridge(&bridge).await;
     deploy_reject_list(&reject_list, &[]).await;
-    let (asset_id, opid) = bfa_with_units(&mut a, &a_online, &bridge, Some(reject_list)).await;
+    let (asset_id, _, lock_id) =
+        bfa_with_units(&mut a, &a_online, &bridge, Some(reject_list)).await;
 
     let res = a
         .burn(a_online.clone(), asset_id.clone(), 30, Some(reason()), 1, 1)
@@ -277,7 +278,7 @@ async fn bfa_burn_settles_and_keeps_send_receive() {
     );
     assert_eq!(mint_rights(&mut a, &asset_id), 1);
 
-    emit_funds_in(&bridge, opid, 100).await;
+    record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
     finalize_evm().await;
     send(&mut a, &a_online, &mut b, &b_online, &asset_id, 10).await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;

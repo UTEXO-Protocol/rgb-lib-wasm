@@ -186,7 +186,6 @@ impl super::Wallet {
             received_consignment_meta: payload.received_consignment_meta,
             received_signed_txs: payload.received_signed_txs,
             received_mints: payload.received_mints,
-            mint_scanned_blocks: Default::default(),
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
         };

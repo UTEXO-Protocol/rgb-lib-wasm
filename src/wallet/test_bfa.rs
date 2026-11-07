@@ -6,13 +6,16 @@ wasm_bindgen_test_configure!(run_in_browser);
 #[path = "../../tests/utils/mod.rs"]
 pub(super) mod utils;
 
-use crate::wallet::{AssetFilter, Online, OnlineOptions, Wallet, WalletData};
+use crate::wallet::{AssetFilter, EvmChain, Online, OnlineOptions, Wallet, WalletData};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferStatus, generate_keys,
 };
 use amplify::{ByteArray, Wrapper};
-use rgbstd::{OpId, Opout};
+use bdk_wallet::bitcoin::psbt::Psbt;
+use rgbstd::containers::LockId;
+use rgbstd::{OpId, Opout, Txid as RgbTxid};
 use serde_json::{Value, json};
+use std::str::FromStr;
 use utils::*;
 
 pub(super) const CHAIN_ID: u64 = 31337;
@@ -35,17 +38,32 @@ pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     }
 }
 
-pub(super) fn evm_rpc_urls() -> HashMap<u64, String> {
-    HashMap::from([(CHAIN_ID, EVM_RPC_URL.to_string())])
+pub(super) fn evm_chains(min: u64, max: u64) -> HashMap<u64, EvmChain> {
+    HashMap::from([(
+        CHAIN_ID,
+        EvmChain {
+            rpc_url: EVM_RPC_URL.to_string(),
+            min_mint_lock_blocks: min,
+            max_mint_lock_blocks: max,
+        },
+    )])
 }
 
 pub(super) async fn funded_wallet(wd: WalletData, utxos: u8) -> (Wallet, Online) {
-    // a failed test can leave the mock set
-    crate::api::evm::MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
+    funded_wallet_with(wd, utxos, 2, 1_000_000).await
+}
+
+/// A funded wallet whose mint lock blocks are between `min` and `max`.
+pub(super) async fn funded_wallet_with(
+    wd: WalletData,
+    utxos: u8,
+    min: u64,
+    max: u64,
+) -> (Wallet, Online) {
     let mut wallet = Wallet::new(wd).unwrap();
     let online = wallet
         .go_online(OnlineOptions {
-            evm_rpc_urls: evm_rpc_urls(),
+            evm_chains: evm_chains(min, max),
             ..go_online_options(false)
         })
         .await
@@ -253,38 +271,54 @@ async fn bfa_issue_list_and_backup() {
 }
 
 #[wasm_bindgen_test]
-async fn bfa_go_online_checks_evm_rpc_urls() {
+async fn bfa_go_online_checks_evm_chains() {
     let mut wallet = Wallet::new(wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa])).unwrap();
+    let go_online = |evm_chains: HashMap<u64, EvmChain>| OnlineOptions {
+        evm_chains,
+        ..go_online_options(false)
+    };
+    let chain = |chain_id: u64, rpc_url: &str| {
+        HashMap::from([(
+            chain_id,
+            EvmChain {
+                rpc_url: s(rpc_url),
+                min_mint_lock_blocks: 2,
+                max_mint_lock_blocks: 1_000_000,
+            },
+        )])
+    };
 
-    let unreachable = HashMap::from([(CHAIN_ID, s("http://127.0.0.1:9"))]);
+    let unreachable = chain(CHAIN_ID, "http://127.0.0.1:9");
     assert!(matches!(
-        wallet
-            .go_online(OnlineOptions {
-                evm_rpc_urls: unreachable.clone(),
-                ..go_online_options(false)
-            })
-            .await,
+        wallet.go_online(go_online(unreachable.clone())).await,
         Err(Error::InvalidEvmRpcUrl { .. })
     ));
+    let result = wallet.go_online(go_online(evm_chains(11, 10))).await;
+    assert!(
+        matches!(result, Err(Error::InvalidEvmChain { ref details })
+            if details.contains("min_mint_lock_blocks (11) is greater than max_mint_lock_blocks (10)")),
+        "{result:?}"
+    );
+    assert_eq!(
+        wallet
+            .go_online(go_online(chain(CHAIN_ID + 1, EVM_RPC_URL)))
+            .await
+            .unwrap_err(),
+        Error::EvmChainIdMismatch {
+            expected: CHAIN_ID + 1,
+            actual: CHAIN_ID
+        }
+    );
 
     // the wallet works after a failure
     wallet
-        .go_online(OnlineOptions {
-            evm_rpc_urls: evm_rpc_urls(),
-            ..go_online_options(false)
-        })
+        .go_online(go_online(evm_chains(2, 1_000_000)))
         .await
         .unwrap();
 
-    // a wallet without BFA does not check the URLs
+    // a wallet without BFA does not check the chains
     let mut other = Wallet::new(wallet_data(vec![AssetSchema::Nia])).unwrap();
-    other
-        .go_online(OnlineOptions {
-            evm_rpc_urls: unreachable,
-            ..go_online_options(false)
-        })
-        .await
-        .unwrap();
+    other.go_online(go_online(unreachable)).await.unwrap();
 }
 
 #[wasm_bindgen_test]
@@ -326,8 +360,6 @@ async fn bfa_mint_right_moves_with_another_asset() {
     assert_eq!(mint_rights(&mut a, &bfa.asset_id), 2);
 }
 
-/// Topic of `FundsIn(address indexed, uint256 indexed, uint64)`.
-const FUNDS_IN_TOPIC: &str = "f1a18caea297591892fc07ea412a5e617d8e51e1155912d8871793e1d4e70f87";
 /// The unlocked first account of anvil.
 const ANVIL_ACCOUNT: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
@@ -352,18 +384,23 @@ pub(super) fn new_evm_address() -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-/// A field of the EVM block with the given tag.
-async fn evm_block_field(tag: &str, field: &str) -> u64 {
-    let block = evm_rpc("eth_getBlockByNumber", json!([tag, false])).await;
-    u64::from_str_radix(block[field].as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+pub(super) async fn evm_block_number() -> u64 {
+    let block = evm_rpc("eth_getBlockByNumber", json!(["latest", false])).await;
+    u64::from_str_radix(
+        block["number"].as_str().unwrap().trim_start_matches("0x"),
+        16,
+    )
+    .unwrap()
 }
 
-pub(super) async fn finalized_block() -> u64 {
-    evm_block_field("finalized", "number").await
+pub(super) async fn evm_mine(blocks: u64) {
+    evm_rpc("anvil_mine", json!([format!("0x{blocks:x}")])).await;
 }
 
-pub(super) async fn latest_evm_timestamp() -> i64 {
-    evm_block_field("latest", "timestamp").await as i64
+/// The lock ID of the mint `opid` in the TX of `psbt`.
+pub(super) fn lock_id_of(psbt: &str, opid: OpId) -> LockId {
+    let txid = Psbt::from_str(psbt).unwrap().unsigned_tx.compute_txid();
+    LockId::with(opid, RgbTxid::from_str(&txid.to_string()).unwrap())
 }
 
 /// Mine enough EVM blocks to finalize the current ones.
@@ -371,24 +408,30 @@ pub(super) async fn finalize_evm() {
     evm_rpc("anvil_mine", json!(["0x50"])).await;
 }
 
-/// Put at `address` a bridge that emits `FundsIn(word 0, word 1, word 2)` from its calldata.
+/// Put at `address` a bridge that keeps a word per lock ID and amount. A call of 100 bytes
+/// (selector, lock ID, amount, word) stores the word. Any other call returns the word of the lock
+/// ID and amount after the selector, as `getFundsInBlock` does.
 pub(super) async fn deploy_bridge(address: &str) {
-    let code =
-        format!("0x60206040600037602035600035 7f{FUNDS_IN_TOPIC} 60206000a300").replace(' ', "");
+    let code = "0x36606414601c5760406004600037604060002054600052602060 00f3 5b604435604060046000376040600020 55 00"
+        .replace(' ', "");
     evm_rpc("anvil_setCode", json!([address, code])).await;
 }
 
-pub(super) async fn emit_funds_in(bridge: &str, opid: OpId, amount: u64) {
-    let data = format!(
-        "0x{:064x}{}{amount:064x}",
-        0,
-        hex::encode(opid.to_byte_array())
-    );
+/// Record on `bridge` the lock `lock_id` of `amount` in `block`.
+pub(super) async fn record_lock(bridge: &str, lock_id: &LockId, amount: u64, block: u64) {
+    let key = format!("{}{amount:064x}", hex::encode(lock_id.to_byte_array()));
+    let data = format!("0x00000000{key}{:064x}", block + 1);
     evm_rpc(
         "eth_sendTransaction",
         json!([{"from": ANVIL_ACCOUNT, "to": bridge, "data": data}]),
     )
     .await;
+    let read = evm_rpc(
+        "eth_call",
+        json!([{"to": bridge, "data": format!("0x2ce06e2d{key}")}, "latest"]),
+    )
+    .await;
+    assert_eq!(read, json!(format!("0x{:064x}", block + 1)));
 }
 
 /// Put at `address` a reject list that rejects the asset opouts `rejected`.
@@ -423,13 +466,13 @@ pub(super) async fn deploy_reject_list_opouts(address: &str, rejected: &[Opout])
     evm_rpc("anvil_setCode", json!([address, code])).await;
 }
 
-/// Issue a BFA with `bridge` and mint 100 units. The minter does not check the `FundsIn` event.
+/// Issue a BFA with `bridge` and mint 100 units. The minter does not check the lock.
 pub(super) async fn bfa_with_units(
     wallet: &mut Wallet,
     online: &Online,
     bridge: &str,
     reject_list: Option<String>,
-) -> (String, OpId) {
+) -> (String, OpId, LockId) {
     let bfa = wallet
         .issue_asset_bfa(
             s("₿FA"),
@@ -441,11 +484,12 @@ pub(super) async fn bfa_with_units(
             reject_list,
         )
         .unwrap();
-    let after_block = finalized_block().await;
+    let before_block = evm_block_number().await + 1000;
     let (unsigned, opid) = wallet
-        .test_mint_begin(online.clone(), bfa.asset_id.clone(), 100, after_block)
+        .test_mint_begin(online.clone(), bfa.asset_id.clone(), 100, before_block)
         .await
         .unwrap();
+    let lock_id = lock_id_of(&unsigned, opid);
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     wallet.inflate_end(online.clone(), signed).await.unwrap();
     for _ in 0..3 {
@@ -460,31 +504,31 @@ pub(super) async fn bfa_with_units(
     let balance = wallet.get_asset_balance(bfa.asset_id.clone()).unwrap();
     assert_eq!((balance.settled, balance.spendable), (100, 100));
     assert_eq!(mint_rights(wallet, &bfa.asset_id), 1);
-    (bfa.asset_id, opid)
+    (bfa.asset_id, opid, lock_id)
 }
 
 #[wasm_bindgen_test]
-async fn bfa_send_receive_waits_for_funds_in() {
+async fn bfa_send_receive_waits_for_mint_lock() {
     let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
     let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
     let bridge = new_evm_address();
     deploy_bridge(&bridge).await;
-    let (asset_id, opid) = bfa_with_units(&mut a, &a_online, &bridge, None).await;
+    let (asset_id, _, lock_id) = bfa_with_units(&mut a, &a_online, &bridge, None).await;
 
-    // no FundsIn event: the receiver does not accept the transfer
+    // no lock: the receiver does not accept the transfer
     send(&mut a, &a_online, &mut b, &b_online, &asset_id, 30).await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert!(statuses.is_empty(), "{statuses:?}");
     assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
 
-    // an event for another amount, then a non-finalized one, do not back the mint
-    emit_funds_in(&bridge, opid, 99).await;
+    // a lock of another amount, then one not finalized, do not back the mint
+    record_lock(&bridge, &lock_id, 99, evm_block_number().await).await;
     finalize_evm().await;
-    emit_funds_in(&bridge, opid, 100).await;
+    record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert!(statuses.is_empty(), "{statuses:?}");
 
-    // the finalized event backs the mint
+    // the finalized lock backs the mint
     finalize_evm().await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
@@ -544,9 +588,9 @@ async fn bfa_receive_refuses_rejected_allocation() {
     let reject_list = new_evm_address();
     deploy_bridge(&bridge).await;
     deploy_reject_list(&reject_list, &[]).await;
-    let (asset_id, opid) =
+    let (asset_id, opid, lock_id) =
         bfa_with_units(&mut a, &a_online, &bridge, Some(reject_list.clone())).await;
-    emit_funds_in(&bridge, opid, 100).await;
+    record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
     finalize_evm().await;
 
     // the list rejects the minted allocation after the send
@@ -565,9 +609,9 @@ async fn bfa_receive_refuses_malicious_reject_list() {
     let reject_list = new_evm_address();
     deploy_bridge(&bridge).await;
     deploy_reject_list(&reject_list, &[]).await;
-    let (asset_id, opid) =
+    let (asset_id, _, lock_id) =
         bfa_with_units(&mut a, &a_online, &bridge, Some(reject_list.clone())).await;
-    emit_funds_in(&bridge, opid, 100).await;
+    record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
     finalize_evm().await;
     send(&mut a, &a_online, &mut b, &b_online, &asset_id, 30).await;
 
@@ -622,6 +666,96 @@ async fn bfa_reject_list_url() {
         get("oversized").await,
         Err(Error::RejectListService { ref details }) if details.contains("reject list too large")
     ));
+}
+
+#[wasm_bindgen_test]
+async fn bfa_reject_list_rpc_config() {
+    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let (mut b, _) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
+    let bridge = new_evm_address();
+    let reject_list = new_evm_address();
+    deploy_bridge(&bridge).await;
+    deploy_reject_list(&reject_list, &[]).await;
+    let (asset_id, _, lock_id) =
+        bfa_with_units(&mut a, &a_online, &bridge, Some(reject_list)).await;
+    record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
+    finalize_evm().await;
+    let b_no_evm = b.go_online(go_online_options(false)).await.unwrap();
+    let receive = blind_rcv(
+        &mut b,
+        &b_no_evm,
+        None,
+        Assignment::Fungible(30),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    let recipient_map = HashMap::from([(
+        asset_id.clone(),
+        vec![recipient(&receive.recipient_id, 30, None, PROXY_URL)],
+    )]);
+    // the sender needs the EVM RPC URL of the chain of the reject list
+    let a_no_evm = a.go_online(go_online_options(false)).await.unwrap();
+    let result = a
+        .send_begin(
+            a_no_evm,
+            recipient_map.clone(),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::NoEvmRpcUrl { chain_id: CHAIN_ID })),
+        "{result:?}"
+    );
+
+    // the receiver waits for one
+    let a_online = a
+        .go_online(OnlineOptions {
+            evm_chains: evm_chains(2, 1_000_000),
+            ..go_online_options(false)
+        })
+        .await
+        .unwrap();
+    let begin = a
+        .send_begin(
+            a_online.clone(),
+            recipient_map.clone(),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let signed = a.sign_psbt(begin.psbt, None).unwrap();
+    a.send_end(a_online.clone(), signed, false).await.unwrap();
+    b.refresh(b_no_evm, None, vec![], false).await.unwrap();
+    let transfers = b.list_transfers(AssetFilter::Any, None).unwrap();
+    assert_eq!(
+        transfers.last().unwrap().status,
+        TransferStatus::WaitingCounterparty
+    );
+
+    // and settles with it
+    let b_online = b
+        .go_online(OnlineOptions {
+            evm_chains: evm_chains(2, 1_000_000),
+            ..go_online_options(false)
+        })
+        .await
+        .unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
 }
 
 pub(super) fn s(value: &str) -> String {

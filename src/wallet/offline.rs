@@ -827,12 +827,14 @@ pub struct Recipient {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct ReceivedMint {
-    /// ID of the mint operation, which the lock has to commit to
+    /// ID of the mint operation
     pub opid: String,
+    /// ID the lock has to be made for: it commits to the mint operation and to the TX including it
+    pub lock_id: String,
     /// Amount minted, which the lock has to match
     pub amount: u64,
-    /// External chain block the lock has to follow
-    pub after_block: u64,
+    /// External chain block the lock has to be included before
+    pub before_block: u64,
     /// EIP-155 chain ID of the EVM chain the asset's bridge contract lives on
     pub evm_chain_id: u64,
     /// Address of the asset's bridge contract, where the lock has to be made
@@ -1232,8 +1234,6 @@ pub struct Wallet {
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
-    /// Last finalized EVM block scanned for each terminal mint, keyed by recipient_id and opid
-    pub(crate) mint_scanned_blocks: HashMap<String, HashMap<String, u64>>,
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent in-memory RGB stock.
@@ -1388,7 +1388,6 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
-            mint_scanned_blocks: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: {
@@ -2568,7 +2567,10 @@ impl Wallet {
     }
 
     /// Get the details of the mint received on the provided `recipient_id`, once the wallet has
-    /// checked it: what the lock on the external chain has to match for the mint to complete.
+    /// checked it: what the lock on the external chain has to match for the mint to complete. The
+    /// lock has to be made for [`ReceivedMint::lock_id`], of [`ReceivedMint::amount`], and be
+    /// included before [`ReceivedMint::before_block`]. A checked mint is not refused later by the
+    /// reject list.
     ///
     /// Returns `None` if no mint checked by the wallet pays `recipient_id`, or if it failed.
     pub fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, Error> {
@@ -3730,7 +3732,6 @@ impl Wallet {
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
-            mint_scanned_blocks: self.mint_scanned_blocks.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
         })
@@ -3850,7 +3851,6 @@ impl Wallet {
         self.received_consignment_meta = snapshot.received_consignment_meta;
         self.received_signed_txs = snapshot.received_signed_txs;
         self.received_mints = snapshot.received_mints;
-        self.mint_scanned_blocks = snapshot.mint_scanned_blocks;
 
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
@@ -3942,7 +3942,6 @@ pub(crate) mod address_reuse_tests {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
-            mint_scanned_blocks: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),

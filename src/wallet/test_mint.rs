@@ -3,39 +3,52 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
-use crate::wallet::online::{MINT_AFTER_BLOCK_GRACE_SECS, MINT_FINALITY_GRACE_SECS};
 use crate::wallet::rust_only::validate_consignment_offchain;
 use crate::wallet::{
-    AssetFilter, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData, Recipient,
-    Wallet,
+    AssetFilter, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData,
+    ReceivedMint, Recipient, Wallet,
 };
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, OS_MINT, RgbOutExt, TransferKind,
     TransferStatus, script_buf_from_recipient_id,
 };
+use amplify::ByteArray;
 use bdk_wallet::bitcoin::{OutPoint, Psbt};
-use rgbstd::{ContractId, OpId, Opout};
+use rgbstd::containers::LockId;
+use rgbstd::{ContractId, OpId, Opout, Txid as RgbTxid};
 use serde_json::json;
 use std::str::FromStr;
 
 const MINT_AMOUNT: u64 = 100;
 
 /// A blind receive of `MINT_AMOUNT`.
-async fn mint_rcv(wallet: &mut Wallet, online: &Online, expiration: u64) -> ReceiveData {
+async fn mint_rcv(wallet: &mut Wallet, online: &Online) -> ReceiveData {
     blind_rcv(
         wallet,
         online,
         None,
         Assignment::Fungible(MINT_AMOUNT),
-        expiration,
+        default_rcv_expiration(),
         vec![transport_endpoint(PROXY_URL)],
     )
     .await
     .unwrap()
 }
 
+/// A mint recipient, with no expiration.
 fn mint_recipient(receive: &ReceiveData, amount: u64) -> Recipient {
-    recipient(&receive.recipient_id, amount, None, PROXY_URL)
+    Recipient {
+        expiration_timestamp: None,
+        ..recipient(&receive.recipient_id, amount, None, PROXY_URL)
+    }
+}
+
+/// A mint recipient for a witness receive, with no expiration.
+fn witness_mint_recipient(receive: &ReceiveData) -> Recipient {
+    Recipient {
+        expiration_timestamp: None,
+        ..recipient(&receive.recipient_id, MINT_AMOUNT, Some(1000), PROXY_URL)
+    }
 }
 
 async fn mint_begin(
@@ -44,11 +57,23 @@ async fn mint_begin(
     asset_id: &str,
     recipient: Recipient,
 ) -> Result<MintBeginResult, Error> {
+    let before_block = evm_block_number().await + 1000;
+    mint_begin_before(minter, minter_online, asset_id, recipient, before_block).await
+}
+
+async fn mint_begin_before(
+    minter: &mut Wallet,
+    minter_online: &Online,
+    asset_id: &str,
+    recipient: Recipient,
+    before_block: u64,
+) -> Result<MintBeginResult, Error> {
     minter
         .mint_begin(
             minter_online.clone(),
             asset_id.to_string(),
             recipient,
+            before_block,
             1,
             1,
             transport_endpoint(PROXY_URL),
@@ -56,9 +81,13 @@ async fn mint_begin(
         .await
 }
 
+fn mint_lock_id(res: &MintBeginResult) -> LockId {
+    lock_id_of(&res.psbt, OpId::from_str(&res.details.opid).unwrap())
+}
+
 /// Lock the mint on the bridge and finalize the lock.
 async fn lock_mint(bridge: &str, res: &MintBeginResult, amount: u64) {
-    emit_funds_in(bridge, OpId::from_str(&res.details.opid).unwrap(), amount).await;
+    record_lock(bridge, &mint_lock_id(res), amount, evm_block_number().await).await;
     finalize_evm().await;
 }
 
@@ -126,15 +155,16 @@ async fn bfa_mint_settles_and_is_spendable() {
         .unwrap();
     let asset_id = asset.asset_id.clone();
 
-    let receive = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
+    let receive = mint_rcv(&mut b, &b_online).await;
     spy_rpc();
     clear_rpc_hooks();
-    let after_block = finalized_block().await;
-    let res = mint_begin(
+    let before_block = evm_block_number().await + 1000;
+    let res = mint_begin_before(
         &mut a,
         &a_online,
         &asset_id,
         mint_recipient(&receive, MINT_AMOUNT),
+        before_block,
     )
     .await
     .unwrap();
@@ -162,24 +192,62 @@ async fn bfa_mint_settles_and_is_spendable() {
         .get_received_mint(receive.recipient_id.clone())
         .unwrap()
         .unwrap();
-    assert_eq!(received.opid, res.details.opid);
-    assert_eq!(received.amount, MINT_AMOUNT);
-    assert_eq!(received.after_block, after_block);
-    assert_eq!(received.evm_chain_id, CHAIN_ID);
-    assert_eq!(received.bridge_contract.to_lowercase(), bridge);
+    assert_eq!(
+        ReceivedMint {
+            bridge_contract: received.bridge_contract.to_lowercase(),
+            ..received.clone()
+        },
+        ReceivedMint {
+            opid: res.details.opid.clone(),
+            lock_id: mint_lock_id(&res).to_string(),
+            amount: MINT_AMOUNT,
+            before_block,
+            evm_chain_id: CHAIN_ID,
+            bridge_contract: bridge.clone(),
+        }
+    );
 
-    // no lock yet, then a lock not finalized yet
+    // a lock under the bare operation ID, or under the operation in another TX, does not confirm
+    // the mint
     let opid = OpId::from_str(&res.details.opid).unwrap();
+    let block = evm_block_number().await;
+    let other_tx = RgbTxid::from_str(&"07".repeat(32)).unwrap();
+    for lock_id in [
+        LockId::from(opid.to_byte_array()),
+        LockId::with(opid, other_tx),
+    ] {
+        record_lock(&bridge, &lock_id, MINT_AMOUNT, block).await;
+    }
+    finalize_evm().await;
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+
+    // no lock under the lock ID yet, then a lock not finalized yet
     for lock in [false, true] {
         if lock {
-            emit_funds_in(&bridge, opid, MINT_AMOUNT).await;
+            record_lock(
+                &bridge,
+                &mint_lock_id(&res),
+                MINT_AMOUNT,
+                evm_block_number().await,
+            )
+            .await;
         }
         let result = mint_end(&mut a, &a_online, &res).await;
         assert!(
-            matches!(result, Err(Error::MintEventNotFound { ref opid }) if *opid == res.details.opid),
+            matches!(result, Err(Error::MintLockNotFound { ref opid }) if *opid == res.details.opid),
             "{result:?}"
         );
     }
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Initiated
+    );
 
     finalize_evm().await;
     let minted = mint_end(&mut a, &a_online, &res).await.unwrap();
@@ -254,10 +322,14 @@ async fn bfa_mint_settles_and_is_spendable() {
     )
     .await
     .unwrap();
-    let recipient = recipient(&receive.recipient_id, MINT_AMOUNT, Some(1000), PROXY_URL);
-    let res = mint_begin(&mut a, &a_online, &asset_id, recipient)
-        .await
-        .unwrap();
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        witness_mint_recipient(&receive),
+    )
+    .await
+    .unwrap();
     let script = script_buf_from_recipient_id(receive.recipient_id.clone())
         .unwrap()
         .unwrap();
@@ -286,7 +358,7 @@ async fn bfa_mint_begin_refusals() {
     let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 5).await;
     let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
     let bridge = new_evm_address();
-    let rcv = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
+    let rcv = mint_rcv(&mut b, &b_online).await;
 
     // the last mint right is never spent
     let single = a
@@ -301,22 +373,40 @@ async fn bfa_mint_begin_refusals() {
     .await;
     assert!(matches!(result, Err(Error::LastMintRight)), "{result:?}");
 
-    // the invoice has to outlast the lock window and carry its expiration
+    // a mint recipient has no expiration
     let bfa = a
         .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 2, CHAIN_ID, s(&bridge), None)
         .unwrap();
     let id = &bfa.asset_id;
-    let short_expiration = default_rcv_expiration() - 86400 + 1800;
-    let short = mint_rcv(&mut b, &b_online, short_expiration).await;
-    let result = mint_begin(&mut a, &a_online, id, mint_recipient(&short, 100)).await;
-    assert!(matches!(result, Err(Error::InvoiceExpired)), "{result:?}");
-    let mut recipient = mint_recipient(&rcv, 100);
-    recipient.expiration_timestamp = None;
+    let recipient = recipient(&rcv.recipient_id, 100, None, PROXY_URL);
     let result = mint_begin(&mut a, &a_online, id, recipient).await;
     assert!(
-        matches!(result, Err(Error::InvalidRecipientData { ref details }) if details.contains("expiration")),
+        matches!(result, Err(Error::InvalidRecipientData { ref details }) if details.contains("cannot have an expiration")),
         "{result:?}"
     );
+
+    // the block the lock has to be included before leaves a block for it, and is within the
+    // configured bounds
+    let (mut c, c_online) =
+        funded_wallet_with(wallet_data(vec![AssetSchema::Bfa]), 5, 10, 100).await;
+    let bfa_c = c
+        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 2, CHAIN_ID, s(&bridge), None)
+        .unwrap();
+    for blocks in [1, 5, 101] {
+        let before_block = evm_block_number().await + blocks;
+        let result = mint_begin_before(
+            &mut c,
+            &c_online,
+            &bfa_c.asset_id,
+            mint_recipient(&rcv, 100),
+            before_block,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::InvalidBeforeBlock { .. })),
+            "{blocks}: {result:?}"
+        );
+    }
 
     // the invoice has to carry the public key of the recipient
     let mut recipient = mint_recipient(&rcv, 100);
@@ -326,41 +416,6 @@ async fn bfa_mint_begin_refusals() {
         matches!(result, Err(Error::InvalidPubkey { .. })),
         "{result:?}"
     );
-}
-
-#[wasm_bindgen_test]
-async fn bfa_mint_refused_out_of_scan_window() {
-    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 4).await;
-    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
-    let bridge = new_evm_address();
-    deploy_bridge(&bridge).await;
-    let asset = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 2, CHAIN_ID, s(&bridge), None)
-        .unwrap();
-    let receive = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
-    let res = mint_begin(
-        &mut a,
-        &a_online,
-        &asset.asset_id,
-        mint_recipient(&receive, MINT_AMOUNT),
-    )
-    .await
-    .unwrap();
-
-    // the lock is finalized, but the receiver scans no block after the one the mint commits to
-    lock_mint(&bridge, &res, MINT_AMOUNT).await;
-    crate::api::evm::MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
-    let refreshed = b.refresh(b_online.clone(), None, vec![], false).await;
-    crate::api::evm::MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-    let refreshed = refreshed.unwrap();
-    let refreshed = refreshed.values().next().unwrap();
-    assert_eq!(
-        refreshed.updated_status,
-        Some(TransferStatus::Failed),
-        "{refreshed:?}"
-    );
-    assert!(b.get_received_mint(receive.recipient_id).unwrap().is_none());
-    assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
 }
 
 #[wasm_bindgen_test]
@@ -439,7 +494,7 @@ async fn bfa_mint_history_refused_by_reject_list() {
     rejected.push(Opout::new(opid, OS_ASSET, 0));
     deploy_reject_list_opouts(&reject_list, &rejected).await;
     finalize_evm().await;
-    let receive = mint_rcv(&mut c, &c_online, default_rcv_expiration()).await;
+    let receive = mint_rcv(&mut c, &c_online).await;
     let result = mint_begin(
         &mut a,
         &a_online,
@@ -588,7 +643,7 @@ async fn bfa_mint_receiver_checks() {
         .asset_id;
 
     // a mint of another amount than the requested one is refused before the lock
-    let rcv = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
+    let rcv = mint_rcv(&mut b, &b_online).await;
     mint_begin(
         &mut a,
         &a_online,
@@ -606,29 +661,8 @@ async fn bfa_mint_receiver_checks() {
     );
     assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_none());
 
-    // a mint that commits to a block older than the invoice by more than the grace is refused
-    let rcv = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
-    let created_at = latest_evm_timestamp().await + MINT_AFTER_BLOCK_GRACE_SECS + 60;
-    edit_batch_transfer(&mut b, rcv.batch_transfer_idx, "created_at", created_at);
-    mint_begin(
-        &mut a,
-        &a_online,
-        &asset_id,
-        mint_recipient(&rcv, MINT_AMOUNT),
-    )
-    .await
-    .unwrap();
-    b.refresh(b_online.clone(), None, vec![], false)
-        .await
-        .unwrap();
-    assert_eq!(
-        transfer_status(&mut b, &rcv.recipient_id),
-        TransferStatus::Failed
-    );
-    assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_none());
-
     // with no EVM RPC URL for the chain, the receiver waits and checks the mint later
-    let rcv = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
+    let rcv = mint_rcv(&mut b, &b_online).await;
     mint_begin(
         &mut a,
         &a_online,
@@ -650,7 +684,7 @@ async fn bfa_mint_receiver_checks() {
     );
     let b_online = b
         .go_online(OnlineOptions {
-            evm_rpc_urls: evm_rpc_urls(),
+            evm_chains: evm_chains(2, 1_000_000),
             ..go_online_options(false)
         })
         .await
@@ -664,25 +698,17 @@ async fn bfa_mint_receiver_checks() {
         MINT_AMOUNT
     );
 
-    // with no EVM RPC URL the lock cannot be looked up, so an expired mint waits in the grace
+    // a checked mint is not failed by its expiration, even with no EVM RPC URL
     let now = crate::utils::now().unix_timestamp();
-    edit_batch_transfer(&mut b, rcv.batch_transfer_idx, "expiration", now - 1);
+    edit_batch_transfer(&mut b, rcv.batch_transfer_idx, "expiration", now - 1000);
     let no_evm = b.go_online(go_online_options(false)).await.unwrap();
     b.refresh(no_evm.clone(), None, vec![], false)
         .await
         .unwrap();
+    assert!(!b.fail_transfers(no_evm, None, false, false).await.unwrap());
     assert_eq!(
         transfer_status(&mut b, &rcv.recipient_id),
         TransferStatus::WaitingCounterparty
-    );
-
-    // with no EVM RPC URL and no lock, a mint past its deadline and grace fails on refresh
-    let expiration = now - MINT_FINALITY_GRACE_SECS - 1;
-    edit_batch_transfer(&mut b, rcv.batch_transfer_idx, "expiration", expiration);
-    b.refresh(no_evm, None, vec![], false).await.unwrap();
-    assert_eq!(
-        transfer_status(&mut b, &rcv.recipient_id),
-        TransferStatus::Failed
     );
 }
 
@@ -693,13 +719,15 @@ async fn begin_checked_mint(
     receiver: &mut Wallet,
     receiver_online: &Online,
     asset_id: &str,
+    before_block: u64,
 ) -> (MintBeginResult, ReceiveData) {
-    let receive = mint_rcv(receiver, receiver_online, default_rcv_expiration()).await;
-    let res = mint_begin(
+    let receive = mint_rcv(receiver, receiver_online).await;
+    let res = mint_begin_before(
         minter,
         minter_online,
         asset_id,
         mint_recipient(&receive, MINT_AMOUNT),
+        before_block,
     )
     .await
     .unwrap();
@@ -716,89 +744,6 @@ async fn begin_checked_mint(
     (res, receive)
 }
 
-/// Set the lock deadline of the mint on both sides.
-fn set_deadline(
-    minter: &mut Wallet,
-    res: &MintBeginResult,
-    receiver: &mut Wallet,
-    receive: &ReceiveData,
-    deadline: i64,
-) {
-    edit_batch_transfer(minter, res.batch_transfer_idx, "expiration", deadline);
-    edit_batch_transfer(receiver, receive.batch_transfer_idx, "expiration", deadline);
-}
-
-#[wasm_bindgen_test]
-async fn bfa_mint_lock_deadline() {
-    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 4).await;
-    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
-    let bridge = new_evm_address();
-    deploy_bridge(&bridge).await;
-    let asset_id = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 3, CHAIN_ID, s(&bridge), None)
-        .unwrap()
-        .asset_id;
-
-    // a lock included by the deadline, but finalized after it, is waited for: neither side fails
-    // the mint, which is then broadcast past the deadline and settles
-    let (res, receive) = begin_checked_mint(&mut a, &a_online, &mut b, &b_online, &asset_id).await;
-    let opid = OpId::from_str(&res.details.opid).unwrap();
-    emit_funds_in(&bridge, opid, MINT_AMOUNT).await;
-    let deadline = latest_evm_timestamp().await;
-    set_deadline(&mut a, &res, &mut b, &receive, deadline);
-    let wait = deadline + 1 - crate::utils::now().unix_timestamp();
-    if wait > 0 {
-        sleep_ms(wait as u32 * 1000).await;
-    }
-    assert!(
-        !b.fail_transfers(b_online.clone(), None, false, false)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !a.fail_transfers(a_online.clone(), None, false, false)
-            .await
-            .unwrap()
-    );
-    finalize_evm().await;
-    b.refresh(b_online.clone(), None, vec![], false)
-        .await
-        .unwrap();
-    mint_end(&mut a, &a_online, &res).await.unwrap();
-    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
-    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
-    assert_eq!(
-        b.get_asset_balance(asset_id.clone()).unwrap().settled,
-        MINT_AMOUNT
-    );
-
-    // with no lock by the deadline, then with a lock after it, the mint is not broadcast and both
-    // sides fail it
-    let (res, receive) = begin_checked_mint(&mut a, &a_online, &mut b, &b_online, &asset_id).await;
-    let deadline = crate::utils::now().unix_timestamp() - 1;
-    set_deadline(&mut a, &res, &mut b, &receive, deadline);
-    let result = mint_end(&mut a, &a_online, &res).await;
-    assert!(matches!(result, Err(Error::TransferExpired)), "{result:?}");
-    lock_mint(&bridge, &res, MINT_AMOUNT).await;
-    let result = mint_end(&mut a, &a_online, &res).await;
-    assert!(matches!(result, Err(Error::TransferExpired)), "{result:?}");
-    assert!(
-        b.fail_transfers(b_online.clone(), None, false, false)
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        transfer_status(&mut b, &receive.recipient_id),
-        TransferStatus::Failed
-    );
-    assert!(b.get_received_mint(receive.recipient_id).unwrap().is_none());
-    assert!(
-        a.fail_transfers(a_online.clone(), None, false, false)
-            .await
-            .unwrap()
-    );
-}
-
 #[wasm_bindgen_test]
 async fn bfa_mint_begin_reserves_inputs() {
     let (mut a, a_online) =
@@ -811,12 +756,14 @@ async fn bfa_mint_begin_reserves_inputs() {
         .unwrap()
         .asset_id;
 
-    let rcv = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
-    let res = mint_begin(
+    let rcv = mint_rcv(&mut b, &b_online).await;
+    let before_block = evm_block_number().await + 3;
+    let res = mint_begin_before(
         &mut a,
         &a_online,
         &asset_id,
         mint_recipient(&rcv, MINT_AMOUNT),
+        before_block,
     )
     .await
     .unwrap();
@@ -844,12 +791,21 @@ async fn bfa_mint_begin_reserves_inputs() {
     );
     let a_online = a
         .go_online(OnlineOptions {
-            evm_rpc_urls: evm_rpc_urls(),
+            evm_chains: evm_chains(2, 1_000_000),
             ..go_online_options(false)
         })
         .await
         .unwrap();
 
+    // a mint is failed only once its lock has expired
+    let result = a
+        .fail_transfers(a_online.clone(), Some(res.batch_transfer_idx), false, false)
+        .await;
+    assert!(
+        matches!(result, Err(Error::CannotFailBatchTransfer)),
+        "{result:?}"
+    );
+    finalize_evm().await;
     assert!(
         a.fail_transfers(a_online.clone(), Some(res.batch_transfer_idx), false, false)
             .await
@@ -882,7 +838,7 @@ async fn bfa_mint_begin_reserves_inputs() {
     );
 
     // a failed post releases the inputs
-    let rcv = mint_rcv(&mut b, &b_online, default_rcv_expiration()).await;
+    let rcv = mint_rcv(&mut b, &b_online).await;
     rpc_fail(PROXY_URL, "consignment.post");
     let result = mint_begin(
         &mut a,
@@ -898,4 +854,526 @@ async fn bfa_mint_begin_reserves_inputs() {
         TransferStatus::Failed
     );
     assert!(a.get_reserved_outpoints().unwrap().is_empty());
+}
+
+/// A minter with a BFA of `rights` mint rights on a new bridge, and a receiver.
+async fn minter_and_receiver(
+    rights: u8,
+    receiver_utxos: u8,
+    reject_list: Option<String>,
+) -> (Wallet, Online, Wallet, Online, String, String) {
+    let (a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), rights + 1).await;
+    let (b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), receiver_utxos).await;
+    let bridge = new_evm_address();
+    deploy_bridge(&bridge).await;
+    let asset_id = a
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            rights,
+            CHAIN_ID,
+            s(&bridge),
+            reject_list,
+        )
+        .unwrap()
+        .asset_id;
+    (a, a_online, b, b_online, bridge, asset_id)
+}
+
+#[wasm_bindgen_test]
+async fn bfa_mint_lock_before_block() {
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(4, 3, None).await;
+
+    // a lock in the block the mint commits to expires it on both sides
+    let before_block = evm_block_number().await + 3;
+    let (res, receive) = begin_checked_mint(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        before_block,
+    )
+    .await;
+    evm_mine(5).await;
+    record_lock(&bridge, &mint_lock_id(&res), MINT_AMOUNT, before_block).await;
+    finalize_evm().await;
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+    let result = mint_end(&mut a, &a_online, &res).await;
+    assert!(
+        matches!(result, Err(Error::MintLockExpired { ref opid, before_block: block })
+            if *opid == res.details.opid && block == before_block),
+        "{result:?}"
+    );
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+    let result = mint_end(&mut a, &a_online, &res).await;
+    assert!(
+        matches!(result, Err(Error::CannotEndTransfer { .. })),
+        "{result:?}"
+    );
+
+    // no lock before the block: the receiver fails the mint once the blocks before it are
+    // finalized, the sender when asked to
+    let before_block = evm_block_number().await + 3;
+    let (res, receive) = begin_checked_mint(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        before_block,
+    )
+    .await;
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+    evm_mine(3).await;
+    finalize_evm().await;
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+    a.refresh(a_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Initiated
+    );
+    // a mint is of an asset, so no_asset_only keeps it
+    let result = a
+        .fail_transfers(a_online.clone(), Some(res.batch_transfer_idx), true, false)
+        .await;
+    assert!(
+        matches!(result, Err(Error::CannotFailBatchTransfer)),
+        "{result:?}"
+    );
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Initiated
+    );
+    assert!(
+        a.fail_transfers(a_online.clone(), Some(res.batch_transfer_idx), false, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+
+    // fail_transfers fails a sent mint only once its lock has expired
+    let receive = mint_rcv(&mut b, &b_online).await;
+    let before_block = evm_block_number().await + 3;
+    mint_begin_before(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+        before_block,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !a.fail_transfers(a_online.clone(), None, false, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Initiated
+    );
+    evm_mine(3).await;
+    finalize_evm().await;
+    assert!(
+        !a.fail_transfers(a_online.clone(), None, true, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Initiated
+    );
+    assert!(
+        a.fail_transfers(a_online.clone(), None, false, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+}
+
+#[wasm_bindgen_test]
+async fn bfa_mint_before_block_too_far() {
+    let (mut a, a_online, _, _, bridge, asset_id) = minter_and_receiver(4, 1, None).await;
+    let (mut b, b_online) = funded_wallet_with(wallet_data(vec![AssetSchema::Bfa]), 3, 2, 50).await;
+
+    // a mint committing to a block further than the receiver accepts is refused
+    let receive = mint_rcv(&mut b, &b_online).await;
+    let before_block = evm_block_number().await + 100;
+    mint_begin_before(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+        before_block,
+    )
+    .await
+    .unwrap();
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+
+    // a closer block is accepted
+    let before_block = evm_block_number().await + 25;
+    let (_, receive) = begin_checked_mint(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        before_block,
+    )
+    .await;
+    assert_eq!(
+        b.get_received_mint(receive.recipient_id)
+            .unwrap()
+            .unwrap()
+            .before_block,
+        before_block
+    );
+
+    // a further block is accepted when the lock is already recorded
+    let receive = mint_rcv(&mut b, &b_online).await;
+    let before_block = evm_block_number().await + 100;
+    let res = mint_begin_before(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+        before_block,
+    )
+    .await
+    .unwrap();
+    record_lock(
+        &bridge,
+        &mint_lock_id(&res),
+        MINT_AMOUNT,
+        evm_block_number().await,
+    )
+    .await;
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert!(
+        b.get_received_mint(receive.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    finalize_evm().await;
+    mint_end(&mut a, &a_online, &res).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+}
+
+#[wasm_bindgen_test]
+async fn bfa_mint_reject_list_not_repeated() {
+    let reject_list = new_evm_address();
+    deploy_reject_list(&reject_list, &[]).await;
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(3, 3, Some(reject_list.clone())).await;
+
+    // a checked mint is not refused by a later reject list
+    let rights = mint_right_opouts(&mut a, &asset_id).concat();
+    let before_block = evm_block_number().await + 1000;
+    let (res, _) = begin_checked_mint(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        before_block,
+    )
+    .await;
+    deploy_reject_list_opouts(&reject_list, &rights).await;
+    lock_mint(&bridge, &res, MINT_AMOUNT).await;
+    mint_end(&mut a, &a_online, &res).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+
+    // a mint whose lock is finalized before the first check is not refused either. The list only
+    // grows, so this is another asset with another list
+    let reject_list = new_evm_address();
+    deploy_reject_list(&reject_list, &[]).await;
+    let asset_id = a
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            2,
+            CHAIN_ID,
+            s(&bridge),
+            Some(reject_list.clone()),
+        )
+        .unwrap()
+        .asset_id;
+    let rights = mint_right_opouts(&mut a, &asset_id).concat();
+    let receive = mint_rcv(&mut b, &b_online).await;
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    lock_mint(&bridge, &res, MINT_AMOUNT).await;
+    deploy_reject_list_opouts(&reject_list, &rights).await;
+    finalize_evm().await;
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_ne!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+    mint_end(&mut a, &a_online, &res).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+    assert_eq!(b.get_asset_balance(asset_id).unwrap().settled, MINT_AMOUNT);
+
+    // nor is a mint whose lock is recorded but not finalized before the first check. An issue
+    // needs empty UTXOs
+    let unsigned = a
+        .create_utxos_begin(a_online.clone(), false, Some(2), None, 1, true)
+        .await
+        .unwrap();
+    let signed = a.sign_psbt(unsigned, None).unwrap();
+    a.create_utxos_end(a_online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    a.sync(a_online.clone()).await.unwrap();
+    let reject_list = new_evm_address();
+    deploy_reject_list(&reject_list, &[]).await;
+    let asset_id = a
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            2,
+            CHAIN_ID,
+            s(&bridge),
+            Some(reject_list.clone()),
+        )
+        .unwrap()
+        .asset_id;
+    let rights = mint_right_opouts(&mut a, &asset_id).concat();
+    let receive = mint_rcv(&mut b, &b_online).await;
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    deploy_reject_list_opouts(&reject_list, &rights).await;
+    finalize_evm().await;
+    record_lock(
+        &bridge,
+        &mint_lock_id(&res),
+        MINT_AMOUNT,
+        evm_block_number().await,
+    )
+    .await;
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+    assert!(
+        b.get_received_mint(receive.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    finalize_evm().await;
+    mint_end(&mut a, &a_online, &res).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+    assert_eq!(b.get_asset_balance(asset_id).unwrap().settled, MINT_AMOUNT);
+}
+
+#[wasm_bindgen_test]
+async fn bfa_mint_never_failed_by_clock() {
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(3, 2, None).await;
+    let receive = witness_rcv(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Fungible(MINT_AMOUNT),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        witness_mint_recipient(&receive),
+    )
+    .await
+    .unwrap();
+    record_lock(
+        &bridge,
+        &mint_lock_id(&res),
+        MINT_AMOUNT,
+        evm_block_number().await,
+    )
+    .await;
+
+    // past the invoice expiration, failing the expired transfers checks the mint and does not
+    // fail it, on either side
+    let now = crate::utils::now().unix_timestamp();
+    edit_batch_transfer(&mut b, receive.batch_transfer_idx, "expiration", now - 1000);
+    edit_batch_transfer(&mut a, res.batch_transfer_idx, "expiration", now - 1000);
+    assert!(
+        b.get_received_mint(receive.recipient_id.clone())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !b.fail_transfers(b_online.clone(), None, false, false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        b.get_received_mint(receive.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+    let result = b
+        .fail_transfers(
+            b_online.clone(),
+            Some(receive.batch_transfer_idx),
+            false,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::CannotFailBatchTransfer)),
+        "{result:?}"
+    );
+    assert!(
+        !a.fail_transfers(a_online.clone(), None, false, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Initiated
+    );
+    finalize_evm().await;
+    mint_end(&mut a, &a_online, &res).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+    assert_eq!(
+        transfer_status(&mut a, &receive.recipient_id),
+        TransferStatus::Settled
+    );
+
+    // failing an unchecked mint checks it and is denied
+    let receive = mint_rcv(&mut b, &b_online).await;
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    record_lock(
+        &bridge,
+        &mint_lock_id(&res),
+        MINT_AMOUNT,
+        evm_block_number().await,
+    )
+    .await;
+    let result = b
+        .fail_transfers(
+            b_online.clone(),
+            Some(receive.batch_transfer_idx),
+            false,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::CannotFailBatchTransfer)),
+        "{result:?}"
+    );
+    assert!(
+        b.get_received_mint(receive.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+    finalize_evm().await;
+    mint_end(&mut a, &a_online, &res).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+
+    // a receive with no mint expires with its invoice
+    let receive = witness_rcv(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Fungible(MINT_AMOUNT),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    edit_batch_transfer(&mut b, receive.batch_transfer_idx, "expiration", now - 1000);
+    assert!(
+        b.fail_transfers(b_online.clone(), None, false, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::Failed
+    );
 }

@@ -38,8 +38,6 @@ pub struct WalletSnapshot {
     pub received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints keyed by recipient_id.
     pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
-    /// Scanned EVM blocks of the received mints keyed by recipient_id.
-    pub mint_scanned_blocks: HashMap<String, HashMap<String, u64>>,
     /// Encoded RGB store (base64).
     pub rgb_store: String,
     /// Pinned derivation index per keychain for address reuse.
@@ -249,15 +247,12 @@ mod tests {
                 "rid".to_owned(),
                 super::super::ReceivedMint {
                     opid: "opid".to_owned(),
+                    lock_id: "lock".to_owned(),
                     amount: 1,
-                    after_block: 2,
+                    before_block: 2,
                     evm_chain_id: 3,
                     bridge_contract: "bridge".to_owned(),
                 },
-            )]),
-            mint_scanned_blocks: HashMap::from([(
-                "rid".to_owned(),
-                HashMap::from([("opid".to_owned(), 4)]),
             )]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
@@ -294,10 +289,6 @@ mod tests {
             snapshot.received_signed_txs
         );
         assert_eq!(restored_snapshot.received_mints, snapshot.received_mints);
-        assert_eq!(
-            restored_snapshot.mint_scanned_blocks,
-            snapshot.mint_scanned_blocks
-        );
 
         let restored = deserialize_stock(&restored_snapshot.rgb_store).expect("deserialize stock");
 
