@@ -492,7 +492,7 @@ async fn test_full_wallet_flow() {
     // Two-wallet NIA send: wallet A → wallet B
     // Must happen before blind_receive which locks the NIA UTXO via pending_blinded
     let wd_b = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
-    let mut wallet_b = Wallet::new(wd_b).unwrap();
+    let mut wallet_b = Wallet::new(wd_b.clone()).unwrap();
     let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
@@ -552,7 +552,9 @@ async fn test_full_wallet_flow() {
         .unwrap();
     assert!(!begun.is_empty());
     assert!(begun.iter().all(|t| t.status == TransferStatus::Initiated));
-    let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
+    // A signer that never synced has no chain data
+    let signer = Wallet::new(wd.clone()).unwrap();
+    let signed_psbt = signer.sign_psbt(unsigned_psbt, None).unwrap();
     let signed_txid = rgb_lib_wasm::bitcoin::psbt::Psbt::from_str(&signed_psbt)
         .unwrap()
         .unsigned_tx
@@ -731,7 +733,7 @@ async fn test_full_wallet_flow() {
         .send_btc_begin(online.clone(), addr_b2, 50_000, 1, false)
         .await
         .unwrap();
-    let signed_btc = wallet.sign_psbt(unsigned_btc, None).unwrap();
+    let signed_btc = signer.sign_psbt(unsigned_btc, None).unwrap();
     let btc_txid = wallet
         .send_btc_end(online.clone(), signed_btc, false)
         .await
@@ -937,7 +939,8 @@ async fn test_full_wallet_flow() {
         .drain_to_begin(online_b.clone(), drain_addr, false, 1)
         .await
         .unwrap();
-    let signed_drain = wallet_b.sign_psbt(unsigned_drain, None).unwrap();
+    let signer_b = Wallet::new(wd_b).unwrap();
+    let signed_drain = signer_b.sign_psbt(unsigned_drain, None).unwrap();
     let drain_txid = wallet_b
         .drain_to_end(online_b.clone(), signed_drain)
         .await
