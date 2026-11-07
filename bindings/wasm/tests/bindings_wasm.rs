@@ -5,7 +5,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::wallet::{DatabaseType, ReceiveData, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
-use rgb_lib_wasm_bindings::WasmWallet;
+use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet};
 
 fn wallet() -> WasmWallet {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -67,6 +67,12 @@ async fn witness_receive_takes_number_bigint_and_string() {
         let data: ReceiveData = serde_wasm_bindgen::from_value(data).unwrap();
         assert_eq!(data.expiration_timestamp, exp);
         assert_eq!(data.public_key.len(), 64);
+        let invoice = WasmInvoice::new(&format!("{}&foo=bar", data.invoice)).unwrap();
+        let invoice_data = invoice.invoice_data().unwrap();
+        let get = |k| js_sys::Reflect::get(&invoice_data, &JsValue::from_str(k)).unwrap();
+        assert_eq!(get("expirationTimestamp"), JsValue::from(exp));
+        let params = js_sys::JSON::stringify(&get("unknownQueryParams")).unwrap();
+        assert_eq!(String::from(params), r#"{"foo":"bar"}"#);
     }
 }
 
