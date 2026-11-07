@@ -69,15 +69,13 @@ fn issue(wallet: &Wallet) -> String {
         .asset_id
 }
 
-// Begin, sign and end a send, optionally editing the consignment of each asset in between.
+// Begin, sign and end a send.
 async fn begin_end(
     wallet: &mut Wallet,
     online: &Online,
     map: HashMap<String, Vec<Recipient>>,
     donation: bool,
-    edit: Option<fn(&mut RgbTransfer)>,
 ) -> (String, String) {
-    let assets: Vec<String> = map.keys().cloned().collect();
     let unsigned = wallet
         .send_begin(
             online.clone(),
@@ -99,16 +97,6 @@ async fn begin_end(
         .unsigned_tx
         .compute_txid()
         .to_string();
-    if let Some(edit) = edit {
-        for asset_id in &assets {
-            let bytes = wallet.send_consignment_bytes(&txid, asset_id).unwrap();
-            let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
-            edit(&mut consignment);
-            wallet
-                .set_send_consignment_bytes(&txid, asset_id, save(&consignment))
-                .unwrap();
-        }
-    }
     wallet
         .send_end(online.clone(), signed.clone(), false)
         .await
@@ -173,7 +161,7 @@ async fn witness_receive_locates_payment() {
             recipient(&rids[1], 34, Some(1500), PROXY_URL),
         ],
     )]);
-    let (signed, txid) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
+    let (signed, txid) = begin_end(&mut wallet_a, &online_a, map, false).await;
 
     refresh(&mut wallet_b, &online_b).await;
     for rid in &rids[..2] {
@@ -220,7 +208,7 @@ async fn blind_receive_locates_payment() {
     .unwrap()
     .recipient_id;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
-    let (_, txid) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
+    let (_, txid) = begin_end(&mut wallet_a, &online_a, map, false).await;
 
     refresh(&mut wallet_b, &online_b).await;
     let transfer = transfer_of(&wallet_b, &rid);
@@ -243,36 +231,6 @@ async fn blind_receive_locates_payment() {
     );
     settle(&mut wallet_a, &online_a, std::slice::from_ref(&rid)).await;
     assert_eq!(wallet_a.get_asset_balance(asset_id).unwrap().settled, 934);
-}
-
-#[wasm_bindgen_test]
-async fn receive_refuses_consignment_without_terminals() {
-    let (mut wallet_a, online_a) = sender().await;
-    let asset_id = issue(&wallet_a);
-    let (mut wallet_b, online_b) = new_wallet().await;
-    fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
-    create_utxos(&mut wallet_b, &online_b, 1).await;
-
-    let rid = blind_rcv(
-        &mut wallet_b,
-        &online_b,
-        None,
-        Assignment::Fungible(66),
-        default_rcv_expiration(),
-        vec![transport_endpoint(PROXY_URL)],
-    )
-    .await
-    .unwrap()
-    .recipient_id;
-    let map = HashMap::from([(asset_id, vec![recipient(&rid, 66, None, PROXY_URL)])]);
-    let edit: fn(&mut RgbTransfer) = |c| {
-        assert!(!c.terminals.is_empty());
-        c.terminals = Default::default();
-    };
-    begin_end(&mut wallet_a, &online_a, map, false, Some(edit)).await;
-
-    refresh(&mut wallet_b, &online_b).await;
-    assert_eq!(transfer_of(&wallet_b, &rid).status, TransferStatus::Failed);
 }
 
 #[wasm_bindgen_test]
@@ -307,7 +265,7 @@ async fn witness_receive_multiple_assets_success() {
             ],
         ),
     ]);
-    let (signed, txid) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
+    let (signed, txid) = begin_end(&mut wallet_a, &online_a, map, false).await;
 
     refresh(&mut wallet_b, &online_b).await;
     for rid in &rids {
@@ -332,31 +290,6 @@ async fn witness_receive_multiple_assets_success() {
 }
 
 #[wasm_bindgen_test]
-async fn witness_receive_accepts_repeated_terminal_seal() {
-    let (mut wallet_a, online_a) = sender().await;
-    let asset_id = issue(&wallet_a);
-    let (mut wallet_b, online_b) = new_wallet().await;
-
-    let rid = receive_witness(&mut wallet_b, &online_b, 66, PROXY_URL).await;
-    let map = HashMap::from([(asset_id, vec![recipient(&rid, 66, Some(2000), PROXY_URL)])]);
-    let edit: fn(&mut RgbTransfer) = |c| {
-        assert_eq!(c.terminals.len(), 1);
-        let seals = c.terminals.values_mut().next().unwrap();
-        assert_eq!(seals.len(), 1);
-        let seal = seals.iter().next().copied().unwrap();
-        seals.push(seal).unwrap();
-    };
-    begin_end(&mut wallet_a, &online_a, map, false, Some(edit)).await;
-
-    refresh(&mut wallet_b, &online_b).await;
-    // the TX of a single-recipient send is released with the ACK and broadcast by the recipient
-    assert_eq!(
-        transfer_of(&wallet_b, &rid).status,
-        TransferStatus::WaitingConfirmations
-    );
-}
-
-#[wasm_bindgen_test]
 async fn donation_receive_broadcasts_signed_tx() {
     let (mut wallet_a, online_a) = sender().await;
     let asset_id = issue(&wallet_a);
@@ -367,7 +300,7 @@ async fn donation_receive_broadcasts_signed_tx() {
         vec![recipient(&rid, 66, Some(2000), PROXY_URL)],
     )]);
     // a donation embeds the signed TX in the consignment, which the recipient broadcasts
-    begin_end(&mut wallet_a, &online_a, map, true, None).await;
+    begin_end(&mut wallet_a, &online_a, map, true).await;
 
     refresh(&mut wallet_b, &online_b).await;
     assert_eq!(
@@ -390,7 +323,7 @@ async fn receive_refuses_history_witness_not_on_chain() {
         asset_id.clone(),
         vec![recipient(&rid_b, 200, Some(2000), PROXY_URL)],
     )]);
-    let (_, w1) = begin_end(&mut wallet_a, &online_a, map, false, None).await;
+    let (_, w1) = begin_end(&mut wallet_a, &online_a, map, false).await;
     settle(&mut wallet_b, &online_b, std::slice::from_ref(&rid_b)).await;
     assert_eq!(
         wallet_b
@@ -481,7 +414,7 @@ async fn ack_failure_no_duplicate_colorings() {
     let rid = data.recipient_id;
     let idx = data.batch_transfer_idx;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
-    begin_end(&mut wallet, &online, map, false, None).await;
+    begin_end(&mut wallet, &online, map, false).await;
 
     clear_rpc_hooks();
     rpc_fail(PROXY_URL, "ack.post");
@@ -588,7 +521,7 @@ async fn donate_to(
         asset_id.to_string(),
         vec![recipient(rid, 66, Some(2000), PROXY_URL)],
     )]);
-    let (_, txid) = begin_end(wallet, online, map, true, None).await;
+    let (_, txid) = begin_end(wallet, online, map, true).await;
     // esplora indexes the mempool with a delay
     for _ in 0..60 {
         rcv.sync(rcv_online.clone()).await.unwrap();

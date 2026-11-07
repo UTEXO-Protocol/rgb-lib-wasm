@@ -565,6 +565,57 @@ pub(crate) struct ProxyReceiveData {
     pub(crate) batch: bool,
 }
 
+/// The assignments of a type an operation moves with a transition of the type's default type,
+/// beside its main transition (see [`add_or_side_output`]).
+#[derive(Default)]
+struct SideTransfer {
+    inputs: Vec<(Opout, AllocatedState)>,
+    outputs: Vec<(BuilderSeal<GraphSeal>, AllocatedState)>,
+    /// Set when the main transition can't assign this type but still spends it (a burn), and there
+    /// is change: the output of this transition that the main transition then spends, as its seal
+    /// and amount. The other outputs are the change.
+    split: Option<(GraphSeal, u64)>,
+}
+
+/// The amount of `state`, 0 for a state that isn't an amount.
+fn state_amount(state: &AllocatedState) -> u64 {
+    match state {
+        AllocatedState::Amount(amt) => amt.as_u64(),
+        _ => 0,
+    }
+}
+
+/// Assign `state` of type `ty` to `seal` through the main transition when it can assign the type
+/// (and set `main_used`), otherwise through `side_transfers`.
+fn add_or_side_output(
+    builder: TransitionBuilder,
+    main_assignment_types: &HashSet<AssignmentType>,
+    main_used: &mut bool,
+    side_transfers: &mut BTreeMap<AssignmentType, SideTransfer>,
+    ty: AssignmentType,
+    seal: BuilderSeal<GraphSeal>,
+    state: AllocatedState,
+) -> Result<TransitionBuilder, Error> {
+    if main_assignment_types.contains(&ty) {
+        *main_used = true;
+        return Ok(builder.add_owned_state_raw(ty, seal, state)?);
+    }
+    side_transfers
+        .entry(ty)
+        .or_default()
+        .outputs
+        .push((seal, state));
+    Ok(builder)
+}
+
+/// A destination at which a consignment pays this recipient, see `find_payments`.
+pub(crate) struct ConsignmentPayment<'c> {
+    pub(crate) bundle: &'c WitnessBundle,
+    /// for witness receives, the vout of the bundle witness TX being paid
+    pub(crate) vout: Option<u32>,
+    pub(crate) receiving: HashMap<Opout, Assignment>,
+}
+
 pub(crate) enum ReceiveMatcher {
     Blind(SecretSeal),
     /// the script paid and the blinding of the seal, derived from the keys of both parties
@@ -1275,44 +1326,56 @@ impl Wallet {
         .then(|| tx.clone())
     }
 
-    /// Find the consignment terminal that pays this recipient. Return its bundle and, for a
-    /// witness receive, the paid vout. Return None when no terminal or more than one destination
-    /// pays it.
-    fn find_terminal_bundle<'c>(
-        &self,
-        consignment: &'c RgbTransfer,
-        matcher: &ReceiveMatcher,
-    ) -> Option<(&'c WitnessBundle, Option<u32>)> {
-        let mut matches: Vec<(&'c WitnessBundle, Option<u32>)> = vec![];
-        let mut push_match = |witness_bundle: &'c WitnessBundle, vout: Option<u32>| {
-            if !matches.iter().any(|(wb, v)| {
-                wb.bundle.bundle_id() == witness_bundle.bundle.bundle_id() && *v == vout
-            }) {
-                matches.push((witness_bundle, vout));
-            }
-        };
+    /// The outputs spent within the consignment by its known transitions. The validation checks
+    /// the inputs of a known transition, and the witness TX must close their seals, so only this
+    /// wallet can spend an output paying it.
+    fn known_spent_opouts(consignment: &RgbTransfer) -> BTreeSet<Opout> {
+        consignment
+            .bundles
+            .iter()
+            .flat_map(|wb| wb.bundle.known_transitions.iter())
+            .flat_map(|kt| kt.transition.inputs.iter().copied())
+            .collect()
+    }
 
-        for (bundle_id, seals) in consignment.terminals.iter() {
-            let Some(witness_bundle) = consignment
-                .bundles
+    /// Locate the destinations (bundle and, for witness receives, vout) that pay this recipient,
+    /// with the assignments not in `spent`. Assignments to one vout of one bundle are one
+    /// destination. Trust the result only for a validated consignment.
+    fn find_payments<'c, 'a>(
+        &'a self,
+        consignment: &'c RgbTransfer,
+        matcher: &'a ReceiveMatcher,
+        spent: &'a BTreeSet<Opout>,
+    ) -> impl Iterator<Item = ConsignmentPayment<'c>> + 'a
+    where
+        'c: 'a,
+    {
+        let known_concealed = match matcher {
+            ReceiveMatcher::Blind(secret_seal) => Some(*secret_seal),
+            ReceiveMatcher::Witness(..) => None,
+        };
+        consignment.bundles.iter().flat_map(move |witness_bundle| {
+            // the vouts paid by this bundle, `None` for concealed seals
+            let mut vouts: BTreeSet<Option<u32>> = BTreeSet::new();
+            let seals = witness_bundle
+                .bundle
+                .known_transitions
                 .iter()
-                .find(|wb| wb.bundle.bundle_id() == *bundle_id)
-            else {
-                continue;
-            };
+                .flat_map(|kt| kt.transition.assignments.values())
+                .flat_map(|typed_assigns| typed_assigns.seals());
             match matcher {
                 ReceiveMatcher::Blind(secret_seal) => {
                     if seals
                         .into_iter()
-                        .any(|seal| seal == BuilderSeal::Concealed(*secret_seal))
+                        .any(|seal| *seal == BuilderSeal::Concealed(*secret_seal))
                     {
-                        push_match(witness_bundle, None);
+                        vouts.insert(None);
                     }
                 }
                 ReceiveMatcher::Witness(script_pubkey, blinding) => {
                     let tx = &witness_bundle.tx;
                     for seal in seals {
-                        let BuilderSeal::Revealed(seal) = seal else {
+                        let BuilderSeal::Revealed(seal) = *seal else {
                             continue;
                         };
                         if seal.txid != TxPtr::WitnessTx {
@@ -1329,23 +1392,23 @@ impl Wallet {
                             .get(vout as usize)
                             .is_some_and(|out| out.script_pubkey == *script_pubkey)
                         {
-                            push_match(witness_bundle, Some(vout));
+                            vouts.insert(Some(vout));
                         }
                     }
                 }
             }
-        }
 
-        if matches.len() > 1 {
-            error!(
-                self.logger,
-                "Consignment declares {} terminal payments to this recipient, refusing it as \
-                 ambiguous",
-                matches.len()
-            );
-            return None;
-        }
-        matches.into_iter().next()
+            vouts.into_iter().filter_map(move |vout| {
+                let mut receiving =
+                    self.assignments_for_bundle(witness_bundle, vout, known_concealed);
+                receiving.retain(|opout, _| !spent.contains(opout));
+                (!receiving.is_empty()).then_some(ConsignmentPayment {
+                    bundle: witness_bundle,
+                    vout,
+                    receiving,
+                })
+            })
+        })
     }
 
     fn assignments_for_bundle(
@@ -1718,38 +1781,44 @@ impl Wallet {
 
     fn _check_dag(
         &self,
-        dag_data: &OpoutsDagData,
+        ops_dag: &OpsDag,
         reject_opouts: &HashSet<Opout>,
         allow_opouts: &HashSet<Opout>,
         check_opouts: &HashSet<Opout>,
     ) -> Result<HashSet<Opout>, Error> {
-        let (dag, index) = dag_data;
         let mut to_reject = HashSet::new();
 
         // for each opout we are checking, traverse its ancestor chain
-        for check_opout in check_opouts {
-            let &opout_node = index.get(check_opout).ok_or(Error::Internal {
+        'check: for check_opout in check_opouts {
+            // allow shields this path upward: do not traverse this branch further
+            if allow_opouts.contains(check_opout) {
+                continue;
+            }
+            // encountering a reject opout on an unshielded path: reject
+            if reject_opouts.contains(check_opout) {
+                to_reject.insert(*check_opout);
+                continue;
+            }
+            let op_node = ops_dag.op_node(&check_opout.op).ok_or(Error::Internal {
                 details: s!("opout not found in DAG"),
             })?;
 
-            // traverse from this node to its ancestors, depth first
-            let mut stack = vec![opout_node];
+            // traverse from the operation creating it to its ancestors, depth first, checking the
+            // opouts each operation spends
+            let mut stack = vec![op_node];
             let mut visited = HashSet::new();
             while let Some(node) = stack.pop() {
                 if !visited.insert(node) {
                     continue;
                 }
-                let node_opout = &dag[node];
-                // allow shields this path upward: do not traverse this branch further
-                if allow_opouts.contains(node_opout) {
-                    continue;
-                }
-                // encountering a reject node on an unshielded path: reject
-                if reject_opouts.contains(node_opout) {
-                    to_reject.insert(*check_opout);
-                    break;
-                }
-                for (_edge, parent) in dag.parents(node).iter(dag) {
+                for (spent_opout, parent) in ops_dag.spent_opouts(node) {
+                    if allow_opouts.contains(&spent_opout) {
+                        continue;
+                    }
+                    if reject_opouts.contains(&spent_opout) {
+                        to_reject.insert(*check_opout);
+                        continue 'check;
+                    }
                     stack.push(parent);
                 }
             }
@@ -2617,7 +2686,6 @@ impl Wallet {
         let input_outpoints: Vec<Outpoint> =
             prev_outputs.iter().map(|o| Outpoint::from(*o)).collect();
 
-        let mut all_transitions: HashMap<ContractId, Vec<Transition>> = HashMap::new();
         let mut asset_beneficiaries = bmap![];
         let mut extra_state = HashMap::<ContractId, Vec<(i32, Opout, AllocatedState)>>::new();
         let mut input_opouts: HashMap<ContractId, HashMap<Opout, AllocatedState>> = HashMap::new();
@@ -2637,16 +2705,28 @@ impl Wallet {
                     .extend(opout_state_map.into_iter().map(|(o, s)| (txo_idx, o, s)));
             }
 
-            all_opout_state_vec.sort_by_key(|(_, _, state)| match state {
-                AllocatedState::Amount(amt) => amt.as_u64(),
-                _ => 0,
-            });
+            all_opout_state_vec.sort_by_key(|(_, _, state)| state_amount(state));
 
             let mut inputs_added = AssignmentsCollection::default();
             let mut asset_transition_builder = runtime.transition_builder(
                 transfer_info.asset_info.contract_id,
                 transfer_info.main_transition.clone().type_name(),
             )?;
+            // the main transition only takes some assignment types as inputs and assignments:
+            // the others are moved by a transition of their default type in the same bundle
+            let schema = runtime.contract_schema(transfer_info.asset_info.contract_id)?;
+            let main_schema = &schema
+                .transitions
+                .get(&asset_transition_builder.transition_type())
+                .expect("main transition missing from the schema")
+                .transition_schema;
+            let main_input_types: HashSet<AssignmentType> =
+                main_schema.inputs.keys().copied().collect();
+            let main_assignment_types: HashSet<AssignmentType> =
+                main_schema.assignments.keys().copied().collect();
+            let mut main_inputs = vec![];
+            let mut main_used = false;
+            let mut side_transfers: BTreeMap<AssignmentType, SideTransfer> = BTreeMap::new();
             // a retry raises the need, but the transition spends no more mint rights than asked
             let inputs_needed = AssignmentsCollection {
                 mint: transfer_info.original_assignments_needed.mint,
@@ -2672,8 +2752,15 @@ impl Wallet {
                     .entry(txo_idx)
                     .or_default()
                     .push(Assignment::from_opout_and_state(opout, &state));
-                asset_transition_builder =
-                    asset_transition_builder.add_input(opout, state.clone())?;
+                if main_input_types.contains(&opout.ty) {
+                    main_inputs.push((opout, state.clone()));
+                } else {
+                    side_transfers
+                        .entry(opout.ty)
+                        .or_default()
+                        .inputs
+                        .push((opout, state.clone()));
+                }
                 input_opouts
                     .entry(transfer_info.asset_info.contract_id)
                     .or_default()
@@ -2699,23 +2786,20 @@ impl Wallet {
 
                 beneficiaries.push(seal);
 
-                match &recipient.assignment {
-                    Assignment::Fungible(amt) => {
-                        asset_transition_builder = asset_transition_builder.add_fungible_state(
-                            RGB_STATE_ASSET_OWNER,
-                            seal,
-                            *amt,
-                        )?;
-                    }
-                    Assignment::InflationRight(amt) => {
-                        asset_transition_builder = asset_transition_builder.add_fungible_state(
-                            RGB_STATE_INFLATION_ALLOWANCE,
-                            seal,
-                            *amt,
-                        )?;
-                    }
+                let (ty, amt) = match &recipient.assignment {
+                    Assignment::Fungible(amt) => (OS_ASSET, *amt),
+                    Assignment::InflationRight(amt) => (OS_INFLATION, *amt),
                     _ => unreachable!(),
-                }
+                };
+                asset_transition_builder = add_or_side_output(
+                    asset_transition_builder,
+                    &main_assignment_types,
+                    &mut main_used,
+                    &mut side_transfers,
+                    ty,
+                    seal,
+                    Amount::from(amt).into(),
+                )?;
             }
 
             let change = inputs_added.change(&transfer_info.original_assignments_needed);
@@ -2729,28 +2813,93 @@ impl Wallet {
                     &input_outpoints,
                     unspents.as_slice(),
                 )?;
+                let mut change_outputs: Vec<(AssignmentType, AllocatedState)> = vec![];
                 if change.fungible > 0 {
-                    asset_transition_builder = asset_transition_builder.add_fungible_state(
-                        RGB_STATE_ASSET_OWNER,
-                        seal,
-                        change.fungible,
-                    )?;
+                    change_outputs.push((OS_ASSET, Amount::from(change.fungible).into()));
                 }
                 if change.inflation > 0 {
-                    asset_transition_builder = asset_transition_builder.add_fungible_state(
-                        RGB_STATE_INFLATION_ALLOWANCE,
-                        seal,
-                        change.inflation,
-                    )?;
+                    change_outputs.push((OS_INFLATION, Amount::from(change.inflation).into()));
                 }
                 for _ in 0..change.mint {
-                    asset_transition_builder =
-                        asset_transition_builder.add_rights(RGB_STATE_MINT_RIGHT, seal)?;
+                    change_outputs.push((OS_MINT, AllocatedState::Void));
+                }
+                for (ty, state) in change_outputs {
+                    // split the inputs into change and the burn amount, sealed to an outpoint
+                    // this TX spends; the main transition spends that split output
+                    if !main_assignment_types.contains(&ty) && main_input_types.contains(&ty) {
+                        let side = side_transfers.entry(ty).or_default();
+                        if side.split.is_none() {
+                            let (split_inputs, rest): (Vec<_>, Vec<_>) =
+                                main_inputs.into_iter().partition(|(o, _)| o.ty == ty);
+                            main_inputs = rest;
+                            let inputs_amount: u64 =
+                                split_inputs.iter().map(|(_, s)| state_amount(s)).sum();
+                            let needed = inputs_amount
+                                .checked_sub(state_amount(&state))
+                                .ok_or(InternalError::Unexpected)?;
+                            side.inputs.extend(split_inputs);
+                            let split_seal =
+                                GraphSeal::rand_from(psbt.unsigned_tx.input[0].previous_output);
+                            side.split = Some((split_seal, needed));
+                            side.outputs.push((
+                                BuilderSeal::Revealed(split_seal),
+                                Amount::from(needed).into(),
+                            ));
+                        }
+                    }
+                    asset_transition_builder = add_or_side_output(
+                        asset_transition_builder,
+                        &main_assignment_types,
+                        &mut main_used,
+                        &mut side_transfers,
+                        ty,
+                        BuilderSeal::Revealed(seal),
+                        state,
+                    )?;
                 }
             };
 
+            // the transitions moving the assignment types the main transition doesn't, before
+            // the main one, which may spend the output of a split
+            for (ty, side) in side_transfers {
+                if side.outputs.is_empty() {
+                    return Err(Error::Internal {
+                        details: format!("not enough outputs to move assignments of type {ty}"),
+                    });
+                }
+                let mut side_builder = runtime.transition_builder_raw(
+                    transfer_info.asset_info.contract_id,
+                    schema.default_transition_for_assignment(&ty),
+                )?;
+                for (opout, state) in side.inputs {
+                    side_builder = side_builder.add_input(opout, state)?;
+                }
+                for (seal, state) in side.outputs {
+                    side_builder = side_builder.add_owned_state_raw(ty, seal, state)?;
+                }
+                let side_transition = side_builder.complete_transition()?;
+                if let Some((split_seal, needed)) = side.split
+                    && let Some(no) = side_transition.assignments.get(&ty).and_then(|a| {
+                        a.as_fungible()
+                            .iter()
+                            .position(|a| a.revealed_seal() == Some(split_seal))
+                    })
+                {
+                    main_inputs.push((
+                        Opout::new(side_transition.id(), ty, no as u16),
+                        Amount::from(needed).into(),
+                    ));
+                }
+                psbt.push_rgb_transition(side_transition)
+                    .map_err(InternalError::from)?;
+            }
+            for (opout, state) in main_inputs {
+                asset_transition_builder = asset_transition_builder.add_input(opout, state)?;
+            }
+
             if transfer_info.main_transition == TypeOfTransition::Inflate {
                 let inflation = transfer_info.original_assignments_needed.inflation;
+                main_used = true;
                 asset_transition_builder = asset_transition_builder
                     .add_global_state(RGB_GLOBAL_ISSUED_SUPPLY, Amount::from(inflation))
                     .unwrap()
@@ -2762,6 +2911,7 @@ impl Wallet {
             }
             if transfer_info.main_transition == TypeOfTransition::Burn {
                 let burn = transfer_info.original_assignments_needed.fungible;
+                main_used = true;
                 asset_transition_builder = asset_transition_builder
                     .add_global_state(RGB_GLOBAL_BURNED_ASSET, Amount::from(burn))
                     .unwrap();
@@ -2779,20 +2929,25 @@ impl Wallet {
                     .iter()
                     .map(|r| r.assignment.main_amount())
                     .sum();
+                main_used = true;
                 asset_transition_builder = asset_transition_builder
                     .add_global_state(RGB_GLOBAL_ISSUED_SUPPLY, Amount::from(minted))
                     .unwrap()
-                    .add_metadata("afterBlock", rgbstd::stl::BlockNumber::from(after_block))
+                    .add_metadata("beforeBlock", rgbstd::stl::BlockNumber::from(after_block))
                     .unwrap();
             }
 
-            let transition = asset_transition_builder.complete_transition()?;
-            all_transitions
-                .entry(transfer_info.asset_info.contract_id)
-                .or_default()
-                .push(transition.clone());
-            psbt.push_rgb_transition(transition)
-                .map_err(InternalError::from)?;
+            // a transition must spend something: skip a main transition that spends and does
+            // nothing (a transfer of rights only, which side transitions move)
+            if asset_transition_builder.has_inputs() {
+                let transition = asset_transition_builder.complete_transition()?;
+                psbt.push_rgb_transition(transition)
+                    .map_err(InternalError::from)?;
+            } else if main_used {
+                return Err(Error::Internal {
+                    details: s!("main transition assigning or recording state without inputs"),
+                });
+            }
             asset_beneficiaries.insert(asset_id.clone(), beneficiaries);
         }
 
@@ -2830,10 +2985,6 @@ impl Wallet {
                     .add_input(opout, state.clone())?
                     .add_owned_state_raw(opout.ty, seal, state)?;
                 let extra_transition = extra_builder.complete_transition()?;
-                all_transitions
-                    .entry(cid)
-                    .or_default()
-                    .push(extra_transition.clone());
                 extra_allocations
                     .entry(cid.to_string())
                     .or_default()
@@ -2859,15 +3010,6 @@ impl Wallet {
             .set_mpc_entropy(entropy)
             .map_err(InternalError::from)?;
 
-        for (cid, transitions) in &all_transitions {
-            for transition in transitions {
-                for opout in transition.inputs() {
-                    psbt.set_rgb_contract_consumer(*cid, opout, transition.id())
-                        .map_err(InternalError::from)?;
-                }
-            }
-        }
-
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         let fascia = psbt.rgb_commit().map_err(|e| Error::Internal {
             details: e.to_string(),
@@ -2886,7 +3028,13 @@ impl Wallet {
                 details: format!("cannot serialize fascia: {e}"),
             })?
             .release();
-        runtime.consume_fascia(fascia.clone(), None)?;
+        // a burn enters the store at burn_end: a dry run or a failed begin leaves no split output
+        let burning = transfer_info_map
+            .values()
+            .all(|ti| ti.main_transition == TypeOfTransition::Burn);
+        if !burning {
+            runtime.consume_fascia(fascia.clone(), None)?;
+        }
 
         for (asset_id, transfer_info) in transfer_info_map.iter_mut() {
             let beneficiaries = asset_beneficiaries[asset_id].clone();
@@ -2930,13 +3078,23 @@ impl Wallet {
             ) && reject_list_source.is_some();
 
             let consignment = if should_build_dag {
-                let (consignment, dag_data) = runtime.transfer_with_dag(
-                    transfer_info.asset_info.contract_id,
-                    beneficiaries_witness,
-                    beneficiaries_blinded,
-                    burn_opids(&fascia, contract_id),
-                    Some(witness_txid),
-                )?;
+                let (consignment, ops_dag) = if burning {
+                    runtime.transfer_from_fascia_with_dag(
+                        contract_id,
+                        beneficiaries_witness,
+                        beneficiaries_blinded,
+                        burn_opids(&fascia, contract_id),
+                        &fascia,
+                    )?
+                } else {
+                    runtime.transfer_with_dag(
+                        contract_id,
+                        beneficiaries_witness,
+                        beneficiaries_blinded,
+                        burn_opids(&fascia, contract_id),
+                        Some(witness_txid),
+                    )?
+                };
 
                 let (reject_opouts, allow_opouts) = self
                     ._get_reject_list_async(reject_list_source.as_ref().unwrap())
@@ -2945,12 +3103,8 @@ impl Wallet {
                     .get(&transfer_info.asset_info.contract_id)
                     .unwrap();
                 let asset_input_opouts = asset_opouts.keys().cloned().collect();
-                let to_reject = self._check_dag(
-                    &dag_data,
-                    &reject_opouts,
-                    &allow_opouts,
-                    &asset_input_opouts,
-                )?;
+                let to_reject =
+                    self._check_dag(&ops_dag, &reject_opouts, &allow_opouts, &asset_input_opouts)?;
                 if !to_reject.is_empty() {
                     warn!(
                         self.logger,
@@ -3005,7 +3159,9 @@ impl Wallet {
                 .insert(asset_id.clone(), transfer_info.clone());
         }
 
-        runtime.upsert_witness(witness_txid, WitnessOrd::Tentative)?;
+        if !burning {
+            runtime.upsert_witness(witness_txid, WitnessOrd::Tentative)?;
+        }
 
         // Store batch transfer info in memory instead of filesystem
         let info_contents = InfoBatchTransfer {
@@ -3171,9 +3327,8 @@ impl Wallet {
         terminal_opids: &HashSet<OpId>,
         scanned_blocks: &mut HashMap<OpId, u64>,
     ) -> Result<Option<OpId>, Error> {
-        let anchors: Vec<ExternalAnchor> =
-            pending.pending().unresolved_anchors().cloned().collect();
-        let Some(ExternalAnchor::MintEvent { opid, .. }) = anchors.first() else {
+        let claims: Vec<Claim> = pending.pending().unresolved_claims().cloned().collect();
+        let Some(Claim::Lock { opid, .. }) = claims.first() else {
             return Ok(None);
         };
         let BridgeLocation::Evm(EvmContract { chain_id, address }) =
@@ -3192,9 +3347,9 @@ impl Wallet {
             std::mem::take(scanned_blocks),
             max_mint_scan_blocks(),
         );
-        for anchor in &anchors {
-            let ExternalAnchor::MintEvent { opid, .. } = anchor;
-            let confirmed = resolver.is_confirmed(&address, anchor).await?;
+        for claim in &claims {
+            let Claim::Lock { opid, .. } = claim;
+            let confirmed = resolver.is_confirmed(&address, claim).await?;
             *scanned_blocks = resolver.scanned_blocks();
             if !confirmed {
                 if resolver.is_exhausted(opid) {
@@ -3207,9 +3362,9 @@ impl Wallet {
             }
             pending
                 .pending()
-                .resolve_anchor(anchor)
+                .resolve_claim(claim)
                 .map_err(|e| Error::Internal {
-                    details: format!("unexpected anchor resolution error: {e}"),
+                    details: format!("unexpected claim resolution error: {e}"),
                 })?;
         }
         Ok(None)
@@ -3762,9 +3917,7 @@ impl Wallet {
         &self,
         runtime: &RgbRuntime,
         pending: PendingConsignment<true>,
-        terminal_bundle: &WitnessBundle,
-        vout: Option<u32>,
-        known_concealed: Option<SecretSeal>,
+        receiving: &HashMap<Opout, Assignment>,
         asset_schema: AssetSchema,
         asset_id: &str,
         mint_transfer: Option<&DbTransfer>,
@@ -3774,11 +3927,7 @@ impl Wallet {
         let validity = validation_status.validity();
         debug!(self.logger, "Consignment validity: {:?}", validity);
 
-        let received = self.assignments_for_bundle(terminal_bundle, vout, known_concealed);
-        if received.is_empty() {
-            error!(self.logger, "Cannot find any receiving assignment");
-            return Ok(None);
-        };
+        let received = receiving.clone();
         let reject_list_source = match asset_schema {
             AssetSchema::Ifa => {
                 let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.to_string()) {
@@ -3799,9 +3948,9 @@ impl Wallet {
 
             let to_reject = self._check_dag(
                 validation_status
-                    .dag_data_opt
+                    .ops_dag
                     .as_ref()
-                    .expect("build_opouts_dag is true"),
+                    .expect("build_ops_dag is true"),
                 &reject_opouts,
                 &allow_opouts,
                 &received.clone().into_keys().collect(),
@@ -4136,18 +4285,6 @@ impl Wallet {
                 .await;
         }
 
-        if consignment.terminals.is_empty() {
-            error!(self.logger, "Consignment declares no terminals");
-            return self
-                ._refuse_consignment_async(
-                    data,
-                    &recipient_id,
-                    recipient_seed,
-                    updated_batch_transfer,
-                )
-                .await;
-        }
-
         // the seal blinding is derived from the keys of both parties
         let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
             details: s!("invalid recipient secret key"),
@@ -4168,12 +4305,21 @@ impl Wallet {
         };
         let blinding = derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding;
         let matcher = transfer.receive_matcher(blinding)?;
-        let Some((terminal_bundle, vout)) = self.find_terminal_bundle(&consignment, &matcher)
-        else {
-            error!(
-                self.logger,
-                "Cannot find a consignment terminal paying this recipient"
-            );
+        let spent = Self::known_spent_opouts(&consignment);
+        let mut payments: Vec<_> = self.find_payments(&consignment, &matcher, &spent).collect();
+        if payments.len() != 1 {
+            if payments.is_empty() {
+                error!(
+                    self.logger,
+                    "Cannot find any unspent assignment paying this recipient"
+                );
+            } else {
+                error!(
+                    self.logger,
+                    "Consignment pays this recipient at {} destinations, refusing it as ambiguous",
+                    payments.len()
+                );
+            }
             return self
                 ._refuse_consignment_async(
                     data,
@@ -4182,14 +4328,15 @@ impl Wallet {
                     updated_batch_transfer,
                 )
                 .await;
-        };
-        let witness_id = terminal_bundle.witness_id();
+        }
+        let ConsignmentPayment {
+            bundle: paying_bundle,
+            vout,
+            receiving,
+        } = payments.remove(0);
+        let witness_id = paying_bundle.witness_id();
         let txid = witness_id.to_string();
-        let donation_tx = Self::donation_signed_tx(&terminal_bundle.tx);
-        let known_concealed = match matcher {
-            ReceiveMatcher::Blind(secret_seal) => Some(secret_seal),
-            ReceiveMatcher::Witness(..) => None,
-        };
+        let donation_tx = Self::donation_signed_tx(&paying_bundle.tx);
 
         let chain_resolver = self
             .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
@@ -4207,7 +4354,7 @@ impl Wallet {
         let schema_rules = asset_schema.schema_rules();
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            build_opouts_dag: true,
+            build_ops_dag: true,
             ..Default::default()
         };
         let mut pending = match consignment
@@ -4248,16 +4395,17 @@ impl Wallet {
             .collect();
         let received_mint = pending
             .pending()
-            .unresolved_anchors()
-            .find_map(|anchor| {
-                let ExternalAnchor::MintEvent {
+            .unresolved_claims()
+            .find_map(|claim| {
+                let Claim::Lock {
                     opid,
                     amount,
-                    after_block,
-                } = anchor;
+                    before_block,
+                    ..
+                } = claim;
                 terminal_opids
                     .contains(opid)
-                    .then_some((*opid, *amount, *after_block))
+                    .then_some((*opid, *amount, *before_block))
             })
             .map(|(opid, amount, after_block)| {
                 let BridgeLocation::Evm(EvmContract { chain_id, address }) =
@@ -4340,23 +4488,21 @@ impl Wallet {
                     && !mint_saved
                 {
                     let mut assumed = pending.clone();
-                    let unresolved: Vec<ExternalAnchor> =
-                        assumed.pending().unresolved_anchors().cloned().collect();
-                    for anchor in &unresolved {
+                    let unresolved: Vec<Claim> =
+                        assumed.pending().unresolved_claims().cloned().collect();
+                    for claim in &unresolved {
                         assumed
                             .pending()
-                            .resolve_anchor(anchor)
+                            .resolve_claim(claim)
                             .map_err(|e| Error::Internal {
-                                details: format!("unexpected anchor resolution error: {e}"),
+                                details: format!("unexpected claim resolution error: {e}"),
                             })?;
                     }
                     let checked = self
                         ._check_received_consignment(
                             &runtime,
                             assumed,
-                            terminal_bundle,
-                            vout,
-                            known_concealed,
+                            &receiving,
                             asset_schema,
                             &asset_id,
                             Some(transfer),
@@ -4394,9 +4540,7 @@ impl Wallet {
             ._check_received_consignment(
                 &runtime,
                 pending,
-                terminal_bundle,
-                vout,
-                known_concealed,
+                &receiving,
                 asset_schema,
                 &asset_id,
                 received_mint.as_ref().map(|_| transfer),
@@ -7213,6 +7357,7 @@ impl Wallet {
         }
 
         self._broadcast_psbt(psbt, false).await?;
+        runtime.consume_fascia(fascia, None)?;
         runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
         // Drop runtime so Stock returns to RefCell before auto-save
         drop(runtime);
@@ -10337,6 +10482,38 @@ mod bfa_tests {
         );
     }
 
+    #[test]
+    fn issue_asset_bfa_takes_unicode_ticker() {
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let mut wallet = make_test_wallet(false);
+        wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Bfa];
+        let issue = |ticker: String| {
+            wallet.issue_asset_bfa(
+                ticker,
+                s!("Name"),
+                0,
+                1,
+                31337,
+                s!("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
+                None,
+            )
+        };
+        assert!(matches!(
+            issue(s!("")),
+            Err(Error::InvalidTicker { details: m }) if m == "ticker must contain at least one character."
+        ));
+        assert!(matches!(
+            issue("₿TC".repeat(3)),
+            Err(Error::InvalidTicker { details: m }) if m == "ticker has 9 characters, while at most 8 are allowed."
+        ));
+        // a valid unicode ticker passes the check: the wallet has no UTXO, so the issuance fails later
+        assert!(!matches!(
+            issue(s!("₿TC")),
+            Err(Error::InvalidTicker { .. })
+        ));
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn evm_reject_list_rejects_descendants_of_rejected_opout() {
@@ -10383,24 +10560,28 @@ mod bfa_tests {
         assert_eq!(reject, HashSet::from([test_opout(1)]));
         assert_eq!(allow, HashSet::from([test_opout(2)]));
 
-        // 1 -> 3 and 1 -> 2 -> 4: the allowed opout 2 shields 4 but not 3
-        let mut dag = rgbstd::validation::OpoutsDagInfo::new();
-        for b in 1..=4 {
-            let node = dag.register_output(test_opout(b));
-            dag.cache_outputs(&test_opout(b).op, vec![node]);
+        // 1 -> 3 -> 5 and 1 -> 2 -> 4: the allowed opout 2 shields 4 but not 3 and 5
+        let mut dag = rgbstd::validation::OpsDag::new();
+        for b in 1..=5 {
+            dag.register_op(test_opout(b).op);
         }
-        for (parent, child) in [(1, 3), (1, 2), (2, 4)] {
-            dag.connect_input_to_outputs_by_opid(test_opout(parent), &test_opout(child).op);
+        for (parent, child) in [(1, 3), (1, 2), (2, 4), (3, 5)] {
+            dag.connect_input(test_opout(parent), test_opout(child).op);
         }
-        let to_reject = wallet
-            ._check_dag(
-                &dag.to_opouts_dag_data(),
-                &reject,
-                &allow,
-                &HashSet::from([test_opout(3), test_opout(4)]),
-            )
-            .unwrap();
-        assert_eq!(to_reject, HashSet::from([test_opout(3)]));
+        let check = |opouts: &[u8]| {
+            wallet
+                ._check_dag(
+                    &dag,
+                    &reject,
+                    &allow,
+                    &opouts.iter().map(|b| test_opout(*b)).collect(),
+                )
+                .unwrap()
+        };
+        assert_eq!(check(&[3, 4]), HashSet::from([test_opout(3)]));
+        assert_eq!(check(&[5]), HashSet::from([test_opout(5)]));
+        assert_eq!(check(&[1]), HashSet::from([test_opout(1)]));
+        assert_eq!(check(&[2]), HashSet::new());
 
         // a chain with no URL gives an error, not an empty list
         wallet.online_data.as_mut().unwrap().evm_rpc_urls.clear();
