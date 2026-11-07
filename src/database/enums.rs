@@ -233,6 +233,7 @@ impl TransferStatus {
 pub enum WalletTransactionType {
     CreateUtxos = 1,
     Drain = 2,
+    SendBtc = 3,
 }
 
 /// An RGB assignment.

@@ -33,6 +33,49 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     }
 }
 
+#[derive(Clone, Copy)]
+enum End {
+    Send,
+    SendBtc,
+    CreateUtxos,
+    Drain,
+    Inflate,
+}
+
+const VANILLA_ENDS: [End; 3] = [End::SendBtc, End::CreateUtxos, End::Drain];
+
+fn psbt_txid(signed: &str) -> String {
+    signed
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string()
+}
+
+async fn assert_refused(
+    wallet: &mut Wallet,
+    online: &rgb_lib_wasm::wallet::Online,
+    ends: &[End],
+    signed: &str,
+    error: Error,
+) {
+    for end in ends {
+        let (online, signed) = (online.clone(), signed.to_string());
+        let res = match end {
+            End::Send => wallet.send_end(online, signed, true).await.map(|_| ()),
+            End::SendBtc => wallet.send_btc_end(online, signed, true).await.map(|_| ()),
+            End::CreateUtxos => wallet
+                .create_utxos_end(online, signed, true)
+                .await
+                .map(|_| ()),
+            End::Drain => wallet.drain_to_end(online, signed).await.map(|_| ()),
+            End::Inflate => wallet.inflate_end(online, signed).await.map(|_| ()),
+        };
+        assert_eq!(res, Err(error.clone()));
+    }
+}
+
 fn transport_endpoint() -> String {
     format!("rpc://{}", PROXY_URL.trim_start_matches("http://"))
 }
@@ -99,10 +142,27 @@ async fn test_no_receive_on_pending_send_input() {
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let txid = psbt_txid(&signed);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::SendBtc, End::Drain],
+        &signed,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed.clone(), true)
         .await
         .unwrap();
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::CreateUtxos],
+        &signed,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
@@ -215,10 +275,21 @@ async fn test_no_receive_on_pending_send_input() {
         "a send must not use an input of a pending send, got: {result:?}"
     );
 
-    // a failed send cannot be ended and frees its inputs, also after it is deleted
+    // a pending send can be ended only by send_end
     let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let signed = wallet.sign_psbt(psbt.to_string(), None).unwrap();
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::SendBtc, End::CreateUtxos, End::Drain, End::Inflate],
+        &signed,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
+
+    // a failed send cannot be ended and frees its inputs, also after it is deleted
     let transfers = wallet
-        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid))
+        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid.clone()))
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].status, TransferStatus::Initiated);
@@ -229,9 +300,14 @@ async fn test_no_receive_on_pending_send_input() {
             .await
             .unwrap()
     );
-    let signed = wallet.sign_psbt(psbt.to_string(), None).unwrap();
-    let result = wallet.send_end(online.clone(), signed, false).await;
-    assert!(matches!(result, Err(Error::CannotEndTransfer { .. })));
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::Send],
+        &signed,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
     assert!(
         wallet
             .delete_transfers(Some(batch_transfer_idx), false)
@@ -355,6 +431,18 @@ async fn test_no_inflate_end_after_expiration() {
         .await
         .unwrap();
     let psbt = unsigned.parse::<Psbt>().unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    assert_refused(
+        &mut saved,
+        &saved_online,
+        &[End::SendBtc],
+        &signed,
+        Error::WrongOperation {
+            txid: psbt_txid(&signed),
+        },
+    )
+    .await;
     let inputs: HashSet<Outpoint> = psbt
         .unsigned_tx
         .input
@@ -390,7 +478,6 @@ async fn test_no_inflate_end_after_expiration() {
     )
     .await
     .unwrap();
-    let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let result = wallet.inflate_end(online.clone(), signed).await;
     js_sys::eval("Date.now = realDateNow").unwrap();
     assert!(
@@ -729,16 +816,62 @@ async fn test_full_wallet_flow() {
     let total_before = btc_before.vanilla.settled + btc_before.vanilla.future;
 
     // 50_000 sats
+    wallet.backup("pw").unwrap();
+    assert!(!wallet.backup_info().unwrap());
+    // backup timestamps compare as text, which is only safe across seconds
+    sleep_ms(1100).await;
     let unsigned_btc = wallet
         .send_btc_begin(online.clone(), addr_b2, 50_000, 1, false)
         .await
         .unwrap();
+    assert!(wallet.backup_info().unwrap());
     let signed_btc = signer.sign_psbt(unsigned_btc, None).unwrap();
+    let txid = psbt_txid(&signed_btc);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::CreateUtxos, End::Drain],
+        &signed_btc,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    assert_refused(
+        &mut saved,
+        &saved_online,
+        &[End::CreateUtxos],
+        &signed_btc,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
+    wallet.backup("pw").unwrap();
+    assert!(!wallet.backup_info().unwrap());
+    sleep_ms(1100).await;
     let btc_txid = wallet
-        .send_btc_end(online.clone(), signed_btc, false)
+        .send_btc_end(online.clone(), signed_btc.clone(), false)
         .await
         .unwrap();
     assert!(!btc_txid.is_empty());
+    assert!(wallet.backup_info().unwrap());
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::SendBtc],
+        &signed_btc,
+        Error::CannotEndTransfer { txid: txid.clone() },
+    )
+    .await;
+    // the save that send_btc_end schedules keeps the end across a reload
+    sleep_ms(1100).await;
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    assert_refused(
+        &mut saved,
+        &saved_online,
+        &[End::SendBtc],
+        &signed_btc,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
@@ -772,12 +905,37 @@ async fn test_full_wallet_flow() {
         .find_map(|o| o.mpc_entropy())
         .unwrap();
     let signed_inflate = wallet.sign_psbt(unsigned_inflate, None).unwrap();
+    let txid = psbt_txid(&signed_inflate);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::Send, End::SendBtc, End::CreateUtxos, End::Drain],
+        &signed_inflate,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
     let inflate_result = wallet
-        .inflate_end(online.clone(), signed_inflate)
+        .inflate_end(online.clone(), signed_inflate.clone())
         .await
         .unwrap();
     assert!(!inflate_result.txid.is_empty());
     assert_eq!(inflate_result.entropy, inflate_entropy);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::Inflate, End::Send],
+        &signed_inflate,
+        Error::CannotEndTransfer { txid: txid.clone() },
+    )
+    .await;
+    assert_refused(
+        &mut wallet,
+        &online,
+        &VANILLA_ENDS,
+        &signed_inflate,
+        Error::WrongOperation { txid },
+    )
+    .await;
     let inflation = wallet
         .list_transfers(
             AssetFilter::Id(ifa.asset_id.clone()),
@@ -941,11 +1099,28 @@ async fn test_full_wallet_flow() {
         .unwrap();
     let signer_b = Wallet::new(wd_b).unwrap();
     let signed_drain = signer_b.sign_psbt(unsigned_drain, None).unwrap();
+    let txid = psbt_txid(&signed_drain);
+    assert_refused(
+        &mut wallet_b,
+        &online_b,
+        &[End::SendBtc, End::CreateUtxos],
+        &signed_drain,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
     let drain_txid = wallet_b
-        .drain_to_end(online_b.clone(), signed_drain)
+        .drain_to_end(online_b.clone(), signed_drain.clone())
         .await
         .unwrap();
     assert!(!drain_txid.is_empty());
+    assert_refused(
+        &mut wallet_b,
+        &online_b,
+        &[End::Drain],
+        &signed_drain,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
