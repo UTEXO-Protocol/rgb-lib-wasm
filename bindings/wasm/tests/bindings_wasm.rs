@@ -155,7 +155,7 @@ async fn go_online_reads_options_object() {
         js_sys::JSON::parse(&format!(
             r#"{{"indexerConfig":{{"Esplora":{{"url":"http://127.0.0.1:8094/regtest/api"}}}},
             "skipConsistencyCheck":true,"proxyAuthKeys":{{}},
-            "evmRpcUrls":{{"{chain_id}":"http://127.0.0.1:8545"}}}}"#
+            "evmChains":{{"{chain_id}":{{"rpcUrl":"http://127.0.0.1:8545","minMintLockBlocks":2,"maxMintLockBlocks":1000}}}}}}"#
         ))
         .unwrap()
     };
