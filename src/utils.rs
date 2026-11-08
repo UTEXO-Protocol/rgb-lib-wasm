@@ -501,9 +501,34 @@ pub(crate) async fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, E
 #[cfg(feature = "esplora")]
 pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
     use crate::wallet::online::Indexer;
+    #[cfg(target_arch = "wasm32")]
+    no_store_fetch(indexer_url);
     let opts = esplora_client::Builder::new(indexer_url).timeout(INDEXER_TIMEOUT.into());
     let client = opts.build_async_with_sleeper::<WasmSleeper>().ok()?;
     Some(Indexer::EsploraAsync(Box::new(client)))
+}
+
+// Esplora sends `cache-control: max-age`, so the browser can serve stale chain data.
+// The client cannot set the fetch cache mode. This wrapper sets `no-store` on indexer requests.
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function no_store_fetch(base) {
+    const g = globalThis;
+    if (!g.__rgbLibNoStoreUrls) {
+        g.__rgbLibNoStoreUrls = new Set();
+        const fetch = g.fetch;
+        g.fetch = function (input, init) {
+            if (input instanceof Request && [...g.__rgbLibNoStoreUrls].some(p => input.url.startsWith(p))) {
+                input = new Request(input, { cache: 'no-store' });
+            }
+            return fetch.call(this, input, init);
+        };
+    }
+    g.__rgbLibNoStoreUrls.add(base);
+}
+"#)]
+extern "C" {
+    fn no_store_fetch(base: &str);
 }
 
 #[cfg(feature = "esplora")]
@@ -1474,6 +1499,45 @@ mod tests {
                 matches!(result, Err(Error::InvalidProxyProtocol { version }) if version == "0.2")
             );
             mock.assert();
+        }
+    }
+
+    #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+    mod no_store_fetch_browser {
+        use super::super::no_store_fetch;
+        use wasm_bindgen_test::*;
+
+        // Stub fetch, register two indexers, and record what reaches the stub.
+        #[wasm_bindgen_test]
+        async fn no_store_only_on_registered_indexers() {
+            js_sys::Function::new_no_args(
+                "const g = globalThis; g.__realUrls = g.__rgbLibNoStoreUrls; delete g.__rgbLibNoStoreUrls; g.__realFetch = g.fetch; g.__seen = []; \
+                 g.fetch = (input, init) => { g.__seen.push([input, init]); return Promise.resolve(new Response('')); };",
+            )
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .unwrap();
+            no_store_fetch("http://indexer-a.test/api");
+            no_store_fetch("http://indexer-b.test/");
+            let out = js_sys::Function::new_no_args(
+                "return (async () => { const g = globalThis; const init = { method: 'POST', body: 'x' }; \
+                 const other = new Request('http://other.test/x'); \
+                 g.fetch(new Request('http://indexer-a.test/api/blocks/tip/height')); \
+                 g.fetch(new Request('http://indexer-b.test/tx', { method: 'POST', body: 'tx' })); \
+                 g.fetch(other); g.fetch('http://other.test/y', init); \
+                 const s = g.__seen; g.fetch = g.__realFetch; g.__rgbLibNoStoreUrls = g.__realUrls; \
+                 return [s.length, s[0][0].cache, s[1][0].cache, s[1][0].method, await s[1][0].text(), \
+                   s[2][0] === other && s[2][0].cache === 'default', \
+                   s[3][0] === 'http://other.test/y' && s[3][1] === init].join(); })();",
+            )
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .unwrap();
+            let out = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(out))
+                .await
+                .unwrap();
+            assert_eq!(
+                out.as_string().unwrap(),
+                "4,no-store,no-store,POST,tx,true,true"
+            );
         }
     }
 }

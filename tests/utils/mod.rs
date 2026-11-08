@@ -159,11 +159,11 @@ pub async fn wait_for_esplora_sync() {
     let client = reqwest::Client::new();
     // 120 iterations × 500ms = 60s timeout
     for _ in 0..120 {
-        if let Ok(resp) = client
-            .get(format!("{}/blocks/tip/height", ESPLORA_URL))
-            .send()
-            .await
-        {
+        let request = client.get(format!("{}/blocks/tip/height", ESPLORA_URL));
+        // Never use the browser HTTP cache.
+        #[cfg(target_arch = "wasm32")]
+        let request = request.fetch_cache_no_store();
+        if let Ok(resp) = request.send().await {
             if let Ok(text) = resp.text().await {
                 if let Ok(h) = text.trim().parse::<u64>() {
                     if h >= target {
@@ -357,6 +357,39 @@ pub fn spy_rpc() {
     )
     .call0(&JsValue::NULL)
     .unwrap();
+}
+
+/// Record the fetch cache mode of each esplora request.
+#[allow(dead_code)]
+pub fn spy_esplora_cache() {
+    js_sys::Function::new_with_args(
+        "url",
+        "if (!globalThis.__esploraFetch) {
+            globalThis.__esploraFetch = globalThis.fetch;
+            globalThis.__esploraModes = [];
+            globalThis.fetch = function (input, init) {
+                if (input instanceof Request && input.url.startsWith(url)) {
+                    globalThis.__esploraModes.push(input.cache);
+                }
+                return globalThis.__esploraFetch.call(this, input, init);
+            };
+        }",
+    )
+    .call1(&JsValue::NULL, &ESPLORA_URL.into())
+    .unwrap();
+}
+
+/// The fetch cache modes of the esplora requests seen.
+#[allow(dead_code)]
+pub fn esplora_cache_modes() -> Vec<String> {
+    let modes = js_sys::Reflect::get(&js_sys::global(), &"__esploraModes".into()).unwrap();
+    if modes.is_undefined() {
+        return vec![];
+    }
+    js_sys::Array::from(&modes)
+        .iter()
+        .map(|m| m.as_string().unwrap_or_default())
+        .collect()
 }
 
 // `before` hooks throw a network error before the call reaches the proxy, the others transform the
