@@ -101,7 +101,10 @@ fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment> {
         .collect()
 }
 
-async fn ifa(wallet_utxos: u8) -> (Wallet, Online, String, WalletData) {
+async fn ifa(
+    wallet_utxos: u8,
+    reject_list_url: Option<String>,
+) -> (Wallet, Online, String, WalletData) {
     let wd = wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let (wallet, online) = funded_wallet(wd.clone(), wallet_utxos).await;
     let asset = wallet
@@ -111,7 +114,7 @@ async fn ifa(wallet_utxos: u8) -> (Wallet, Online, String, WalletData) {
             0,
             vec![600, 400],
             vec![100],
-            None,
+            reject_list_url,
         )
         .unwrap();
     (wallet, online, asset.asset_id, wd)
@@ -119,9 +122,23 @@ async fn ifa(wallet_utxos: u8) -> (Wallet, Online, String, WalletData) {
 
 #[wasm_bindgen_test]
 async fn ifa_burn_with_and_without_reason_settles() {
-    let (mut wallet, online, asset_id, wd) = ifa(5).await;
+    let url = format!("{REGTEST_HELPER_URL}/reject-list/test/burn");
+    serve_reject_list(&url, "");
+    let (mut wallet, online, asset_id, wd) = ifa(5, Some(url.clone())).await;
 
-    // one-step burn with a reason
+    // a burn only the rejected allocation could cover fails
+    let rejected = opouts_holding(&mut wallet, &asset_id, &Assignment::Fungible(600)).concat();
+    assert_eq!(rejected.len(), 1);
+    serve_reject_list(&url, &rejected[0].to_string());
+    let result = wallet
+        .burn(online.clone(), asset_id.clone(), 401, Some(reason()), 1, 1)
+        .await;
+    assert!(
+        matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
+        "{result:?}"
+    );
+
+    // one-step burn with a reason, which leaves the rejected allocation out
     let res = wallet
         .burn(online.clone(), asset_id.clone(), 150, Some(reason()), 1, 1)
         .await
@@ -136,6 +153,9 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(burned.assignments, vec![Assignment::Fungible(250)]);
     assert_eq!(burned.recipient_id, None);
     assert!(burned.change_utxo.is_some());
+    let held = assignments(&mut wallet, &asset_id);
+    assert!(held.contains(&Assignment::Fungible(600)) && held.contains(&Assignment::Fungible(250)));
+    serve_reject_list(&url, "");
 
     // the kept consignment proves the burn with the signed transaction
     let bytes = wallet.transfer_artifacts[&res.txid].consignment_bytes[&asset_id].clone();
@@ -280,7 +300,15 @@ async fn bfa_burn_settles_and_keeps_send_receive() {
 
     record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
     finalize_evm().await;
-    send(&mut a, &a_online, &mut b, &b_online, &asset_id, 10).await;
+    send(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        Assignment::Fungible(10),
+    )
+    .await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
     assert_eq!(balance(&b, &asset_id), (10, 10, 10));
@@ -289,7 +317,7 @@ async fn bfa_burn_settles_and_keeps_send_receive() {
 
 #[wasm_bindgen_test]
 async fn burn_end_refuses_failed_ended_and_other_operations() {
-    let (mut wallet, online, asset_id, _) = ifa(5).await;
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
     let before = balance(&wallet, &asset_id);
 
     // a failed burn
@@ -416,7 +444,7 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
 
 #[wasm_bindgen_test]
 async fn burn_begin_reserves_inputs_until_end_or_fail() {
-    let (mut wallet, online, asset_id, _) = ifa(5).await;
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
     let inputs = |psbt: &str| -> Vec<Outpoint> {
         Psbt::from_str(psbt)
             .unwrap()
@@ -466,9 +494,11 @@ async fn burn_begin_reserves_inputs_until_end_or_fail() {
 
 #[wasm_bindgen_test]
 async fn ifa_send_moves_inflation_rights() {
-    let (mut a, a_online, asset_id, _) = ifa(3).await;
+    let url = format!("{REGTEST_HELPER_URL}/reject-list/test/send");
+    serve_reject_list(&url, "");
+    let (mut a, a_online, asset_id, _) = ifa(3, Some(url.clone())).await;
     let (mut b, b_online) =
-        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 2).await;
+        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 3).await;
     let send_to_b = async |a: &mut Wallet, b: &mut Wallet, assignments: Vec<Assignment>| {
         let mut recipients = vec![];
         for assignment in assignments {
@@ -542,4 +572,91 @@ async fn ifa_send_moves_inflation_rights() {
     assert_eq!(types, vec![TS_TRANSFER_INFLATION]);
     assert_eq!(balance(&a, &asset_id).0, 934);
     assert!(assignments(&mut b, &asset_id).contains(&Assignment::InflationRight(20)));
+
+    // a send that selects a rejected right retries with the other one and gets the list once
+    let r20 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(20)).concat();
+    assert_eq!(r20.len(), 1);
+    serve_reject_list(&url, &r20[0].to_string());
+    let fetches = reject_list_fetches(&url);
+    let right = Assignment::InflationRight(10);
+    send(&mut b, &b_online, &mut a, &a_online, &asset_id, right).await;
+    assert_eq!(reject_list_fetches(&url) - fetches, 1);
+    settle_both(&mut b, &b_online, &mut a, &a_online).await;
+    assert_eq!(inflation_rights(&mut b, &asset_id), vec![20, 20]);
+}
+
+fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
+    let mut rights: Vec<u64> = assignments(wallet, asset_id)
+        .into_iter()
+        .filter_map(|a| match a {
+            Assignment::InflationRight(amount) => Some(amount),
+            _ => None,
+        })
+        .collect();
+    rights.sort();
+    rights
+}
+
+async fn inflate_and_settle(b: &mut Wallet, b_online: &Online, asset_id: &str, amount: u64) {
+    let unsigned = b
+        .inflate_begin(b_online.clone(), asset_id.to_string(), vec![amount], 1, 1)
+        .await
+        .unwrap();
+    let signed = b.sign_psbt(unsigned, None).unwrap();
+    let res = b.inflate_end(b_online.clone(), signed).await.unwrap();
+    mine_and_refresh(b, b_online).await;
+    assert_eq!(
+        transfer(b, asset_id, res.batch_transfer_idx).status,
+        TransferStatus::Settled
+    );
+}
+
+#[wasm_bindgen_test]
+async fn ifa_inflate_reject_list() {
+    let url = format!("{REGTEST_HELPER_URL}/reject-list/test/inflate");
+    serve_reject_list(&url, "");
+    let (mut a, a_online, asset_id, _) = ifa(3, Some(url.clone())).await;
+    let (mut b, b_online) =
+        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 4).await;
+    for amount in [60, 40] {
+        let right = Assignment::InflationRight(amount);
+        send(&mut a, &a_online, &mut b, &b_online, &asset_id, right).await;
+        settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    }
+    let r60 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(60)).concat();
+    let r40 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(40)).concat();
+    assert_eq!((r60.len(), r40.len()), (1, 1));
+
+    // an inflation only the rejected right could cover fails
+    serve_reject_list(&url, &r60[0].to_string());
+    let result = b
+        .inflate_begin(b_online.clone(), asset_id.clone(), vec![41], 1, 1)
+        .await;
+    assert!(
+        matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
+        "{result:?}"
+    );
+
+    // an inflation the allowed right covers spends it and leaves the rejected one out
+    inflate_and_settle(&mut b, &b_online, &asset_id, 30).await;
+    assert_eq!(inflation_rights(&mut b, &asset_id), vec![10, 60]);
+    assert!(assignments(&mut b, &asset_id).contains(&Assignment::Fungible(30)));
+
+    // an inflation that selects a rejected right retries with the other one and gets the list once
+    serve_reject_list(&url, &r40[0].to_string());
+    let fetches = reject_list_fetches(&url);
+    inflate_and_settle(&mut b, &b_online, &asset_id, 5).await;
+    assert_eq!(reject_list_fetches(&url) - fetches, 1);
+    assert_eq!(inflation_rights(&mut b, &asset_id), vec![10, 55]);
+    assert!(assignments(&mut b, &asset_id).contains(&Assignment::Fungible(5)));
+
+    // a right with a rejected allocation in its history is refused
+    serve_reject_list(&url, &format!("{}\n{}", r60[0], r40[0]));
+    let result = b
+        .inflate_begin(b_online.clone(), asset_id.clone(), vec![5], 1, 1)
+        .await;
+    assert!(
+        matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
+        "{result:?}"
+    );
 }

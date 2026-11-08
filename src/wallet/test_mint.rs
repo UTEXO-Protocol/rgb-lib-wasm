@@ -13,9 +13,9 @@ use crate::{
     TransferStatus, script_buf_from_recipient_id,
 };
 use amplify::ByteArray;
-use bdk_wallet::bitcoin::{OutPoint, Psbt};
+use bdk_wallet::bitcoin::Psbt;
 use rgbstd::containers::LockId;
-use rgbstd::{ContractId, OpId, Opout, Txid as RgbTxid};
+use rgbstd::{OpId, Opout, Txid as RgbTxid};
 use serde_json::json;
 use std::str::FromStr;
 
@@ -510,25 +510,9 @@ async fn bfa_mint_history_refused_by_reject_list() {
 
 /// The mint right opouts of `asset_id`, by UTXO, in the order the wallet selects the UTXOs.
 fn mint_right_opouts(wallet: &mut Wallet, asset_id: &str) -> Vec<Vec<Opout>> {
-    let unspents = wallet.list_unspents(None, false, true).unwrap();
-    let contract_id = ContractId::from_str(asset_id).unwrap();
-    let runtime = wallet.rgb_runtime().unwrap();
-    unspents
+    opouts_holding(wallet, asset_id, &Assignment::MintRight)
         .into_iter()
-        .filter(|u| {
-            u.rgb_allocations.iter().any(|a| {
-                a.asset_id.as_deref() == Some(asset_id) && a.assignment == Assignment::MintRight
-            })
-        })
-        .map(|u| {
-            runtime
-                .contract_assignments_for(contract_id, [OutPoint::from(u.utxo.outpoint)])
-                .unwrap()
-                .into_values()
-                .flat_map(|state| state.into_keys())
-                .filter(|opout| opout.ty == OS_MINT)
-                .collect()
-        })
+        .map(|opouts| opouts.into_iter().filter(|o| o.ty == OS_MINT).collect())
         .collect()
 }
 

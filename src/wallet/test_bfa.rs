@@ -6,14 +6,15 @@ wasm_bindgen_test_configure!(run_in_browser);
 #[path = "../../tests/utils/mod.rs"]
 pub(super) mod utils;
 
-use crate::wallet::{AssetFilter, EvmChain, Online, OnlineOptions, Wallet, WalletData};
+use crate::wallet::{AssetFilter, EvmChain, Online, OnlineOptions, Recipient, Wallet, WalletData};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferStatus, generate_keys,
 };
 use amplify::{ByteArray, Wrapper};
+use bdk_wallet::bitcoin::OutPoint;
 use bdk_wallet::bitcoin::psbt::Psbt;
 use rgbstd::containers::LockId;
-use rgbstd::{OpId, Opout, Txid as RgbTxid};
+use rgbstd::{ContractId, OpId, Opout, Txid as RgbTxid};
 use serde_json::{Value, json};
 use std::str::FromStr;
 use utils::*;
@@ -98,26 +99,34 @@ pub(super) fn mint_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
         .count()
 }
 
-/// Send `amount` of `asset_id` from `sender` to a blinded UTXO of `receiver`.
+/// Send `assignment` of `asset_id` from `sender` to a blinded UTXO of `receiver`.
 pub(super) async fn send(
     sender: &mut Wallet,
     sender_online: &Online,
     receiver: &mut Wallet,
     receiver_online: &Online,
     asset_id: &str,
-    amount: u64,
+    assignment: Assignment,
 ) {
     let receive = blind_rcv(
         receiver,
         receiver_online,
         None,
-        Assignment::Fungible(amount),
+        Assignment::Any,
         default_rcv_expiration(),
         vec![transport_endpoint(PROXY_URL)],
     )
     .await
     .unwrap();
-    let recipient = recipient(&receive.recipient_id, amount, None, PROXY_URL);
+    let recipient = Recipient {
+        assignment: assignment.clone(),
+        ..recipient(
+            &receive.recipient_id,
+            assignment.main_amount(),
+            None,
+            PROXY_URL,
+        )
+    };
     let recipient_map = HashMap::from([(asset_id.to_string(), vec![recipient])]);
     let begin = sender
         .send_begin(
@@ -192,10 +201,37 @@ pub(super) async fn send_and_settle(
         receiver,
         receiver_online,
         asset_id,
-        amount,
+        Assignment::Fungible(amount),
     )
     .await;
     settle_both(sender, sender_online, receiver, receiver_online).await;
+}
+
+/// The opouts of `asset_id`, by UTXO, of the UTXOs that hold `assignment`.
+pub(super) fn opouts_holding(
+    wallet: &mut Wallet,
+    asset_id: &str,
+    assignment: &Assignment,
+) -> Vec<Vec<Opout>> {
+    let unspents = wallet.list_unspents(None, false, true).unwrap();
+    let contract_id = ContractId::from_str(asset_id).unwrap();
+    let runtime = wallet.rgb_runtime().unwrap();
+    unspents
+        .into_iter()
+        .filter(|u| {
+            u.rgb_allocations
+                .iter()
+                .any(|a| a.asset_id.as_deref() == Some(asset_id) && &a.assignment == assignment)
+        })
+        .map(|u| {
+            runtime
+                .contract_assignments_for(contract_id, [OutPoint::from(u.utxo.outpoint)])
+                .unwrap()
+                .into_values()
+                .flat_map(|state| state.into_keys())
+                .collect()
+        })
+        .collect()
 }
 
 #[wasm_bindgen_test]
@@ -516,7 +552,15 @@ async fn bfa_send_receive_waits_for_mint_lock() {
     let (asset_id, _, lock_id) = bfa_with_units(&mut a, &a_online, &bridge, None).await;
 
     // no lock: the receiver does not accept the transfer
-    send(&mut a, &a_online, &mut b, &b_online, &asset_id, 30).await;
+    send(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        Assignment::Fungible(30),
+    )
+    .await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert!(statuses.is_empty(), "{statuses:?}");
     assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
@@ -594,7 +638,15 @@ async fn bfa_receive_refuses_rejected_allocation() {
     finalize_evm().await;
 
     // the list rejects the minted allocation after the send
-    send(&mut a, &a_online, &mut b, &b_online, &asset_id, 30).await;
+    send(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        Assignment::Fungible(30),
+    )
+    .await;
     deploy_reject_list(&reject_list, &[(opid, 0)]).await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses, vec![TransferStatus::Failed]);
@@ -613,7 +665,15 @@ async fn bfa_receive_refuses_malicious_reject_list() {
         bfa_with_units(&mut a, &a_online, &bridge, Some(reject_list.clone())).await;
     record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
     finalize_evm().await;
-    send(&mut a, &a_online, &mut b, &b_online, &asset_id, 30).await;
+    send(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        Assignment::Fungible(30),
+    )
+    .await;
 
     // the receiver cannot read the list: the transfer stays pending and the asset is not imported
     evm_rpc("anvil_setCode", json!([reject_list, "0x"])).await;
