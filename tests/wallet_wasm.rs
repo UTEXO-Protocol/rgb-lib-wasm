@@ -263,12 +263,17 @@ async fn test_receive_and_transfers() {
         ("~", Some("assetOwner"), Assignment::Fungible(0)),
         (AMOUNT_100, None, Assignment::Any),
         ("~", None, Assignment::Any),
+        ("~", Some("linkRight"), Assignment::LinkRight),
     ] {
         let data = bfa_invoice(state, name).unwrap().invoice_data();
         assert_eq!(data.asset_schema, Some(AssetSchema::Bfa));
         assert_eq!(data.assignment, assignment);
     }
-    for (state, name) in [(AMOUNT_100, "inflationAllowance"), ("~", "other")] {
+    for (state, name) in [
+        (AMOUNT_100, "inflationAllowance"),
+        (AMOUNT_100, "linkRight"),
+        ("~", "other"),
+    ] {
         assert!(matches!(
             bfa_invoice(state, Some(name)),
             Err(Error::InvalidInvoice { .. })

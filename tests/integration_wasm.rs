@@ -399,6 +399,8 @@ async fn test_no_inflate_end_after_expiration() {
             vec![],
             vec![1000],
             None,
+            false,
+            None,
         )
         .unwrap();
 
@@ -567,6 +569,8 @@ async fn test_full_wallet_flow() {
             0,
             vec![1000],
             vec![5000],
+            None,
+            false,
             None,
         )
         .unwrap();

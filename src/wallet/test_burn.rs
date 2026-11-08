@@ -20,7 +20,7 @@ fn reason() -> String {
 }
 
 /// Mine and refresh three times, so that the miner gets the broadcast transaction.
-async fn mine_and_refresh(wallet: &mut Wallet, online: &Online) {
+pub(super) async fn mine_and_refresh(wallet: &mut Wallet, online: &Online) {
     for _ in 0..3 {
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
@@ -37,7 +37,7 @@ fn balance(wallet: &Wallet, asset_id: &str) -> (u64, u64, u64) {
     (b.settled, b.future, b.spendable)
 }
 
-fn transfer(wallet: &Wallet, asset_id: &str, batch_transfer_idx: i32) -> Transfer {
+pub(super) fn transfer(wallet: &Wallet, asset_id: &str, batch_transfer_idx: i32) -> Transfer {
     wallet
         .list_transfers(AssetFilter::Id(asset_id.to_string()), None)
         .unwrap()
@@ -57,7 +57,10 @@ fn burns(wallet: &Wallet, asset_id: &str) -> Vec<(TransferKind, Option<String>)>
 }
 
 /// The known transitions of the bundle of `txid` in `consignment`.
-fn known_transitions<'c>(consignment: &'c RgbTransfer, txid: &str) -> Vec<&'c KnownTransition> {
+pub(super) fn known_transitions<'c>(
+    consignment: &'c RgbTransfer,
+    txid: &str,
+) -> Vec<&'c KnownTransition> {
     consignment
         .bundles
         .iter()
@@ -90,7 +93,7 @@ fn assert_burn_split(consignment: &RgbTransfer, txid: &str) {
     assert_eq!(consignment.terminal_ops(), BTreeSet::from([burns[0].opid]));
 }
 
-fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment> {
+pub(super) fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment> {
     wallet
         .list_unspents(None, false, true)
         .unwrap()
@@ -115,6 +118,8 @@ async fn ifa(
             vec![600, 400],
             vec![100],
             reject_list_url,
+            false,
+            None,
         )
         .unwrap();
     (wallet, online, asset.asset_id, wd)

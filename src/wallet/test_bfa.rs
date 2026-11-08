@@ -254,11 +254,31 @@ async fn bfa_issue_list_and_backup() {
     let (mut wallet, _online) = funded_wallet(wd.clone(), 3).await;
 
     assert!(matches!(
-        wallet.issue_asset_bfa(s("BFA"), s("Bridged"), 2, 0, CHAIN_ID, s(BRIDGE), None),
+        wallet.issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            2,
+            0,
+            CHAIN_ID,
+            s(BRIDGE),
+            None,
+            false,
+            None
+        ),
         Err(Error::NoMintRights)
     ));
     assert!(matches!(
-        wallet.issue_asset_bfa(s("BFA"), s("Bridged"), 2, 1, CHAIN_ID, s("0x12"), None),
+        wallet.issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            2,
+            1,
+            CHAIN_ID,
+            s("0x12"),
+            None,
+            false,
+            None
+        ),
         Err(Error::InvalidEvmContractAddress { .. })
     ));
 
@@ -271,6 +291,8 @@ async fn bfa_issue_list_and_backup() {
             2,
             CHAIN_ID,
             s(BRIDGE),
+            None,
+            false,
             None,
         )
         .unwrap();
@@ -363,7 +385,17 @@ async fn bfa_mint_right_moves_with_another_asset() {
     let (mut a, a_online) =
         funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa]), 2).await;
     let bfa = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 2, CHAIN_ID, s(BRIDGE), None)
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            2,
+            CHAIN_ID,
+            s(BRIDGE),
+            None,
+            false,
+            None,
+        )
         .unwrap();
     let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Nia]), 3).await;
     let nia = b
@@ -518,6 +550,8 @@ pub(super) async fn bfa_with_units(
             CHAIN_ID,
             s(bridge),
             reject_list,
+            false,
+            None,
         )
         .unwrap();
     let before_block = evm_block_number().await + 1000;
