@@ -101,6 +101,7 @@ pub struct WasmWallet {
 #[wasm_bindgen]
 impl WasmWallet {
     /// Create a new RGB wallet from a JSON-encoded WalletData.
+    /// It does not load IndexedDB and cannot save over a stored snapshot; use `create()`.
     #[wasm_bindgen(constructor)]
     pub fn new(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)

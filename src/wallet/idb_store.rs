@@ -21,6 +21,8 @@ const STORE_NAME: &str = "snapshots";
 /// A serializable snapshot of wallet state for IndexedDB persistence.
 #[derive(Serialize, Deserialize)]
 pub struct WalletSnapshot {
+    /// Random id of the wallet object that wrote this snapshot.
+    pub writer: u64,
     /// Monotonic wallet-local snapshot sequence used to reject stale writes.
     pub sequence: u64,
     /// The in-memory RGB-lib database.
@@ -56,7 +58,14 @@ async fn open_db() -> Result<Rexie, String> {
 }
 
 /// Save a wallet snapshot to IndexedDB under the given key.
-pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), String> {
+///
+/// `loaded` is the writer and sequence of the snapshot this wallet loaded from IndexedDB.
+/// Fail when nothing is written: the stored snapshot is not from this wallet, or it is not older.
+pub async fn save_snapshot(
+    key: &str,
+    snapshot: &WalletSnapshot,
+    loaded: Option<(u64, u64)>,
+) -> Result<(), String> {
     let db = open_db().await?;
     let tx = db
         .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
@@ -77,11 +86,17 @@ pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), S
             .ok_or_else(|| "IndexedDB value is not a string".to_string())?;
         let existing: WalletSnapshot =
             serde_json::from_str(&json).map_err(|e| format!("Deserialize error: {e}"))?;
-        if existing.sequence >= snapshot.sequence {
+        if (existing.writer != snapshot.writer
+            && Some((existing.writer, existing.sequence)) != loaded)
+            || existing.sequence >= snapshot.sequence
+        {
             tx.done()
                 .await
                 .map_err(|e| format!("IndexedDB commit error: {e:?}"))?;
-            return Ok(());
+            return Err(format!(
+                "IndexedDB keeps snapshot {} of writer {}",
+                existing.sequence, existing.writer
+            ));
         }
     }
     let js_val = JsValue::from_str(&json_str);
@@ -226,6 +241,7 @@ mod tests {
         transfer_artifact.signed_psbt = Some("signed-psbt".to_owned());
         transfer_artifact.fascia = Some(vec![7, 8]);
         let snapshot = WalletSnapshot {
+            writer: 1,
             sequence: 1,
             db: InMemoryDb::new(),
             bdk_changeset: None,

@@ -161,6 +161,7 @@ impl super::Wallet {
 
     /// Restore wallet state from an encrypted backup.
     /// The wallet must be created first via `Wallet::new()` with the same mnemonic/xpubs.
+    /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()`, or its data directory holds no snapshot.
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
         let (pub_data, ciphertext) = decode_backup(backup_bytes)?;
         let payload_json = decrypt_payload(ciphertext, password, &pub_data)?;
@@ -178,6 +179,7 @@ impl super::Wallet {
             serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
 
         let snapshot = super::idb_store::WalletSnapshot {
+            writer: 0,
             sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,

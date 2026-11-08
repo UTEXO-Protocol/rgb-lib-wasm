@@ -111,9 +111,10 @@ Rust `Wallet::flush()` and JavaScript `wallet.flush()` resolve only after the
 IndexedDB read-write transaction commits. Persist dependent application state,
 acknowledge accepted RGB funding, or broadcast a transaction that depends on an
 RGB mutation only after the flush succeeds. A failed flush leaves the current
-in-memory wallet state intact and can be retried. Snapshots carry a monotonic
-sequence, and IndexedDB rejects stale writes so an earlier automatic save cannot
-overwrite a later explicit flush.
+in-memory wallet state intact and can be retried. A flush that writes nothing
+fails. A wallet saves over a stored snapshot only if it loaded that snapshot
+through `create()` or `Wallet::restore()`, or wrote it itself. A wallet built with
+`new` on a data directory that holds a snapshot cannot save.
 
 Lightning-specific `consume_fascia` and `color_psbt_and_consume` operations
 await this durable commit before returning success.
@@ -260,7 +261,7 @@ const bytes = wallet.backup('my-password');
 // Check if backup is needed
 const needed = wallet.backupInfo(); // true if wallet changed since last backup
 
-// Restore (wallet must be created first with the same mnemonic)
+// Restore (create the wallet with create() and the same mnemonic)
 wallet.restoreBackup(backupBytes, 'my-password');
 ```
 

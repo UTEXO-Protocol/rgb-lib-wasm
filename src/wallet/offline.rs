@@ -1272,6 +1272,10 @@ pub struct Wallet {
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Random id of this object in stored snapshots.
+    pub(crate) idb_writer: u64,
+    /// Writer and sequence of the snapshot loaded from IndexedDB.
+    pub(crate) idb_loaded: Option<(u64, u64)>,
     /// Persistent in-memory RGB stock.
     pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<crate::utils::MemStock>>>,
     pub(crate) vss_client: Option<super::vss::VssBackupClient>,
@@ -1289,6 +1293,7 @@ impl Wallet {
             .await
             .map_err(|details| Error::Persistence { details })?;
         if let Some(snapshot) = snapshot {
+            wallet.idb_loaded = Some((snapshot.writer, snapshot.sequence));
             wallet
                 .idb_sequence
                 .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
@@ -1298,6 +1303,8 @@ impl Wallet {
     }
 
     /// Create a new RGB wallet based on the provided [`WalletData`].
+    ///
+    /// It does not load IndexedDB. It cannot save over a stored snapshot; use [`Wallet::restore`] for that.
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
     pub fn new(wallet_data: WalletData) -> Result<Self, Error> {
         let wdata = wallet_data.clone();
@@ -1401,6 +1408,12 @@ impl Wallet {
         // RGB-LIB setup
         let database = crate::database::memory_db::InMemoryDb::new();
 
+        let mut writer = [0u8; 8];
+        getrandom::getrandom(&mut writer).map_err(|e| Error::Internal {
+            details: format!("RNG unavailable: {e}"),
+        })?;
+        let idb_writer = u64::from_le_bytes(writer);
+
         info!(logger, "New wallet completed");
         Ok(Wallet {
             wallet_data,
@@ -1426,6 +1439,8 @@ impl Wallet {
             received_mints: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            idb_writer,
+            idb_loaded: None,
             rgb_stock: {
                 let stock = std::mem::take(&mut runtime.stock);
                 std::rc::Rc::new(std::cell::RefCell::new(Some(stock)))
@@ -3862,6 +3877,7 @@ impl Wallet {
             })?;
 
         Ok(super::idb_store::WalletSnapshot {
+            writer: self.idb_writer,
             sequence: self
                 .idb_sequence
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3883,9 +3899,10 @@ impl Wallet {
     /// This method resolves only after the IndexedDB read-write transaction commits. Callers must
     /// not persist dependent application state until this method succeeds. A failure leaves the
     /// current in-memory wallet state intact and may be retried.
+    /// It fails when IndexedDB is not written.
     pub async fn flush(&self) -> Result<(), Error> {
         let snapshot = self.snapshot()?;
-        super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
+        super::idb_store::save_snapshot(&self.idb_key(), &snapshot, self.idb_loaded)
             .await
             .map_err(|details| Error::Persistence { details })
     }
@@ -3913,9 +3930,10 @@ impl Wallet {
         };
         let key = self.idb_key();
         let flag = self.idb_save_in_progress.clone();
+        let loaded = self.idb_loaded;
 
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = super::idb_store::save_snapshot(&key, &snapshot).await {
+            if let Err(e) = super::idb_store::save_snapshot(&key, &snapshot, loaded).await {
                 web_sys::console::error_1(&format!("IDB save error: {e}").into());
             }
             flag.store(false, Ordering::SeqCst);
@@ -4085,6 +4103,8 @@ pub(crate) mod address_reuse_tests {
             received_mints: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            idb_writer: 0,
+            idb_loaded: None,
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
