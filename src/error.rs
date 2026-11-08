@@ -61,6 +61,10 @@ pub enum Error {
     #[error("The given PSBT cannot be finalized")]
     CannotFinalizePsbt,
 
+    /// An asset cannot be linked to itself
+    #[error("An asset cannot be linked to itself")]
+    CannotLinkToItself,
+
     /// Cannot use BFA schema on mainnet
     #[error("Cannot use BFA schema on mainnet")]
     CannotUseBfaOnMainnet,
@@ -301,6 +305,13 @@ pub enum Error {
     InvalidBurnReason {
         /// Error details
         details: String,
+    },
+
+    /// The provided contract ID is invalid
+    #[error("Invalid contract ID: {contract_id}")]
+    InvalidContractId {
+        /// The invalid contract ID
+        contract_id: String,
     },
 
     /// The provided asset details is invalid
@@ -706,6 +717,13 @@ pub enum Error {
     UnsupportedLayer1 {
         /// Layer 1
         layer_1: String,
+    },
+
+    /// The schema doesn't support link transitions
+    #[error("Link not supported")]
+    UnsupportedLink {
+        /// Asset schema
+        asset_schema: AssetSchema,
     },
 
     /// The given schema is not supported

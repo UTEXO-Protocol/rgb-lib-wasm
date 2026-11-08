@@ -14,6 +14,8 @@ mod test_bfa;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_burn;
 #[cfg(all(test, target_arch = "wasm32"))]
+mod test_link;
+#[cfg(all(test, target_arch = "wasm32"))]
 mod test_mint;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_send;

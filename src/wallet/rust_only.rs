@@ -365,6 +365,7 @@ impl Wallet {
                     max_supply: None,
                     known_circulating_supply: None,
                     reject_list_url: None,
+                    linked_from_contract: None,
                 }
             }
             AssetSchema::Ifa => {
@@ -399,6 +400,7 @@ impl Wallet {
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
                     reject_list_url,
+                    linked_from_contract: contract_link(contract.link_from())?,
                 }
             }
             AssetSchema::Bfa => {
@@ -426,6 +428,7 @@ impl Wallet {
                     max_supply: None,
                     known_circulating_supply: None,
                     reject_list_url,
+                    linked_from_contract: contract_link(contract.link_from())?,
                 }
             }
         };

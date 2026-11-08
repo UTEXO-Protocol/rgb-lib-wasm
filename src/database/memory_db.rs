@@ -70,6 +70,8 @@ pub struct DbAsset {
     pub max_supply: Option<String>,
     pub known_circulating_supply: Option<String>,
     pub reject_list_url: Option<String>,
+    pub linked_from_contract: Option<String>,
+    pub linked_to_contract: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -88,6 +90,8 @@ pub struct DbAssetActMod {
     pub max_supply: ActiveValue<Option<String>>,
     pub known_circulating_supply: ActiveValue<Option<String>>,
     pub reject_list_url: ActiveValue<Option<String>>,
+    pub linked_from_contract: ActiveValue<Option<String>>,
+    pub linked_to_contract: ActiveValue<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +371,8 @@ impl DbAssetActMod {
             max_supply: av(self.max_supply),
             known_circulating_supply: av(self.known_circulating_supply),
             reject_list_url: av(self.reject_list_url),
+            linked_from_contract: av(self.linked_from_contract),
+            linked_to_contract: av(self.linked_to_contract),
         })
     }
 }
@@ -461,6 +467,8 @@ impl From<DbAsset> for DbAssetActMod {
             max_supply: ActiveValue::Unchanged(m.max_supply),
             known_circulating_supply: ActiveValue::Unchanged(m.known_circulating_supply),
             reject_list_url: ActiveValue::Unchanged(m.reject_list_url),
+            linked_from_contract: ActiveValue::Unchanged(m.linked_from_contract),
+            linked_to_contract: ActiveValue::Unchanged(m.linked_to_contract),
         }
     }
 }
@@ -550,6 +558,8 @@ impl InMemoryDb {
             max_supply: av(a.max_supply),
             known_circulating_supply: av(a.known_circulating_supply),
             reject_list_url: av(a.reject_list_url),
+            linked_from_contract: av(a.linked_from_contract),
+            linked_to_contract: av(a.linked_to_contract),
         };
         self.assets.borrow_mut().push(row);
         Ok(idx)
@@ -843,6 +853,12 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &a.reject_list_url {
             row.reject_list_url = v.clone();
+        }
+        if let ActiveValue::Set(v) = &a.linked_from_contract {
+            row.linked_from_contract = v.clone();
+        }
+        if let ActiveValue::Set(v) = &a.linked_to_contract {
+            row.linked_to_contract = v.clone();
         }
         Ok(row.clone())
     }

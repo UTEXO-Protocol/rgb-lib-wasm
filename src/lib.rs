@@ -175,7 +175,7 @@ use rgbstd::{
 use rgbstd::{
     Assign, AssignmentType, KnownTransition, OpId, TransitionBundle,
     containers::{CheckedClaimResolver, Consignment, PendingConsignment, WitnessBundle},
-    contract::SchemaWrapper,
+    contract::{LinkError, LinkableSchemaWrapper, SchemaWrapper},
     txout::TxPtr,
     validation::{OpsDag, Validity, Warning},
 };
@@ -183,7 +183,8 @@ use rgbstd::{
 use rgbstd::{RevealedValue, TypedAssigns};
 #[cfg(feature = "esplora")]
 use schemata::{
-    BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN, TS_MINT,
+    BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_LINK, OS_MINT, TS_BURN, TS_LINK,
+    TS_MINT,
 };
 use schemata::{BridgedFungibleAsset, InflatableFungibleAsset, NonInflatableAsset};
 use serde::de::{self, Unexpected, Visitor};

@@ -63,6 +63,13 @@ impl AssetSchema {
         Self::from_schema_id(schema_id)
     }
 
+    pub(crate) fn supports_link(&self) -> bool {
+        match self {
+            Self::Ifa | Self::Bfa => true,
+            Self::Nia => false,
+        }
+    }
+
     pub(crate) fn schema_rules(&self) -> SchemaRules {
         match self {
             Self::Nia => NonInflatableAsset::schema_rules(),
@@ -250,6 +257,8 @@ pub enum Assignment {
     NonFungible,
     /// Inflation right
     InflationRight(u64),
+    /// Link right
+    LinkRight,
     /// Mint right
     MintRight,
     /// Any assignment
@@ -265,6 +274,7 @@ impl Assignment {
                 Self::InflationRight(amt.as_u64())
             }
             AllocatedState::Data(_) => Self::NonFungible,
+            AllocatedState::Void if opout.ty == OS_LINK => Self::LinkRight,
             AllocatedState::Void if opout.ty == OS_MINT => Self::MintRight,
             _ => unreachable!(),
         }
@@ -276,6 +286,7 @@ impl Assignment {
             Self::Fungible(amt) => assignments.fungible += amt,
             Self::NonFungible => assignments.non_fungible = true,
             Self::InflationRight(amt) => assignments.inflation += amt,
+            Self::LinkRight => assignments.link = true,
             Self::MintRight => assignments.mint += 1,
             _ => unreachable!("when using this method we should know the assignment type"),
         }
@@ -312,6 +323,8 @@ pub enum TypeOfTransition {
     Burn = 3,
     /// Mint transition (minting assets backed by tokens locked on the external chain)
     Mint = 4,
+    /// Link transition (spending the link right to link the asset to another contract)
+    Link = 5,
 }
 
 impl TypeOfTransition {
@@ -321,6 +334,7 @@ impl TypeOfTransition {
             Self::Transfer => "transfer",
             Self::Burn => "burn",
             Self::Mint => "mint",
+            Self::Link => "link",
         }
     }
 }
