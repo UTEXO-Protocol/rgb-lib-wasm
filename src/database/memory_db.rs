@@ -309,6 +309,12 @@ pub struct DbWalletTransaction {
     pub idx: i32,
     pub txid: String,
     pub r#type: WalletTransactionType,
+    pub status: TransferStatus,
+    pub expiration: Option<i64>,
+    pub inputs: Vec<Outpoint>,
+    pub sent: u64,
+    pub received: u64,
+    pub fee: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -316,6 +322,12 @@ pub struct DbWalletTransactionActMod {
     pub idx: ActiveValue<i32>,
     pub txid: ActiveValue<String>,
     pub r#type: ActiveValue<WalletTransactionType>,
+    pub status: ActiveValue<TransferStatus>,
+    pub expiration: ActiveValue<Option<i64>>,
+    pub inputs: ActiveValue<Vec<Outpoint>>,
+    pub sent: ActiveValue<u64>,
+    pub received: ActiveValue<u64>,
+    pub fee: ActiveValue<u64>,
 }
 
 impl Default for AssetSchema {
@@ -758,6 +770,12 @@ impl InMemoryDb {
             idx,
             txid: av(w.txid),
             r#type: av_or(w.r#type, WalletTransactionType::CreateUtxos),
+            status: av_or(w.status, TransferStatus::Initiated),
+            expiration: av(w.expiration),
+            inputs: av(w.inputs),
+            sent: av(w.sent),
+            received: av(w.received),
+            fee: av(w.fee),
         };
         self.wallet_transactions.borrow_mut().push(row);
         Ok(idx)
@@ -1182,6 +1200,37 @@ impl InMemoryDb {
         &self,
     ) -> Result<Vec<DbWalletTransaction>, InternalError> {
         Ok(self.wallet_transactions.borrow().clone())
+    }
+
+    pub(crate) fn get_wallet_transaction_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<Option<DbWalletTransaction>, InternalError> {
+        Ok(self
+            .wallet_transactions
+            .borrow()
+            .iter()
+            .find(|w| w.txid == txid)
+            .cloned())
+    }
+
+    pub(crate) fn update_wallet_transaction(
+        &self,
+        w: DbWalletTransactionActMod,
+    ) -> Result<(), InternalError> {
+        let idx = av(w.idx);
+        let mut wallet_transactions = self.wallet_transactions.borrow_mut();
+        let row = wallet_transactions
+            .iter_mut()
+            .find(|r| r.idx == idx)
+            .ok_or(InternalError::Unexpected)?;
+        if let ActiveValue::Set(v) = w.status {
+            row.status = v;
+        }
+        if let ActiveValue::Set(v) = w.expiration {
+            row.expiration = v;
+        }
+        Ok(())
     }
 
     pub(crate) fn get_transfer_transport_endpoints_data(
@@ -2199,17 +2248,55 @@ mod tests {
             .unwrap();
         assert_eq!(idx, 1);
 
-        db.set_wallet_transaction(DbWalletTransactionActMod {
-            txid: ActiveValue::Set("wtx2".to_string()),
-            r#type: ActiveValue::Set(WalletTransactionType::Drain),
-            ..Default::default()
-        })
-        .unwrap();
+        let input = Outpoint {
+            txid: "in".to_string(),
+            vout: 1,
+        };
+        let idx = db
+            .set_wallet_transaction(DbWalletTransactionActMod {
+                txid: ActiveValue::Set("wtx2".to_string()),
+                r#type: ActiveValue::Set(WalletTransactionType::Drain),
+                expiration: ActiveValue::Set(Some(10)),
+                inputs: ActiveValue::Set(vec![input.clone()]),
+                sent: ActiveValue::Set(5),
+                ..Default::default()
+            })
+            .unwrap();
 
         let items = db.iter_wallet_transactions().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].r#type, WalletTransactionType::CreateUtxos);
         assert_eq!(items[1].r#type, WalletTransactionType::Drain);
+        assert_eq!(items[0].status, TransferStatus::Initiated);
+        assert_eq!(items[0].expiration, None);
+        assert!(items[0].inputs.is_empty());
+        assert_eq!((items[0].sent, items[0].received, items[0].fee), (0, 0, 0));
+
+        assert!(
+            db.get_wallet_transaction_by_txid("other")
+                .unwrap()
+                .is_none()
+        );
+        db.update_wallet_transaction(DbWalletTransactionActMod {
+            idx: ActiveValue::Set(idx),
+            status: ActiveValue::Set(TransferStatus::Failed),
+            expiration: ActiveValue::Set(Some(20)),
+            ..Default::default()
+        })
+        .unwrap();
+        let row = db.get_wallet_transaction_by_txid("wtx2").unwrap().unwrap();
+        assert_eq!(row.idx, idx);
+        assert_eq!(row.r#type, WalletTransactionType::Drain);
+        assert_eq!(row.status, TransferStatus::Failed);
+        assert_eq!(row.expiration, Some(20));
+        assert_eq!(row.inputs, vec![input]);
+        assert_eq!((row.sent, row.received, row.fee), (5, 0, 0));
+
+        let missing = DbWalletTransactionActMod {
+            idx: ActiveValue::Set(idx + 1),
+            ..Default::default()
+        };
+        assert!(db.update_wallet_transaction(missing).is_err());
     }
 
     // ── BackupInfo ─────────────────────────────────────────────────

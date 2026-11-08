@@ -19,6 +19,8 @@ mod test_link;
 mod test_mint;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_send;
+#[cfg(all(test, target_arch = "wasm32"))]
+mod test_vanilla;
 pub mod vss;
 
 pub use offline::*;

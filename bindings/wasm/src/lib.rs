@@ -329,6 +329,26 @@ impl WasmWallet {
         to_js(&txs)
     }
 
+    /// List begun vanilla operations that are not ended, aborted or failed.
+    #[wasm_bindgen(js_name = "listPendingVanillaTxs")]
+    pub fn list_pending_vanilla_txs(&self) -> Result<JsValue, JsValue> {
+        let txs = self
+            .inner
+            .borrow()
+            .list_pending_vanilla_txs()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&txs)
+    }
+
+    /// Fail a begun vanilla operation and release its inputs.
+    #[wasm_bindgen(js_name = "abortPendingVanillaTx")]
+    pub fn abort_pending_vanilla_tx(&self, txid: &str) -> Result<(), JsValue> {
+        self.inner
+            .borrow()
+            .abort_pending_vanilla_tx(txid.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Sign a PSBT (base64-encoded). Returns the signed PSBT string.
     #[wasm_bindgen(js_name = "signPsbt")]
     pub fn sign_psbt(&self, unsigned_psbt: &str) -> Result<String, JsValue> {

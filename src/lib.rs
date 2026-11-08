@@ -58,7 +58,9 @@ pub use rgbstd::{
 };
 
 pub use crate::{
-    database::enums::{AssetSchema, Assignment, Encryption, TransferStatus, TransportType},
+    database::enums::{
+        AssetSchema, Assignment, Encryption, TransferStatus, TransportType, WalletTransactionType,
+    },
     error::Error,
     keys::{generate_keys, restore_keys},
     utils::BitcoinNetwork,
@@ -239,10 +241,7 @@ use crate::{
 use crate::{
     database::{
         LocalRgbAllocation, LocalTransportEndpoint, LocalUnspent, TransferData,
-        enums::{
-            ColoringType, RecipientTypeFull, TransportEndpointKind, TypeOfTransition,
-            WalletTransactionType,
-        },
+        enums::{ColoringType, RecipientTypeFull, TransportEndpointKind, TypeOfTransition},
     },
     error::InternalError,
     utils::{

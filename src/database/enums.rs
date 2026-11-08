@@ -241,10 +241,14 @@ impl TransferStatus {
     }
 }
 
+/// The type of a vanilla wallet transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum WalletTransactionType {
+    /// Transaction used to create UTXOs
     CreateUtxos = 1,
+    /// Transaction used to drain the wallet
     Drain = 2,
+    /// Transaction used to send BTC
     SendBtc = 3,
 }
 

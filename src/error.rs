@@ -34,6 +34,10 @@ pub enum Error {
     #[error("Bitcoin network mismatch")]
     BitcoinNetworkMismatch,
 
+    /// Requested pending vanilla TX cannot be aborted
+    #[error("Pending vanilla TX cannot be aborted")]
+    CannotAbortPendingVanillaTx,
+
     /// A wallet cannot go online twice with different data
     #[error("Cannot change online object")]
     CannotChangeOnline,
