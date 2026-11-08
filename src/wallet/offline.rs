@@ -929,6 +929,8 @@ pub struct Transaction {
     /// Height and Unix timestamp of the block containing the transaction if confirmed, `None` if
     /// unconfirmed
     pub confirmation_time: Option<BlockTime>,
+    /// Whether the transaction belongs to a begun vanilla operation that is not ended yet
+    pub pending: bool,
 }
 
 /// Block height and timestamp of a block.
@@ -949,8 +951,20 @@ pub enum TransactionType {
     Drain,
     /// Transaction used to create UTXOs
     CreateUtxos,
-    /// Transaction not created by rgb-lib directly
-    User,
+    /// Transaction used to perform a BTC send
+    SendBtc,
+    /// Incoming transaction
+    Incoming,
+}
+
+/// A begun vanilla operation that is not ended, aborted or failed.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PendingVanillaTx {
+    /// Transaction ID
+    pub txid: String,
+    /// Type of the vanilla operation
+    pub r#type: WalletTransactionType,
 }
 
 /// An asset filter for listing transfers.
@@ -1626,6 +1640,18 @@ impl Wallet {
                 None => a.batch_info.is_some() && now < a.expiration,
             })
             .flat_map(|(_, a)| a.inputs.clone())
+            .collect())
+    }
+
+    /// Return the inputs of the begun vanilla operations.
+    pub(crate) fn get_reserved_vanilla_outpoints(&self) -> Result<Vec<OutPoint>, Error> {
+        Ok(self
+            .database
+            .iter_wallet_transactions()?
+            .into_iter()
+            .filter(|w| w.status == TransferStatus::Initiated)
+            .flat_map(|w| w.inputs)
+            .map(OutPoint::from)
             .collect())
     }
 
@@ -2799,7 +2825,14 @@ impl Wallet {
 
         self.sync_if_requested(online, skip_sync)?;
 
-        let vanilla = self._get_btc_balance(KeychainKind::Internal)?;
+        let mut vanilla = self._get_btc_balance(KeychainKind::Internal)?;
+        let reserved = self.get_reserved_vanilla_outpoints()?;
+        let reserved_btc: u64 = self
+            .internal_unspents()
+            .filter(|u| reserved.contains(&u.outpoint))
+            .map(|u| u.txout.value.to_sat())
+            .sum();
+        vanilla.spendable = vanilla.spendable.saturating_sub(reserved_btc);
         let colored = self._get_btc_balance(KeychainKind::External)?;
 
         let balance = BtcBalance { vanilla, colored };
@@ -2934,12 +2967,13 @@ impl Wallet {
 
         let mut create_utxos_txids = vec![];
         let mut drain_txids = vec![];
+        let mut send_btc_txids = vec![];
         let wallet_transactions = self.database.iter_wallet_transactions()?;
-        for tx in wallet_transactions {
+        for tx in &wallet_transactions {
             match tx.r#type {
-                WalletTransactionType::CreateUtxos => create_utxos_txids.push(tx.txid),
-                WalletTransactionType::Drain => drain_txids.push(tx.txid),
-                WalletTransactionType::SendBtc => {}
+                WalletTransactionType::CreateUtxos => create_utxos_txids.push(tx.txid.clone()),
+                WalletTransactionType::Drain => drain_txids.push(tx.txid.clone()),
+                WalletTransactionType::SendBtc => send_btc_txids.push(tx.txid.clone()),
             }
         }
         let rgb_send_txids: Vec<String> = self
@@ -2948,7 +2982,7 @@ impl Wallet {
             .into_iter()
             .filter_map(|t| t.txid)
             .collect();
-        let transactions = self
+        let mut transactions = self
             .bdk_wallet
             .transactions()
             .map(|t| {
@@ -2959,8 +2993,10 @@ impl Wallet {
                     TransactionType::CreateUtxos
                 } else if rgb_send_txids.contains(&txid) {
                     TransactionType::RgbSend
+                } else if send_btc_txids.contains(&txid) {
+                    TransactionType::SendBtc
                 } else {
-                    TransactionType::User
+                    TransactionType::Incoming
                 };
                 let confirmation_time = match t.chain_position {
                     ChainPosition::Confirmed { anchor, .. } => Some(BlockTime {
@@ -2978,11 +3014,68 @@ impl Wallet {
                     sent: sent.to_sat(),
                     fee: fee.to_sat(),
                     confirmation_time,
+                    pending: false,
                 }
             })
+            .collect::<Vec<_>>();
+        let pending: Vec<Transaction> = wallet_transactions
+            .into_iter()
+            .filter(|w| w.status == TransferStatus::Initiated)
+            .filter(|w| !transactions.iter().any(|t| t.txid == w.txid))
+            .map(|w| Transaction {
+                transaction_type: match w.r#type {
+                    WalletTransactionType::CreateUtxos => TransactionType::CreateUtxos,
+                    WalletTransactionType::Drain => TransactionType::Drain,
+                    WalletTransactionType::SendBtc => TransactionType::SendBtc,
+                },
+                txid: w.txid,
+                received: w.received,
+                sent: w.sent,
+                fee: w.fee,
+                confirmation_time: None,
+                pending: true,
+            })
             .collect();
+        transactions.extend(pending);
         info!(self.logger, "List transactions completed");
         Ok(transactions)
+    }
+
+    /// List the begun vanilla operations that are not ended, aborted or failed.
+    pub fn list_pending_vanilla_txs(&self) -> Result<Vec<PendingVanillaTx>, Error> {
+        info!(self.logger, "Listing pending vanilla TXs...");
+        let pending = self
+            .database
+            .iter_wallet_transactions()?
+            .into_iter()
+            .filter(|w| w.status == TransferStatus::Initiated)
+            .map(|w| PendingVanillaTx {
+                txid: w.txid,
+                r#type: w.r#type,
+            })
+            .collect();
+        info!(self.logger, "List pending vanilla TXs completed");
+        Ok(pending)
+    }
+
+    /// Fail the begun vanilla operation with the given TXID and release its inputs.
+    pub fn abort_pending_vanilla_tx(&self, txid: String) -> Result<(), Error> {
+        info!(self.logger, "Aborting pending vanilla TX {}...", txid);
+        let row = self
+            .database
+            .get_wallet_transaction_by_txid(&txid)?
+            .filter(|w| w.status == TransferStatus::Initiated)
+            .ok_or(Error::CannotAbortPendingVanillaTx)?;
+        self.database
+            .update_wallet_transaction(DbWalletTransactionActMod {
+                idx: ActiveValue::Set(row.idx),
+                status: ActiveValue::Set(TransferStatus::Failed),
+                ..Default::default()
+            })?;
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+        info!(self.logger, "Abort pending vanilla TX completed");
+        Ok(())
     }
 
     pub(crate) fn normalize_recipient_id(&self, recipient_id: &str) -> String {

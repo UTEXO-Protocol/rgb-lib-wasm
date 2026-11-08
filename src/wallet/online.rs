@@ -2719,45 +2719,95 @@ impl Wallet {
         Ok(tx)
     }
 
-    fn _record_vanilla_transaction(
-        &self,
-        txid: String,
-        r#type: WalletTransactionType,
-    ) -> Result<(), Error> {
-        self.database
-            .set_wallet_transaction(DbWalletTransactionActMod {
-                txid: ActiveValue::Set(txid),
-                r#type: ActiveValue::Set(r#type),
-                ..Default::default()
-            })?;
-        Ok(())
-    }
-
     async fn _record_vanilla_begin(
         &self,
         psbt: &Psbt,
         r#type: WalletTransactionType,
     ) -> Result<(), Error> {
-        self._record_vanilla_transaction(psbt.unsigned_tx.compute_txid().to_string(), r#type)?;
+        let tx = &psbt.unsigned_tx;
+        let txid = tx.compute_txid().to_string();
+        let (sent, received) = self.bdk_wallet.sent_and_received(tx);
+        let fee = self
+            .bdk_wallet
+            .calculate_fee(tx)
+            .map_err(|e| Error::Internal {
+                details: e.to_string(),
+            })?;
+        let mut row = DbWalletTransactionActMod {
+            txid: ActiveValue::Set(txid.clone()),
+            r#type: ActiveValue::Set(r#type),
+            status: ActiveValue::Set(TransferStatus::Initiated),
+            expiration: ActiveValue::Set(Some(now().unix_timestamp() + DURATION_SEND_TRANSFER)),
+            inputs: ActiveValue::Set(
+                tx.input
+                    .iter()
+                    .map(|i| Outpoint::from(i.previous_output))
+                    .collect(),
+            ),
+            sent: ActiveValue::Set(sent.to_sat()),
+            received: ActiveValue::Set(received.to_sat()),
+            fee: ActiveValue::Set(fee.to_sat()),
+            ..Default::default()
+        };
+        // a txid has one row: a repeated begin renews it
+        if let Some(existing) = self.database.get_wallet_transaction_by_txid(&txid)? {
+            row.idx = ActiveValue::Set(existing.idx);
+            self.database.update_wallet_transaction(row)?;
+        } else {
+            self.database.set_wallet_transaction(row)?;
+        }
         self.update_backup_info(false)?;
         // the PSBT leaves the wallet only after its operation is saved
         self.flush().await
+    }
+
+    fn _finalize_vanilla_transaction(&self, tx: &BdkTransaction) -> Result<(), Error> {
+        if let Some(existing) = self
+            .database
+            .get_wallet_transaction_by_txid(&tx.compute_txid().to_string())?
+        {
+            self.database
+                .update_wallet_transaction(DbWalletTransactionActMod {
+                    idx: ActiveValue::Set(existing.idx),
+                    status: ActiveValue::Set(TransferStatus::WaitingConfirmations),
+                    ..Default::default()
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Fail the begun vanilla operations that have expired. Return whether one changed.
+    fn _fail_expired_vanilla_transactions(&self) -> Result<bool, Error> {
+        let now = now().unix_timestamp();
+        let mut changed = false;
+        for row in self.database.iter_wallet_transactions()? {
+            if row.status == TransferStatus::Initiated && row.expiration.is_some_and(|e| e < now) {
+                self.database
+                    .update_wallet_transaction(DbWalletTransactionActMod {
+                        idx: ActiveValue::Set(row.idx),
+                        status: ActiveValue::Set(TransferStatus::Failed),
+                        ..Default::default()
+                    })?;
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
 
     /// Check that the PSBT is of the given vanilla operation and is not already ended.
     fn _check_vanilla_end(&self, psbt: &Psbt, r#type: WalletTransactionType) -> Result<(), Error> {
         let bdk_txid = psbt.unsigned_tx.compute_txid();
         let txid = bdk_txid.to_string();
+        let row = self.database.get_wallet_transaction_by_txid(&txid)?;
         // an end or a refresh removes the artifacts of an RGB operation and keeps its batch
         if self.transfer_artifacts.contains_key(&txid)
             || self._get_outgoing_batch_transfer(&txid)?.is_some()
-            || self
-                .database
-                .iter_wallet_transactions()?
-                .iter()
-                .any(|t| t.txid == txid && t.r#type != r#type)
+            || row.as_ref().is_some_and(|t| t.r#type != r#type)
         {
             return Err(Error::WrongOperation { txid });
+        }
+        if row.is_some_and(|t| t.status == TransferStatus::Failed) {
+            return Err(Error::CannotEndTransfer { txid });
         }
         // a broadcast always adds the TX to the graph, a TX listed by the wallet can be evicted
         if self.bdk_wallet.tx_graph().get_tx(bdk_txid).is_some() {
@@ -2806,9 +2856,14 @@ impl Wallet {
         }
         debug!(self.logger, "Will try to create {} UTXOs", utxos_to_create);
 
-        let inputs: Vec<BdkOutPoint> = self.internal_unspents().map(|u| u.outpoint).collect();
-        let inputs: &[BdkOutPoint] = &inputs;
-        let usable_btc_amount = self.get_uncolorable_btc_sum()?;
+        let reserved = self.get_reserved_vanilla_outpoints()?;
+        let (inputs, usable_btc_amount) = self
+            .internal_unspents()
+            .filter(|u| !reserved.contains(&u.outpoint))
+            .fold((vec![], 0), |(mut inputs, sum), u| {
+                inputs.push(u.outpoint);
+                (inputs, sum + u.txout.value.to_sat())
+            });
         let utxo_size = size.unwrap_or(UTXO_SIZE);
         if utxo_size == 0 {
             return Err(Error::InvalidAmountZero);
@@ -2827,7 +2882,7 @@ impl Wallet {
             addresses.push(self.get_new_address()?.script_pubkey());
         }
         while !addresses.is_empty() {
-            match self._create_split_tx(inputs, &addresses, utxo_size, fee_rate_checked) {
+            match self._create_split_tx(&inputs, &addresses, utxo_size, fee_rate_checked) {
                 Ok(psbt) => {
                     self._record_vanilla_begin(&psbt, WalletTransactionType::CreateUtxos)
                         .await?;
@@ -2879,6 +2934,7 @@ impl Wallet {
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
         self._check_vanilla_end(&signed_psbt, WalletTransactionType::CreateUtxos)?;
         let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
+        self._finalize_vanilla_transaction(&tx)?;
 
         let mut num_utxos_created = 0;
         if !skip_sync {
@@ -5939,6 +5995,10 @@ impl Wallet {
 
     /// Update pending RGB transfers (wasm32 async).
     ///
+    /// With no `asset_id`, it also updates begun vanilla operations and ignores `filter` for
+    /// them. It settles an ended one once its TX has a confirmation. It fails a begun one that
+    /// has expired.
+    ///
     /// See native [`refresh`](Wallet::refresh) for full documentation.
     pub async fn refresh(
         &mut self,
@@ -5998,6 +6058,28 @@ impl Wallet {
                     failure,
                 },
             );
+        }
+
+        if asset_id.is_none() {
+            self._fail_expired_vanilla_transactions()?;
+            // settle the ended vanilla operations whose TX has a confirmation
+            for row in self.database.iter_wallet_transactions()? {
+                if row.status != TransferStatus::WaitingConfirmations {
+                    continue;
+                }
+                match self.indexer().get_tx_confirmations(&row.txid).await {
+                    Ok(Some(n)) if n >= 1 => {
+                        self.database
+                            .update_wallet_transaction(DbWalletTransactionActMod {
+                                idx: ActiveValue::Set(row.idx),
+                                status: ActiveValue::Set(TransferStatus::Settled),
+                                ..Default::default()
+                            })?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(self.logger, "Cannot refresh vanilla TX {}: {e}", row.txid),
+                }
+            }
         }
 
         info!(self.logger, "Refresh completed");
@@ -6213,6 +6295,9 @@ impl Wallet {
 
     /// Fail pending RGB transfers (wasm32 async).
     ///
+    /// With no `batch_transfer_idx`, it also fails begun vanilla operations that have expired,
+    /// whatever `no_asset_only` is.
+    ///
     /// See native [`fail_transfers`](Wallet::fail_transfers) for full documentation.
     ///
     /// A transfer in status [`TransferStatus::WaitingBroadcast`] can be failed only once past its
@@ -6347,6 +6432,8 @@ impl Wallet {
                     }
                 }
             }
+            // a vanilla operation has no asset
+            transfers_changed |= self._fail_expired_vanilla_transactions()?;
         }
 
         info!(self.logger, "Fail transfers completed");
@@ -7208,7 +7295,8 @@ impl Wallet {
 
         let script_pubkey = self.get_script_pubkey(&address)?;
 
-        let unspendable = self._get_unspendable_bdk_outpoints()?;
+        let mut unspendable = self._get_unspendable_bdk_outpoints()?;
+        unspendable.extend(self.get_reserved_vanilla_outpoints()?);
 
         let change_script = if self.wallet_data.reuse_addresses {
             Some(
@@ -7268,6 +7356,7 @@ impl Wallet {
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
         self._check_vanilla_end(&signed_psbt, WalletTransactionType::SendBtc)?;
         let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
+        self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
@@ -7361,6 +7450,7 @@ impl Wallet {
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
         self._check_vanilla_end(&signed_psbt, WalletTransactionType::Drain)?;
         let tx = self._broadcast_psbt(signed_psbt, false).await?;
+        self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
@@ -9497,9 +9587,14 @@ mod send_end_tests {
         let parsed = Psbt::from_str(&psbt).unwrap();
         for recorded in VANILLA_TYPES {
             let (mut wallet, online) = setup();
-            wallet
-                ._record_vanilla_transaction(txid.clone(), recorded)
-                .unwrap();
+            seed_vanilla(
+                &wallet,
+                &txid,
+                recorded,
+                TransferStatus::Initiated,
+                None,
+                vec![],
+            );
             let errs = vanilla_end_errs(&mut wallet, &online, &psbt);
             for (err, r#type) in errs.into_iter().zip(VANILLA_TYPES) {
                 if r#type != recorded {
@@ -9512,6 +9607,117 @@ mod send_end_tests {
             let res = inflate_end_err(&mut wallet, &online, &psbt);
             assert_eq!(res, Error::UnknownTransfer { txid: txid.clone() });
         }
+    }
+
+    fn seed_vanilla(
+        wallet: &Wallet,
+        txid: &str,
+        r#type: WalletTransactionType,
+        status: TransferStatus,
+        expiration: Option<i64>,
+        inputs: Vec<Outpoint>,
+    ) -> i32 {
+        wallet
+            .database
+            .set_wallet_transaction(DbWalletTransactionActMod {
+                txid: ActiveValue::Set(txid.to_string()),
+                r#type: ActiveValue::Set(r#type),
+                status: ActiveValue::Set(status),
+                expiration: ActiveValue::Set(expiration),
+                inputs: ActiveValue::Set(inputs),
+                ..Default::default()
+            })
+            .unwrap()
+    }
+
+    fn vanilla_statuses(wallet: &Wallet) -> Vec<TransferStatus> {
+        wallet
+            .database
+            .iter_wallet_transactions()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.status)
+            .collect()
+    }
+
+    fn outpoint(n: u8) -> Outpoint {
+        Outpoint::from(OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+    }
+
+    // An expired begun row with input 1, a begun row with input 2 and an ended row.
+    fn seed_vanilla_rows(wallet: &Wallet) {
+        let r#type = WalletTransactionType::SendBtc;
+        seed_vanilla(
+            wallet,
+            "a",
+            r#type,
+            TransferStatus::Initiated,
+            Some(1),
+            vec![outpoint(1)],
+        );
+        let (st, exp) = (TransferStatus::Initiated, Some(i64::MAX));
+        seed_vanilla(wallet, &"b".repeat(64), r#type, st, exp, vec![outpoint(2)]);
+        let st = TransferStatus::WaitingConfirmations;
+        seed_vanilla(wallet, &"c".repeat(64), r#type, st, None, vec![outpoint(3)]);
+    }
+
+    #[test]
+    fn vanilla_end_refuses_failed_operation() {
+        let (psbt, txid) = dummy_psbt();
+        for r#type in VANILLA_TYPES {
+            let (mut wallet, online) = setup();
+            seed_vanilla(&wallet, &txid, r#type, TransferStatus::Failed, None, vec![]);
+            let errs = vanilla_end_errs(&mut wallet, &online, &psbt);
+            for (err, end_type) in errs.into_iter().zip(VANILLA_TYPES) {
+                if end_type == r#type {
+                    assert_eq!(err, Error::CannotEndTransfer { txid: txid.clone() });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fail_transfers_fails_expired_vanilla() {
+        for no_asset_only in [false, true] {
+            let (mut wallet, online) = setup();
+            seed_vanilla_rows(&wallet);
+            let res = block_on(wallet.fail_transfers(online, None, no_asset_only, true));
+            assert_eq!(res, Ok(true));
+            assert_eq!(
+                vanilla_statuses(&wallet),
+                vec![
+                    TransferStatus::Failed,
+                    TransferStatus::Initiated,
+                    TransferStatus::WaitingConfirmations
+                ]
+            );
+            let reserved = wallet.get_reserved_vanilla_outpoints().unwrap();
+            assert_eq!(reserved, vec![OutPoint::from(outpoint(2))]);
+            let pending = wallet.list_pending_vanilla_txs().unwrap();
+            assert_eq!(
+                pending,
+                vec![PendingVanillaTx {
+                    txid: "b".repeat(64),
+                    r#type: WalletTransactionType::SendBtc
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_fails_expired_vanilla() {
+        let (mut wallet, online) = setup();
+        seed_vanilla_rows(&wallet);
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        assert!(res.is_empty());
+        assert_eq!(
+            vanilla_statuses(&wallet),
+            vec![
+                TransferStatus::Failed,
+                TransferStatus::Initiated,
+                TransferStatus::WaitingConfirmations
+            ]
+        );
     }
 
     #[test]
