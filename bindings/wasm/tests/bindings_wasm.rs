@@ -168,3 +168,14 @@ async fn go_online_reads_options_object() {
 fn get_received_mint_is_null_when_unknown() {
     assert!(wallet().get_received_mint("unknown").unwrap().is_null());
 }
+
+#[wasm_bindgen_test]
+fn pending_vanilla_txs_list_and_abort() {
+    let wallet = wallet();
+    let pending = js_sys::Array::from(&wallet.list_pending_vanilla_txs().unwrap());
+    assert_eq!(pending.length(), 0);
+    let e = err(wallet
+        .abort_pending_vanilla_tx(&"0".repeat(64))
+        .unwrap_err());
+    assert_eq!(e, "Pending vanilla TX cannot be aborted");
+}
