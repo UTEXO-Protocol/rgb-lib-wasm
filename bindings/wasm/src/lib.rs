@@ -169,7 +169,9 @@ impl WasmWallet {
     ///
     /// `amounts_js` is a JS array of u64 values.
     /// `inflation_amounts_js` is a JS array of u64 values for inflation allowances.
+    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from.
     #[wasm_bindgen(js_name = "issueAssetIfa")]
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
         ticker: &str,
@@ -178,6 +180,8 @@ impl WasmWallet {
         amounts_js: JsValue,
         inflation_amounts_js: JsValue,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<JsValue, JsValue> {
         let amounts: Vec<u64> = serde_wasm_bindgen::from_value(amounts_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid amounts array: {e}")))?;
@@ -193,6 +197,8 @@ impl WasmWallet {
                 amounts,
                 inflation_amounts,
                 reject_list_url,
+                link_right,
+                linked_from_contract,
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&asset)
@@ -202,6 +208,7 @@ impl WasmWallet {
     ///
     /// `contract_address` is the bridge contract on the EVM chain `chain_id`.
     /// `reject_list_address` is an optional reject list contract on the same chain.
+    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from.
     #[wasm_bindgen(js_name = "issueAssetBfa")]
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_bfa(
@@ -213,6 +220,8 @@ impl WasmWallet {
         chain_id: u64,
         contract_address: &str,
         reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<JsValue, JsValue> {
         let asset = self
             .inner
@@ -225,6 +234,8 @@ impl WasmWallet {
                 chain_id,
                 contract_address.to_string(),
                 reject_list_address,
+                link_right,
+                linked_from_contract,
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&asset)
@@ -855,6 +866,80 @@ impl WasmWallet {
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
             .burn_end(online, signed_psbt.to_string())
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Link an IFA or BFA asset to another contract: begin, sign with the wallet keys and end.
+    /// Returns an OperationResult JS object.
+    #[wasm_bindgen(js_name = "link")]
+    pub async fn link(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        linked_to_contract: &str,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .link(
+                online,
+                asset_id.to_string(),
+                linked_to_contract.to_string(),
+                fee_rate,
+                min_confirmations,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Link an IFA or BFA asset to another contract (begin): prepare a PSBT. Returns a
+    /// LinkBeginResult JS object.
+    #[wasm_bindgen(js_name = "linkBegin")]
+    pub async fn link_begin(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        linked_to_contract: &str,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .link_begin(
+                online,
+                asset_id.to_string(),
+                linked_to_contract.to_string(),
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Link an IFA or BFA asset to another contract (end): broadcast a signed PSBT. Returns an
+    /// OperationResult JS object.
+    #[wasm_bindgen(js_name = "linkEnd")]
+    pub async fn link_end(
+        &self,
+        online_js: JsValue,
+        signed_psbt: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .link_end(online, signed_psbt.to_string())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)

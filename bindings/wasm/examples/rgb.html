@@ -730,7 +730,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Issuing IFA: ' + ticker + '...', 'log-warn');
         const asset = state.wallet.issueAssetIfa(
-          ticker, name, precision, amounts, inflationAmounts, rejectListUrl
+          ticker, name, precision, amounts, inflationAmounts, rejectListUrl, false, null
         );
         showJson('ifa-output', 'ifa-result', asset);
         log('IFA issued: ' + (asset.assetId || ticker), 'log-ok');

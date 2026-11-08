@@ -330,7 +330,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 8: Issue IFA asset
         log('[8/12] Issuing IFA asset...', 'log-info');
-        const ifa = wallet.issueAssetIfa('INFL', 'Inflatable Token', 0, [500], [], undefined);
+        const ifa = wallet.issueAssetIfa('INFL', 'Inflatable Token', 0, [500], [], undefined, false, null);
         append('[8/12] IFA issued: ' + ifa.assetId);
         log('[8/12] IFA issued', 'log-ok');
 

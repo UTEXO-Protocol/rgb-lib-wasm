@@ -48,11 +48,15 @@ const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
+pub(crate) const RGB_STATE_LINK_RIGHT: &str = "linkRight";
 pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
 pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
 pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
 pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
+pub(crate) const RGB_GLOBAL_LINKED_FROM_CONTRACT: &str = "linkedFromContract";
+#[cfg(feature = "esplora")]
+pub(crate) const RGB_GLOBAL_LINKED_TO_CONTRACT: &str = "linkedToContract";
 pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
 #[cfg(feature = "esplora")]
@@ -76,6 +80,25 @@ pub(crate) struct LocalAssetData {
     pub(crate) max_supply: Option<u64>,
     pub(crate) known_circulating_supply: Option<u64>,
     pub(crate) reject_list_url: Option<String>,
+    pub(crate) linked_from_contract: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Seal the genesis of the next IFA asset issued assigns a link right to, if set.
+    pub(crate) static MOCK_IFA_LINK_RIGHT: std::cell::RefCell<Option<BuilderSeal<BlindSeal<RgbTxid>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The ID of the contract a contract `link` (e.g. [`LinkableSchemaWrapper::link_from`]) points
+/// to, if any.
+pub(crate) fn contract_link(
+    link: Result<Option<ContractId>, LinkError>,
+) -> Result<Option<String>, Error> {
+    link.map(|contract_id| contract_id.map(|c| c.to_string()))
+        .map_err(|e| Error::Internal {
+            details: format!("invalid contract link: {e}"),
+        })
 }
 
 /// The bitcoin balances (in sats) for the vanilla and colored wallets.
@@ -170,6 +193,11 @@ pub struct Metadata {
     pub details: Option<String>,
     /// Reject list URL
     pub reject_list_url: Option<String>,
+    /// ID of the contract the asset is linked from (e.g. the one it replaces), if any
+    pub linked_from_contract: Option<String>,
+    /// ID of the contract the asset has been linked to (e.g. the one replacing it), if linked by
+    /// this wallet: a link assigns nothing, so no consignment of a later operation carries it
+    pub linked_to_contract: Option<String>,
 }
 
 /// A Non-Inflatable Asset.
@@ -643,6 +671,9 @@ impl Invoice {
                         Assignment::InflationRight(v.value())
                     }
                     (None, Some(RGB_STATE_INFLATION_ALLOWANCE)) => Assignment::InflationRight(0),
+                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
+                        Assignment::LinkRight
+                    }
                     (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
                     (None, None) => Assignment::Any,
                     (_, _) => {
@@ -658,6 +689,9 @@ impl Invoice {
                         Assignment::Fungible(v.value())
                     }
                     (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
+                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
+                        Assignment::LinkRight
+                    }
                     (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
                     (None, None) => Assignment::Any,
                     (_, _) => {
@@ -1054,6 +1088,8 @@ pub enum TransferKind {
     Inflation,
     /// A burn transfer
     Burn,
+    /// A link transfer
+    Link,
     /// A mint transfer
     Mint,
 }
@@ -1867,6 +1903,8 @@ impl Wallet {
             ticker: ActiveValue::Set(asset_data.ticker),
             timestamp: ActiveValue::Set(timestamp),
             reject_list_url: ActiveValue::Set(asset_data.reject_list_url),
+            linked_from_contract: ActiveValue::Set(asset_data.linked_from_contract),
+            linked_to_contract: ActiveValue::Set(None),
         };
         let idx = self.database.set_asset(db_asset.clone())?;
         db_asset.idx = ActiveValue::Set(idx);
@@ -1993,6 +2031,7 @@ impl Wallet {
             max_supply: None,
             known_circulating_supply: None,
             reject_list_url: None,
+            linked_from_contract: None,
         };
         let asset = self.add_asset_to_db(
             asset_id.clone(),
@@ -2053,6 +2092,15 @@ impl Wallet {
     ///
     /// The `inflation_amounts` can be empty. If provided the sum of its elements plus the sum of
     /// `amounts` cannot exceed the maximum `u64` value.
+    ///
+    /// If `link_right` is true, the asset is issued with its link right, on a separate UTXO, which
+    /// can be spent once to link the asset to another contract (see
+    #[cfg_attr(feature = "esplora", doc = "[`link`](Wallet::link)).")]
+    #[cfg_attr(not(feature = "esplora"), doc = "`link`).")]
+    ///
+    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
+    /// the one it replaces).
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
         ticker: String,
@@ -2061,6 +2109,8 @@ impl Wallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<AssetIFA, Error> {
         info!(
             self.logger,
@@ -2075,6 +2125,13 @@ impl Wallet {
         let asset_schema = &AssetSchema::Ifa;
 
         self.check_schema_support(asset_schema)?;
+
+        let linked_from_contract = linked_from_contract
+            .map(|contract_id| {
+                ContractId::from_str(&contract_id)
+                    .map_err(|_| Error::InvalidContractId { contract_id })
+            })
+            .transpose()?;
 
         let settled = self._get_total_issue_amount(&amounts, true)?;
         let inflation_amt = self.get_total_inflation_amount(&inflation_amounts, settled)?;
@@ -2163,6 +2220,26 @@ impl Wallet {
             self.logger,
             "Assigning inflation rights: {inflation_utxos:?}"
         );
+        let mut link_utxo = None;
+        if link_right {
+            let utxo = self.get_utxo(&exclude_outpoints, Some(&unspents), false, Some(0))?;
+            builder = builder
+                .add_rights(RGB_STATE_LINK_RIGHT, self.get_builder_seal(utxo.clone()))
+                .expect("invalid link right");
+            link_utxo = Some(utxo);
+        }
+        if let Some(linked_from_contract) = &linked_from_contract {
+            builder = builder
+                .add_global_state(RGB_GLOBAL_LINKED_FROM_CONTRACT, *linked_from_contract)
+                .expect("invalid global state data");
+        }
+
+        #[cfg(test)]
+        if let Some(seal) = MOCK_IFA_LINK_RIGHT.take() {
+            builder = builder
+                .add_rights(RGB_STATE_LINK_RIGHT, seal)
+                .expect("invalid link right");
+        }
 
         let validated_contract = builder.issue_contract().expect("failure issuing contract");
         let asset_id = validated_contract.contract_id().to_string();
@@ -2182,6 +2259,7 @@ impl Wallet {
             max_supply: Some(max_supply),
             known_circulating_supply: Some(settled),
             reject_list_url,
+            linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
         let asset = self.add_asset_to_db(
             asset_id.clone(),
@@ -2231,6 +2309,16 @@ impl Wallet {
             };
             self.database.set_coloring(db_coloring)?;
         }
+        if let Some(utxo) = link_utxo {
+            let db_coloring = DbColoringActMod {
+                txo_idx: ActiveValue::Set(utxo.idx),
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                r#type: ActiveValue::Set(ColoringType::Issue),
+                assignment: ActiveValue::Set(Assignment::LinkRight),
+                ..Default::default()
+            };
+            self.database.set_coloring(db_coloring)?;
+        }
 
         let asset = AssetIFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
@@ -2249,6 +2337,15 @@ impl Wallet {
     /// same chain.
     ///
     /// A BFA genesis issues no units. Each mint right goes on its own UTXO.
+    ///
+    /// If `link_right` is true, the asset is issued with its link right, on a separate UTXO, which
+    /// can be spent once to link the asset to another contract (see
+    #[cfg_attr(feature = "esplora", doc = "[`link`](Wallet::link)).")]
+    #[cfg_attr(not(feature = "esplora"), doc = "`link`).")]
+    ///
+    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
+    /// the one it replaces).
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_bfa(
         &self,
         ticker: String,
@@ -2258,6 +2355,8 @@ impl Wallet {
         chain_id: u64,
         contract_address: String,
         reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<AssetBFA, Error> {
         info!(
             self.logger,
@@ -2271,6 +2370,13 @@ impl Wallet {
         let asset_schema = &AssetSchema::Bfa;
 
         self.check_schema_support(asset_schema)?;
+
+        let linked_from_contract = linked_from_contract
+            .map(|contract_id| {
+                ContractId::from_str(&contract_id)
+                    .map_err(|_| Error::InvalidContractId { contract_id })
+            })
+            .transpose()?;
 
         if mint_rights == 0 {
             return Err(Error::NoMintRights);
@@ -2343,6 +2449,19 @@ impl Wallet {
                 .expect("invalid mintRight");
         }
         debug!(self.logger, "Assigning mint rights: {issue_utxos:?}");
+        let mut link_utxo = None;
+        if link_right {
+            let utxo = self.get_utxo(&exclude_outpoints, Some(&unspents), false, Some(0))?;
+            builder = builder
+                .add_rights(RGB_STATE_LINK_RIGHT, self.get_builder_seal(utxo.clone()))
+                .expect("invalid link right");
+            link_utxo = Some(utxo);
+        }
+        if let Some(linked_from_contract) = &linked_from_contract {
+            builder = builder
+                .add_global_state(RGB_GLOBAL_LINKED_FROM_CONTRACT, *linked_from_contract)
+                .expect("invalid global state data");
+        }
 
         let mut runtime = self.rgb_runtime()?;
         let validated_contract = builder.issue_contract().expect("failure issuing contract");
@@ -2363,6 +2482,7 @@ impl Wallet {
             max_supply: None,
             known_circulating_supply: None,
             reject_list_url: None,
+            linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
         let asset = self.add_asset_to_db(
             asset_id.clone(),
@@ -2398,6 +2518,16 @@ impl Wallet {
                 asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
                 r#type: ActiveValue::Set(ColoringType::Issue),
                 assignment: ActiveValue::Set(Assignment::MintRight),
+                ..Default::default()
+            };
+            self.database.set_coloring(db_coloring)?;
+        }
+        if let Some(utxo) = link_utxo {
+            let db_coloring = DbColoringActMod {
+                txo_idx: ActiveValue::Set(utxo.idx),
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                r#type: ActiveValue::Set(ColoringType::Issue),
+                assignment: ActiveValue::Set(Assignment::LinkRight),
                 ..Default::default()
             };
             self.database.set_coloring(db_coloring)?;
@@ -2628,6 +2758,8 @@ impl Wallet {
             ticker: asset.ticker,
             details: asset.details,
             reject_list_url: asset.reject_list_url,
+            linked_from_contract: asset.linked_from_contract,
+            linked_to_contract: asset.linked_to_contract,
         })
     }
 
@@ -2882,8 +3014,10 @@ impl Wallet {
             }
         } else if asset_transfer.transition_type == Some(TypeOfTransition::Mint) {
             TransferKind::Mint
+        } else if asset_transfer.transition_type == Some(TypeOfTransition::Link) {
+            TransferKind::Link
         } else if transfer.recipient_id.is_none() {
-            // a burn is the only outgoing transfer without a recipient
+            // a burn is the only other outgoing transfer without a recipient
             TransferKind::Burn
         } else if filtered_coloring.clone().count() > 0
             && filtered_coloring
@@ -2927,6 +3061,7 @@ impl Wallet {
             TransferKind::Send
             | TransferKind::Inflation
             | TransferKind::Burn
+            | TransferKind::Link
             | TransferKind::Mint => {
                 let change_txo_idx: Vec<i32> = filtered_coloring
                     .filter(|c| c.r#type == ColoringType::Change)
@@ -2948,6 +3083,7 @@ impl Wallet {
                 TransferKind::Send
                 | TransferKind::Inflation
                 | TransferKind::Burn
+                | TransferKind::Link
                 | TransferKind::Mint,
                 _,
             ) => Some(self.get_send_consignment_path(
@@ -3268,6 +3404,11 @@ impl Wallet {
                     invoice_builder = invoice_builder.set_amount_raw(*amt);
                     invoice_builder =
                         invoice_builder.set_assignment_name(RGB_STATE_INFLATION_ALLOWANCE);
+                    assignment
+                }
+                (Assignment::LinkRight, Some(AssetSchema::Ifa) | Some(AssetSchema::Bfa)) => {
+                    invoice_builder = invoice_builder.set_void();
+                    invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_LINK_RIGHT);
                     assignment
                 }
                 (Assignment::Any, _) => Assignment::Any,

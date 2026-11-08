@@ -151,7 +151,17 @@ async fn bfa_mint_settles_and_is_spendable() {
     let bridge = new_evm_address();
     deploy_bridge(&bridge).await;
     let asset = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 3, CHAIN_ID, s(&bridge), None)
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            3,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+        )
         .unwrap();
     let asset_id = asset.asset_id.clone();
 
@@ -362,7 +372,17 @@ async fn bfa_mint_begin_refusals() {
 
     // the last mint right is never spent
     let single = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 1, CHAIN_ID, s(&bridge), None)
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            1,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+        )
         .unwrap();
     let result = mint_begin(
         &mut a,
@@ -375,7 +395,17 @@ async fn bfa_mint_begin_refusals() {
 
     // a mint recipient has no expiration
     let bfa = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 2, CHAIN_ID, s(&bridge), None)
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            2,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+        )
         .unwrap();
     let id = &bfa.asset_id;
     let recipient = recipient(&rcv.recipient_id, 100, None, PROXY_URL);
@@ -390,7 +420,17 @@ async fn bfa_mint_begin_refusals() {
     let (mut c, c_online) =
         funded_wallet_with(wallet_data(vec![AssetSchema::Bfa]), 5, 10, 100).await;
     let bfa_c = c
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 2, CHAIN_ID, s(&bridge), None)
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            2,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+        )
         .unwrap();
     for blocks in [1, 5, 101] {
         let before_block = evm_block_number().await + blocks;
@@ -436,6 +476,8 @@ async fn bfa_mint_history_refused_by_reject_list() {
             CHAIN_ID,
             s(&bridge),
             Some(reject_list.clone()),
+            false,
+            None,
         )
         .unwrap();
     let asset_id = asset.asset_id.clone();
@@ -533,6 +575,8 @@ async fn bfa_mint_multi_right_utxo() {
             CHAIN_ID,
             s(&bridge),
             Some(reject_list.clone()),
+            false,
+            None,
         )
         .unwrap()
         .asset_id;
@@ -622,7 +666,17 @@ async fn bfa_mint_receiver_checks() {
     let bridge = new_evm_address();
     deploy_bridge(&bridge).await;
     let asset_id = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 4, CHAIN_ID, s(&bridge), None)
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            4,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+        )
         .unwrap()
         .asset_id;
 
@@ -736,7 +790,17 @@ async fn bfa_mint_begin_reserves_inputs() {
     let bridge = new_evm_address();
     deploy_bridge(&bridge).await;
     let asset_id = a
-        .issue_asset_bfa(s("BFA"), s("Bridged"), 0, 2, CHAIN_ID, s(&bridge), None)
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            2,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+        )
         .unwrap()
         .asset_id;
 
@@ -808,7 +872,16 @@ async fn bfa_mint_begin_reserves_inputs() {
 
     // a burn PSBT does not end a mint
     let ifa = a
-        .issue_asset_ifa(s("IFA"), s("Inflatable"), 0, vec![100], vec![], None)
+        .issue_asset_ifa(
+            s("IFA"),
+            s("Inflatable"),
+            0,
+            vec![100],
+            vec![],
+            None,
+            false,
+            None,
+        )
         .unwrap();
     let burn = a
         .burn_begin(a_online.clone(), ifa.asset_id, 10, None, 1, 1, true)
@@ -859,6 +932,8 @@ async fn minter_and_receiver(
             CHAIN_ID,
             s(&bridge),
             reject_list,
+            false,
+            None,
         )
         .unwrap()
         .asset_id;
@@ -1119,6 +1194,8 @@ async fn bfa_mint_reject_list_not_repeated() {
             CHAIN_ID,
             s(&bridge),
             Some(reject_list.clone()),
+            false,
+            None,
         )
         .unwrap()
         .asset_id;
@@ -1171,6 +1248,8 @@ async fn bfa_mint_reject_list_not_repeated() {
             CHAIN_ID,
             s(&bridge),
             Some(reject_list.clone()),
+            false,
+            None,
         )
         .unwrap()
         .asset_id;

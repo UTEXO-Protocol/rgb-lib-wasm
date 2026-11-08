@@ -198,6 +198,10 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
+      - name: Run link tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_link::'
 
       - name: Stop regtest services
         if: always()

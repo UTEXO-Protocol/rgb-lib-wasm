@@ -149,6 +149,8 @@ pub struct AssignmentsCollection {
     pub non_fungible: bool,
     /// Inflation assignments
     pub inflation: u64,
+    /// Link right assignment
+    pub link: bool,
     /// Mint rights
     pub mint: u64,
 }
@@ -177,6 +179,9 @@ impl AssignmentsCollection {
             AllocatedState::Data(_) => {
                 self.add_non_fungible();
             }
+            AllocatedState::Void if opout.ty == OS_LINK => {
+                self.link = true;
+            }
             AllocatedState::Void if opout.ty == OS_MINT => {
                 self.mint += 1;
             }
@@ -193,6 +198,7 @@ impl AssignmentsCollection {
                 needed.inflation.saturating_sub(self.inflation) > 0
             }
             (AllocatedState::Data(_), _) => needed.non_fungible && !self.non_fungible,
+            (AllocatedState::Void, OS_LINK) => needed.link && !self.link,
             (AllocatedState::Void, OS_MINT) => needed.mint > self.mint,
             _ => false,
         }
@@ -203,6 +209,7 @@ impl AssignmentsCollection {
             fungible: self.fungible - needed.fungible,
             non_fungible: false,
             inflation: self.inflation - needed.inflation,
+            link: false,
             mint: self.mint - needed.mint,
         }
     }
@@ -215,6 +222,9 @@ impl AssignmentsCollection {
             return false;
         }
         if self.inflation < needed.inflation {
+            return false;
+        }
+        if needed.link && !self.link {
             return false;
         }
         if self.mint < needed.mint {
@@ -267,6 +277,30 @@ pub struct BurnDetails {
     pub entropy: u64,
     /// Hex-encoded 32-byte reason committed in the burn transition, if any
     pub burn_reason: Option<String>,
+}
+
+/// The result of a link begin operation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct LinkBeginResult {
+    /// PSBT to inspect and sign
+    pub psbt: String,
+    /// Batch transfer idx, None when `dry_run: true`
+    pub batch_transfer_idx: Option<i32>,
+    /// Operation details
+    pub details: LinkDetails,
+}
+
+/// Details for link operations.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct LinkDetails {
+    /// Strict-encoded fascia, for inspection
+    pub fascia: Vec<u8>,
+    /// Minimum confirmations for the operation
+    pub min_confirmations: u8,
+    /// Entropy used for the merkle tree construction operation
+    pub entropy: u64,
 }
 
 /// The result of a mint begin operation.
@@ -385,6 +419,35 @@ pub(crate) struct InfoAssetTransfer {
     burn_reason: Option<BurnReason>,
     /// External chain block the lock of a mint has to be included before
     before_block: Option<u64>,
+    /// Contract a link links the asset to
+    linked_to_contract: Option<ContractId>,
+}
+
+impl InfoAssetTransfer {
+    /// OpIds of the transitions to explicitly request when consigning from `fascia`: a burn or a
+    /// link has no beneficiary, so its transition is selected by OpId, while the others are
+    /// selected by their beneficiaries
+    fn requested_opids(&self, fascia: &Fascia) -> Vec<OpId> {
+        let transition_type = match self.main_transition {
+            TypeOfTransition::Burn => TS_BURN,
+            TypeOfTransition::Link => TS_LINK,
+            TypeOfTransition::Transfer | TypeOfTransition::Inflate | TypeOfTransition::Mint => {
+                return vec![];
+            }
+        };
+        fascia
+            .bundles()
+            .get(&self.asset_info.contract_id)
+            .map(|bundle| {
+                bundle
+                    .known_transitions
+                    .iter()
+                    .filter(|kt| kt.transition.transition_type == transition_type)
+                    .map(|kt| kt.opid)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// The outcome of [`Wallet::_resolve_claims`].
@@ -438,22 +501,6 @@ async fn get_ack_signed(
     proxy_client
         .get_ack(transfer_ids, &signature, &timestamp)
         .await
-}
-
-/// The burn transitions of the contract in the fascia.
-fn burn_opids(fascia: &Fascia, contract_id: ContractId) -> Vec<OpId> {
-    fascia
-        .bundles()
-        .get(&contract_id)
-        .map(|bundle| {
-            bundle
-                .known_transitions
-                .iter()
-                .filter(|kt| kt.transition.transition_type == TS_BURN)
-                .map(|kt| kt.opid)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn fascia_from_bytes(fascia_bytes: Vec<u8>) -> Result<Fascia, Error> {
@@ -1620,6 +1667,26 @@ impl Wallet {
                         received.insert(opout, Assignment::NonFungible);
                     };
                 }
+                // the link right is the only declarative state handled here
+                if *ass_type != OS_LINK {
+                    continue;
+                }
+                for (no, declarative_assignment) in
+                    typed_assigns.as_declarative().iter().enumerate()
+                {
+                    let opout = Opout::new(*opid, *ass_type, no as u16);
+                    if let BuilderSeal::Concealed(seal) = declarative_assignment.seal
+                        && Some(seal) == known_concealed
+                    {
+                        received.insert(opout, Assignment::LinkRight);
+                    }
+                    if let BuilderSeal::Revealed(seal) = declarative_assignment.seal
+                        && seal.txid == TxPtr::WitnessTx
+                        && Some(seal.vout.into_u32()) == vout
+                    {
+                        received.insert(opout, Assignment::LinkRight);
+                    }
+                }
             }
         }
 
@@ -1709,6 +1776,13 @@ impl Wallet {
                 && asset_allocations
                     .iter()
                     .any(|a| matches!(a.assignment, Assignment::InflationRight(_)))
+            {
+                needed = true;
+            }
+            if !assignments_collected.link & assignments_needed.link
+                && asset_allocations
+                    .iter()
+                    .any(|a| matches!(a.assignment, Assignment::LinkRight))
             {
                 needed = true;
             }
@@ -2102,12 +2176,19 @@ impl Wallet {
             }
 
             for recipient in transfer_info.recipients.clone() {
-                if transfer_info.main_transition == TypeOfTransition::Burn {
+                if matches!(
+                    transfer_info.main_transition,
+                    TypeOfTransition::Burn | TypeOfTransition::Link
+                ) {
+                    let requested_assignment =
+                        if transfer_info.main_transition == TypeOfTransition::Burn {
+                            Assignment::Fungible(transfer_info.original_assignments_needed.fungible)
+                        } else {
+                            Assignment::LinkRight
+                        };
                     let transfer = DbTransferActMod {
                         asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                        requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(
-                            transfer_info.original_assignments_needed.fungible,
-                        ))),
+                        requested_assignment: ActiveValue::Set(Some(requested_assignment)),
                         incoming: ActiveValue::Set(false),
                         recipient_encryption: ActiveValue::Set(recipient.encryption),
                         burn_reason: ActiveValue::Set(
@@ -2929,6 +3010,15 @@ impl Wallet {
                     .or_default()
                     .insert(opout, state);
             }
+            // the inputs left after excluding the rejected ones may not cover what the operation
+            // needs, as for a rejected link right: selecting inputs again would select it again,
+            // as it's the only one
+            if !inputs_added.enough(&transfer_info.original_assignments_needed) {
+                return Err(Error::InsufficientAssignments {
+                    asset_id: asset_id.clone(),
+                    available: inputs_added,
+                });
+            }
 
             let mut beneficiaries = vec![];
             for recipient in &transfer_info.recipients {
@@ -2949,9 +3039,10 @@ impl Wallet {
 
                 beneficiaries.push(seal);
 
-                let (ty, amt) = match &recipient.assignment {
-                    Assignment::Fungible(amt) => (OS_ASSET, *amt),
-                    Assignment::InflationRight(amt) => (OS_INFLATION, *amt),
+                let (ty, state) = match &recipient.assignment {
+                    Assignment::Fungible(amt) => (OS_ASSET, Amount::from(*amt).into()),
+                    Assignment::InflationRight(amt) => (OS_INFLATION, Amount::from(*amt).into()),
+                    Assignment::LinkRight => (OS_LINK, AllocatedState::Void),
                     _ => unreachable!(),
                 };
                 asset_transition_builder = add_or_side_output(
@@ -2961,7 +3052,7 @@ impl Wallet {
                     &mut side_transfers,
                     ty,
                     seal,
-                    Amount::from(amt).into(),
+                    state,
                 )?;
             }
 
@@ -3083,6 +3174,15 @@ impl Wallet {
                         .add_global_state(RGB_GLOBAL_BURN_REASON, burn_reason)?;
                 }
             }
+            if transfer_info.main_transition == TypeOfTransition::Link {
+                let linked_to_contract =
+                    transfer_info.linked_to_contract.ok_or(Error::Internal {
+                        details: s!("link transfer is missing the contract to link to"),
+                    })?;
+                main_used = true;
+                asset_transition_builder = asset_transition_builder
+                    .add_global_state(RGB_GLOBAL_LINKED_TO_CONTRACT, linked_to_contract)?;
+            }
             if transfer_info.main_transition == TypeOfTransition::Mint {
                 let before_block = transfer_info.before_block.ok_or(Error::Internal {
                     details: s!("mint transfer is missing the external chain block"),
@@ -3195,11 +3295,15 @@ impl Wallet {
                 details: format!("cannot serialize fascia: {e}"),
             })?
             .release();
-        // a burn enters the store at burn_end: a dry run or a failed begin leaves no split output
-        let burning = transfer_info_map
-            .values()
-            .all(|ti| ti.main_transition == TypeOfTransition::Burn);
-        if !burning {
+        // a burn or a link enters the store at its end: a dry run or a failed begin leaves no
+        // split output
+        let without_recipient = transfer_info_map.values().all(|ti| {
+            matches!(
+                ti.main_transition,
+                TypeOfTransition::Burn | TypeOfTransition::Link
+            )
+        });
+        if !without_recipient {
             runtime.consume_fascia(fascia.clone(), None)?;
         }
 
@@ -3234,21 +3338,24 @@ impl Wallet {
                 }
                 None => None,
             };
-            let is_burn = transfer_info.main_transition == TypeOfTransition::Burn;
+            let op_without_recipient = matches!(
+                transfer_info.main_transition,
+                TypeOfTransition::Burn | TypeOfTransition::Link
+            );
             let keeps_fascia = matches!(
                 transfer_info.main_transition,
-                TypeOfTransition::Burn | TypeOfTransition::Mint
+                TypeOfTransition::Burn | TypeOfTransition::Link | TypeOfTransition::Mint
             );
             // check every operation, so that none spends a rejected allocation
             let should_build_dag = reject_list_source.is_some();
 
             let consignment = if should_build_dag {
-                let (consignment, ops_dag) = if burning {
+                let (consignment, ops_dag) = if without_recipient {
                     runtime.transfer_from_fascia_with_dag(
                         contract_id,
                         beneficiaries_witness,
                         beneficiaries_blinded,
-                        burn_opids(&fascia, contract_id),
+                        transfer_info.requested_opids(&fascia),
                         &fascia,
                     )?
                 } else {
@@ -3256,7 +3363,7 @@ impl Wallet {
                         contract_id,
                         beneficiaries_witness,
                         beneficiaries_blinded,
-                        burn_opids(&fascia, contract_id),
+                        transfer_info.requested_opids(&fascia),
                         Some(witness_txid),
                     )?
                 };
@@ -3292,8 +3399,7 @@ impl Wallet {
                 }
 
                 Some(consignment)
-            } else if is_burn {
-                // a burn has no recipient: burn_end builds its consignment
+            } else if op_without_recipient {
                 None
             } else {
                 Some(runtime.transfer(
@@ -3328,7 +3434,7 @@ impl Wallet {
                 .insert(asset_id.clone(), transfer_info.clone());
         }
 
-        if !burning {
+        if !without_recipient {
             runtime.upsert_witness(witness_txid, WitnessOrd::Tentative)?;
         }
 
@@ -6272,6 +6378,7 @@ impl Wallet {
                     return Err(Error::InvalidAmountZero);
                 }
             }
+            (Assignment::LinkRight, AssetSchema::Ifa | AssetSchema::Bfa) => {}
             _ => {
                 return Err(Error::InvalidAssignment);
             }
@@ -6478,6 +6585,12 @@ impl Wallet {
                     .or_default()
                     .push(local_recipient);
 
+                if recipient.assignment == Assignment::LinkRight && original_assignments_needed.link
+                {
+                    return Err(Error::InvalidRecipientData {
+                        details: s!("the link right can only be sent to a single recipient"),
+                    });
+                }
                 recipient
                     .assignment
                     .add_to_assignments(&mut original_assignments_needed);
@@ -6551,6 +6664,7 @@ impl Wallet {
                     main_transition,
                     burn_reason: None,
                     before_block: None,
+                    linked_to_contract: None,
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -7352,6 +7466,7 @@ impl Wallet {
             main_transition: TypeOfTransition::Inflate,
             burn_reason: None,
             before_block: None,
+            linked_to_contract: None,
         };
         let psbt_string = self
             ._prepare_single_asset_psbt(
@@ -7542,7 +7657,7 @@ impl Wallet {
         info!(self.logger, "Burning (begin) amount: {}...", amount);
         self.check_online(online.clone())?;
 
-        let asset = self.database.check_asset_exists(asset_id.clone())?;
+        let asset = self.database.check_asset_exists(asset_id)?;
         let schema = asset.schema;
         self.check_schema_support(&schema)?;
         if !SCHEMAS_SUPPORTING_BURN.contains(&schema) {
@@ -7557,13 +7672,86 @@ impl Wallet {
             .map(|reason| self.check_burn_reason(reason))
             .transpose()?;
 
-        let (fee_rate_checked, unspents, input_unspents, mut runtime) =
-            self._get_transfer_begin_data(online, fee_rate)?;
-
         let assignments_needed = AssignmentsCollection {
             fungible: amount,
             ..Default::default()
         };
+        let begin_data = self
+            ._begin_without_recipient(
+                online,
+                asset,
+                assignments_needed,
+                TypeOfTransition::Burn,
+                burn_reason,
+                None,
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await?;
+
+        info!(self.logger, "Burn (begin) completed");
+        Ok(BurnBeginResult {
+            psbt: begin_data.psbt,
+            batch_transfer_idx: begin_data.batch_transfer_idx,
+            details: BurnDetails {
+                fascia: begin_data.fascia,
+                min_confirmations,
+                entropy: begin_data.entropy,
+                burn_reason: burn_reason.map(|r| r.to_string()),
+            },
+        })
+    }
+
+    /// Complete the burn operation by broadcasting the provided PSBT and saving the transfer.
+    ///
+    /// The provided PSBT, prepared with the [`burn_begin`](Wallet::burn_begin) function, needs to
+    /// have already been signed.
+    ///
+    /// The wallet keeps a consignment that proves the burn, with its full history.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    pub async fn burn_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Burning (end)...");
+        self.check_online(online)?;
+
+        let (res, _) = self
+            ._end_without_recipient(signed_psbt, TypeOfTransition::Burn)
+            .await?;
+
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+
+        info!(self.logger, "Burn (end) completed");
+        Ok(res)
+    }
+
+    /// Prepare the PSBT of an operation that pays no one (a burn or a link), spending the
+    /// `assignments_needed` of `asset` with the `main_transition`.
+    ///
+    /// The operation still needs a witness output, so it sends dust to a new address of this
+    /// wallet.
+    #[allow(clippy::too_many_arguments)]
+    async fn _begin_without_recipient(
+        &mut self,
+        online: Online,
+        asset: DbAsset,
+        assignments_needed: AssignmentsCollection,
+        main_transition: TypeOfTransition,
+        burn_reason: Option<BurnReason>,
+        linked_to_contract: Option<ContractId>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        let (fee_rate_checked, unspents, input_unspents, mut runtime) =
+            self._get_transfer_begin_data(online, fee_rate)?;
+
+        let asset_id = asset.id;
         let asset_spend = self._select_rgb_inputs(
             asset_id.clone(),
             &assignments_needed,
@@ -7607,9 +7795,10 @@ impl Wallet {
             original_assignments_needed: assignments_needed.clone(),
             assignments_needed,
             assignments_spent: HashMap::new(),
-            main_transition: TypeOfTransition::Burn,
+            main_transition,
             burn_reason,
             before_block: None,
+            linked_to_contract,
         };
         let begin_data = self
             ._prepare_single_asset_psbt(
@@ -7628,7 +7817,7 @@ impl Wallet {
         drop(runtime);
 
         if dry_run {
-            // a dry run reserves nothing: burn_end saves the transfer
+            // a dry run reserves nothing: the end saves the transfer
             let txid = Psbt::from_str(&begin_data.psbt)?
                 .unsigned_tx
                 .compute_txid()
@@ -7641,46 +7830,27 @@ impl Wallet {
             self.trigger_auto_backup();
         }
 
-        info!(self.logger, "Burn (begin) completed");
-        Ok(BurnBeginResult {
-            psbt: begin_data.psbt,
-            batch_transfer_idx: begin_data.batch_transfer_idx,
-            details: BurnDetails {
-                fascia: begin_data.fascia,
-                min_confirmations,
-                entropy: begin_data.entropy,
-                burn_reason: burn_reason.map(|r| r.to_string()),
-            },
-        })
+        Ok(begin_data)
     }
 
-    /// Complete the burn operation by broadcasting the provided PSBT and saving the transfer.
-    ///
-    /// The provided PSBT, prepared with the [`burn_begin`](Wallet::burn_begin) function, needs to
-    /// have already been signed.
-    ///
-    /// The wallet keeps a consignment that proves the burn, with its full history.
-    ///
-    /// This doesn't require the wallet to have private keys.
-    pub async fn burn_end(
+    /// Complete an operation that pays no one (a burn or a link) with the `main_transition`,
+    /// broadcasting the `signed_psbt`. Return the result and the asset transfers of the
+    /// operation.
+    async fn _end_without_recipient(
         &mut self,
-        online: Online,
         signed_psbt: String,
-    ) -> Result<OperationResult, Error> {
-        info!(self.logger, "Burning (end)...");
-        self.check_online(online)?;
-
+        main_transition: TypeOfTransition,
+    ) -> Result<(OperationResult, BTreeMap<String, InfoAssetTransfer>), Error> {
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
 
-        // only a burn begun without dry run, and not failed or ended, has a batch transfer
         let batch_transfer = self._check_end_initiated(&txid)?;
 
         let artifacts = self
             .transfer_artifacts
             .get(&txid)
             .ok_or(Error::UnknownTransfer { txid: txid.clone() })?;
-        if !artifacts.is_operation(|t| *t == TypeOfTransition::Burn) {
+        if !artifacts.is_operation(|t| *t == main_transition) {
             return Err(Error::WrongOperation { txid });
         }
         let info_contents = artifacts.batch_info.clone().ok_or(Error::Internal {
@@ -7702,7 +7872,7 @@ impl Wallet {
                 contract_id,
                 [],
                 [],
-                burn_opids(&fascia, contract_id),
+                transfer_info.requested_opids(&fascia),
                 &fascia,
             )?;
             let mut bytes = Vec::new();
@@ -7745,15 +7915,162 @@ impl Wallet {
             },
         );
 
+        Ok((
+            OperationResult {
+                txid,
+                batch_transfer_idx,
+                entropy: info_contents.entropy,
+            },
+            transfer_info_map,
+        ))
+    }
+
+    /// Link an RGB asset to the contract with ID `linked_to_contract` (e.g. one replacing it),
+    /// spending its link right.
+    ///
+    /// This calls [`link_begin`](Wallet::link_begin), signs the resulting PSBT and finally
+    /// calls [`link_end`](Wallet::link_end).
+    ///
+    /// A wallet with private keys is required.
+    pub async fn link(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
+        info!(
+            self.logger,
+            "Linking to contract: {}...", linked_to_contract
+        );
+        self._check_xprv()?;
+        let begin = self
+            .link_begin(
+                online.clone(),
+                asset_id,
+                linked_to_contract,
+                fee_rate,
+                min_confirmations,
+                true,
+            )
+            .await?;
+        let signed_psbt = self.sign_psbt(begin.psbt, None)?;
+        let res = self.link_end(online, signed_psbt).await?;
+        info!(self.logger, "Link completed");
+        Ok(res)
+    }
+
+    /// Prepare the PSBT to link an RGB asset to the contract with ID `linked_to_contract` (e.g. one
+    /// replacing it), with the provided `fee_rate` (in sat/vB).
+    ///
+    /// The link spends the link right of the asset, which the wallet needs to hold, and commits the
+    /// contract it links to (`linkedToContract`), which can't be the asset's own one. As the asset
+    /// has at most one link right, an asset can be linked only once.
+    ///
+    /// If `dry_run` is false, the wallet saves the transfer in [`TransferStatus::Initiated`] and
+    /// returns its batch transfer idx.
+    ///
+    /// Sign the returned PSBT and give it to [`link_end`](Wallet::link_end).
+    ///
+    /// This doesn't require the wallet to have private keys.
+    pub async fn link_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<LinkBeginResult, Error> {
+        info!(
+            self.logger,
+            "Linking (begin) to contract: {}...", linked_to_contract
+        );
+        self.check_online(online.clone())?;
+
+        let asset = self.database.check_asset_exists(asset_id)?;
+        let schema = asset.schema;
+        self.check_schema_support(&schema)?;
+        if !schema.supports_link() {
+            return Err(Error::UnsupportedLink {
+                asset_schema: schema,
+            });
+        }
+        let linked_to_contract =
+            ContractId::from_str(&linked_to_contract).map_err(|_| Error::InvalidContractId {
+                contract_id: linked_to_contract,
+            })?;
+        // the link right can be spent only once, linking the asset to itself would waste it
+        if linked_to_contract.to_string() == asset.id {
+            return Err(Error::CannotLinkToItself);
+        }
+
+        let assignments_needed = AssignmentsCollection {
+            link: true,
+            ..Default::default()
+        };
+        let begin_data = self
+            ._begin_without_recipient(
+                online,
+                asset,
+                assignments_needed,
+                TypeOfTransition::Link,
+                None,
+                Some(linked_to_contract),
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await?;
+
+        info!(self.logger, "Link (begin) completed");
+        Ok(LinkBeginResult {
+            psbt: begin_data.psbt,
+            batch_transfer_idx: begin_data.batch_transfer_idx,
+            details: LinkDetails {
+                fascia: begin_data.fascia,
+                min_confirmations,
+                entropy: begin_data.entropy,
+            },
+        })
+    }
+
+    /// Complete the link operation by broadcasting the provided PSBT and saving the transfer.
+    ///
+    /// The provided PSBT, prepared with the [`link_begin`](Wallet::link_begin) function, needs to
+    /// have already been signed.
+    ///
+    /// The wallet keeps a consignment that proves the link, with its full history.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    pub async fn link_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Linking (end)...");
+        self.check_online(online)?;
+
+        let (res, transfer_info_map) = self
+            ._end_without_recipient(signed_psbt, TypeOfTransition::Link)
+            .await?;
+
+        // the link transition assigns nothing, so no consignment of a later operation carries
+        // it: the link is known only to this wallet, which records it once broadcast
+        for (asset_id, transfer_info) in transfer_info_map {
+            if let Some(linked_to_contract) = transfer_info.linked_to_contract {
+                let mut asset: DbAssetActMod = self.database.check_asset_exists(asset_id)?.into();
+                asset.linked_to_contract = ActiveValue::Set(Some(linked_to_contract.to_string()));
+                self.database.update_asset(&mut asset)?;
+            }
+        }
+
         self.update_backup_info(false)?;
         self.trigger_auto_backup();
 
-        info!(self.logger, "Burn (end) completed");
-        Ok(OperationResult {
-            txid,
-            batch_transfer_idx,
-            entropy: info_contents.entropy,
-        })
+        info!(self.logger, "Link (end) completed");
+        Ok(res)
     }
 
     /// The outgoing batch transfer of `txid`, if any. Fail with [`Error::CannotEndTransfer`] if
@@ -8032,6 +8349,7 @@ impl Wallet {
             main_transition: TypeOfTransition::Mint,
             burn_reason: None,
             before_block: Some(before_block),
+            linked_to_contract: None,
         };
         let begin_data = self
             ._prepare_single_asset_psbt(
@@ -8253,6 +8571,7 @@ impl Wallet {
             main_transition: TypeOfTransition::Mint,
             burn_reason: None,
             before_block: Some(before_block),
+            linked_to_contract: None,
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id, transfer_info)]);
         let PrepareTransferPsbtResult::Success(begin_data) = self
@@ -8784,6 +9103,7 @@ mod send_end_tests {
             main_transition,
             burn_reason: None,
             before_block: None,
+            linked_to_contract: None,
         }
     }
 
@@ -9248,6 +9568,54 @@ mod send_end_tests {
         let res = inflate_end_err(&mut wallet, &online, &psbt);
         assert_eq!(res, Error::WrongOperation { txid: txid.clone() });
         assert!(wallet.transfer_artifacts.contains_key(&txid));
+    }
+
+    fn link_end_err(wallet: &mut Wallet, online: &Online, psbt: &str) -> Error {
+        block_on(wallet.link_end(online.clone(), psbt.to_string())).unwrap_err()
+    }
+
+    fn operation_artifacts(main_transition: TypeOfTransition) -> TransferArtifacts {
+        let info = info_asset(main_transition, vec![], HashMap::new());
+        artifacts(BTreeMap::from([(s!("asset"), info)]))
+    }
+
+    #[test]
+    fn link_end_refuses_other_operation() {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup();
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), operation_artifacts(TypeOfTransition::Burn));
+        let res = link_end_err(&mut wallet, &online, &psbt);
+        assert_eq!(res, Error::WrongOperation { txid: txid.clone() });
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), operation_artifacts(TypeOfTransition::Link));
+        let res = block_on(wallet.burn_end(online.clone(), psbt.clone())).unwrap_err();
+        assert_eq!(res, Error::WrongOperation { txid: txid.clone() });
+        let res = send_end_err(&mut wallet, &online, &psbt);
+        assert_eq!(res, Error::WrongOperation { txid: txid.clone() });
+        assert!(wallet.transfer_artifacts.contains_key(&txid));
+    }
+
+    #[test]
+    fn link_end_after_fail_or_end() {
+        let (psbt, txid) = dummy_psbt();
+        for st in [
+            TransferStatus::Failed,
+            TransferStatus::WaitingConfirmations,
+            TransferStatus::Settled,
+        ] {
+            let (mut wallet, online) = setup();
+            let idx = seed_batch(&wallet, &txid, st, false, None);
+            wallet
+                .transfer_artifacts
+                .insert(txid.clone(), operation_artifacts(TypeOfTransition::Link));
+            let res = link_end_err(&mut wallet, &online, &psbt);
+            assert_eq!(res, Error::CannotEndTransfer { txid: txid.clone() });
+            assert_eq!(status(&wallet, idx), st);
+            assert!(wallet.transfer_artifacts.contains_key(&txid));
+        }
     }
 
     #[test]
@@ -10830,6 +11198,133 @@ mod bfa_tests {
     }
 
     #[test]
+    fn link_right_assignment() {
+        let link = Opout::new(OpId::from([1u8; 32]), OS_LINK, 0);
+        let assignment = Assignment::from_opout_and_state(link, &AllocatedState::Void);
+        assert_eq!(assignment, Assignment::LinkRight);
+        let mut collected = AssignmentsCollection::default();
+        assignment.add_to_assignments(&mut collected);
+        assert!(collected.link);
+        let needed = AssignmentsCollection {
+            link: true,
+            ..Default::default()
+        };
+        assert!(AssignmentsCollection::default().opout_contributes(
+            &link,
+            &AllocatedState::Void,
+            &needed
+        ));
+        assert!(!collected.opout_contributes(&link, &AllocatedState::Void, &needed));
+        assert!(!AssignmentsCollection::default().enough(&needed));
+        assert!(collected.enough(&needed));
+        assert!(!AssetSchema::Nia.supports_link());
+        assert!(AssetSchema::Ifa.supports_link());
+        assert!(AssetSchema::Bfa.supports_link());
+        assert_eq!(TypeOfTransition::Link.type_name(), "link");
+    }
+
+    #[test]
+    fn issue_with_invalid_linked_from_contract() {
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let mut wallet = make_test_wallet(false);
+        wallet.wallet_data.supported_schemas = AssetSchema::VALUES.to_vec();
+        let invalid = Error::InvalidContractId {
+            contract_id: s!("invalid"),
+        };
+        let res = wallet.issue_asset_ifa(
+            s!("IFA"),
+            s!("Name"),
+            0,
+            vec![10],
+            vec![],
+            None,
+            true,
+            Some(s!("invalid")),
+        );
+        assert_eq!(res.unwrap_err(), invalid);
+        let res = wallet.issue_asset_bfa(
+            s!("BFA"),
+            s!("Name"),
+            0,
+            1,
+            31337,
+            s!("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
+            None,
+            true,
+            Some(s!("invalid")),
+        );
+        assert_eq!(res.unwrap_err(), invalid);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn link_begin_refuses_invalid_input() {
+        use crate::api::evm::tests::block_on;
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+
+        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Ifa];
+        let url = "http://127.0.0.1:1";
+        wallet.online_data = Some(OnlineData::for_test(url));
+        let online = Online {
+            id: 1,
+            indexer_url: url.to_string(),
+        };
+        let ifa = ContractId::copy_from_slice([9; 32]).unwrap().to_string();
+        for (id, schema) in [
+            (ifa.as_str(), AssetSchema::Ifa),
+            ("rgb:nia", AssetSchema::Nia),
+        ] {
+            wallet
+                .database
+                .set_asset(DbAssetActMod {
+                    id: ActiveValue::Set(id.to_string()),
+                    schema: ActiveValue::Set(schema),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let other = ContractId::copy_from_slice([8; 32]).unwrap().to_string();
+        let cases = [
+            (
+                "rgb:unknown",
+                other.as_str(),
+                Error::AssetNotFound {
+                    asset_id: s!("rgb:unknown"),
+                },
+            ),
+            (
+                "rgb:nia",
+                other.as_str(),
+                Error::UnsupportedLink {
+                    asset_schema: AssetSchema::Nia,
+                },
+            ),
+            (
+                ifa.as_str(),
+                "invalid",
+                Error::InvalidContractId {
+                    contract_id: s!("invalid"),
+                },
+            ),
+            (ifa.as_str(), ifa.as_str(), Error::CannotLinkToItself),
+        ];
+        for (id, linked_to, expected) in cases {
+            let err = block_on(wallet.link_begin(
+                online.clone(),
+                id.to_string(),
+                linked_to.to_string(),
+                1,
+                1,
+                true,
+            ))
+            .unwrap_err();
+            assert_eq!(err, expected);
+        }
+    }
+
+    #[test]
     fn issue_asset_bfa_takes_unicode_ticker() {
         use crate::wallet::offline::address_reuse_tests::make_test_wallet;
 
@@ -10843,6 +11338,8 @@ mod bfa_tests {
                 1,
                 31337,
                 s!("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
+                None,
+                false,
                 None,
             )
         };
