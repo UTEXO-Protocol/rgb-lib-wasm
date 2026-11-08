@@ -548,3 +548,39 @@ pub async fn settle(wallet: &mut Wallet, online: &Online, recipient_ids: &[Strin
         .collect();
     panic!("transfers did not settle: {statuses:?}");
 }
+
+/// Serve `body` as the reject list at `url`, from the page, and count the fetches of `url`.
+#[allow(dead_code)]
+pub fn serve_reject_list(url: &str, body: &str) {
+    js_sys::Function::new_with_args(
+        "url, body",
+        "if (!globalThis.__rgbRejectLists) {
+            globalThis.__rgbRejectLists = {};
+            globalThis.__rgbRejectListFetches = {};
+            const next = globalThis.fetch;
+            globalThis.fetch = function (input, init) {
+                const u = new URL(input instanceof Request ? input.url : String(input)).href;
+                const list = globalThis.__rgbRejectLists[u];
+                if (list === undefined) return next.call(this, input, init);
+                globalThis.__rgbRejectListFetches[u] = (globalThis.__rgbRejectListFetches[u] || 0) + 1;
+                return Promise.resolve(new Response(list, { status: 200 }));
+            };
+        }
+        globalThis.__rgbRejectLists[new URL(url).href] = body;",
+    )
+    .call2(&JsValue::NULL, &url.into(), &body.into())
+    .unwrap();
+}
+
+/// The number of times the page served the reject list at `url`.
+#[allow(dead_code)]
+pub fn reject_list_fetches(url: &str) -> u32 {
+    js_sys::Function::new_with_args(
+        "url",
+        "return (globalThis.__rgbRejectListFetches || {})[new URL(url).href] || 0;",
+    )
+    .call1(&JsValue::NULL, &url.into())
+    .unwrap()
+    .as_f64()
+    .unwrap() as u32
+}

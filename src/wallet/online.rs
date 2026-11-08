@@ -346,6 +346,7 @@ pub(crate) struct InfoBatchTransfer {
 }
 
 /// Where the reject list of an asset is kept.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum RejectListSource {
     /// A list of opouts served at a URL
     Url(String),
@@ -361,6 +362,9 @@ impl From<RejectListLocation> for RejectListSource {
         }
     }
 }
+
+/// The reject and allow opouts of each reject list fetched by an operation.
+type RejectLists = HashMap<RejectListSource, (HashSet<Opout>, HashSet<Opout>)>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AssetInfo {
@@ -2830,6 +2834,7 @@ impl Wallet {
         expiration_timestamp: Option<i64>,
         btc_change: Option<BtcChange>,
         rejected: &mut HashSet<Opout>,
+        reject_lists: &mut RejectLists,
     ) -> Result<Option<Vec<u8>>, Error> {
         let mut change_utxo_option = None;
         let mut change_utxo_idx = None;
@@ -3234,10 +3239,8 @@ impl Wallet {
                 transfer_info.main_transition,
                 TypeOfTransition::Burn | TypeOfTransition::Mint
             );
-            let should_build_dag = matches!(
-                transfer_info.main_transition,
-                TypeOfTransition::Transfer | TypeOfTransition::Burn | TypeOfTransition::Mint
-            ) && reject_list_source.is_some();
+            // check every operation, so that none spends a rejected allocation
+            let should_build_dag = reject_list_source.is_some();
 
             let consignment = if should_build_dag {
                 let (consignment, ops_dag) = if burning {
@@ -3258,15 +3261,19 @@ impl Wallet {
                     )?
                 };
 
-                let (reject_opouts, allow_opouts) = self
-                    ._get_reject_list_async(reject_list_source.as_ref().unwrap())
-                    .await?;
+                // fetch a list once per operation, so that all retries use the same version
+                let source = reject_list_source.as_ref().unwrap();
+                if !reject_lists.contains_key(source) {
+                    let decisions = self._get_reject_list_async(source).await?;
+                    reject_lists.insert(source.clone(), decisions);
+                }
+                let (reject_opouts, allow_opouts) = &reject_lists[source];
                 let asset_opouts = input_opouts
                     .get(&transfer_info.asset_info.contract_id)
                     .unwrap();
                 let asset_input_opouts = asset_opouts.keys().cloned().collect();
                 let to_reject =
-                    self._check_dag(&ops_dag, &reject_opouts, &allow_opouts, &asset_input_opouts)?;
+                    self._check_dag(&ops_dag, reject_opouts, allow_opouts, &asset_input_opouts)?;
                 if !to_reject.is_empty() {
                     warn!(
                         self.logger,
@@ -3360,6 +3367,7 @@ impl Wallet {
         sender_transport_endpoint: Option<String>,
         runtime: &mut RgbRuntime,
         rejected: &mut HashSet<Opout>,
+        reject_lists: &mut RejectLists,
         dry_run: bool,
     ) -> Result<PrepareTransferPsbtResult, Error> {
         // prepare BDK PSBT
@@ -3398,6 +3406,7 @@ impl Wallet {
                 expiration_timestamp,
                 btc_change,
                 rejected,
+                reject_lists,
             )
             .await?
         {
@@ -4228,28 +4237,68 @@ impl Wallet {
         Ok(Some((valid_consignment, received)))
     }
 
-    /// Select the inputs again, without the rejected ones.
-    fn _reselect_inputs(
-        &self,
-        transfer_info_map: &BTreeMap<String, InfoAssetTransfer>,
-        asset_id: &str,
-        transfer_info: &InfoAssetTransfer,
+    /// Prepare the PSBT of an operation on one asset (an inflation, a burn or a mint).
+    /// Retry without the inputs that the reject list rejects, and select more inputs to replace them.
+    #[allow(clippy::too_many_arguments)]
+    async fn _prepare_single_asset_psbt(
+        &mut self,
+        transfer_info: InfoAssetTransfer,
+        unspents: Vec<LocalUnspent>,
         input_unspents: &[LocalUnspent],
-    ) -> Result<BTreeMap<String, InfoAssetTransfer>, Error> {
-        let assignments_needed = transfer_info_map[asset_id].assignments_needed.clone();
-        let asset_spend = self._select_rgb_inputs(
-            asset_id.to_string(),
-            &assignments_needed,
-            input_unspents.to_vec(),
-        )?;
-        Ok(BTreeMap::from([(
-            asset_id.to_string(),
-            InfoAssetTransfer {
-                asset_spend,
-                assignments_needed,
-                ..transfer_info.clone()
-            },
-        )]))
+        witness_recipients: &Vec<(ScriptBuf, u64)>,
+        fee_rate_checked: FeeRate,
+        min_confirmations: u8,
+        operation_secret_key: Option<Vec<u8>>,
+        sender_transport_endpoint: Option<String>,
+        runtime: &mut RgbRuntime,
+        dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        let asset_id = transfer_info.asset_info.contract_id.to_string();
+        let mut rejected = HashSet::new();
+        let mut reject_lists = RejectLists::new();
+        let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
+        loop {
+            match self
+                ._prepare_transfer_psbt_wasm(
+                    &mut transfer_info_map,
+                    false,
+                    unspents.clone(),
+                    input_unspents,
+                    witness_recipients,
+                    fee_rate_checked,
+                    min_confirmations,
+                    None,
+                    None,
+                    operation_secret_key.clone(),
+                    sender_transport_endpoint.clone(),
+                    runtime,
+                    &mut rejected,
+                    &mut reject_lists,
+                    dry_run,
+                )
+                .await?
+            {
+                PrepareTransferPsbtResult::Retry => {
+                    // select the inputs again, without the rejected ones
+                    let assignments_needed =
+                        transfer_info_map[&asset_id].assignments_needed.clone();
+                    let asset_spend = self._select_rgb_inputs(
+                        asset_id.clone(),
+                        &assignments_needed,
+                        input_unspents.to_vec(),
+                    )?;
+                    transfer_info_map = BTreeMap::from([(
+                        asset_id.clone(),
+                        InfoAssetTransfer {
+                            asset_spend,
+                            assignments_needed,
+                            ..transfer_info.clone()
+                        },
+                    )]);
+                }
+                PrepareTransferPsbtResult::Success(begin_data) => return Ok(begin_data),
+            }
+        }
     }
 
     async fn _wait_consignment_async(
@@ -6470,6 +6519,7 @@ impl Wallet {
         }
 
         let mut rejected = HashSet::new();
+        let mut reject_lists = RejectLists::new();
         let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> = BTreeMap::new();
         let mut invoices_checked = false;
 
@@ -6568,6 +6618,7 @@ impl Wallet {
                     Some(sender_transport_endpoint.clone()),
                     &mut runtime,
                     &mut rejected,
+                    &mut reject_lists,
                     dry_run,
                 )
                 .await?
@@ -7302,14 +7353,9 @@ impl Wallet {
             burn_reason: None,
             before_block: None,
         };
-        let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> =
-            BTreeMap::from([(asset_id.clone(), transfer_info)]);
-
-        let mut rejected = HashSet::new();
-        let psbt_string = match self
-            ._prepare_transfer_psbt_wasm(
-                &mut transfer_info_map,
-                false,
+        let psbt_string = self
+            ._prepare_single_asset_psbt(
+                transfer_info,
                 unspents,
                 &input_unspents,
                 &witness_recipients,
@@ -7317,19 +7363,11 @@ impl Wallet {
                 min_confirmations,
                 None,
                 None,
-                None,
-                None,
                 &mut runtime,
-                &mut rejected,
                 true,
             )
             .await?
-        {
-            PrepareTransferPsbtResult::Retry => {
-                unreachable!("unimplemented retry logic for inflate transition")
-            }
-            PrepareTransferPsbtResult::Success(data) => data.psbt,
-        };
+            .psbt;
 
         // release the RGB stock so the wallet state can be saved
         drop(runtime);
@@ -7573,39 +7611,20 @@ impl Wallet {
             burn_reason,
             before_block: None,
         };
-        let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
-        let mut rejected = HashSet::new();
-        let begin_data = loop {
-            match self
-                ._prepare_transfer_psbt_wasm(
-                    &mut transfer_info_map,
-                    false,
-                    unspents.clone(),
-                    &input_unspents,
-                    &witness_recipients,
-                    fee_rate_checked,
-                    min_confirmations,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &mut runtime,
-                    &mut rejected,
-                    dry_run,
-                )
-                .await?
-            {
-                PrepareTransferPsbtResult::Retry => {
-                    transfer_info_map = self._reselect_inputs(
-                        &transfer_info_map,
-                        &asset_id,
-                        &transfer_info,
-                        &input_unspents,
-                    )?;
-                }
-                PrepareTransferPsbtResult::Success(begin_data) => break begin_data,
-            }
-        };
+        let begin_data = self
+            ._prepare_single_asset_psbt(
+                transfer_info,
+                unspents,
+                &input_unspents,
+                &witness_recipients,
+                fee_rate_checked,
+                min_confirmations,
+                None,
+                None,
+                &mut runtime,
+                dry_run,
+            )
+            .await?;
         drop(runtime);
 
         if dry_run {
@@ -8014,39 +8033,20 @@ impl Wallet {
             burn_reason: None,
             before_block: Some(before_block),
         };
-        let mut transfer_info_map = BTreeMap::from([(asset_id.clone(), transfer_info.clone())]);
-        let mut rejected = HashSet::new();
-        let begin_data = loop {
-            match self
-                ._prepare_transfer_psbt_wasm(
-                    &mut transfer_info_map,
-                    false,
-                    unspents.clone(),
-                    &input_unspents,
-                    &witness_recipients,
-                    fee_rate_checked,
-                    min_confirmations,
-                    None,
-                    None,
-                    Some(operation_sk.to_bytes().to_vec()),
-                    Some(sender_transport_endpoint.clone()),
-                    &mut runtime,
-                    &mut rejected,
-                    false,
-                )
-                .await?
-            {
-                PrepareTransferPsbtResult::Retry => {
-                    transfer_info_map = self._reselect_inputs(
-                        &transfer_info_map,
-                        &asset_id,
-                        &transfer_info,
-                        &input_unspents,
-                    )?;
-                }
-                PrepareTransferPsbtResult::Success(begin_data) => break begin_data,
-            }
-        };
+        let begin_data = self
+            ._prepare_single_asset_psbt(
+                transfer_info,
+                unspents,
+                &input_unspents,
+                &witness_recipients,
+                fee_rate_checked,
+                min_confirmations,
+                Some(operation_sk.to_bytes().to_vec()),
+                Some(sender_transport_endpoint.clone()),
+                &mut runtime,
+                false,
+            )
+            .await?;
         drop(runtime);
 
         let txid = Psbt::from_str(&begin_data.psbt)?
@@ -8270,6 +8270,7 @@ impl Wallet {
                 None,
                 &mut runtime,
                 &mut HashSet::new(),
+                &mut RejectLists::new(),
                 true,
             )
             .await?
