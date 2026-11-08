@@ -24,6 +24,102 @@ pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
 const FASCIA_MAX_LEN: usize = amplify::confinement::U32;
 
+/// The maximum length of a confined collection, given an accessor returning it from a bundle.
+const fn bundle_confinement_max<
+    C: amplify::confinement::Collection,
+    const MIN: usize,
+    const MAX: usize,
+>(
+    _: fn(&TransitionBundle) -> &Confined<C, MIN, MAX>,
+) -> usize {
+    MAX
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold and still be spent. A bundle spends
+/// at most as many opouts as its input map holds.
+pub(crate) const MAX_UTXO_ASSET_ALLOCATIONS: usize =
+    bundle_confinement_max(|b: &TransitionBundle| &b.input_map);
+
+/// Maximum number of allocations of an asset a UTXO can hold (see [`MAX_UTXO_ASSET_ALLOCATIONS`]).
+pub(crate) fn max_utxo_asset_allocations() -> usize {
+    #[cfg(test)]
+    if let Some(max_allocations) = MOCK_MAX_UTXO_ASSET_ALLOCATIONS.with_borrow(|m| *m) {
+        return max_allocations;
+    }
+    MAX_UTXO_ASSET_ALLOCATIONS
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MOCK_SPAM_RECIPIENT_ASSIGNMENTS: std::cell::RefCell<Option<(u16, u64)>> =
+        const { std::cell::RefCell::new(None) };
+    pub(crate) static MOCK_SPAM_HIDDEN_SPENDS: std::cell::RefCell<Option<()>> =
+        const { std::cell::RefCell::new(None) };
+    pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: std::cell::RefCell<Option<usize>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// test mock: move part of the recipient amount to `num` extra assignments of `amount` to the
+// same concealed seal
+#[cfg(test)]
+pub(crate) fn mock_spam_recipient_assignments(mut transition: Transition) -> Transition {
+    let Some((num, amount)) = MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take() else {
+        return transition;
+    };
+    let Some(TypedAssigns::Fungible(assignments)) = transition.assignments.get_mut(&OS_ASSET)
+    else {
+        panic!("transition has no fungible assignments");
+    };
+    let (idx, seal, recipient_amount) = assignments
+        .iter()
+        .enumerate()
+        .find_map(|(i, a)| match a.seal {
+            BuilderSeal::Concealed(seal) => Some((i, seal, a.state.as_u64())),
+            BuilderSeal::Revealed(_) => None,
+        })
+        .unwrap();
+    let spam_total = (num as u64)
+        .checked_mul(amount)
+        .expect("spam total overflows u64");
+    assert!(recipient_amount > spam_total);
+    assignments.get_mut(idx).unwrap().state = RevealedValue::new(recipient_amount - spam_total);
+    for _ in 0..num {
+        assignments
+            .push(Assign {
+                seal: BuilderSeal::Concealed(seal),
+                state: RevealedValue::new(amount),
+            })
+            .unwrap();
+    }
+    transition
+}
+
+// test mock: mark each concealed assignment but the first as spent in the input map, by a
+// transition the consignment does not carry
+#[cfg(test)]
+pub(crate) fn mock_spam_hidden_spends(psbt: &mut Psbt, transition: &Transition) {
+    if MOCK_SPAM_HIDDEN_SPENDS.take().is_none() {
+        return;
+    }
+    let Some(TypedAssigns::Fungible(assignments)) = transition.assignments.get(&OS_ASSET) else {
+        panic!("transition has no fungible assignments");
+    };
+    let opid = transition.id();
+    for (no, _) in assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a.seal, BuilderSeal::Concealed(_)))
+        .skip(1)
+    {
+        psbt.set_rgb_contract_consumer(
+            transition.contract_id,
+            Opout::new(opid, OS_ASSET, no as u16),
+            OpId::from([0xaa; 32]),
+        )
+        .unwrap();
+    }
+}
+
 struct BeginOperationData {
     psbt: String,
     fascia: Vec<u8>,
@@ -1443,6 +1539,24 @@ impl Wallet {
                 })
             })
         })
+    }
+
+    /// The number of allocations of the asset with ID `asset_id` the TXO at `outpoint`, if known
+    /// and unspent, holds or will receive from transfers that did not fail.
+    fn count_utxo_asset_allocations(
+        &self,
+        outpoint: &Outpoint,
+        asset_id: &str,
+    ) -> Result<usize, Error> {
+        let Some(txo) = self.database.get_txo(outpoint)? else {
+            return Ok(0);
+        };
+        if txo.spent {
+            return Ok(0);
+        }
+        Ok(self
+            .database
+            .count_txo_incoming_asset_colorings(txo.idx, asset_id)?)
     }
 
     fn assignments_for_bundle(
@@ -2985,6 +3099,10 @@ impl Wallet {
             // nothing (a transfer of rights only, which side transitions move)
             if asset_transition_builder.has_inputs() {
                 let transition = asset_transition_builder.complete_transition()?;
+                #[cfg(test)]
+                let transition = mock_spam_recipient_assignments(transition);
+                #[cfg(test)]
+                mock_spam_hidden_spends(psbt, &transition);
                 psbt.push_rgb_transition(transition)
                     .map_err(InternalError::from)?;
             } else if main_used {
@@ -4465,6 +4583,52 @@ impl Wallet {
         } = payments.remove(0);
         let witness_id = paying_bundle.witness_id();
         let txid = witness_id.to_string();
+
+        if receiving.len() != 1 {
+            error!(
+                self.logger,
+                "Consignment pays this recipient {} allocations, refusing it",
+                receiving.len()
+            );
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
+                .await;
+        }
+
+        // a UTXO with more allocations of an asset than one bundle can spend cannot be spent.
+        // Allocations of pending transfers count too.
+        let receive_outpoint = match &transfer.recipient_type {
+            Some(RecipientTypeFull::Blind { unblinded_utxo }) => unblinded_utxo.clone(),
+            Some(RecipientTypeFull::Witness { .. }) => Outpoint {
+                txid: txid.clone(),
+                vout: vout.ok_or(InternalError::Unexpected)?,
+            },
+            _ => return Err(InternalError::Unexpected.into()),
+        };
+        let held = self.count_utxo_asset_allocations(&receive_outpoint, &asset_id)?;
+        if held + receiving.len() > max_utxo_asset_allocations() {
+            error!(
+                self.logger,
+                "Consignment pays {} allocation(s) of the asset to a UTXO already holding {held}, \
+                 exceeding the {} a UTXO can hold and still be spent",
+                receiving.len(),
+                max_utxo_asset_allocations()
+            );
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
+                .await;
+        }
+
         let donation_tx = Self::donation_signed_tx(&paying_bundle.tx);
 
         let chain_resolver = self

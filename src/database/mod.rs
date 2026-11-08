@@ -111,12 +111,7 @@ pub(crate) struct DbBatchTransferData {
 
 impl DbColoring {
     pub(crate) fn incoming(&self) -> bool {
-        [
-            ColoringType::Receive,
-            ColoringType::Change,
-            ColoringType::Issue,
-        ]
-        .contains(&self.r#type)
+        ColoringType::INCOMING.contains(&self.r#type)
     }
 }
 

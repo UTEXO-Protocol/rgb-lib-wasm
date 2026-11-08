@@ -1009,6 +1009,32 @@ impl InMemoryDb {
         Ok(())
     }
 
+    /// Count the incoming colorings of the asset with ID `asset_id` on the TXO with index
+    /// `txo_idx`, from transfers that did not fail.
+    pub(crate) fn count_txo_incoming_asset_colorings(
+        &self,
+        txo_idx: i32,
+        asset_id: &str,
+    ) -> Result<usize, InternalError> {
+        let asset_transfers = self.asset_transfers.borrow();
+        let batch_transfers = self.batch_transfers.borrow();
+        Ok(self
+            .colorings
+            .borrow()
+            .iter()
+            .filter(|c| c.txo_idx == txo_idx && ColoringType::INCOMING.contains(&c.r#type))
+            .filter(|c| {
+                asset_transfers.iter().any(|at| {
+                    at.idx == c.asset_transfer_idx
+                        && at.asset_id.as_deref() == Some(asset_id)
+                        && batch_transfers.iter().any(|bt| {
+                            bt.idx == at.batch_transfer_idx && bt.status != TransferStatus::Failed
+                        })
+                })
+            })
+            .count())
+    }
+
     pub(crate) fn del_coloring(&self, asset_transfer_idx: i32) -> Result<(), InternalError> {
         self.colorings
             .borrow_mut()
@@ -1943,6 +1969,47 @@ mod tests {
         let items = db.iter_colorings().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].asset_transfer_idx, 20);
+    }
+
+    #[test]
+    fn test_count_txo_incoming_asset_colorings() {
+        let db = make_db();
+        let bt_ok = db
+            .set_batch_transfer(make_batch_transfer_mod(
+                TransferStatus::WaitingConfirmations,
+            ))
+            .unwrap();
+        let bt_failed = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Failed))
+            .unwrap();
+        let at = |bt, asset_id| {
+            db.set_asset_transfer(make_asset_transfer_mod(bt, asset_id))
+                .unwrap()
+        };
+        let at1 = at(bt_ok, Some("a"));
+        let at2 = at(bt_failed, Some("a"));
+        let at3 = at(bt_ok, Some("b"));
+        let at4 = at(bt_ok, None);
+        let txo1 = db.set_txo(make_txo_mod("t", 0, "1000")).unwrap();
+        let txo2 = db.set_txo(make_txo_mod("t", 1, "1000")).unwrap();
+        for (txo, at, ty) in [
+            (txo1, at1, ColoringType::Receive),
+            (txo1, at1, ColoringType::Change),
+            (txo1, at1, ColoringType::Issue),
+            (txo1, at1, ColoringType::Input),
+            (txo1, at2, ColoringType::Receive),
+            (txo1, at3, ColoringType::Receive),
+            (txo1, at4, ColoringType::Receive),
+            (txo2, at1, ColoringType::Receive),
+        ] {
+            db.set_coloring(make_coloring_mod(txo, at, ty, 1)).unwrap();
+        }
+
+        // inputs, failed transfers and other assets do not count
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "a").unwrap(), 3);
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo2, "a").unwrap(), 1);
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "b").unwrap(), 1);
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "c").unwrap(), 0);
     }
 
     // ── Media ──────────────────────────────────────────────────────

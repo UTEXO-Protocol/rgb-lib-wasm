@@ -173,12 +173,14 @@ use rgbstd::{
 };
 #[cfg(feature = "esplora")]
 use rgbstd::{
-    Assign, AssignmentType, KnownTransition, OpId,
+    Assign, AssignmentType, KnownTransition, OpId, TransitionBundle,
     containers::{CheckedClaimResolver, Consignment, PendingConsignment, WitnessBundle},
     contract::SchemaWrapper,
     txout::TxPtr,
     validation::{OpsDag, Validity, Warning},
 };
+#[cfg(all(test, feature = "esplora"))]
+use rgbstd::{RevealedValue, TypedAssigns};
 #[cfg(feature = "esplora")]
 use schemata::{
     BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_MINT, TS_BURN, TS_MINT,
