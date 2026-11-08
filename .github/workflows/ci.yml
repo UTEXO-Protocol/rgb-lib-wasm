@@ -194,6 +194,11 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 3600
         run: 'wasm-pack test --headless --firefox --release --lib -- test_mint::'
 
+      - name: Run receive check tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
+
       - name: Stop regtest services
         if: always()
         working-directory: tests
