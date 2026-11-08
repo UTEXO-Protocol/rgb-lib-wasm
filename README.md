@@ -142,7 +142,7 @@ const count = await wallet.createUtxosEnd(online, signedPsbt, false);
 const nia = wallet.issueAssetNia('TICK', 'My Token', 0, [1000]);
 
 // IFA (inflatable supply)
-const ifa = wallet.issueAssetIfa('IFAT', 'Inflatable', 0, [1000], [500], undefined);
+const ifa = wallet.issueAssetIfa('IFAT', 'Inflatable', 0, [1000], [500], undefined, false, null);
 ```
 
 ### Sending RGB assets
@@ -351,8 +351,8 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
-| `issueAssetIfa(...)` | no | Issue an Inflatable Fungible Asset |
-| `issueAssetBfa(...)` | no | Issue a Bridged Fungible Asset with mint rights and no units |
+| `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight` |
+| `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight` |
 | `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
 | `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
 | `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
@@ -367,6 +367,9 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
+| `link(online, assetId, linkedToContract, feeRate, minConf)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
+| `linkBegin(online, assetId, linkedToContract, feeRate, minConf, dryRun)` | yes | Prepare link PSBT |
+| `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
 | `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
 | `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
