@@ -84,7 +84,7 @@ struct HeightResponse {
     height: u64,
 }
 
-pub async fn mine_blocks(n: u32) -> u64 {
+async fn mine_raw(n: u32) -> u64 {
     let client = reqwest::Client::new();
     let resp: MineResponse = client
         .post(format!("{}/mine", REGTEST_HELPER_URL))
@@ -96,6 +96,32 @@ pub async fn mine_blocks(n: u32) -> u64 {
         .await
         .expect("mine response parse failed");
     resp.height
+}
+
+/// Mine n blocks, then mine more until esplora's mempool is empty, so every TX the wallet
+/// broadcast is in a block.
+pub async fn mine_blocks(n: u32) -> u64 {
+    let mut h = mine_raw(n).await;
+    let client = reqwest::Client::new();
+    for _ in 0..20 {
+        wait_for_esplora_sync().await;
+        let request = client.get(format!("{}/mempool/txids", ESPLORA_URL));
+        #[cfg(target_arch = "wasm32")]
+        let request = request.fetch_cache_no_store();
+        let txids: Vec<String> = request
+            .send()
+            .await
+            .expect("mempool request failed")
+            .json()
+            .await
+            .expect("mempool response parse failed");
+        if txids.is_empty() {
+            return h;
+        }
+        sleep_ms(1000).await;
+        h = mine_raw(1).await;
+    }
+    panic!("esplora mempool did not drain");
 }
 
 pub async fn fund_address(addr: &str, amount: &str) -> String {
