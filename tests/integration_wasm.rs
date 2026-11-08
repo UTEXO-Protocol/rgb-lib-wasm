@@ -1420,3 +1420,102 @@ async fn test_go_online_other_network() {
         "a testnet wallet must be refused by a regtest indexer, got: {result:?}"
     );
 }
+
+#[wasm_bindgen_test]
+async fn test_sync_after_block_sees_new_utxo() {
+    spy_esplora_cache();
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    let addr = wallet.get_address().unwrap();
+    wallet.sync(online.clone()).await.unwrap();
+
+    fund_address(&addr, "0.001").await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    assert_eq!(
+        wallet.get_btc_balance(None, true).unwrap().vanilla.settled,
+        100_000
+    );
+
+    let modes = esplora_cache_modes();
+    assert!(
+        !modes.is_empty() && modes.iter().all(|m| m == "no-store"),
+        "esplora fetch cache modes: {modes:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_restored_wallet_inflates_after_inflation() {
+    let wd = test_wallet_data(vec![AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 5).await;
+    let ifa = wallet
+        .issue_asset_ifa(
+            "TIFA".to_string(),
+            "Test IFA".to_string(),
+            0,
+            vec![1000],
+            vec![5000],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+    let unsigned = wallet
+        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let inflate_txid = wallet
+        .inflate_end(online.clone(), signed)
+        .await
+        .unwrap()
+        .txid;
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    refresh(&mut wallet, &online).await;
+    let height = wallet
+        .get_tx_height(online.clone(), inflate_txid)
+        .await
+        .unwrap();
+
+    let states = |w: &Wallet| -> Vec<(TransferKind, TransferStatus)> {
+        w.list_transfers(AssetFilter::Id(ifa.asset_id.clone()), None)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.kind, t.status))
+            .collect()
+    };
+    let original = states(&wallet);
+    let password = "test_password_123";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    let mut restored = Wallet::new(wd).unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    assert_eq!(
+        states(&restored),
+        original,
+        "restored transfers must match the original"
+    );
+
+    let online_r = restored.go_online(go_online_options(false)).await.unwrap();
+    restored.sync(online_r.clone()).await.unwrap();
+    let r = restored
+        .inflate_begin(online_r.clone(), ifa.asset_id.clone(), vec![200], 1, 1)
+        .await;
+    assert!(
+        r.is_ok(),
+        "restored inflate_begin: {:?}; inflation tx height: {height:?}; transfers: {original:?}",
+        r.as_ref().err()
+    );
+    let signed_r = restored.sign_psbt(r.unwrap(), None).unwrap();
+    restored
+        .inflate_end(online_r.clone(), signed_r)
+        .await
+        .unwrap();
+    assert!(height.is_some(), "the inflation transaction must be mined");
+}
