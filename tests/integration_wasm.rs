@@ -1214,8 +1214,12 @@ async fn test_full_wallet_flow() {
         "BTC balance should survive backup/restore"
     );
 
-    // Restore into a fresh wallet: IFA units and inflation rights must survive
-    let mut restored = Wallet::new(wd).unwrap();
+    // Restore into a fresh wallet on an empty data directory: IFA units and inflation rights must survive
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored".to_string(),
+        ..wd
+    })
+    .unwrap();
     restored.restore_backup(&backup_bytes, password).unwrap();
     let restored_ifa = restored
         .list_assets(vec![AssetSchema::Ifa])
@@ -1494,7 +1498,11 @@ async fn test_restored_wallet_inflates_after_inflation() {
     let password = "test_password_123";
     let backup_bytes = wallet.backup(password).unwrap();
 
-    let mut restored = Wallet::new(wd).unwrap();
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored_inflate".to_string(),
+        ..wd
+    })
+    .unwrap();
     restored.restore_backup(&backup_bytes, password).unwrap();
     assert_eq!(
         states(&restored),
