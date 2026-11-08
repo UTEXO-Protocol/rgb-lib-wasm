@@ -103,6 +103,11 @@ pub enum ColoringType {
     Change = 4,
 }
 
+impl ColoringType {
+    /// The types of the colorings that assign allocations to a TXO.
+    pub(crate) const INCOMING: [Self; 3] = [Self::Receive, Self::Change, Self::Issue];
+}
+
 /// The type of an RGB recipient
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum RecipientTypeFull {
