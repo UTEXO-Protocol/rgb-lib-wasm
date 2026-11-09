@@ -703,6 +703,25 @@ mod tests {
     }
 
     #[test]
+    fn wrong_nonce_length_fails() {
+        let key = test_signing_key();
+        for nonce in ["00".to_string(), "00".repeat(BACKUP_NONCE_LENGTH + 1)] {
+            let metadata = VssEncryptionMetadata {
+                nonce,
+                ..VssEncryptionMetadata::new().unwrap()
+            };
+            assert!(matches!(
+                decrypt_data(&[], &key, &metadata, None),
+                Err(Error::InvalidBackup)
+            ));
+            assert!(matches!(
+                encrypt_data(&[], &key, &metadata, None),
+                Err(Error::InvalidBackup)
+            ));
+        }
+    }
+
+    #[test]
     fn different_salts_produce_different_keys() {
         let key = test_signing_key();
         let m1 = VssEncryptionMetadata::new().unwrap();
