@@ -4034,17 +4034,19 @@ impl Wallet {
     }
 
     /// Restore wallet state from an IndexedDB snapshot.
+    /// It changes nothing when it fails.
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
     pub fn restore_from_snapshot(
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
-        // Restore the in-memory database
-        self.database = Arc::new(snapshot.db);
+        let stock = super::idb_store::deserialize_stock(&snapshot.rgb_store)
+            .map_err(|details| Error::Internal { details })?;
 
-        // Restore BDK changeset and re-load the BDK wallet
+        // Load the BDK wallet from the changeset into a new store
         if let Some(changeset) = snapshot.bdk_changeset {
-            self.bdk_database.set_data(Some(changeset));
+            let mut bdk_database: BdkPersister = super::memory_store::MemoryStore::new();
+            bdk_database.set_data(Some(changeset));
 
             // Reconstruct descriptors (same logic as Wallet::new)
             let wdata = &self.wallet_data;
@@ -4078,10 +4080,8 @@ impl Wallet {
                     chain_net.chain_hash().to_bytes(),
                 ));
 
-            match wallet_params.load_wallet(&mut self.bdk_database) {
-                Ok(Some(wallet)) => {
-                    self.bdk_wallet = wallet;
-                }
+            let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database) {
+                Ok(Some(wallet)) => wallet,
                 Ok(None) => {
                     return Err(Error::Persistence {
                         details: s!("persisted BDK changeset did not contain a loadable wallet"),
@@ -4092,8 +4092,12 @@ impl Wallet {
                         details: format!("failed to load persisted BDK wallet: {error}"),
                     });
                 }
-            }
+            };
+            // All parts are valid. Nothing below can fail.
+            self.bdk_database = bdk_database;
+            self.bdk_wallet = bdk_wallet;
         }
+        self.database = Arc::new(snapshot.db);
 
         // Restore complete pending transfers so send_end can resume after a page reload.
         self.transfer_artifacts = snapshot.transfer_artifacts;
@@ -4107,8 +4111,6 @@ impl Wallet {
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
 
-        let stock = super::idb_store::deserialize_stock(&snapshot.rgb_store)
-            .map_err(|details| Error::Internal { details })?;
         *self.rgb_stock.borrow_mut() = Some(stock);
 
         Ok(())
