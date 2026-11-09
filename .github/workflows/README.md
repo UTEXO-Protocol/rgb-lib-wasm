@@ -13,19 +13,19 @@ Builds WASM package and publishes to npm as `@utexo/rgb-lib-wasm`.
 
 - **Trigger**: manual (`workflow_dispatch`)
 - **Input**: `version` (e.g. `0.3.0-beta.4`)
-- **What it does**: `wasm-pack build` → set version → `npm publish` → GitHub Release
-- **Intended branch**: `master`
+- **What it does**: checks → `wasm-pack build --locked` → set version → GitHub Release and tag → `npm publish --provenance`
+- **Checks**: runs from `master` only, the tag must be new, and CI must have passed on the commit
 - **npm tag**: `latest` (default)
 
 ## release-dev.yml — Dev Release
 
-Same as production but with a custom suffix for testing.
+Same as production, with a custom suffix for testing.
 
 - **Trigger**: manual (`workflow_dispatch`)
 - **Inputs**: `version` (e.g. `0.3.0-beta.4`) + `suffix` (e.g. `test1`)
 - **Published version**: `0.3.0-beta.4.test1`
-- **npm tag**: value of `suffix` (not `latest`)
-- **Intended branch**: `dev` or any feature branch
+- **npm tag**: `dev` (not `latest`)
+- **Checks**: any branch; the tag must be new, and CI must have passed on the commit
 
 ### Example
 

@@ -12,28 +12,68 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Build WASM (dev)
+  verify:
+    name: Verify release (dev)
     runs-on: ubuntu-latest
-
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      full_version: ${{ steps.version.outputs.full_version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Get full version
         id: version
+        env:
+          RAW: ${{ inputs.version }}
+          RAW_SUFFIX: ${{ inputs.suffix }}
         run: |
-          RAW="${{ inputs.version }}"
           BASE="${RAW#v}"
-          SUFFIX="$(echo '${{ inputs.suffix }}' | tr '-' '.')"
+          SUFFIX="$(echo "$RAW_SUFFIX" | tr '-' '.')"
           if [[ "$BASE" == *-* ]]; then
             FULL_VERSION="${BASE}.${SUFFIX}"
           else
             FULL_VERSION="${BASE}-${SUFFIX}"
           fi
-          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+          if ! [[ "$FULL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.]+$ ]]; then
+            echo "::error::Invalid version: $FULL_VERSION"
+            exit 1
+          fi
+          echo "full_version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$FULL_VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $FULL_VERSION"
+
+      - name: Check that the tag is new
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG exists"
+            exit 1
+          fi
+
+      - name: Check that CI passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
+          if [ "$RUNS" = 0 ]; then
+            echo "::error::No successful CI run on $GITHUB_SHA"
+            exit 1
+          fi
+
+  build:
+    name: Build WASM (dev)
+    needs: verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,21 +81,24 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        run: cargo install wasm-pack@0.14.0
+        run: cargo install wasm-pack@0.14.0 --locked
 
       - name: Build WASM package
         working-directory: bindings/wasm
-        run: wasm-pack build --target web --out-dir pkg
+        run: wasm-pack build --target web --out-dir pkg -- --locked
 
       - name: Set package version and name
         working-directory: bindings/wasm/pkg
+        env:
+          VERSION: ${{ needs.verify.outputs.full_version }}
         run: |
-          VERSION="${{ steps.version.outputs.full_version }}"
           node -e "
             const pkg = require('./package.json');
             pkg.name = '@utexo/rgb-lib-wasm';
-            pkg.version = '$VERSION';
-            pkg.repository = { type: 'git', url: 'https://github.com/UTEXO-Protocol/rgb-lib-wasm.git' };
+            pkg.version = process.env.VERSION;
+            pkg.repository = { type: 'git', url: 'git+https://github.com/UTEXO-Protocol/rgb-lib-wasm.git' };
+            // wasm-pack does not list the inline JS snippets, which the bindings import.
+            if (require('fs').existsSync('snippets') && !pkg.files.includes('snippets')) pkg.files.push('snippets');
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
           "
           cat package.json
@@ -63,56 +106,65 @@ jobs:
       - name: Copy README into package
         run: cp README.md bindings/wasm/pkg/README.md
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rgb-lib-wasm-pkg
+          path: bindings/wasm/pkg
+          retention-days: 5
+
+  release:
+    name: Create GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Release ${{ needs.verify.outputs.tag }} (dev)
+          body: |
+            ## rgb-lib-wasm ${{ needs.verify.outputs.tag }} (dev build)
+
+            Branch: `${{ github.ref_name }}`
+
+            ### Installation
+
+            ```bash
+            npm install @utexo/rgb-lib-wasm@${{ needs.verify.outputs.full_version }}
+            ```
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish to npm with dev tag
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rgb-lib-wasm-pkg
+          path: pkg
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Publish to npm with dev tag
-        working-directory: bindings/wasm/pkg
-        run: npm publish --access public --tag ${{ inputs.suffix }}
+      - name: Publish
+        working-directory: pkg
+        run: npm publish --access public --provenance --tag dev
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  release:
-    name: Create GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Get full version
-        id: version
-        run: |
-          RAW="${{ inputs.version }}"
-          BASE="${RAW#v}"
-          SUFFIX="$(echo '${{ inputs.suffix }}' | tr '-' '.')"
-          if [[ "$BASE" == *-* ]]; then
-            FULL_VERSION="${BASE}.${SUFFIX}"
-          else
-            FULL_VERSION="${BASE}-${SUFFIX}"
-          fi
-          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$FULL_VERSION" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Release ${{ steps.version.outputs.tag }} (dev)
-          body: |
-            ## rgb-lib-wasm ${{ steps.version.outputs.tag }} (dev build)
-            
-            Branch: `${{ github.ref_name }}`
-            
-            ### Installation
-            
-            ```bash
-            npm install @utexo/rgb-lib-wasm@${{ steps.version.outputs.full_version }}
-            ```
-          draft: false
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
