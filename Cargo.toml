@@ -38,7 +38,7 @@ sha2 = { version = "0.11", default-features = false }
 x25519-dalek = { version = "3", default-features = false, features = [
     "static_secrets",
 ] }
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 esplora-client = { version = "0.12", default-features = false, features = [
     "async-https",
 ] }

@@ -2,7 +2,7 @@
 //!
 //! Each test simulates a browser reload by:
 //! 1. Performing operations on a wallet
-//! 2. Explicitly flushing the wallet to IndexedDB
+//! 2. Saving the wallet to IndexedDB, by flush or by the call itself
 //! 3. Dropping the wallet
 //! 4. Restoring through the production IndexedDB API
 //! 5. Verifying state survived
@@ -17,7 +17,9 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::idb_store::{load_snapshot, save_snapshot};
-use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
+use rgb_lib_wasm::wallet::{
+    AssetFilter, DatabaseType, Online, Recipient, Wallet, WalletData, WitnessData,
+};
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferStatus, generate_keys,
 };
@@ -227,6 +229,13 @@ async fn test_address_reuse_persists_across_reload() {
     let mut wallet = Wallet::new(wd.clone()).unwrap();
     let addr_initial = wallet.get_address().unwrap();
     assert!(addr_initial.starts_with("bcrt1"));
+    // get_address saves the pinned index with no flush
+    sleep_ms(3000).await;
+    let stored = load_snapshot(&wallet.idb_key()).await.unwrap().unwrap();
+    assert_eq!(
+        stored.reuse_address_index.get(&KeychainKind::Internal),
+        None
+    );
 
     // Same address on repeated calls
     assert_eq!(addr_initial, wallet.get_address().unwrap());
@@ -235,12 +244,22 @@ async fn test_address_reuse_persists_across_reload() {
     let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
     assert_ne!(addr_initial, rotated);
     assert_eq!(rotated, wallet.get_address().unwrap());
+    // rotate_address saves the pinned index with no flush
+    sleep_ms(3000).await;
+    let stored = load_snapshot(&wallet.idb_key()).await.unwrap().unwrap();
+    assert_eq!(
+        stored.reuse_address_index.get(&KeychainKind::Internal),
+        Some(&1)
+    );
 
     // Simulate browser refresh
     let mut wallet = simulate_reload(wallet, &wd).await;
 
     // After reload, rotated address should be preserved
     let addr_after_reload = wallet.get_address().unwrap();
+    // the flush writes a newer snapshot, so the queue skips the save of get_address
+    wallet.flush().await.unwrap();
+    sleep_ms(1000).await;
     assert_eq!(
         rotated, addr_after_reload,
         "rotated address must survive page reload"
@@ -253,6 +272,11 @@ async fn test_address_reuse_persists_across_reload() {
     let rotated2 = wallet.rotate_address(KeychainKind::Internal).unwrap();
     assert_ne!(addr_after_reload, rotated2);
     assert_eq!(rotated2, wallet.get_address().unwrap());
+
+    // the queued saves older than the flush are skipped, not errors
+    wallet.flush().await.unwrap();
+    sleep_ms(3000).await;
+    wallet.get_address().unwrap();
 }
 
 /// Test: Address reuse pinned index survives encrypted backup + restore.
@@ -351,6 +375,9 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
         after_full_scan.vanilla.settled, funded_balance.vanilla.settled,
         "full_scan recovers the BTC balance"
     );
+    // full_scan saves the balance with no flush
+    let (mut saved, _) = saved_wallet(&thin).await;
+    assert_eq!(saved.get_btc_balance(None, true).unwrap(), after_full_scan);
 }
 
 /// Test: BDK wallet state (BTC balance) survives page reload.
@@ -471,8 +498,9 @@ async fn test_persistence_across_reload() {
     assert!(!send_result.txid.is_empty());
 
     // === Section 3: Signed PSBT survives reload during send ===
-    // Reload wallet A after send_end but before refresh
-    let mut wallet = simulate_reload(wallet, &wd_a).await;
+    // Reload wallet A after send_end but before refresh, with no flush
+    drop(wallet);
+    let mut wallet = Wallet::restore(wd_a.clone()).await.unwrap();
     let online = wallet.go_online(go_online_options(true)).await.unwrap();
     wallet.sync(online.clone()).await.unwrap();
 
@@ -555,8 +583,10 @@ async fn test_persistence_across_reload() {
         "Transfers should exist after backup restore"
     );
 
-    // Reload again: state should survive (Bug 3 regression)
-    let mut reloaded = simulate_reload(fresh_wallet, &wd_restored).await;
+    // Reload again with no flush: restore_backup saves the state
+    sleep_ms(3000).await;
+    drop(fresh_wallet);
+    let mut reloaded = Wallet::restore(wd_restored.clone()).await.unwrap();
     reloaded.go_online(go_online_options(true)).await.unwrap();
 
     let transfers_after_reload = reloaded.list_transfers(AssetFilter::NoAsset, None).unwrap();
@@ -643,7 +673,6 @@ async fn test_received_contract_survives_reload() {
     rpc_fail(PROXY_URL, "ack.post");
     let _ = wallet_b.refresh(online_b, None, vec![], false).await;
     clear_rpc_hooks();
-    wallet_b.flush().await.unwrap();
     drop(wallet_b);
 
     // after a reload the cached consignment completes the receive, with no download
@@ -752,4 +781,249 @@ async fn test_initiated_send_completes_after_reload() {
         .unwrap();
     settle(&mut wallet_b, &online_b, &[receive.recipient_id.clone()]).await;
     wallet_a.flush().await.unwrap();
+}
+
+/// Settled balance of a NIA asset; 0 when the wallet does not know the asset.
+fn settled_nia(wallet: &Wallet, asset_id: &str) -> u64 {
+    wallet
+        .list_assets(vec![AssetSchema::Nia])
+        .unwrap()
+        .nia
+        .unwrap_or_default()
+        .iter()
+        .find(|a| a.asset_id == asset_id)
+        .map_or(0, |a| a.balance.settled)
+}
+
+/// Send 100 NIA units from a new sender to a new receiver up to the sender's send_end.
+/// Return the receiver, its Online, the recipient id and the asset id.
+async fn incoming_nia(case: &str) -> (Wallet, Online, String, String) {
+    let now = js_sys::Date::now();
+    let keys_a = generate_keys(BitcoinNetwork::Regtest);
+    let keys_b = generate_keys(BitcoinNetwork::Regtest);
+    let wd_a = test_wallet_data(
+        &keys_a,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-{case}-a-{now}"),
+    );
+    let wd_b = test_wallet_data(
+        &keys_b,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-{case}-b-{now}"),
+    );
+    let mut a = Wallet::new(wd_a).unwrap();
+    let mut b = Wallet::new(wd_b).unwrap();
+    let online_a = a.go_online(go_online_options(false)).await.unwrap();
+    let online_b = b.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut a, &online_a, "1.0").await;
+    create_utxos(&mut a, &online_a, 5).await;
+    let asset = a
+        .issue_asset_nia("INC".into(), "Incoming".into(), 0, vec![1000])
+        .unwrap();
+    let rid = witness_rcv(
+        &mut b,
+        &online_b,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport_endpoint()],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![utils::recipient(&rid, 100, Some(2000), PROXY_URL)],
+    )]);
+    let unsigned = a
+        .send_begin(
+            online_a.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint()),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt;
+    let signed = a.sign_psbt(unsigned, None).unwrap();
+    a.send_end(online_a, signed, false).await.unwrap();
+    (b, online_b, rid, asset.asset_id)
+}
+
+/// Test: two changes in a row are both saved.
+#[wasm_bindgen_test]
+async fn test_issue_after_issue_is_saved() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-issues-{}", js_sys::Date::now()),
+    );
+    let mut wallet = Wallet::new(wd).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 2).await;
+    let one = wallet
+        .issue_asset_nia("ONE".into(), "One".into(), 0, vec![100])
+        .unwrap();
+    let two = wallet
+        .issue_asset_nia("TWO".into(), "Two".into(), 0, vec![200])
+        .unwrap();
+    sleep_ms(3000).await;
+    let (saved, _) = saved_wallet(&wallet).await;
+    let ids: Vec<String> = saved
+        .list_assets(vec![AssetSchema::Nia])
+        .unwrap()
+        .nia
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.asset_id)
+        .collect();
+    assert!(
+        ids.contains(&one.asset_id) && ids.contains(&two.asset_id),
+        "saved assets {ids:?}, issued {} and {}",
+        one.asset_id,
+        two.asset_id
+    );
+}
+
+/// Test: a sync is saved.
+#[wasm_bindgen_test]
+async fn test_synced_balance_is_saved() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-sync-{}", js_sys::Date::now()),
+    );
+    let mut wallet = Wallet::new(wd).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    let live = wallet.get_btc_balance(None, true).unwrap();
+    assert!(live.vanilla.future > 0);
+    let (mut saved, _) = saved_wallet(&wallet).await;
+    let stored = saved.get_btc_balance(None, true).unwrap();
+    assert_eq!(stored, live, "saved balance {stored:?}, live {live:?}");
+}
+
+/// Test: a refresh of an incoming transfer is saved.
+#[wasm_bindgen_test]
+async fn test_received_transfer_is_saved() {
+    let (mut b, online_b, rid, asset_id) = incoming_nia("rcv").await;
+    b.refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    let live = transfer_of(&b, &rid).status;
+    assert_eq!(live, TransferStatus::WaitingConfirmations);
+    let (saved, _) = saved_wallet(&b).await;
+    let stored = transfer_of(&saved, &rid).status;
+    assert_eq!(stored, live, "saved status {stored:?}, live {live:?}");
+    drop(saved);
+
+    settle(&mut b, &online_b, &[rid]).await;
+    let (saved, _) = saved_wallet(&b).await;
+    assert_eq!(
+        settled_nia(&saved, &asset_id),
+        100,
+        "saved balance, live {}",
+        settled_nia(&b, &asset_id)
+    );
+}
+
+/// Test: a transfer that a refused fail moves forward is saved.
+#[wasm_bindgen_test]
+async fn test_transfer_progressed_by_refused_fail_is_saved() {
+    let (mut b, online_b, rid, _) = incoming_nia("fail").await;
+    let idx = transfer_of(&b, &rid).batch_transfer_idx;
+    let res = b.fail_transfers(online_b, Some(idx), false, false).await;
+    assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+    let live = transfer_of(&b, &rid).status;
+    assert_eq!(live, TransferStatus::WaitingConfirmations);
+    let (saved, _) = saved_wallet(&b).await;
+    let stored = transfer_of(&saved, &rid).status;
+    assert_eq!(stored, live, "saved status {stored:?}, live {live:?}");
+}
+
+/// Test: a sync call returns the error of an earlier save that failed.
+#[wasm_bindgen_test]
+async fn test_failed_queued_save_is_an_error() {
+    let wd = flushed_empty_wallet("persist-qfail").await;
+    // this wallet did not load the snapshot, so IndexedDB refuses its writes
+    let mut second = Wallet::new(wd).unwrap();
+    second.get_address().unwrap();
+    sleep_ms(3000).await;
+    let res = second.get_address();
+    assert!(
+        matches!(res, Err(Error::Persistence { .. })),
+        "get_address returned {res:?} after a failed save"
+    );
+}
+
+/// Test: a backup returns its bytes when only the save fails, and the save error stays.
+#[wasm_bindgen_test]
+async fn test_backup_returns_bytes_when_save_fails() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-bfail-{}", js_sys::Date::now()),
+    );
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    wallet.flush().await.unwrap();
+    let key = wallet.idb_key();
+    let mut own = load_snapshot(&key).await.unwrap().unwrap();
+    // another wallet saves, so IndexedDB refuses the writes of this one
+    Wallet::restore(wd).await.unwrap().flush().await.unwrap();
+    wallet.get_address().unwrap();
+    sleep_ms(3000).await;
+    let res = wallet.backup("pw");
+    assert!(res.is_ok(), "backup returned {res:?} after a failed save");
+    assert!(!wallet.backup_info().unwrap(), "backup time did not move");
+    assert!(
+        wallet.last_save_error().is_some(),
+        "backup cleared the save error"
+    );
+    let res = wallet.get_address();
+    assert!(
+        matches!(res, Err(Error::Persistence { .. })),
+        "get_address returned {res:?} after a failed save"
+    );
+
+    // put back a snapshot of this wallet, so its next save commits
+    let stored = load_snapshot(&key).await.unwrap().unwrap();
+    own.sequence = stored.sequence + 1;
+    save_snapshot(&key, &own, Some((stored.writer, stored.sequence)))
+        .await
+        .unwrap();
+    wallet.flush().await.unwrap();
+    assert_eq!(wallet.last_save_error(), None);
+}
+
+/// Test: an async call returns the error of its failed save.
+#[wasm_bindgen_test]
+async fn test_failed_save_of_an_async_call_is_an_error() {
+    let wd = flushed_empty_wallet("persist-afail").await;
+    // this wallet did not load the snapshot, so IndexedDB refuses its writes
+    let mut second = Wallet::new(wd).unwrap();
+    let online = second.go_online(go_online_options(false)).await.unwrap();
+    let res = second
+        .witness_receive(
+            Some(online),
+            None,
+            Assignment::Fungible(100),
+            default_rcv_expiration(),
+            vec![transport_endpoint()],
+            1,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(res, Err(Error::Persistence { .. })),
+        "witness_receive returned {res:?} with a failed save"
+    );
 }
