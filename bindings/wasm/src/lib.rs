@@ -138,6 +138,12 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Return the error of the last failed IndexedDB save, until a save commits.
+    #[wasm_bindgen(js_name = "lastSaveError")]
+    pub fn last_save_error(&self) -> Option<String> {
+        self.inner.borrow().last_save_error()
+    }
+
     /// Return the WalletData as a JS object.
     #[wasm_bindgen(js_name = "getWalletData")]
     pub fn get_wallet_data(&self) -> Result<JsValue, JsValue> {

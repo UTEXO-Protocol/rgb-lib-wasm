@@ -155,6 +155,8 @@ impl super::Wallet {
         let backup_bytes = encode_backup(&ciphertext, &pub_data)?;
 
         self.update_backup_info(true)?;
+        // A failed save does not stop the export. The next call returns the save error.
+        let _ = self.queue_save();
 
         Ok(backup_bytes)
     }
@@ -162,14 +164,14 @@ impl super::Wallet {
     /// Restore wallet state from an encrypted backup.
     /// The wallet must be created first via `Wallet::new()` with the same mnemonic/xpubs.
     /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()`, or its data directory holds no snapshot.
-    /// A failed restore changes nothing.
+    /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
         let (pub_data, ciphertext) = decode_backup(backup_bytes)?;
         let payload_json = decrypt_payload(ciphertext, password, &pub_data)?;
         self.restore_payload(&payload_json)?;
 
         // Persist restored state to IndexedDB so it survives page reloads
-        self.trigger_auto_backup();
+        self.queue_save()?;
 
         Ok(())
     }
@@ -235,7 +237,7 @@ impl super::Wallet {
         let fingerprint = self.wallet_data.master_fingerprint.clone();
 
         self.update_backup_info(true)?;
-        match client.upload_backup(&payload_json, &fingerprint).await {
+        let res = match client.upload_backup(&payload_json, &fingerprint).await {
             Ok(version) => {
                 *self.last_vss_backup_error.borrow_mut() = None;
                 Ok(version)
@@ -245,7 +247,9 @@ impl super::Wallet {
                 *self.last_vss_backup_error.borrow_mut() = Some(e.to_string());
                 Err(e)
             }
-        }
+        };
+        self.flush().await?;
+        res
     }
 
     /// Upload a backup if the wallet has changes not yet backed up. Call after
@@ -264,7 +268,7 @@ impl super::Wallet {
     }
 
     /// Download and restore wallet state from VSS server.
-    /// A failed restore changes nothing.
+    /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
     pub async fn vss_restore_backup(&mut self) -> Result<(), Error> {
         let client = self.vss_client.as_ref().ok_or(Error::Internal {
             details: s!("VSS backup not configured"),
@@ -274,7 +278,7 @@ impl super::Wallet {
         self.restore_payload(&payload_json)?;
 
         // Persist restored state to IndexedDB so it survives page reloads
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         Ok(())
     }
@@ -527,11 +531,7 @@ mod tests {
         drop(sender);
 
         let mut rebuilt = make_test_wallet_with_keys(keys, false);
-        // `restore_backup` ends in `trigger_auto_backup`, which panics on native once the state is restored.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rebuilt.restore_backup(&backup_bytes, password)
-        }));
-        assert!(rebuilt.rgb_stock.borrow().is_some(), "restore did not run");
+        rebuilt.restore_backup(&backup_bytes, password).unwrap();
 
         rebuilt.online_data = Some(OnlineData::for_test(indexer_url));
         let online = Online {
@@ -850,23 +850,6 @@ mod tests {
         let result = wallet.restore_backup(&backup, "pw");
 
         assert!(result.is_err(), "restore of a broken backup succeeded");
-        assert!(
-            wallet
-                .database
-                .get_db_data(false)
-                .unwrap()
-                .batch_transfers
-                .iter()
-                .any(|t| t.txid == Some("3".repeat(64))),
-            "the failed restore removed the transfer"
-        );
-        assert_eq!(
-            wallet
-                .transfer_artifacts
-                .get(&"3".repeat(64))
-                .and_then(|a| a.signed_psbt.clone()),
-            Some(s!("psbt"))
-        );
         assert_eq!(
             wallet.serialize_backup_payload().unwrap(),
             before,

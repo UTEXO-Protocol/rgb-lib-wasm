@@ -229,6 +229,13 @@ async fn test_address_reuse_persists_across_reload() {
     let mut wallet = Wallet::new(wd.clone()).unwrap();
     let addr_initial = wallet.get_address().unwrap();
     assert!(addr_initial.starts_with("bcrt1"));
+    // get_address saves the pinned index with no flush
+    sleep_ms(3000).await;
+    let stored = load_snapshot(&wallet.idb_key()).await.unwrap().unwrap();
+    assert_eq!(
+        stored.reuse_address_index.get(&KeychainKind::Internal),
+        None
+    );
 
     // Same address on repeated calls
     assert_eq!(addr_initial, wallet.get_address().unwrap());
@@ -237,12 +244,22 @@ async fn test_address_reuse_persists_across_reload() {
     let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
     assert_ne!(addr_initial, rotated);
     assert_eq!(rotated, wallet.get_address().unwrap());
+    // rotate_address saves the pinned index with no flush
+    sleep_ms(3000).await;
+    let stored = load_snapshot(&wallet.idb_key()).await.unwrap().unwrap();
+    assert_eq!(
+        stored.reuse_address_index.get(&KeychainKind::Internal),
+        Some(&1)
+    );
 
     // Simulate browser refresh
     let mut wallet = simulate_reload(wallet, &wd).await;
 
     // After reload, rotated address should be preserved
     let addr_after_reload = wallet.get_address().unwrap();
+    // the flush writes a newer snapshot, so the queue skips the save of get_address
+    wallet.flush().await.unwrap();
+    sleep_ms(1000).await;
     assert_eq!(
         rotated, addr_after_reload,
         "rotated address must survive page reload"
@@ -255,6 +272,11 @@ async fn test_address_reuse_persists_across_reload() {
     let rotated2 = wallet.rotate_address(KeychainKind::Internal).unwrap();
     assert_ne!(addr_after_reload, rotated2);
     assert_eq!(rotated2, wallet.get_address().unwrap());
+
+    // the queued saves older than the flush are skipped, not errors
+    wallet.flush().await.unwrap();
+    sleep_ms(3000).await;
+    wallet.get_address().unwrap();
 }
 
 /// Test: Address reuse pinned index survives encrypted backup + restore.
@@ -353,6 +375,9 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
         after_full_scan.vanilla.settled, funded_balance.vanilla.settled,
         "full_scan recovers the BTC balance"
     );
+    // full_scan saves the balance with no flush
+    let (mut saved, _) = saved_wallet(&thin).await;
+    assert_eq!(saved.get_btc_balance(None, true).unwrap(), after_full_scan);
 }
 
 /// Test: BDK wallet state (BTC balance) survives page reload.
@@ -473,8 +498,9 @@ async fn test_persistence_across_reload() {
     assert!(!send_result.txid.is_empty());
 
     // === Section 3: Signed PSBT survives reload during send ===
-    // Reload wallet A after send_end but before refresh
-    let mut wallet = simulate_reload(wallet, &wd_a).await;
+    // Reload wallet A after send_end but before refresh, with no flush
+    drop(wallet);
+    let mut wallet = Wallet::restore(wd_a.clone()).await.unwrap();
     let online = wallet.go_online(go_online_options(true)).await.unwrap();
     wallet.sync(online.clone()).await.unwrap();
 
@@ -557,8 +583,10 @@ async fn test_persistence_across_reload() {
         "Transfers should exist after backup restore"
     );
 
-    // Reload again: state should survive (Bug 3 regression)
-    let mut reloaded = simulate_reload(fresh_wallet, &wd_restored).await;
+    // Reload again with no flush: restore_backup saves the state
+    sleep_ms(3000).await;
+    drop(fresh_wallet);
+    let mut reloaded = Wallet::restore(wd_restored.clone()).await.unwrap();
     reloaded.go_online(go_online_options(true)).await.unwrap();
 
     let transfers_after_reload = reloaded.list_transfers(AssetFilter::NoAsset, None).unwrap();
@@ -645,7 +673,6 @@ async fn test_received_contract_survives_reload() {
     rpc_fail(PROXY_URL, "ack.post");
     let _ = wallet_b.refresh(online_b, None, vec![], false).await;
     clear_rpc_hooks();
-    wallet_b.flush().await.unwrap();
     drop(wallet_b);
 
     // after a reload the cached consignment completes the receive, with no download
@@ -935,6 +962,46 @@ async fn test_failed_queued_save_is_an_error() {
         matches!(res, Err(Error::Persistence { .. })),
         "get_address returned {res:?} after a failed save"
     );
+}
+
+/// Test: a backup returns its bytes when only the save fails, and the save error stays.
+#[wasm_bindgen_test]
+async fn test_backup_returns_bytes_when_save_fails() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-bfail-{}", js_sys::Date::now()),
+    );
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    wallet.flush().await.unwrap();
+    let key = wallet.idb_key();
+    let mut own = load_snapshot(&key).await.unwrap().unwrap();
+    // another wallet saves, so IndexedDB refuses the writes of this one
+    Wallet::restore(wd).await.unwrap().flush().await.unwrap();
+    wallet.get_address().unwrap();
+    sleep_ms(3000).await;
+    let res = wallet.backup("pw");
+    assert!(res.is_ok(), "backup returned {res:?} after a failed save");
+    assert!(!wallet.backup_info().unwrap(), "backup time did not move");
+    assert!(
+        wallet.last_save_error().is_some(),
+        "backup cleared the save error"
+    );
+    let res = wallet.get_address();
+    assert!(
+        matches!(res, Err(Error::Persistence { .. })),
+        "get_address returned {res:?} after a failed save"
+    );
+
+    // put back a snapshot of this wallet, so its next save commits
+    let stored = load_snapshot(&key).await.unwrap().unwrap();
+    own.sequence = stored.sequence + 1;
+    save_snapshot(&key, &own, Some((stored.writer, stored.sequence)))
+        .await
+        .unwrap();
+    wallet.flush().await.unwrap();
+    assert_eq!(wallet.last_save_error(), None);
 }
 
 /// Test: an async call returns the error of its failed save.

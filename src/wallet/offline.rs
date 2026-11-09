@@ -1284,7 +1284,7 @@ pub struct Wallet {
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
-    pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) idb_queue: std::rc::Rc<super::idb_store::SaveQueue>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Random id of this object in stored snapshots.
     pub(crate) idb_writer: u64,
@@ -1451,7 +1451,7 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
-            idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idb_queue: Default::default(),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer,
             idb_loaded: None,
@@ -2116,7 +2116,7 @@ impl Wallet {
         let asset = AssetNIA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.queue_save()?;
 
         info!(self.logger, "Issue asset NIA completed");
         Ok(asset)
@@ -2364,7 +2364,7 @@ impl Wallet {
         let asset = AssetIFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.queue_save()?;
 
         info!(self.logger, "Issue asset IFA completed");
         Ok(asset)
@@ -2577,7 +2577,7 @@ impl Wallet {
         let asset = AssetBFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.queue_save()?;
 
         info!(self.logger, "Issue asset BFA completed");
         Ok(asset)
@@ -2730,7 +2730,7 @@ impl Wallet {
 
         if transfers_changed {
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
+            self.queue_save()?;
         }
 
         info!(self.logger, "Delete transfer completed");
@@ -3073,7 +3073,7 @@ impl Wallet {
                 ..Default::default()
             })?;
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.queue_save()?;
         info!(self.logger, "Abort pending vanilla TX completed");
         Ok(())
     }
@@ -3744,7 +3744,7 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Blind receive completed");
         Ok(ReceiveData {
@@ -3815,7 +3815,7 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Witness receive completed");
         Ok(ReceiveData {
@@ -3856,8 +3856,8 @@ impl Wallet {
 
         if !self.wallet_data.reuse_addresses {
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
         }
+        self.queue_save()?;
 
         info!(self.logger, "Get address completed");
         Ok(address.to_string())
@@ -3882,7 +3882,7 @@ impl Wallet {
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         let address = self.bdk_wallet.peek_address(keychain, new_index).address;
 
-        self.trigger_auto_backup();
+        self.queue_save()?;
 
         Ok(address.to_string())
     }
@@ -3949,9 +3949,29 @@ impl Wallet {
         self.wallet_dir.to_string_lossy().to_string()
     }
 
-    /// Trigger an async save of wallet state to IndexedDB.
-    pub(crate) fn trigger_auto_backup(&self) {
-        self.save_to_idb();
+    /// Return the error of the last failed IndexedDB save, until a save commits.
+    pub fn last_save_error(&self) -> Option<String> {
+        self.idb_queue.failed()
+    }
+
+    /// Queue a save of the current state and return before the write.
+    /// Return an error when an earlier save failed and no save since has committed.
+    /// The change stays in memory and its save is queued again.
+    pub(crate) fn queue_save(&self) -> Result<(), Error> {
+        if cfg!(not(target_arch = "wasm32")) {
+            return Ok(());
+        }
+        let failed = self.idb_queue.failed();
+        let snapshot = self.snapshot()?;
+        let queue = self.idb_queue.clone();
+        let key = self.idb_key();
+        let loaded = self.idb_loaded;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = queue.write(&key, &snapshot, loaded).await {
+                web_sys::console::error_1(&format!("IDB save error: {e}").into());
+            }
+        });
+        failed.map_or(Ok(()), |details| Err(Error::Persistence { details }))
     }
 
     pub(crate) fn snapshot(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
@@ -3993,44 +4013,16 @@ impl Wallet {
     /// not persist dependent application state until this method succeeds. A failure leaves the
     /// current in-memory wallet state intact and may be retried.
     /// It fails when IndexedDB is not written.
+    /// Resolve when this save or a newer one has committed.
     pub async fn flush(&self) -> Result<(), Error> {
+        if cfg!(not(target_arch = "wasm32")) {
+            return Ok(());
+        }
         let snapshot = self.snapshot()?;
-        super::idb_store::save_snapshot(&self.idb_key(), &snapshot, self.idb_loaded)
+        self.idb_queue
+            .write(&self.idb_key(), &snapshot, self.idb_loaded)
             .await
             .map_err(|details| Error::Persistence { details })
-    }
-
-    /// Save current wallet state to IndexedDB asynchronously via spawn_local.
-    fn save_to_idb(&self) {
-        use std::sync::atomic::Ordering;
-
-        // Debounce: skip if a save is already in progress
-        if self
-            .idb_save_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        let snapshot = match self.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                web_sys::console::error_1(&error.to_string().into());
-                self.idb_save_in_progress.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-        let key = self.idb_key();
-        let flag = self.idb_save_in_progress.clone();
-        let loaded = self.idb_loaded;
-
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = super::idb_store::save_snapshot(&key, &snapshot, loaded).await {
-                web_sys::console::error_1(&format!("IDB save error: {e}").into());
-            }
-            flag.store(false, Ordering::SeqCst);
-        });
     }
 
     /// Restore wallet state from an IndexedDB snapshot.
@@ -4196,7 +4188,7 @@ pub(crate) mod address_reuse_tests {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
-            idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idb_queue: Default::default(),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer: 0,
             idb_loaded: None,

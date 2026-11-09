@@ -172,6 +172,11 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 600
         run: wasm-pack test --headless --firefox --release --test receive_wasm
 
+      - name: Run persistence tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: wasm-pack test --headless --firefox --release --test persistence_wasm
+
       - name: Run send tests
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 3600

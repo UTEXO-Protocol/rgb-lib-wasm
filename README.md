@@ -114,7 +114,21 @@ RGB mutation only after the flush succeeds. A failed flush leaves the current
 in-memory wallet state intact and can be retried. A flush that writes nothing
 fails. A wallet saves over a stored snapshot only if it loaded that snapshot
 through `create()` or `Wallet::restore()`, or wrote it itself. A wallet built with
-`new` on a data directory that holds a snapshot cannot save.
+`new` on a data directory that holds a snapshot cannot save: its saves fail and
+its calls return a persistence error.
+
+Every call that changes the wallet saves it. Saves are written in order, and
+none is dropped. An async call returns after its save commits, and returns a
+persistence error if the save fails. `sync`, `full_scan`, `refresh`,
+`fail_transfers` and the begins that sync first also save when they keep a
+change and then fail. `backup` and `vss_backup` save the backup time. A sync call
+(`issue_asset_*`, `get_address`, `rotate_address`, `delete_transfers`,
+`abort_pending_vanilla_tx`, `restore_backup`) queues its save
+and returns before the write. It returns a persistence error when an earlier save
+failed and no save since has committed. Its change stays in memory and its save
+is queued again. Await `flush()` to know that the state is stored.
+`backup` returns its bytes also when a save failed. `lastSaveError()` returns
+the error of the last failed save, until a save commits.
 
 Lightning-specific `consume_fascia` and `color_psbt_and_consume` operations
 await this durable commit before returning success.

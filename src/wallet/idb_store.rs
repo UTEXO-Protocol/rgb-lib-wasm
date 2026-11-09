@@ -111,6 +111,43 @@ pub async fn save_snapshot(
     Ok(())
 }
 
+/// Writes the snapshots of one wallet to IndexedDB in turn.
+#[derive(Default)]
+pub(crate) struct SaveQueue {
+    turn: tokio::sync::Mutex<()>,
+    /// Newest sequence written.
+    written: std::cell::Cell<u64>,
+    /// Error of the last write, until a write commits.
+    failed: std::cell::RefCell<Option<String>>,
+}
+
+impl SaveQueue {
+    /// Write the snapshot after the writes before it.
+    /// Skip a snapshot older than one written: that one holds its state.
+    pub(crate) async fn write(
+        &self,
+        key: &str,
+        snapshot: &WalletSnapshot,
+        loaded: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        let _turn = self.turn.lock().await;
+        if snapshot.sequence <= self.written.get() {
+            return Ok(());
+        }
+        let res = save_snapshot(key, snapshot, loaded).await;
+        if res.is_ok() {
+            self.written.set(snapshot.sequence);
+        }
+        *self.failed.borrow_mut() = res.clone().err();
+        res
+    }
+
+    /// Error of a write that no later write has fixed.
+    pub(crate) fn failed(&self) -> Option<String> {
+        self.failed.borrow().clone()
+    }
+}
+
 /// Serialize the RGB store of a stock to base64 for snapshot persistence.
 pub(crate) fn serialize_stock(stock: &MemStock) -> Option<String> {
     use base64::{Engine as _, engine::general_purpose};

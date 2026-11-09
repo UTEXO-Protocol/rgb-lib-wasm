@@ -328,6 +328,12 @@ async fn send_end_retry_after_post_failure() {
             .iter()
             .all(|t| t.status == TransferStatus::Failed)
     );
+    // fail_transfers saves the failed status
+    let (saved, _) = saved_wallet(&wallet).await;
+    let stored = sends(&saved, &txid);
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|t| t.status == TransferStatus::Failed));
+    drop(saved);
     fail_posts(":3010", false);
     assert_eq!(
         end(&mut wallet, &online, &signed).await,
@@ -358,11 +364,16 @@ async fn send_end_retry_after_post_failure() {
             .iter()
             .all(|t| t.status == TransferStatus::Initiated && t.batch_transfer_idx == idx)
     );
-    fail_posts(":3010", false);
+    // a reload keeps the used flag of the post that succeeded, so the retry skips its proxy
+    let (reloaded, online) = saved_wallet(&wallet).await;
+    drop(wallet);
+    let mut wallet = reloaded;
+    fail_posts(":3000", true);
     assert_eq!(
         end(&mut wallet, &online, &signed).await,
         Ok((txid.clone(), idx))
     );
+    fail_posts(":3000", false);
     let saved = sends(&wallet, &txid);
     assert_eq!(saved.len(), 2);
     for t in &saved {

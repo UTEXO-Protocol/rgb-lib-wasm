@@ -2619,6 +2619,13 @@ impl Wallet {
         Ok(())
     }
 
+    /// Sync and save the state, also when the sync fails part way.
+    async fn sync_and_save(&mut self, full_scan: bool) -> Result<(), Error> {
+        let res = self.sync_db_txos(full_scan).await;
+        self.flush().await?;
+        res
+    }
+
     /// Incrementally sync the wallet and save new RGB UTXOs to the DB (wasm32 async).
     ///
     /// Re-queries only already-revealed SPKs. To rediscover UTXOs for unrevealed SPKs (e.g. a thin
@@ -2626,7 +2633,7 @@ impl Wallet {
     pub async fn sync(&mut self, online: Online) -> Result<(), Error> {
         info!(self.logger, "Syncing...");
         self.check_online(online)?;
-        self.sync_db_txos(false).await?;
+        self.sync_and_save(false).await?;
         info!(self.logger, "Sync completed");
         Ok(())
     }
@@ -2638,7 +2645,7 @@ impl Wallet {
     pub async fn full_scan(&mut self, online: Online) -> Result<(), Error> {
         info!(self.logger, "Full scanning...");
         self.check_online(online)?;
-        self.sync_db_txos(true).await?;
+        self.sync_and_save(true).await?;
         info!(self.logger, "Full scan completed");
         Ok(())
     }
@@ -2838,7 +2845,7 @@ impl Wallet {
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
         if !skip_sync {
-            self.sync_db_txos(false).await?;
+            self.sync_and_save(false).await?;
         }
 
         let unspent_txos = self.database.get_unspent_txos(vec![])?;
@@ -2948,7 +2955,7 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Create UTXOs (end) completed");
         Ok(num_utxos_created)
@@ -6018,7 +6025,17 @@ impl Wallet {
             info!(self.logger, "Refreshing assets...");
         }
         self.check_online(online)?;
+        let res = self._refresh(asset_id, filter, skip_sync).await;
+        self.flush().await?;
+        res
+    }
 
+    async fn _refresh(
+        &mut self,
+        asset_id: Option<String>,
+        filter: Vec<RefreshFilter>,
+        skip_sync: bool,
+    ) -> Result<RefreshResult, Error> {
         let mut db_data = self.database.get_db_data(false)?;
 
         if asset_id.is_some() {
@@ -6319,7 +6336,19 @@ impl Wallet {
             "Failing batch transfer with idx {:?}...", batch_transfer_idx
         );
         self.check_online(online)?;
+        let res = self
+            ._fail_transfers(batch_transfer_idx, no_asset_only, skip_sync)
+            .await;
+        self.flush().await?;
+        res
+    }
 
+    async fn _fail_transfers(
+        &mut self,
+        batch_transfer_idx: Option<i32>,
+        no_asset_only: bool,
+        skip_sync: bool,
+    ) -> Result<bool, Error> {
         if !skip_sync {
             self.sync_db_txos(false).await?;
         }
@@ -7219,7 +7248,11 @@ impl Wallet {
             .get_mut(&txid)
             .expect("artifacts checked above");
         artifacts.asset_infos = asset_infos.clone();
-        post_result?;
+        if let Err(e) = post_result {
+            // keep the used flags after a failed post
+            self.flush().await?;
+            return Err(e);
+        }
         // keep the signed PSBT for the refresh
         artifacts.signed_psbt = Some(signed_psbt.clone());
         if artifacts.inputs.is_empty() {
@@ -7268,7 +7301,7 @@ impl Wallet {
         };
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Send (end) completed");
         Ok(OperationResult {
@@ -7294,7 +7327,7 @@ impl Wallet {
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
         if !skip_sync {
-            self.sync_db_txos(false).await?;
+            self.sync_and_save(false).await?;
         }
 
         let script_pubkey = self.get_script_pubkey(&address)?;
@@ -7363,7 +7396,7 @@ impl Wallet {
         self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Send BTC (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -7399,7 +7432,7 @@ impl Wallet {
         self.check_online(online)?;
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
-        self.sync_db_txos(false).await?;
+        self.sync_and_save(false).await?;
 
         let script_pubkey = self.get_script_pubkey(&address)?;
 
@@ -7457,7 +7490,7 @@ impl Wallet {
         self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Drain (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -7682,7 +7715,7 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Inflate (end) completed");
         Ok(OperationResult {
@@ -7818,7 +7851,7 @@ impl Wallet {
             .await?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Burn (end) completed");
         Ok(res)
@@ -7921,8 +7954,8 @@ impl Wallet {
             }
         } else {
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
         }
+        self.flush().await?;
 
         Ok(begin_data)
     }
@@ -8161,7 +8194,7 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Link (end) completed");
         Ok(res)
@@ -8496,7 +8529,7 @@ impl Wallet {
                 .expect("saved by _prepare_transfer_psbt_wasm");
             self._fail_batch_transfer(&batch_transfer)?;
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
+            self.flush().await?;
             return Err(e);
         }
         self.transfer_artifacts
@@ -8511,7 +8544,7 @@ impl Wallet {
             &HashMap::from([(asset_id, consignment_hash)]),
         )?;
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         let opid = mint_opid(&fascia_from_bytes(begin_data.fascia.clone())?, contract_id).ok_or(
             Error::Internal {
@@ -8574,7 +8607,7 @@ impl Wallet {
             Err(e @ Error::MintLockExpired { .. }) => {
                 self._fail_batch_transfer(&batch_transfer)?;
                 self.update_backup_info(false)?;
-                self.trigger_auto_backup();
+                self.flush().await?;
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -8598,7 +8631,7 @@ impl Wallet {
         );
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Mint (end) completed");
         Ok(OperationResult {
@@ -8712,6 +8745,7 @@ impl Wallet {
 
         if !skip_sync {
             self.sync_db_txos(false).await?;
+            self.flush().await?;
         }
 
         let all_unspents: Vec<LocalOutput> = self.internal_unspents().collect();
