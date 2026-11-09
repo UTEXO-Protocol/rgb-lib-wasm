@@ -367,7 +367,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `listTransfers(assetId?)` | no | List RGB transfers |
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
-| `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended, aborted or failed |
+| `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
 | `abortPendingVanillaTx(txid)` | no | Fail a begun vanilla operation and release its inputs |
 | `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA |
 | `sync(online)` | yes | Sync wallet with indexer |
@@ -397,8 +397,8 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
 | `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
-| `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers and begun vanilla operations |
-| `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers and begun vanilla operations |
+| `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers and settle ended vanilla operations |
+| `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
 | `deleteTransfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
 | `signPsbt(psbt)` | no | Sign a PSBT |
 | `finalizePsbt(psbt)` | no | Finalize a signed PSBT |
