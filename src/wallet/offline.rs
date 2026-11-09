@@ -1301,6 +1301,7 @@ impl Wallet {
     ///
     /// The returned wallet is ready for use only after the IndexedDB read and snapshot
     /// restoration complete. IndexedDB and snapshot decoding failures are returned to the caller.
+    /// It asks the browser to keep the storage. A refusal does not fail the call.
     pub async fn restore(wallet_data: WalletData) -> Result<Self, Error> {
         let mut wallet = Self::new(wallet_data)?;
         let snapshot = super::idb_store::load_snapshot(&wallet.idb_key())
@@ -1313,6 +1314,7 @@ impl Wallet {
                 .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
             wallet.restore_from_snapshot(snapshot)?;
         }
+        super::idb_store::request_persistent_storage();
         Ok(wallet)
     }
 

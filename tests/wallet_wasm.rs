@@ -13,6 +13,7 @@ use rgb_lib_wasm::wallet::vss::{
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
 use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, transport_endpoint};
+use wasm_bindgen::JsValue;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -380,6 +381,71 @@ fn test_validate_consignment_result_serializes() {
     let json = serde_json::to_string(&result).unwrap();
     assert!(json.contains("\"valid\":true"));
     assert!(json.contains("test warning"));
+}
+
+fn run_js(body: &str) -> JsValue {
+    js_sys::Function::new_no_args(body)
+        .call0(&JsValue::NULL)
+        .unwrap()
+}
+
+#[wasm_bindgen_test]
+async fn test_save_uses_strict_durability() {
+    run_js(
+        "const original = IDBDatabase.prototype.transaction;
+        globalThis.__idbTransactionOriginal = original;
+        globalThis.__idbTransactions = [];
+        IDBDatabase.prototype.transaction = function (stores, mode, options) {
+            globalThis.__idbTransactions.push(`${mode}:${options && options.durability}`);
+            return original.apply(this, arguments);
+        };",
+    );
+    let wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let flushed = wallet.flush().await;
+    let transactions: Vec<String> = js_sys::Array::from(&run_js(
+        "IDBDatabase.prototype.transaction = globalThis.__idbTransactionOriginal;
+        return globalThis.__idbTransactions;",
+    ))
+    .iter()
+    .map(|t| t.as_string().unwrap())
+    .collect();
+    flushed.unwrap();
+    let saves: Vec<&String> = transactions
+        .iter()
+        .filter(|t| t.starts_with("readwrite:"))
+        .collect();
+    assert!(
+        !saves.is_empty() && saves.iter().all(|t| *t == "readwrite:strict"),
+        "{transactions:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_create_and_restore_request_persistent_storage() {
+    run_js(
+        "globalThis.__persistCalls = 0;
+        navigator.storage.persist = function () {
+            globalThis.__persistCalls += 1;
+            return Promise.resolve(false);
+        };",
+    );
+    let persist_calls = || {
+        js_sys::Reflect::get(&js_sys::global(), &"__persistCalls".into())
+            .unwrap()
+            .as_f64()
+            .unwrap()
+    };
+    let mut wallet = Wallet::restore(test_wallet_data(vec![AssetSchema::Nia]))
+        .await
+        .unwrap();
+    let after_create = persist_calls();
+    let backup = wallet.backup("password").unwrap();
+    let restored = wallet.restore_backup(&backup, "password");
+    let after_restore = persist_calls();
+    run_js("delete navigator.storage.persist;");
+    assert!(restored.is_ok(), "{restored:?}");
+    assert_eq!(after_create, 1.0);
+    assert_eq!(after_restore, 2.0);
 }
 
 // ---------------------------------------------------------------------------

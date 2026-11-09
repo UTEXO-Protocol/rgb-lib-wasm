@@ -1302,7 +1302,29 @@ async fn test_full_wallet_flow() {
     assert!(!has_test_nia(&vss_restored));
     assert_eq!(btc_total(&mut vss_restored), 0);
     vss_restored.configure_vss_backup(&vss_config);
+    // The restore asks for persistent storage
+    js_sys::Function::new_no_args(
+        "globalThis.__persistCalls = 0;
+        navigator.storage.persist = function () {
+            globalThis.__persistCalls += 1;
+            return Promise.resolve(false);
+        };",
+    )
+    .call0(&wasm_bindgen::JsValue::NULL)
+    .unwrap();
     vss_restored.vss_restore_backup().await.unwrap();
+    let persist_calls = js_sys::Reflect::get(&js_sys::global(), &"__persistCalls".into())
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    js_sys::Function::new_no_args("delete navigator.storage.persist;")
+        .call0(&wasm_bindgen::JsValue::NULL)
+        .unwrap();
+    assert_eq!(
+        persist_calls, 1.0,
+        "vss_restore_backup should request persistent storage"
+    );
+
     assert!(
         has_test_nia(&vss_restored),
         "NIA asset should survive VSS backup/restore"
