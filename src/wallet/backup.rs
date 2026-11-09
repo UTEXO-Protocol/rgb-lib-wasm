@@ -162,6 +162,7 @@ impl super::Wallet {
     /// Restore wallet state from an encrypted backup.
     /// The wallet must be created first via `Wallet::new()` with the same mnemonic/xpubs.
     /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()`, or its data directory holds no snapshot.
+    /// A failed restore changes nothing.
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
         let (pub_data, ciphertext) = decode_backup(backup_bytes)?;
         let payload_json = decrypt_payload(ciphertext, password, &pub_data)?;
@@ -263,6 +264,7 @@ impl super::Wallet {
     }
 
     /// Download and restore wallet state from VSS server.
+    /// A failed restore changes nothing.
     pub async fn vss_restore_backup(&mut self) -> Result<(), Error> {
         let client = self.vss_client.as_ref().ok_or(Error::Internal {
             details: s!("VSS backup not configured"),
