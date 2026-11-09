@@ -502,33 +502,38 @@ pub(crate) async fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, E
 pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
     use crate::wallet::online::Indexer;
     #[cfg(target_arch = "wasm32")]
-    no_store_fetch(indexer_url);
+    no_store_fetch(indexer_url, u32::from(INDEXER_TIMEOUT) * 1000);
     let opts = esplora_client::Builder::new(indexer_url).timeout(INDEXER_TIMEOUT.into());
     let client = opts.build_async_with_sleeper::<WasmSleeper>().ok()?;
     Some(Indexer::EsploraAsync(Box::new(client)))
 }
 
 // Esplora sends `cache-control: max-age`, so the browser can serve stale chain data.
-// The client cannot set the fetch cache mode. This wrapper sets `no-store` on indexer requests.
+// The client cannot set the fetch cache mode or a timeout on wasm32.
+// This wrapper sets `no-store` and a timeout on indexer requests. It compares normalized URLs.
 #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-export function no_store_fetch(base) {
+export function no_store_fetch(base, timeout_ms) {
     const g = globalThis;
     if (!g.__rgbLibNoStoreUrls) {
-        g.__rgbLibNoStoreUrls = new Set();
+        g.__rgbLibNoStoreUrls = new Map();
         const fetch = g.fetch;
         g.fetch = function (input, init) {
-            if (input instanceof Request && [...g.__rgbLibNoStoreUrls].some(p => input.url.startsWith(p))) {
-                input = new Request(input, { cache: 'no-store' });
+            const m = input instanceof Request && [...g.__rgbLibNoStoreUrls].find(([p]) => input.url.startsWith(p));
+            if (m) {
+                const signal = AbortSignal.any([input.signal, AbortSignal.timeout(m[1])]);
+                input = new Request(input, { cache: 'no-store', signal });
             }
             return fetch.call(this, input, init);
         };
     }
-    g.__rgbLibNoStoreUrls.add(base);
+    let key = base;
+    try { key = new URL(base).href; } catch (e) {}
+    g.__rgbLibNoStoreUrls.set(key, timeout_ms);
 }
 "#)]
 extern "C" {
-    fn no_store_fetch(base: &str);
+    fn no_store_fetch(base: &str, timeout_ms: u32);
 }
 
 #[cfg(feature = "esplora")]
@@ -1516,7 +1521,7 @@ mod tests {
         use super::super::no_store_fetch;
         use wasm_bindgen_test::*;
 
-        // Stub fetch, register two indexers, and record what reaches the stub.
+        // Stub fetch, register indexers, and record what reaches the stub.
         #[wasm_bindgen_test]
         async fn no_store_only_on_registered_indexers() {
             js_sys::Function::new_no_args(
@@ -1525,18 +1530,22 @@ mod tests {
             )
             .call0(&wasm_bindgen::JsValue::NULL)
             .unwrap();
-            no_store_fetch("http://indexer-a.test/api");
-            no_store_fetch("http://indexer-b.test/");
+            no_store_fetch("http://INDEXER-A.test:80/api", 10_000);
+            no_store_fetch("http://indexer-b.test/", 1);
+            no_store_fetch("not a url", 10_000);
             let out = js_sys::Function::new_no_args(
                 "return (async () => { const g = globalThis; const init = { method: 'POST', body: 'x' }; \
                  const other = new Request('http://other.test/x'); \
                  g.fetch(new Request('http://indexer-a.test/api/blocks/tip/height')); \
                  g.fetch(new Request('http://indexer-b.test/tx', { method: 'POST', body: 'tx' })); \
                  g.fetch(other); g.fetch('http://other.test/y', init); \
+                 const c = new AbortController(); g.fetch(new Request('http://indexer-a.test/api/x', { signal: c.signal })); c.abort(); \
                  const s = g.__seen; g.fetch = g.__realFetch; g.__rgbLibNoStoreUrls = g.__realUrls; \
-                 return [s.length, s[0][0].cache, s[1][0].cache, s[1][0].method, await s[1][0].text(), \
+                 const text = await s[1][0].text(); await new Promise(r => setTimeout(r, 50)); \
+                 return [s.length, s[0][0].cache, s[1][0].cache, s[1][0].method, text, \
                    s[2][0] === other && s[2][0].cache === 'default', \
-                   s[3][0] === 'http://other.test/y' && s[3][1] === init].join(); })();",
+                   s[3][0] === 'http://other.test/y' && s[3][1] === init, \
+                   s[0][0].signal.aborted, s[1][0].signal.reason.name, s[4][0].signal.reason.name].join(); })();",
             )
             .call0(&wasm_bindgen::JsValue::NULL)
             .unwrap();
@@ -1545,7 +1554,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 out.as_string().unwrap(),
-                "4,no-store,no-store,POST,tx,true,true"
+                "5,no-store,no-store,POST,tx,true,true,false,TimeoutError,AbortError"
             );
         }
     }

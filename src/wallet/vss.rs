@@ -195,6 +195,10 @@ impl WasmVssClient {
             .header("content-type", APPLICATION_OCTET_STREAM)
             .header("Authorization", auth_token)
             .body(body)
+            // VSS uses the indexer timeout.
+            .timeout(std::time::Duration::from_secs(
+                crate::utils::INDEXER_TIMEOUT.into(),
+            ))
             .send()
             .await
             .map_err(|e| VssError::Internal(format!("HTTP error: {e}")))?;
