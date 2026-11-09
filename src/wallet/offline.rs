@@ -3946,9 +3946,12 @@ impl Wallet {
         }
     }
 
-    /// Returns the IndexedDB key for this wallet (derived from wallet_dir).
+    /// Return the IndexedDB key of this wallet: its directory and its network.
     pub fn idb_key(&self) -> String {
-        self.wallet_dir.to_string_lossy().to_string()
+        self.wallet_dir
+            .join(self.wallet_data.bitcoin_network.to_string())
+            .to_string_lossy()
+            .to_string()
     }
 
     /// Return the error of the last failed IndexedDB save, until a save commits.
