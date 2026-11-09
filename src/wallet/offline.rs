@@ -2116,7 +2116,7 @@ impl Wallet {
         let asset = AssetNIA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Issue asset NIA completed");
         Ok(asset)
@@ -2364,7 +2364,7 @@ impl Wallet {
         let asset = AssetIFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Issue asset IFA completed");
         Ok(asset)
@@ -2577,7 +2577,7 @@ impl Wallet {
         let asset = AssetBFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Issue asset BFA completed");
         Ok(asset)
@@ -2730,7 +2730,7 @@ impl Wallet {
 
         if transfers_changed {
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
+            self.save_to_idb();
         }
 
         info!(self.logger, "Delete transfer completed");
@@ -3073,7 +3073,7 @@ impl Wallet {
                 ..Default::default()
             })?;
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
         info!(self.logger, "Abort pending vanilla TX completed");
         Ok(())
     }
@@ -3744,7 +3744,7 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Blind receive completed");
         Ok(ReceiveData {
@@ -3815,7 +3815,7 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Witness receive completed");
         Ok(ReceiveData {
@@ -3856,7 +3856,7 @@ impl Wallet {
 
         if !self.wallet_data.reuse_addresses {
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
+            self.save_to_idb();
         }
 
         info!(self.logger, "Get address completed");
@@ -3882,7 +3882,7 @@ impl Wallet {
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         let address = self.bdk_wallet.peek_address(keychain, new_index).address;
 
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         Ok(address.to_string())
     }
@@ -3949,11 +3949,6 @@ impl Wallet {
         self.wallet_dir.to_string_lossy().to_string()
     }
 
-    /// Trigger an async save of wallet state to IndexedDB.
-    pub(crate) fn trigger_auto_backup(&self) {
-        self.save_to_idb();
-    }
-
     pub(crate) fn snapshot(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
         let stock = self
             .rgb_stock
@@ -4001,7 +3996,7 @@ impl Wallet {
     }
 
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.
-    fn save_to_idb(&self) {
+    pub(crate) fn save_to_idb(&self) {
         use std::sync::atomic::Ordering;
 
         // Debounce: skip if a save is already in progress

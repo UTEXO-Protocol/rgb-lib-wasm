@@ -132,7 +132,7 @@ pub enum Error {
         path: String,
     },
 
-    /// The master fingerprint derived from the mnemonic doesn't match the provided one
+    /// A master fingerprint does not match the wallet's
     #[error("Fingerprint mismatch")]
     FingerprintMismatch,
 

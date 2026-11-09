@@ -2948,7 +2948,7 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Create UTXOs (end) completed");
         Ok(num_utxos_created)
@@ -7268,7 +7268,7 @@ impl Wallet {
         };
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Send (end) completed");
         Ok(OperationResult {
@@ -7363,7 +7363,7 @@ impl Wallet {
         self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Send BTC (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -7457,7 +7457,7 @@ impl Wallet {
         self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Drain (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -7682,7 +7682,7 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Inflate (end) completed");
         Ok(OperationResult {
@@ -7818,7 +7818,7 @@ impl Wallet {
             .await?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Burn (end) completed");
         Ok(res)
@@ -7921,7 +7921,7 @@ impl Wallet {
             }
         } else {
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
+            self.save_to_idb();
         }
 
         Ok(begin_data)
@@ -8161,7 +8161,7 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Link (end) completed");
         Ok(res)
@@ -8496,7 +8496,7 @@ impl Wallet {
                 .expect("saved by _prepare_transfer_psbt_wasm");
             self._fail_batch_transfer(&batch_transfer)?;
             self.update_backup_info(false)?;
-            self.trigger_auto_backup();
+            self.save_to_idb();
             return Err(e);
         }
         self.transfer_artifacts
@@ -8511,7 +8511,7 @@ impl Wallet {
             &HashMap::from([(asset_id, consignment_hash)]),
         )?;
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         let opid = mint_opid(&fascia_from_bytes(begin_data.fascia.clone())?, contract_id).ok_or(
             Error::Internal {
@@ -8574,7 +8574,7 @@ impl Wallet {
             Err(e @ Error::MintLockExpired { .. }) => {
                 self._fail_batch_transfer(&batch_transfer)?;
                 self.update_backup_info(false)?;
-                self.trigger_auto_backup();
+                self.save_to_idb();
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -8598,7 +8598,7 @@ impl Wallet {
         );
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         info!(self.logger, "Mint (end) completed");
         Ok(OperationResult {
