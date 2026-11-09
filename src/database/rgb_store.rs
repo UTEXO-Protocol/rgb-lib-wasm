@@ -30,7 +30,7 @@ use strict_types::{TypeLib, TypeLibId};
 type AllocKey = (ContractId, OpId, AssignmentType, u16);
 type GlobalKey = (ContractId, GlobalStateType, OpId, u16);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct Tables {
     schemata: BTreeMap<SchemaId, Schema>,
     type_libs: BTreeMap<TypeLibId, TypeLib>,
@@ -126,12 +126,18 @@ fn min_txid() -> Txid {
 }
 
 /// In-memory implementation of `RgbStore`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct MemRgbStore {
     tables: RefCell<Tables>,
     /// `None`: no transaction. `Some(None)`: read transaction.
     /// `Some(Some(_))`: write transaction with the tables to restore on rollback.
     tx: RefCell<Option<Option<Tables>>>,
+}
+
+impl std::fmt::Debug for MemRgbStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemRgbStore").finish_non_exhaustive()
+    }
 }
 
 impl RgbStore for MemRgbStore {

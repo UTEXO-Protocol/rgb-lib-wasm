@@ -603,7 +603,7 @@ fn test_reuse_addresses_serde_default() {
         }}"#,
         keys.account_xpub_vanilla,
         keys.account_xpub_colored,
-        keys.mnemonic,
+        keys.mnemonic.as_str(),
         keys.master_fingerprint,
     );
     let wd: WalletData = serde_json::from_str(&json).unwrap();

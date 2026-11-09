@@ -200,6 +200,7 @@ use strict_encoding::{
 use time::OffsetDateTime;
 #[cfg(feature = "esplora")]
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
+use zeroize::Zeroizing;
 
 use crate::database::{
     DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
@@ -251,3 +252,6 @@ use crate::{
     },
     wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_BFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
 };
+
+/// Text that replaces a secret in Debug output.
+const REDACTED: &str = "[redacted]";

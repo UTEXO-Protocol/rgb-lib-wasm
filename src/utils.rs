@@ -1413,7 +1413,7 @@ mod tests {
     fn generate_and_restore_keys_round_trip() {
         let keys = fresh_keys();
         let restored =
-            crate::keys::restore_keys(BitcoinNetwork::Regtest, keys.mnemonic.clone()).unwrap();
+            crate::keys::restore_keys(BitcoinNetwork::Regtest, keys.mnemonic.to_string()).unwrap();
         assert_eq!(keys.xpub, restored.xpub);
         assert_eq!(keys.account_xpub_vanilla, restored.account_xpub_vanilla);
         assert_eq!(keys.account_xpub_colored, restored.account_xpub_colored);

@@ -1184,7 +1184,7 @@ impl From<LocalOutput> for Utxo {
 }
 
 /// Data that defines a [`Wallet`].
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct WalletData {
     /// Directory where the wallet directory is stored
@@ -1201,7 +1201,7 @@ pub struct WalletData {
     /// Wallet account-level xPub for the colored-side of the wallet
     pub account_xpub_colored: String,
     /// Wallet mnemonic phrase
-    pub mnemonic: Option<String>,
+    pub mnemonic: Option<Zeroizing<String>>,
     /// Wallet master fingerprint
     pub master_fingerprint: String,
     /// Keychain index for the vanilla-side of the wallet (default: 0)
@@ -1214,6 +1214,24 @@ pub struct WalletData {
     /// Default: `false`
     #[serde(default)]
     pub reuse_addresses: bool,
+}
+
+impl std::fmt::Debug for WalletData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletData")
+            .field("data_dir", &self.data_dir)
+            .field("bitcoin_network", &self.bitcoin_network)
+            .field("database_type", &self.database_type)
+            .field("max_allocations_per_utxo", &self.max_allocations_per_utxo)
+            .field("account_xpub_vanilla", &self.account_xpub_vanilla)
+            .field("account_xpub_colored", &self.account_xpub_colored)
+            .field("mnemonic", &self.mnemonic.as_ref().map(|_| crate::REDACTED))
+            .field("master_fingerprint", &self.master_fingerprint)
+            .field("vanilla_keychain", &self.vanilla_keychain)
+            .field("supported_schemas", &self.supported_schemas)
+            .field("reuse_addresses", &self.reuse_addresses)
+            .finish()
+    }
 }
 
 pub(crate) type BdkPersister = super::memory_store::MemoryStore<ChangeSet>;
@@ -1334,7 +1352,7 @@ impl Wallet {
         let data_dir_path = PathBuf::from(&wdata.data_dir);
         if let Some(mnemonic) = &wdata.mnemonic {
             // check master fingerprint derived from mnemonic matches provided one
-            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)?;
+            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.as_str())?;
             let master_xprv =
                 Xpriv::new_master(wdata.bitcoin_network, &mnemonic.to_seed("")).unwrap();
             let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
