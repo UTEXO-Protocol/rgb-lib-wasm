@@ -578,7 +578,16 @@ pub(crate) fn now() -> OffsetDateTime {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn now() -> OffsetDateTime {
-    OffsetDateTime::now_utc()
+    let now = OffsetDateTime::now_utc();
+    #[cfg(test)]
+    let now = now + time::Duration::seconds(CLOCK_OFFSET.with(std::cell::Cell::get));
+    now
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// Seconds a native test adds to the clock of its thread.
+    pub(crate) static CLOCK_OFFSET: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) struct DumbResolver;

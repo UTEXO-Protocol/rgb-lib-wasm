@@ -339,7 +339,7 @@ impl WasmWallet {
         to_js(&txs)
     }
 
-    /// List begun vanilla operations that are not ended, aborted or failed.
+    /// List begun vanilla operations that are not ended or aborted.
     #[wasm_bindgen(js_name = "listPendingVanillaTxs")]
     pub fn list_pending_vanilla_txs(&self) -> Result<JsValue, JsValue> {
         let txs = self

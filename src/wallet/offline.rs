@@ -957,7 +957,7 @@ pub enum TransactionType {
     Incoming,
 }
 
-/// A begun vanilla operation that is not ended, aborted or failed.
+/// A begun vanilla operation that is not ended or aborted.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct PendingVanillaTx {
@@ -3037,7 +3037,7 @@ impl Wallet {
         Ok(transactions)
     }
 
-    /// List the begun vanilla operations that are not ended, aborted or failed.
+    /// List the begun vanilla operations that are not ended or aborted.
     pub fn list_pending_vanilla_txs(&self) -> Result<Vec<PendingVanillaTx>, Error> {
         info!(self.logger, "Listing pending vanilla TXs...");
         let pending = self
@@ -3893,7 +3893,10 @@ impl Wallet {
         use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 
         let now_str = {
+            #[cfg(target_arch = "wasm32")]
             let ms = js_sys::Date::now() as i64;
+            #[cfg(not(target_arch = "wasm32"))]
+            let ms = (now().unix_timestamp_nanos() / 1_000_000) as i64;
             let secs = ms / 1000;
             let nanos = ((ms % 1000) * 1_000_000) as u32;
             let dt = time::OffsetDateTime::from_unix_timestamp(secs)
