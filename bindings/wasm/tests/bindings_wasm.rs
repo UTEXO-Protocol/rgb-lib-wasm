@@ -1,4 +1,5 @@
-use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -12,6 +13,10 @@ fn wallet() -> WasmWallet {
 }
 
 fn wallet_with_schemas(supported_schemas: Vec<AssetSchema>) -> WasmWallet {
+    WasmWallet::new(&wallet_json(supported_schemas)).unwrap()
+}
+
+fn wallet_json(supported_schemas: Vec<AssetSchema>) -> String {
     let keys = generate_keys(BitcoinNetwork::Regtest);
     let wd = WalletData {
         data_dir: "/tmp/rgb_bindings_test".to_string(),
@@ -26,7 +31,7 @@ fn wallet_with_schemas(supported_schemas: Vec<AssetSchema>) -> WasmWallet {
         supported_schemas,
         reuse_addresses: false,
     };
-    WasmWallet::new(&serde_json::to_string(&wd).unwrap()).unwrap()
+    serde_json::to_string(&wd).unwrap()
 }
 
 fn now_secs() -> u64 {
@@ -178,4 +183,43 @@ fn pending_vanilla_txs_list_and_abort() {
         .abort_pending_vanilla_tx(&"0".repeat(64))
         .unwrap_err());
     assert_eq!(e, "Pending vanilla TX cannot be aborted");
+}
+
+// The runner runs tests in reverse name order.
+// This name makes this test run before `wallet_builds_after_trap`.
+#[wasm_bindgen_test]
+fn wasm_init_runs_after_trap() {
+    rgb_lib_wasm_bindings::init();
+    let trap: js_sys::Function = Closure::once_into_js(|| -> () {
+        panic!("forced trap");
+    })
+    .unchecked_into();
+    assert!(trap.call0(&JsValue::NULL).is_err());
+
+    let init: js_sys::Function =
+        Closure::once_into_js(rgb_lib_wasm_bindings::init).unchecked_into();
+    assert!(
+        init.call0(&JsValue::NULL).is_ok(),
+        "init traps after a trap"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn wallet_builds_after_trap() {
+    let trap: js_sys::Function = Closure::once_into_js(|| -> () {
+        panic!("forced trap");
+    })
+    .unchecked_into();
+    assert!(trap.call0(&JsValue::NULL).is_err());
+
+    let json = wallet_json(vec![AssetSchema::Nia]);
+    let json_new = json.clone();
+    let build: js_sys::Function =
+        Closure::once_into_js(move || WasmWallet::new(&json_new).is_ok()).unchecked_into();
+    assert_eq!(
+        build.call0(&JsValue::NULL).ok().and_then(|v| v.as_bool()),
+        Some(true),
+        "no wallet after a trap"
+    );
+    assert!(WasmWallet::create(&json).await.is_ok());
 }

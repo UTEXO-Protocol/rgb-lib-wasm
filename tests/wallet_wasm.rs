@@ -361,6 +361,15 @@ async fn test_errors_and_backup() {
 }
 
 #[wasm_bindgen_test]
+fn test_restore_backup_wrapping_length_fails() {
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    assert!(matches!(
+        wallet.restore_backup(&[0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4], "pw"),
+        Err(Error::InvalidBackup)
+    ));
+}
+
+#[wasm_bindgen_test]
 fn test_validate_consignment_offchain_invalid_bytes() {
     let result = validate_consignment_offchain(
         b"garbage data",

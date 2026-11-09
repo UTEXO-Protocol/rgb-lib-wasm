@@ -130,16 +130,11 @@ pub(crate) fn encode_backup(ciphertext: &[u8], pub_data: &BackupPubData) -> Resu
 
 /// Decode: split backup bytes into (BackupPubData, ciphertext).
 pub(crate) fn decode_backup(data: &[u8]) -> Result<(BackupPubData, &[u8]), Error> {
-    if data.len() < 4 {
-        return Err(Error::InvalidBackup);
-    }
-    let pub_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + pub_len {
-        return Err(Error::InvalidBackup);
-    }
+    let (len, rest) = data.split_first_chunk::<4>().ok_or(Error::InvalidBackup)?;
+    let pub_len = u32::from_le_bytes(*len) as usize;
+    let (pub_json, ciphertext) = rest.split_at_checked(pub_len).ok_or(Error::InvalidBackup)?;
     let pub_data: BackupPubData =
-        serde_json::from_slice(&data[4..4 + pub_len]).map_err(|_| Error::InvalidBackup)?;
-    let ciphertext = &data[4 + pub_len..];
+        serde_json::from_slice(pub_json).map_err(|_| Error::InvalidBackup)?;
     Ok((pub_data, ciphertext))
 }
 

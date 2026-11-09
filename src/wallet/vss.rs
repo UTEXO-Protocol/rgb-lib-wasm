@@ -297,11 +297,7 @@ impl VssEncryptionMetadata {
         let bytes = hex::decode(&self.nonce).map_err(|e| Error::Internal {
             details: format!("Invalid nonce hex: {e}"),
         })?;
-        bytes[..BACKUP_NONCE_LENGTH]
-            .try_into()
-            .map_err(|_| Error::Internal {
-                details: "Invalid nonce length".to_string(),
-            })
+        bytes.try_into().map_err(|_| Error::InvalidBackup)
     }
 }
 
@@ -700,6 +696,25 @@ mod tests {
             encrypted[mid] ^= 0xFF;
         }
         assert!(decrypt_data(&encrypted, &key, &metadata, None).is_err());
+    }
+
+    #[test]
+    fn wrong_nonce_length_fails() {
+        let key = test_signing_key();
+        for nonce in ["00".to_string(), "00".repeat(BACKUP_NONCE_LENGTH + 1)] {
+            let metadata = VssEncryptionMetadata {
+                nonce,
+                ..VssEncryptionMetadata::new().unwrap()
+            };
+            assert!(matches!(
+                decrypt_data(&[], &key, &metadata, None),
+                Err(Error::InvalidBackup)
+            ));
+            assert!(matches!(
+                encrypt_data(&[], &key, &metadata, None),
+                Err(Error::InvalidBackup)
+            ));
+        }
     }
 
     #[test]
