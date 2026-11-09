@@ -378,12 +378,12 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
         &format!("/tmp/fullscan-funded-{unique}"),
     );
     let mut funded = Wallet::new(wd1.clone()).unwrap();
-    let online = funded.go_online(go_online_options(false)).await.unwrap();
+    let funded_online = funded.go_online(go_online_options(false)).await.unwrap();
     let addr = funded.get_address().unwrap();
     fund_address(&addr, "1.0").await;
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    funded.sync(online.clone()).await.unwrap();
+    funded.sync(funded_online.clone()).await.unwrap();
     let funded_balance = funded.get_btc_balance(None, true).unwrap();
     assert!(funded_balance.vanilla.settled > 0);
 
@@ -394,7 +394,8 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
         &format!("/tmp/fullscan-thin-{unique}"),
     );
     let mut thin = Wallet::new(wd2).unwrap();
-    let online = thin.go_online(go_online_options(false)).await.unwrap();
+    // no scan: keep the thin state
+    let online = thin.go_online(go_online_options(true)).await.unwrap();
 
     thin.sync(online.clone()).await.unwrap();
     let after_incremental = thin.get_btc_balance(None, true).unwrap();
@@ -412,6 +413,19 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     // full_scan saves the balance with no flush
     let (mut saved, _) = saved_wallet(&thin).await;
     assert_eq!(saved.get_btc_balance(None, true).unwrap(), after_full_scan);
+
+    // go_online with the check on scans both keychains of a thin state
+    create_utxos(&mut funded, &funded_online, 1).await;
+    let funded_balance = funded.get_btc_balance(None, true).unwrap();
+    assert!(funded_balance.vanilla.settled > 0 && funded_balance.colored.settled > 0);
+    let wd3 = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/fullscan-checked-{unique}"),
+    );
+    let mut checked = Wallet::new(wd3).unwrap();
+    checked.go_online(go_online_options(false)).await.unwrap();
+    assert_eq!(checked.get_btc_balance(None, true).unwrap(), funded_balance);
 }
 
 /// Test: BDK wallet state (BTC balance) survives page reload.
@@ -1044,7 +1058,8 @@ async fn test_failed_save_of_an_async_call_is_an_error() {
     let wd = flushed_empty_wallet("persist-afail").await;
     // this wallet did not load the snapshot, so IndexedDB refuses its writes
     let mut second = Wallet::new(wd).unwrap();
-    let online = second.go_online(go_online_options(false)).await.unwrap();
+    // no check: its save fails here
+    let online = second.go_online(go_online_options(true)).await.unwrap();
     let res = second
         .witness_receive(
             Some(online),

@@ -1569,3 +1569,174 @@ async fn test_restored_wallet_inflates_after_inflation() {
         .unwrap();
     assert!(height.is_some(), "the inflation transaction must be mined");
 }
+
+#[wasm_bindgen_test]
+async fn test_go_online_checks_outputs_spent_after_backup() {
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 1).await;
+    wallet.go_online(go_online_options(false)).await.unwrap();
+    let colored: Vec<String> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable && u.utxo.exists)
+        .map(|u| u.utxo.outpoint.to_string())
+        .collect();
+    assert!(!colored.is_empty());
+    let password = "test_password_123";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    // spend every output after the backup
+    let addr = Wallet::new(test_wallet_data(vec![AssetSchema::Nia]))
+        .unwrap()
+        .get_address()
+        .unwrap();
+    let unsigned = wallet
+        .drain_to_begin(online.clone(), addr, true, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let inputs: HashSet<String> = signed
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| i.previous_output.to_string())
+        .collect();
+    assert!(
+        colored.iter().all(|o| inputs.contains(o)),
+        "{colored:?} {inputs:?}"
+    );
+    wallet.drain_to_end(online.clone(), signed).await.unwrap();
+    mine_blocks(1).await;
+
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored_consistency".to_string(),
+        ..wd
+    })
+    .unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    for _ in 0..2 {
+        let res = restored.go_online(go_online_options(false)).await;
+        assert!(
+            matches!(res, Err(Error::Inconsistency { ref details })
+                if details.starts_with("spent bitcoins with another wallet: ")
+                    && colored.iter().all(|o| details.contains(o.as_str()))),
+            "{res:?}"
+        );
+    }
+    restored.go_online(go_online_options(true)).await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_go_online_checks_own_spends() {
+    let transport = transport_endpoint();
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 2).await;
+    let asset = wallet
+        .issue_asset_nia("OWN".to_string(), "Own spends".to_string(), 0, vec![1000])
+        .unwrap();
+    let mut rcv_wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let rcv_online = rcv_wallet
+        .go_online(go_online_options(false))
+        .await
+        .unwrap();
+    let receive_data = witness_rcv(
+        &mut rcv_wallet,
+        &rcv_online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![recipient(
+            &receive_data.recipient_id,
+            100,
+            Some(1000),
+            PROXY_URL,
+        )],
+    )]);
+    let unsigned = wallet
+        .send_begin(
+            online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt;
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let send_txid = psbt_txid(&signed);
+    wallet.send_end(online.clone(), signed, true).await.unwrap();
+    let password = "test_password_123";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    // the recipient broadcasts the send before the sender refreshes
+    refresh(&mut rcv_wallet, &rcv_online).await;
+    assert_eq!(
+        transfer_of(&rcv_wallet, &receive_data.recipient_id).status,
+        TransferStatus::WaitingConfirmations
+    );
+    mine_blocks(1).await;
+    assert_eq!(
+        transfer_of(&wallet, &receive_data.recipient_id).status,
+        TransferStatus::WaitingCounterparty
+    );
+    wallet.go_online(go_online_options(false)).await.unwrap();
+
+    // a drain before the refresh spends the send's change
+    let addr = rcv_wallet.get_address().unwrap();
+    let unsigned = wallet
+        .drain_to_begin(online.clone(), addr, true, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let change: Vec<String> = signed
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .filter(|i| i.previous_output.txid.to_string() == send_txid)
+        .map(|i| i.previous_output.to_string())
+        .collect();
+    assert!(!change.is_empty());
+    wallet.drain_to_end(online.clone(), signed).await.unwrap();
+    mine_blocks(1).await;
+    assert_eq!(
+        transfer_of(&wallet, &receive_data.recipient_id).status,
+        TransferStatus::WaitingCounterparty
+    );
+    wallet.go_online(go_online_options(false)).await.unwrap();
+
+    // the backup does not hold the drain that spends the send's change
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored_own_spends".to_string(),
+        ..wd
+    })
+    .unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    let res = restored.go_online(go_online_options(false)).await;
+    assert!(
+        matches!(res, Err(Error::Inconsistency { ref details })
+            if change.iter().all(|o| details.contains(o.as_str()))),
+        "{change:?} {res:?}"
+    );
+}

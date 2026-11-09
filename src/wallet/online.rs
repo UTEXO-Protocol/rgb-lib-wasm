@@ -1000,8 +1000,12 @@ impl Indexer {
 pub struct OnlineOptions {
     /// Indexer the wallet should use
     pub indexer_config: IndexerConfig,
-    /// Whether to skip the consistency check when going online. This wallet runs no consistency
-    /// check yet, so the value has no effect.
+    /// Whether to skip the consistency check when going online.
+    ///
+    /// When false, going online checks that each asset in the database is in the RGB stock. Then it
+    /// runs a full scan. An output the database holds as unspent must be unspent on the chain, or
+    /// spent by a transaction of this wallet. The same holds for the outputs that such a
+    /// transaction pays to this wallet. A mismatch returns [`Error::Inconsistency`].
     pub skip_consistency_check: bool,
     /// Keys that sign calls to proxies that require authentication.
     ///
@@ -2574,7 +2578,7 @@ impl Wallet {
                 // No `..`: a new option must be handled here to compile.
                 let OnlineOptions {
                     indexer_config: _,         // unchanged here
-                    skip_consistency_check: _, // no effect
+                    skip_consistency_check: _, // checked below
                     proxy_auth_keys,
                     evm_chains: _, // set below
                 } = &online_options;
@@ -2588,6 +2592,89 @@ impl Wallet {
             online
         };
         self.online_data.as_mut().unwrap().evm_chains = evm_chains;
+        if !online_options.skip_consistency_check {
+            // DB assets must be contracts in the RGB stock
+            let contract_ids: HashSet<String> = self
+                .rgb_contract_ids()?
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+            if !self
+                .database
+                .get_asset_ids()?
+                .iter()
+                .all(|id| contract_ids.contains(id))
+            {
+                return Err(Error::Inconsistency {
+                    details: s!("DB assets do not match with ones stored in RGB"),
+                });
+            }
+            // unspent DB TXOs must be in BDK's unspent list after a full scan
+            self.sync_and_save(true).await?;
+            let bdk_utxos: HashSet<String> = self
+                .bdk_wallet
+                .list_unspent()
+                .map(|u| u.outpoint.to_string())
+                .collect();
+            // this wallet marks its inputs spent at the next refresh: skip outputs its own
+            // transactions spend, and also check the wallet outputs of these transactions
+            let own_txids: HashSet<String> = self
+                .database
+                .iter_batch_transfers()?
+                .into_iter()
+                .filter_map(|bt| bt.txid)
+                .chain(
+                    self.database
+                        .iter_wallet_transactions()?
+                        .into_iter()
+                        .map(|wt| wt.txid),
+                )
+                .collect();
+            let own_spent: HashSet<String> = self
+                .bdk_wallet
+                .tx_graph()
+                .full_txs()
+                .filter(|t| own_txids.contains(&t.txid.to_string()))
+                .flat_map(|t| {
+                    t.tx.input
+                        .iter()
+                        .map(|i| i.previous_output.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let own_outputs: Vec<String> = self
+                .bdk_wallet
+                .transactions()
+                .filter(|t| own_txids.contains(&t.tx_node.txid.to_string()))
+                .flat_map(|t| {
+                    let txid = t.tx_node.txid;
+                    t.tx_node
+                        .tx
+                        .output
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, o)| self.bdk_wallet.is_mine(o.script_pubkey.clone()))
+                        .map(|(vout, _)| format!("{txid}:{vout}"))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut spent: Vec<String> = self
+                .database
+                .iter_txos()?
+                .into_iter()
+                .filter(|t| !t.spent && t.exists)
+                .map(|t| t.outpoint().to_string())
+                .chain(own_outputs)
+                .filter(|o| !bdk_utxos.contains(o) && !own_spent.contains(o))
+                .collect();
+            if !spent.is_empty() {
+                spent.sort();
+                spent.dedup();
+                return Err(Error::Inconsistency {
+                    details: format!("spent bitcoins with another wallet: {spent:?}"),
+                });
+            }
+        }
         info!(self.logger, "Go online completed");
         Ok(online)
     }
@@ -8877,6 +8964,38 @@ mod go_online_tests {
         let res = go_online(&mut wallet, options(INDEXER_URL, &[]));
         assert_eq!(res, Ok(online));
         assert!(stored_keys(&wallet).is_empty());
+    }
+
+    #[test]
+    fn go_online_checks_db_assets_in_stock() {
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+
+        let mut wallet = make_test_wallet(false);
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(ContractId::copy_from_slice([9; 32]).unwrap().to_string()),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                ..Default::default()
+            })
+            .unwrap();
+        // the regtest genesis hash, so the network check passes
+        let url = fake_esplora(|_: &str| {
+            (
+                "200 OK",
+                b"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206".to_vec(),
+            )
+        });
+        let checked = OnlineOptions {
+            skip_consistency_check: false,
+            ..options(&url, &[])
+        };
+        let err = Error::Inconsistency {
+            details: s!("DB assets do not match with ones stored in RGB"),
+        };
+        assert_eq!(go_online(&mut wallet, checked.clone()), Err(err.clone()));
+        assert_eq!(go_online(&mut wallet, checked), Err(err));
+        assert!(go_online(&mut wallet, options(&url, &[])).is_ok());
     }
 
     #[test]

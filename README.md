@@ -369,7 +369,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
 | `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
 | `abortPendingVanillaTx(txid)` | no | Fail a begun vanilla operation and release its inputs |
-| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA |
+| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. |
 | `sync(online)` | yes | Sync wallet with indexer |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
