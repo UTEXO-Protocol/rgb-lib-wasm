@@ -92,7 +92,6 @@ use std::{
     fmt,
     hash::Hash,
     io::{self, ErrorKind, Read, Write},
-    panic,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, LazyLock},

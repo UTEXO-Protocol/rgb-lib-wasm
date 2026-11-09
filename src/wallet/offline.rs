@@ -1347,12 +1347,6 @@ impl Wallet {
         let wallet_dir = data_dir_path.join(&wdata.master_fingerprint);
         let (logger, _logger_guard) = setup_logger(&wallet_dir, None)?;
         info!(logger.clone(), "New wallet in '{:?}'", wallet_dir);
-        let panic_logger = logger.clone();
-        let prev_hook = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            error!(panic_logger.clone(), "PANIC: {:?}", info);
-            prev_hook(info);
-        }));
 
         // BDK setup
         let (desc_colored, desc_vanilla, watch_only) = if let Some(mnemonic) = wdata.mnemonic {

@@ -297,11 +297,7 @@ impl VssEncryptionMetadata {
         let bytes = hex::decode(&self.nonce).map_err(|e| Error::Internal {
             details: format!("Invalid nonce hex: {e}"),
         })?;
-        bytes[..BACKUP_NONCE_LENGTH]
-            .try_into()
-            .map_err(|_| Error::Internal {
-                details: "Invalid nonce length".to_string(),
-            })
+        bytes.try_into().map_err(|_| Error::InvalidBackup)
     }
 }
 

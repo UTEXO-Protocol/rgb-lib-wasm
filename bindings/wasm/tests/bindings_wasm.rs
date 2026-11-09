@@ -185,13 +185,31 @@ fn pending_vanilla_txs_list_and_abort() {
     assert_eq!(e, "Pending vanilla TX cannot be aborted");
 }
 
-fn forced_panic() {
-    panic!("forced trap");
+// The runner runs tests in reverse name order.
+// This name makes this test run before `wallet_builds_after_trap`.
+#[wasm_bindgen_test]
+fn wasm_init_runs_after_trap() {
+    rgb_lib_wasm_bindings::init();
+    let trap: js_sys::Function = Closure::once_into_js(|| -> () {
+        panic!("forced trap");
+    })
+    .unchecked_into();
+    assert!(trap.call0(&JsValue::NULL).is_err());
+
+    let init: js_sys::Function =
+        Closure::once_into_js(rgb_lib_wasm_bindings::init).unchecked_into();
+    assert!(
+        init.call0(&JsValue::NULL).is_ok(),
+        "init traps after a trap"
+    );
 }
 
 #[wasm_bindgen_test]
 async fn wallet_builds_after_trap() {
-    let trap: js_sys::Function = Closure::once_into_js(forced_panic).unchecked_into();
+    let trap: js_sys::Function = Closure::once_into_js(|| -> () {
+        panic!("forced trap");
+    })
+    .unchecked_into();
     assert!(trap.call0(&JsValue::NULL).is_err());
 
     let json = wallet_json(vec![AssetSchema::Nia]);

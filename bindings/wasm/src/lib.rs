@@ -58,20 +58,23 @@ extern "C" {
 #[wasm_bindgen(start)]
 pub fn init() {
     let _ = instant::Instant::now();
-    panic::set_hook(Box::new(move |info| {
-        let location = info
-            .location()
-            .map(|l| {
-                format!(
-                    "at {}:{}",
-                    l.file().rsplit('/').next().unwrap_or("unknown"),
-                    l.line()
-                )
-            })
-            .unwrap_or_default();
-        let msg = format!("[rgb-lib WASM panic] {location}");
-        console_error(&msg);
-    }));
+    static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK.call_once(|| {
+        panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| {
+                    format!(
+                        "at {}:{}",
+                        l.file().rsplit('/').next().unwrap_or("unknown"),
+                        l.line()
+                    )
+                })
+                .unwrap_or_default();
+            let msg = format!("[rgb-lib WASM panic] {location}");
+            console_error(&msg);
+        }));
+    });
 }
 
 #[wasm_bindgen(js_name = "generateKeys")]
