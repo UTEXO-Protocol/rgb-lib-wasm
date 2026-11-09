@@ -796,4 +796,102 @@ mod tests {
             );
         }
     }
+
+    // A wallet with one transfer, its artifacts and received data.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wallet_with_transfer(keys: crate::keys::Keys) -> crate::wallet::Wallet {
+        use crate::utils::MemStock;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::online::TransferArtifacts;
+
+        let mut wallet = make_test_wallet_with_keys(keys, false);
+        *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
+        seed_acknowledged_transfer(
+            &mut wallet,
+            &"3".repeat(64),
+            Some("rgb:test-asset"),
+            "rpc://127.0.0.1:1",
+        );
+        wallet.transfer_artifacts.insert(
+            "3".repeat(64),
+            TransferArtifacts {
+                signed_psbt: Some(s!("psbt")),
+                ..Default::default()
+            },
+        );
+        wallet
+            .received_consignments
+            .insert(s!("recipient"), vec![1, 2, 3]);
+        wallet
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_payload_of(keys: crate::keys::Keys) -> WalletBackupPayload {
+        use crate::utils::MemStock;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+
+        let source = make_test_wallet_with_keys(keys, false);
+        *source.rgb_stock.borrow_mut() = Some(MemStock::default());
+        serde_json::from_slice(&source.serialize_backup_payload().unwrap()).unwrap()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_failed_restore_keeps_wallet(
+        wallet: &mut crate::wallet::Wallet,
+        payload: &WalletBackupPayload,
+    ) {
+        let before = wallet.serialize_backup_payload().unwrap();
+        let (ciphertext, pub_data) =
+            encrypt_payload(&serde_json::to_vec(payload).unwrap(), "pw").unwrap();
+        let backup = encode_backup(&ciphertext, &pub_data).unwrap();
+
+        let result = wallet.restore_backup(&backup, "pw");
+
+        assert!(result.is_err(), "restore of a broken backup succeeded");
+        assert!(
+            wallet
+                .database
+                .get_db_data(false)
+                .unwrap()
+                .batch_transfers
+                .iter()
+                .any(|t| t.txid == Some("3".repeat(64))),
+            "the failed restore removed the transfer"
+        );
+        assert_eq!(
+            wallet
+                .transfer_artifacts
+                .get(&"3".repeat(64))
+                .and_then(|a| a.signed_psbt.clone()),
+            Some(s!("psbt"))
+        );
+        assert_eq!(
+            wallet.serialize_backup_payload().unwrap(),
+            before,
+            "the failed restore changed the wallet"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn failed_restore_with_bad_rgb_store_keeps_wallet() {
+        let keys = crate::keys::generate_keys(crate::BitcoinNetwork::Regtest);
+        let mut wallet = wallet_with_transfer(keys.clone());
+        let mut payload = backup_payload_of(keys);
+        payload.rgb_store = s!("not base64!");
+
+        assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn failed_restore_of_other_wallet_keeps_wallet() {
+        use crate::keys::generate_keys;
+
+        let mut wallet = wallet_with_transfer(generate_keys(crate::BitcoinNetwork::Regtest));
+        let payload = backup_payload_of(generate_keys(crate::BitcoinNetwork::Regtest));
+        assert!(payload.bdk_changeset.is_some());
+
+        assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+    }
 }
