@@ -10,7 +10,9 @@ use rgb_lib_wasm::wallet::vss::{
     GetObjectRequest, KeyValue, PutObjectRequest, VssBackupConfig, VssEncryptionMetadata,
     WasmVssClient, decrypt_data,
 };
-use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
+use rgb_lib_wasm::wallet::{
+    AssetFilter, DatabaseType, IndexerConfig, Invoice, OnlineOptions, Wallet, WalletData,
+};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
 use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, transport_endpoint};
 use wasm_bindgen::JsValue;
@@ -785,4 +787,86 @@ async fn test_vss_restore_refuses_wrong_total_size() {
     store.set_manifest("total_size", (size + 1).into()).await;
     let err = wallet.vss_restore_backup().await.unwrap_err();
     assert!(matches!(err, Error::InvalidBackup), "{err:?}");
+}
+
+/// Return `None` when `fut` is not ready within `ms`.
+async fn within<F: std::future::Future>(ms: u32, fut: F) -> Option<F::Output> {
+    let timer = js_sys::Function::new_with_args("ms", "return new Promise(r => setTimeout(r, ms))")
+        .call1(&JsValue::NULL, &ms.into())
+        .unwrap();
+    let mut timer = std::pin::pin!(wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
+        timer
+    )));
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(out));
+        }
+        timer.as_mut().poll(cx).map(|_| None)
+    })
+    .await
+}
+
+/// A stalled indexer or VSS server fails the call after the configured timeout.
+#[wasm_bindgen_test]
+async fn test_stalled_indexer_and_vss_time_out() {
+    run_js(
+        "const g = globalThis;
+        g.__stallSaved = [g.fetch, g.__rgbLibNoStoreUrls];
+        delete g.__rgbLibNoStoreUrls;
+        g.__stallAborts = 0;
+        const fetch = g.fetch;
+        g.fetch = function (input, init) {
+            const url = input instanceof Request ? input.url : String(input);
+            if (!url.startsWith('http://stall.invalid/')) {
+                return fetch.call(this, input, init);
+            }
+            const signal = (init && init.signal) || input.signal;
+            return new Promise((_, reject) => signal.addEventListener('abort', () => {
+                g.__stallAborts += 1;
+                reject(signal.reason);
+            }));
+        };",
+    );
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let options = OnlineOptions {
+        indexer_config: IndexerConfig::Esplora {
+            url: "http://STALL.invalid:80/indexer".to_string(),
+        },
+        ..go_online_options(true)
+    };
+    let start = js_sys::Date::now();
+    let online = within(15_000, wallet.go_online(options)).await;
+    let online_ms = js_sys::Date::now() - start;
+
+    wallet.configure_vss_backup(&VssBackupConfig::new(
+        "http://stall.invalid/vss".to_string(),
+        "stall".to_string(),
+        SecretKey::from_slice(&[1; 32]).unwrap(),
+    ));
+    let start = js_sys::Date::now();
+    let backup = within(15_000, wallet.vss_backup()).await;
+    let backup_ms = js_sys::Date::now() - start;
+
+    let aborts = run_js(
+        "const g = globalThis;
+        const [fetch, urls] = g.__stallSaved;
+        g.fetch = fetch;
+        if (urls === undefined) delete g.__rgbLibNoStoreUrls; else g.__rgbLibNoStoreUrls = urls;
+        delete g.__stallSaved;
+        return g.__stallAborts;",
+    )
+    .as_f64()
+    .unwrap();
+    assert!(
+        matches!(online, Some(Err(Error::InvalidIndexer { .. }))),
+        "go_online after {online_ms} ms: {online:?}"
+    );
+    assert!(
+        matches!(backup, Some(Err(Error::VssError { .. }))),
+        "vss_backup after {backup_ms} ms: {backup:?}"
+    );
+    assert!(online_ms >= 9_000.0, "go_online after {online_ms} ms");
+    assert!(backup_ms >= 9_000.0, "vss_backup after {backup_ms} ms");
+    assert_eq!(aborts, 2.0);
 }
