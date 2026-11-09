@@ -8,7 +8,8 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, Recipient, SendBeginResult, Transfer, Wallet, WalletData,
+    AssetFilter, DatabaseType, Online, Outpoint, Recipient, SendBeginResult, Transfer, Wallet,
+    WalletData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
@@ -658,6 +659,87 @@ async fn batch_donation_success() {
     assert_eq!(balance(&rcv2, &asset_b), 22);
     assert_eq!(balance(&wallet, &asset_a), 977);
     assert_eq!(balance(&wallet, &asset_b), 953);
+}
+
+// Settled amount of an asset on each colorable UTXO that holds some.
+fn amounts(wallet: &mut Wallet, asset_id: &str) -> Vec<(Outpoint, u64)> {
+    wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| {
+            let amount = u
+                .rgb_allocations
+                .iter()
+                .filter(|a| a.settled && a.asset_id.as_deref() == Some(asset_id))
+                .map(|a| match a.assignment {
+                    Assignment::Fungible(n) => n,
+                    _ => 0,
+                })
+                .sum::<u64>();
+            (u.utxo.outpoint, amount)
+        })
+        .filter(|(_, amount)| *amount > 0)
+        .collect()
+}
+
+#[wasm_bindgen_test]
+async fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
+    let (mut wallet, online) = new_wallet().await;
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, false, Some(1), None).await;
+    let asset_x = issue(&wallet, "TSTX", 1000);
+    let asset_y = issue(&wallet, "TSTY", 2000);
+    create_utxos(&mut wallet, &online, false, Some(1), None).await;
+    let (mut rcv, rcv_online) = sender().await;
+
+    // u2: X change and all of Y
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let map = HashMap::from([(asset_x.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+    refresh(&mut rcv, &rcv_online).await;
+    refresh(&mut wallet, &online).await;
+    settle(&mut rcv, &rcv_online, &[rid.clone()]).await;
+    settle(&mut wallet, &online, &[rid]).await;
+    create_utxos(&mut wallet, &online, false, Some(2), None).await;
+
+    // u1: X only
+    let rid = blind(&mut wallet, &online, 10, PROXY_URL).await;
+    let map = HashMap::from([(asset_x.clone(), vec![recipient(&rid, 10, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut rcv, &rcv_online, map, false, false).await;
+    end(&mut rcv, &rcv_online, &signed).await.unwrap();
+    refresh(&mut wallet, &online).await;
+    refresh(&mut rcv, &rcv_online).await;
+    settle(&mut wallet, &online, &[rid.clone()]).await;
+    settle(&mut rcv, &rcv_online, &[rid]).await;
+
+    let mut x = amounts(&mut wallet, &asset_x);
+    x.sort_by_key(|(_, n)| *n);
+    assert_eq!(x.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![10, 934]);
+    assert_eq!(amounts(&mut wallet, &asset_y), vec![(x[1].0.clone(), 2000)]);
+    assert_eq!(balance(&wallet, &asset_x), 944);
+    assert_eq!(balance(&wallet, &asset_y), 2000);
+
+    // X selects u1, Y selects u2
+    let rx = blind(&mut rcv, &rcv_online, 10, PROXY_URL).await;
+    let ry = blind(&mut rcv, &rcv_online, 50, PROXY_URL).await;
+    let map = HashMap::from([
+        (asset_x.clone(), vec![recipient(&rx, 10, None, PROXY_URL)]),
+        (asset_y.clone(), vec![recipient(&ry, 50, None, PROXY_URL)]),
+    ]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+    refresh(&mut rcv, &rcv_online).await;
+    refresh(&mut wallet, &online).await;
+    settle(&mut rcv, &rcv_online, &[rx.clone(), ry.clone()]).await;
+    settle(&mut wallet, &online, &[rx, ry]).await;
+
+    assert_eq!(balance(&rcv, &asset_x), 66);
+    assert_eq!(balance(&rcv, &asset_y), 50);
+    assert_eq!(balance(&wallet, &asset_y), 1950);
+    assert_eq!(balance(&wallet, &asset_x), 934);
 }
 
 fn now_secs() -> u64 {
