@@ -67,6 +67,12 @@ mod test {
     use super::*;
 
     #[test]
+    fn debug_hides_mnemonic() {
+        let keys = generate_keys(BitcoinNetwork::Regtest);
+        assert!(!format!("{keys:?}").contains(keys.mnemonic.as_str()));
+    }
+
+    #[test]
     fn generate_success() {
         let Keys {
             mnemonic,

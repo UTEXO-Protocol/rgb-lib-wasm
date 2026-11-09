@@ -958,6 +958,20 @@ mod tests {
         Txid::from_byte_array([n; 32])
     }
 
+    #[test]
+    fn debug_hides_seal_blinding() {
+        let mut store = MemRgbStore::default();
+        let blinding = 8_675_309_123_456_789u64;
+        let seal = GraphSeal::from(BlindSeal::with_blinding(
+            rgbstd::txout::TxPtr::Txid(txid(3)),
+            1u32,
+            blinding,
+        ));
+        store.put_secret_seal(&seal, seal.conceal()).unwrap();
+        assert_eq!(store.begin(TxMode::Write), Ok(TxBegin::Opened));
+        assert!(!format!("{store:?}").contains(&blinding.to_string()));
+    }
+
     fn opout(n: u8) -> Opout {
         Opout::new(op(n), AssignmentType::with(4000), 0)
     }

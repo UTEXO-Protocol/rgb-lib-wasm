@@ -8794,6 +8794,13 @@ mod go_online_tests {
         }
     }
 
+    #[test]
+    fn debug_hides_proxy_auth_keys() {
+        let seed = "11".repeat(32);
+        let opts = options(INDEXER_URL, &[(PROXY_ENDPOINT, &seed)]);
+        assert!(!format!("{opts:?}").contains(&seed));
+    }
+
     fn go_online(wallet: &mut Wallet, options: OnlineOptions) -> Result<Online, Error> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -9141,6 +9148,41 @@ mod send_end_tests {
     // the keys of the recipient and of the operation
     const RECIPIENT_SEED: [u8; 32] = [8; 32];
     const OPERATION_SEED: [u8; 32] = [7; 32];
+
+    #[test]
+    fn debug_hides_operation_secret_key() {
+        let key = format!("{:?}", OPERATION_SEED.to_vec());
+        let info = InfoBatchTransfer {
+            btc_change: None,
+            change_utxo_idx: None,
+            extra_allocations: HashMap::new(),
+            donation: false,
+            min_confirmations: 1,
+            expiration_timestamp: None,
+            entropy: 0,
+            operation_secret_key: Some(OPERATION_SEED.to_vec()),
+            sender_transport_endpoint: None,
+        };
+        let db = DbBatchTransfer {
+            idx: 1,
+            txid: None,
+            status: TransferStatus::WaitingCounterparty,
+            created_at: 0,
+            updated_at: 0,
+            expiration: None,
+            min_confirmations: 1,
+            operation_secret_key: Some(OPERATION_SEED.to_vec()),
+            broadcast_deadline: None,
+            retention_deadline: None,
+        };
+        let act = DbBatchTransferActMod {
+            operation_secret_key: ActiveValue::Set(Some(OPERATION_SEED.to_vec())),
+            ..Default::default()
+        };
+        assert!(!format!("{info:?}").contains(&key));
+        assert!(!format!("{db:?}").contains(&key));
+        assert!(!format!("{act:?}").contains(&key));
+    }
 
     fn recipient_pubkey() -> Vec<u8> {
         ed25519_from_seed(&RECIPIENT_SEED)

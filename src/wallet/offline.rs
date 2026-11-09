@@ -4253,6 +4253,19 @@ pub(crate) mod address_reuse_tests {
     }
 }
 
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+    #[test]
+    fn debug_hides_wallet_mnemonic() {
+        let wd = make_test_wallet(false).get_wallet_data();
+        let phrase = wd.mnemonic.clone().unwrap();
+        assert!(!format!("{wd:?}").contains(phrase.as_str()));
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod receive_expiration_tests {
     use super::address_reuse_tests::make_test_wallet;
