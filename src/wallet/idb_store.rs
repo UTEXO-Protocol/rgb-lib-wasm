@@ -1,9 +1,8 @@
 //! IndexedDB persistence for WASM wallet snapshots.
 
 use bdk_wallet::{ChangeSet, KeychainKind};
-use rexie::{ObjectStore, Rexie, TransactionMode};
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
 use std::collections::HashMap;
 
@@ -47,14 +46,27 @@ pub struct WalletSnapshot {
     pub reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
-async fn open_db() -> Result<Rexie, String> {
-    let rexie = Rexie::builder(DB_NAME)
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = IDBDatabase)]
+    type Db;
+
+    #[wasm_bindgen(catch, method, structural, js_name = transaction)]
+    fn transaction_with_options(
+        this: &Db,
+        store: &str,
+        mode: &str,
+        options: &js_sys::Object,
+    ) -> Result<web_sys::IdbTransaction, JsValue>;
+}
+
+async fn open_db() -> Result<idb::Database, String> {
+    idb::Database::builder(DB_NAME)
         .version(DB_VERSION)
-        .add_object_store(ObjectStore::new(STORE_NAME))
+        .add_object_store(idb::ObjectStore::builder(STORE_NAME))
         .build()
         .await
-        .map_err(|e| format!("IndexedDB open error: {e:?}"))?;
-    Ok(rexie)
+        .map_err(|e| format!("IndexedDB open error: {e:?}"))
 }
 
 /// Save a wallet snapshot to IndexedDB under the given key.
@@ -66,18 +78,24 @@ pub async fn save_snapshot(
     snapshot: &WalletSnapshot,
     loaded: Option<(u64, u64)>,
 ) -> Result<(), String> {
-    let db = open_db().await?;
-    let tx = db
-        .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
+    let db = web_sys::IdbDatabase::from(open_db().await?);
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(&options, &"durability".into(), &"strict".into())
         .map_err(|e| format!("IndexedDB transaction error: {e:?}"))?;
+    let tx = idb::Transaction::from(
+        db.unchecked_ref::<Db>()
+            .transaction_with_options(STORE_NAME, "readwrite", &options)
+            .map_err(|e| format!("IndexedDB transaction error: {e:?}"))?,
+    );
     let store = tx
-        .store(STORE_NAME)
+        .object_store(STORE_NAME)
         .map_err(|e| format!("IndexedDB store error: {e:?}"))?;
 
     let json_str = serde_json::to_string(snapshot).map_err(|e| format!("Serialize error: {e}"))?;
     let js_key = JsValue::from_str(key);
     if let Some(existing) = store
         .get(js_key.clone())
+        .map_err(|e| format!("IndexedDB get error: {e:?}"))?
         .await
         .map_err(|e| format!("IndexedDB get error: {e:?}"))?
     {
@@ -90,8 +108,7 @@ pub async fn save_snapshot(
             && Some((existing.writer, existing.sequence)) != loaded)
             || existing.sequence >= snapshot.sequence
         {
-            tx.done()
-                .await
+            tx.await
                 .map_err(|e| format!("IndexedDB commit error: {e:?}"))?;
             return Err(format!(
                 "IndexedDB keeps snapshot {} of writer {}",
@@ -103,12 +120,37 @@ pub async fn save_snapshot(
 
     store
         .put(&js_val, Some(&js_key))
+        .map_err(|e| format!("IndexedDB put error: {e:?}"))?
         .await
         .map_err(|e| format!("IndexedDB put error: {e:?}"))?;
-    tx.done()
-        .await
+    tx.await
         .map_err(|e| format!("IndexedDB commit error: {e:?}"))?;
     Ok(())
+}
+
+/// Ask the browser to keep this origin's storage. A refusal is logged, not returned.
+pub(crate) fn request_persistent_storage() {
+    use web_sys::console;
+
+    let promise = match js_sys::Reflect::get(&js_sys::global(), &"navigator".into())
+        .and_then(|navigator| js_sys::Reflect::get(&navigator, &"storage".into()))
+        .and_then(|storage| storage.dyn_into::<web_sys::StorageManager>())
+        .and_then(|storage| storage.persist())
+    {
+        Ok(promise) => promise,
+        Err(e) => {
+            console::warn_1(&format!("persistent storage is not available: {e:?}").into());
+            return;
+        }
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        match wasm_bindgen_futures::JsFuture::from(promise).await {
+            Ok(granted) => console::log_1(
+                &format!("persistent storage granted: {}", granted.is_truthy()).into(),
+            ),
+            Err(e) => console::warn_1(&format!("persistent storage request failed: {e:?}").into()),
+        }
+    });
 }
 
 /// Serialize the RGB store of a stock to base64 for snapshot persistence.
@@ -133,15 +175,16 @@ pub(crate) fn deserialize_stock(store_b64: &str) -> Result<MemStock, String> {
 pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> {
     let db = open_db().await?;
     let tx = db
-        .transaction(&[STORE_NAME], TransactionMode::ReadOnly)
+        .transaction(&[STORE_NAME], idb::TransactionMode::ReadOnly)
         .map_err(|e| format!("IndexedDB transaction error: {e:?}"))?;
     let store = tx
-        .store(STORE_NAME)
+        .object_store(STORE_NAME)
         .map_err(|e| format!("IndexedDB store error: {e:?}"))?;
 
     let js_key = JsValue::from_str(key);
     let result = store
         .get(js_key)
+        .map_err(|e| format!("IndexedDB get error: {e:?}"))?
         .await
         .map_err(|e| format!("IndexedDB get error: {e:?}"))?;
 

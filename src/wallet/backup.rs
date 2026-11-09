@@ -170,6 +170,7 @@ impl super::Wallet {
 
         // Persist restored state to IndexedDB so it survives page reloads
         self.save_to_idb();
+        super::idb_store::request_persistent_storage();
 
         Ok(())
     }
@@ -281,6 +282,7 @@ impl super::Wallet {
 
         // Persist restored state to IndexedDB so it survives page reloads
         self.save_to_idb();
+        super::idb_store::request_persistent_storage();
 
         Ok(())
     }

@@ -1936,17 +1936,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rexie"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "887466cfa8a12c08ee4b174998135cea8ff0fd84858627cd793e56535a045bc9"
-dependencies = [
- "idb",
- "thiserror 1.0.69",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "rgb-aluvm"
 version = "0.11.2-rc.1"
 source = "git+https://github.com/rgb-protocol/rgb-aluvm?rev=eb956ccaadf64930990e2ed08f6c4232caee24f9#eb956ccaadf64930990e2ed08f6c4232caee24f9"
@@ -2037,13 +2026,13 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "idb",
  "instant",
  "js-sys",
  "mockito",
  "prost",
  "rand 0.10.3",
  "reqwest 0.13.5",
- "rexie",
  "rgb-invoicing",
  "rgb-ops",
  "rgb-psbt-utils",
