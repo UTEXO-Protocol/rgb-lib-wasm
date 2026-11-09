@@ -1569,3 +1569,65 @@ async fn test_restored_wallet_inflates_after_inflation() {
         .unwrap();
     assert!(height.is_some(), "the inflation transaction must be mined");
 }
+
+#[wasm_bindgen_test]
+async fn test_go_online_checks_outputs_spent_after_backup() {
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 1).await;
+    wallet.go_online(go_online_options(false)).await.unwrap();
+    let colored: Vec<String> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable && u.utxo.exists)
+        .map(|u| u.utxo.outpoint.to_string())
+        .collect();
+    assert!(!colored.is_empty());
+    let password = "test_password_123";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    // spend every output after the backup
+    let addr = Wallet::new(test_wallet_data(vec![AssetSchema::Nia]))
+        .unwrap()
+        .get_address()
+        .unwrap();
+    let unsigned = wallet
+        .drain_to_begin(online.clone(), addr, true, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let inputs: HashSet<String> = signed
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| i.previous_output.to_string())
+        .collect();
+    assert!(
+        colored.iter().all(|o| inputs.contains(o)),
+        "{colored:?} {inputs:?}"
+    );
+    wallet.drain_to_end(online.clone(), signed).await.unwrap();
+    mine_blocks(1).await;
+
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored_consistency".to_string(),
+        ..wd
+    })
+    .unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    for _ in 0..2 {
+        let res = restored.go_online(go_online_options(false)).await;
+        assert!(
+            matches!(res, Err(Error::Inconsistency { ref details })
+                if details.starts_with("spent bitcoins with another wallet: ")
+                    && colored.iter().all(|o| details.contains(o.as_str()))),
+            "{res:?}"
+        );
+    }
+    restored.go_online(go_online_options(true)).await.unwrap();
+}
