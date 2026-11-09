@@ -364,7 +364,7 @@ struct BtcChange {
 // map txo idx to assignments
 type TxoAssignments = HashMap<i32, Vec<Assignment>>;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct InfoBatchTransfer {
     btc_change: Option<BtcChange>,
     change_utxo_idx: Option<i32>,
@@ -377,6 +377,25 @@ pub(crate) struct InfoBatchTransfer {
     operation_secret_key: Option<Vec<u8>>,
     /// the sender's own proxy endpoint, where the recipients post their ACK
     sender_transport_endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for InfoBatchTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfoBatchTransfer")
+            .field("btc_change", &self.btc_change)
+            .field("change_utxo_idx", &self.change_utxo_idx)
+            .field("extra_allocations", &self.extra_allocations)
+            .field("donation", &self.donation)
+            .field("min_confirmations", &self.min_confirmations)
+            .field("expiration_timestamp", &self.expiration_timestamp)
+            .field("entropy", &self.entropy)
+            .field(
+                "operation_secret_key",
+                &self.operation_secret_key.as_ref().map(|_| crate::REDACTED),
+            )
+            .field("sender_transport_endpoint", &self.sender_transport_endpoint)
+            .finish()
+    }
 }
 
 /// Where the reject list of an asset is kept.
@@ -976,7 +995,7 @@ impl Indexer {
 }
 
 /// Options for the [`Wallet::go_online`] method.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct OnlineOptions {
     /// Indexer the wallet should use
@@ -1001,6 +1020,17 @@ pub struct OnlineOptions {
     /// Only used when the wallet supports the [`AssetSchema::Bfa`] schema.
     #[serde(default, deserialize_with = "deserialize_evm_chains")]
     pub evm_chains: HashMap<u64, EvmChain>,
+}
+
+impl std::fmt::Debug for OnlineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnlineOptions")
+            .field("indexer_config", &self.indexer_config)
+            .field("skip_consistency_check", &self.skip_consistency_check)
+            .field("proxy_auth_keys", &self.proxy_auth_keys.keys())
+            .field("evm_chains", &self.evm_chains)
+            .finish()
+    }
 }
 
 /// An EVM chain mint operations use, see [`OnlineOptions::evm_chains`].
@@ -8794,6 +8824,13 @@ mod go_online_tests {
         }
     }
 
+    #[test]
+    fn debug_hides_proxy_auth_keys() {
+        let seed = "11".repeat(32);
+        let opts = options(INDEXER_URL, &[(PROXY_ENDPOINT, &seed)]);
+        assert!(!format!("{opts:?}").contains(&seed));
+    }
+
     fn go_online(wallet: &mut Wallet, options: OnlineOptions) -> Result<Online, Error> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -9141,6 +9178,51 @@ mod send_end_tests {
     // the keys of the recipient and of the operation
     const RECIPIENT_SEED: [u8; 32] = [8; 32];
     const OPERATION_SEED: [u8; 32] = [7; 32];
+
+    #[test]
+    fn debug_hides_witness_blinding() {
+        let data = LocalRecipientData::Witness(LocalWitnessData {
+            amount_sat: 1000,
+            blinding: Some(8_675_309_123_456_789),
+            vout: 1,
+        });
+        assert!(!format!("{data:?}").contains("8675309123456789"));
+    }
+
+    #[test]
+    fn debug_hides_operation_secret_key() {
+        let key = format!("{:?}", OPERATION_SEED.to_vec());
+        let info = InfoBatchTransfer {
+            btc_change: None,
+            change_utxo_idx: None,
+            extra_allocations: HashMap::new(),
+            donation: false,
+            min_confirmations: 1,
+            expiration_timestamp: None,
+            entropy: 0,
+            operation_secret_key: Some(OPERATION_SEED.to_vec()),
+            sender_transport_endpoint: None,
+        };
+        let db = DbBatchTransfer {
+            idx: 1,
+            txid: None,
+            status: TransferStatus::WaitingCounterparty,
+            created_at: 0,
+            updated_at: 0,
+            expiration: None,
+            min_confirmations: 1,
+            operation_secret_key: Some(OPERATION_SEED.to_vec()),
+            broadcast_deadline: None,
+            retention_deadline: None,
+        };
+        let act = DbBatchTransferActMod {
+            operation_secret_key: ActiveValue::Set(Some(OPERATION_SEED.to_vec())),
+            ..Default::default()
+        };
+        assert!(!format!("{info:?}").contains(&key));
+        assert!(!format!("{db:?}").contains(&key));
+        assert!(!format!("{act:?}").contains(&key));
+    }
 
     fn recipient_pubkey() -> Vec<u8> {
         ed25519_from_seed(&RECIPIENT_SEED)

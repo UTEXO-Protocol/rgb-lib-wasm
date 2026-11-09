@@ -190,11 +190,21 @@ pub(crate) struct LocalUnspent {
     pub pending_blinded: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct LocalWitnessData {
     pub amount_sat: u64,
     pub blinding: Option<u64>,
     pub vout: u32,
+}
+
+impl std::fmt::Debug for LocalWitnessData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalWitnessData")
+            .field("amount_sat", &self.amount_sat)
+            .field("blinding", &self.blinding.as_ref().map(|_| crate::REDACTED))
+            .field("vout", &self.vout)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -126,7 +126,7 @@ pub struct DbBackupInfoActMod {
     pub last_operation_timestamp: ActiveValue<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbBatchTransfer {
     pub idx: i32,
     pub txid: Option<String>,
@@ -140,7 +140,27 @@ pub struct DbBatchTransfer {
     pub retention_deadline: Option<i64>,
 }
 
-#[derive(Clone, Debug, Default)]
+impl std::fmt::Debug for DbBatchTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbBatchTransfer")
+            .field("idx", &self.idx)
+            .field("txid", &self.txid)
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("expiration", &self.expiration)
+            .field("min_confirmations", &self.min_confirmations)
+            .field(
+                "operation_secret_key",
+                &self.operation_secret_key.as_ref().map(|_| crate::REDACTED),
+            )
+            .field("broadcast_deadline", &self.broadcast_deadline)
+            .field("retention_deadline", &self.retention_deadline)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct DbBatchTransferActMod {
     pub idx: ActiveValue<i32>,
     pub txid: ActiveValue<Option<String>>,
@@ -152,6 +172,23 @@ pub struct DbBatchTransferActMod {
     pub operation_secret_key: ActiveValue<Option<Vec<u8>>>,
     pub broadcast_deadline: ActiveValue<Option<i64>>,
     pub retention_deadline: ActiveValue<Option<i64>>,
+}
+
+impl std::fmt::Debug for DbBatchTransferActMod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbBatchTransferActMod")
+            .field("idx", &self.idx)
+            .field("txid", &self.txid)
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("expiration", &self.expiration)
+            .field("min_confirmations", &self.min_confirmations)
+            .field("operation_secret_key", &crate::REDACTED)
+            .field("broadcast_deadline", &self.broadcast_deadline)
+            .field("retention_deadline", &self.retention_deadline)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -30,7 +30,7 @@ use strict_types::{TypeLib, TypeLibId};
 type AllocKey = (ContractId, OpId, AssignmentType, u16);
 type GlobalKey = (ContractId, GlobalStateType, OpId, u16);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct Tables {
     schemata: BTreeMap<SchemaId, Schema>,
     type_libs: BTreeMap<TypeLibId, TypeLib>,
@@ -126,12 +126,18 @@ fn min_txid() -> Txid {
 }
 
 /// In-memory implementation of `RgbStore`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct MemRgbStore {
     tables: RefCell<Tables>,
     /// `None`: no transaction. `Some(None)`: read transaction.
     /// `Some(Some(_))`: write transaction with the tables to restore on rollback.
     tx: RefCell<Option<Option<Tables>>>,
+}
+
+impl std::fmt::Debug for MemRgbStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemRgbStore").finish_non_exhaustive()
+    }
 }
 
 impl RgbStore for MemRgbStore {
@@ -956,6 +962,20 @@ mod tests {
 
     fn txid(n: u8) -> Txid {
         Txid::from_byte_array([n; 32])
+    }
+
+    #[test]
+    fn debug_hides_seal_blinding() {
+        let mut store = MemRgbStore::default();
+        let blinding = 8_675_309_123_456_789u64;
+        let seal = GraphSeal::from(BlindSeal::with_blinding(
+            rgbstd::txout::TxPtr::Txid(txid(3)),
+            1u32,
+            blinding,
+        ));
+        store.put_secret_seal(&seal, seal.conceal()).unwrap();
+        assert_eq!(store.begin(TxMode::Write), Ok(TxBegin::Opened));
+        assert!(!format!("{store:?}").contains(&blinding.to_string()));
     }
 
     fn opout(n: u8) -> Opout {
