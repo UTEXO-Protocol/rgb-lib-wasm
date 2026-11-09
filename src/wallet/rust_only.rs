@@ -303,6 +303,8 @@ impl Wallet {
     ) -> Result<(), Error> {
         let mut runtime = self.rgb_runtime()?;
         runtime.upsert_witness(witness_id, witness_ord)?;
+        drop(runtime);
+        self.queue_save()?;
         Ok(())
     }
 
@@ -521,6 +523,7 @@ impl Wallet {
         let update_res =
             self.rgb_runtime()?
                 .update_witnesses(&resolver, after_height, force_witnesses)?;
+        self.flush().await?;
 
         info!(self.logger, "Update witnesses completed");
         Ok(update_res)

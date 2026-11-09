@@ -851,26 +851,30 @@ async fn test_full_wallet_flow() {
     wallet.backup("pw").unwrap();
     assert!(!wallet.backup_info().unwrap());
     sleep_ms(1100).await;
+    // backup saves its time
+    let (saved, _) = saved_wallet(&wallet).await;
+    assert!(!saved.backup_info().unwrap());
+    drop(saved);
     let btc_txid = wallet
         .send_btc_end(online.clone(), signed_btc.clone(), false)
         .await
         .unwrap();
-    assert!(!btc_txid.is_empty());
-    assert!(wallet.backup_info().unwrap());
+    // send_btc_end saves the end before it returns
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
     assert_refused(
-        &mut wallet,
-        &online,
+        &mut saved,
+        &saved_online,
         &[End::SendBtc],
         &signed_btc,
         Error::CannotEndTransfer { txid: txid.clone() },
     )
     .await;
-    // the save that send_btc_end schedules keeps the end across a reload
-    sleep_ms(1100).await;
-    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    drop(saved);
+    assert!(!btc_txid.is_empty());
+    assert!(wallet.backup_info().unwrap());
     assert_refused(
-        &mut saved,
-        &saved_online,
+        &mut wallet,
+        &online,
         &[End::SendBtc],
         &signed_btc,
         Error::CannotEndTransfer { txid },
@@ -1277,6 +1281,10 @@ async fn test_full_wallet_flow() {
     // Upload backup
     let version = wallet.vss_backup().await.unwrap();
     assert!(version > 0, "Backup version should be positive");
+    // vss_backup saves its time
+    let (saved, _) = saved_wallet(&wallet).await;
+    assert!(!saved.backup_info().unwrap());
+    drop(saved);
 
     // Check info after backup
     let info_after = wallet.vss_backup_info().await.unwrap();
@@ -1380,6 +1388,10 @@ async fn test_full_wallet_flow() {
     );
     wallet.configure_vss_backup(&dead_config);
     assert!(wallet.vss_backup().await.is_err());
+    // a failed upload saves its backup times
+    let (saved, _) = saved_wallet(&wallet).await;
+    assert_eq!(saved.backup_info(), wallet.backup_info());
+    drop(saved);
     wallet.configure_vss_backup(&fresh_config);
     let info_err = wallet.vss_backup_info().await.unwrap();
     assert!(
