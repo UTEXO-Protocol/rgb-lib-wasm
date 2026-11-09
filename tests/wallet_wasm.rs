@@ -7,7 +7,7 @@ mod utils;
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
-use utils::{PROXY_URL, go_online_options, transport_endpoint};
+use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, transport_endpoint};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -526,4 +526,97 @@ fn test_reuse_addresses_serde_default() {
     );
     let wd: WalletData = serde_json::from_str(&json).unwrap();
     assert!(!wd.reuse_addresses, "missing field should default to false");
+}
+
+/// A VSS store that holds another wallet's plaintext state does not restore.
+#[wasm_bindgen_test]
+async fn test_vss_restore_refuses_other_wallet_state() {
+    use bdk_wallet::bitcoin::secp256k1::{Secp256k1, rand::rngs::OsRng};
+    use rgb_lib_wasm::wallet::vss::{
+        GetObjectRequest, KeyValue, PutObjectRequest, VssBackupConfig, VssEncryptionMetadata,
+        WasmVssClient, decrypt_data,
+    };
+
+    let backed_up = async |wallet: &mut Wallet| {
+        let (key, public_key) = Secp256k1::new().generate_keypair(&mut OsRng);
+        let store_id = format!("restore-checks-{public_key}");
+        let config = VssBackupConfig::new(VSS_SERVER_URL.to_string(), store_id.clone(), key);
+        wallet.configure_vss_backup(&config);
+        wallet.vss_backup().await.unwrap();
+        (
+            WasmVssClient::new(VSS_SERVER_URL.to_string(), key),
+            store_id,
+            key,
+        )
+    };
+    let get = async |client: &WasmVssClient, store_id: &str, key: &str| {
+        let request = GetObjectRequest {
+            store_id: store_id.to_string(),
+            key: key.to_string(),
+        };
+        client.get_object(&request).await.unwrap().value.unwrap()
+    };
+
+    let mut a = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = a.go_online(go_online_options(true)).await.unwrap();
+    let recv = a
+        .witness_receive(
+            Some(online),
+            None,
+            Assignment::Any,
+            rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    let (client_a, store_a, _) = backed_up(&mut a).await;
+
+    let mut b = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (client_b, store_b, key_b) = backed_up(&mut b).await;
+    let metadata: VssEncryptionMetadata =
+        serde_json::from_slice(&get(&client_b, &store_b, "backup/metadata").await.value).unwrap();
+    let data_b = get(&client_b, &store_b, "backup/data").await.value;
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&decrypt_data(&data_b, &key_b, &metadata, None).unwrap()).unwrap();
+    payload["bdk_changeset"] = serde_json::Value::Null;
+    let data = serde_json::to_vec(&payload).unwrap();
+    let manifest = serde_json::json!({
+        "chunk_count": 1,
+        "total_size": data.len(),
+        "encrypted": false,
+        "version": 99,
+    });
+    let fingerprint = b.get_wallet_data().master_fingerprint.into_bytes();
+
+    let mut items = vec![];
+    for (key, value) in [
+        ("backup/data", data),
+        ("backup/manifest", serde_json::to_vec(&manifest).unwrap()),
+        ("backup/fingerprint", fingerprint),
+    ] {
+        let version = get(&client_a, &store_a, key).await.version;
+        items.push(KeyValue {
+            key: key.to_string(),
+            version,
+            value,
+        });
+    }
+    let request = PutObjectRequest {
+        store_id: store_a,
+        global_version: None,
+        transaction_items: items,
+        delete_items: vec![],
+    };
+    client_a.put_object(&request).await.unwrap();
+
+    let result = a.vss_restore_backup().await;
+    assert!(result.is_err(), "restore of a tampered store succeeded");
+    let transfers = a.list_transfers(AssetFilter::NoAsset, None).unwrap();
+    assert!(
+        transfers
+            .iter()
+            .any(|t| t.recipient_id.as_deref() == Some(recv.recipient_id.as_str()))
+    );
 }
