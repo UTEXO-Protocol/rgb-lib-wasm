@@ -532,7 +532,7 @@ mod tests {
             },
         );
 
-        // `backup()` without its final `update_backup_info`, which needs JS time on native.
+        // The payload, encrypted and encoded as `backup()` does.
         let payload = sender.serialize_backup_payload().unwrap();
         let (ciphertext, pub_data) = encrypt_payload(&payload, password).unwrap();
         let backup_bytes = encode_backup(&ciphertext, &pub_data).unwrap();

@@ -310,7 +310,6 @@ pub struct DbWalletTransaction {
     pub txid: String,
     pub r#type: WalletTransactionType,
     pub status: TransferStatus,
-    pub expiration: Option<i64>,
     pub inputs: Vec<Outpoint>,
     pub sent: u64,
     pub received: u64,
@@ -323,7 +322,6 @@ pub struct DbWalletTransactionActMod {
     pub txid: ActiveValue<String>,
     pub r#type: ActiveValue<WalletTransactionType>,
     pub status: ActiveValue<TransferStatus>,
-    pub expiration: ActiveValue<Option<i64>>,
     pub inputs: ActiveValue<Vec<Outpoint>>,
     pub sent: ActiveValue<u64>,
     pub received: ActiveValue<u64>,
@@ -771,7 +769,6 @@ impl InMemoryDb {
             txid: av(w.txid),
             r#type: av_or(w.r#type, WalletTransactionType::CreateUtxos),
             status: av_or(w.status, TransferStatus::Initiated),
-            expiration: av(w.expiration),
             inputs: av(w.inputs),
             sent: av(w.sent),
             received: av(w.received),
@@ -1226,9 +1223,6 @@ impl InMemoryDb {
             .ok_or(InternalError::Unexpected)?;
         if let ActiveValue::Set(v) = w.status {
             row.status = v;
-        }
-        if let ActiveValue::Set(v) = w.expiration {
-            row.expiration = v;
         }
         Ok(())
     }
@@ -2256,7 +2250,6 @@ mod tests {
             .set_wallet_transaction(DbWalletTransactionActMod {
                 txid: ActiveValue::Set("wtx2".to_string()),
                 r#type: ActiveValue::Set(WalletTransactionType::Drain),
-                expiration: ActiveValue::Set(Some(10)),
                 inputs: ActiveValue::Set(vec![input.clone()]),
                 sent: ActiveValue::Set(5),
                 ..Default::default()
@@ -2268,7 +2261,6 @@ mod tests {
         assert_eq!(items[0].r#type, WalletTransactionType::CreateUtxos);
         assert_eq!(items[1].r#type, WalletTransactionType::Drain);
         assert_eq!(items[0].status, TransferStatus::Initiated);
-        assert_eq!(items[0].expiration, None);
         assert!(items[0].inputs.is_empty());
         assert_eq!((items[0].sent, items[0].received, items[0].fee), (0, 0, 0));
 
@@ -2280,7 +2272,6 @@ mod tests {
         db.update_wallet_transaction(DbWalletTransactionActMod {
             idx: ActiveValue::Set(idx),
             status: ActiveValue::Set(TransferStatus::Failed),
-            expiration: ActiveValue::Set(Some(20)),
             ..Default::default()
         })
         .unwrap();
@@ -2288,7 +2279,6 @@ mod tests {
         assert_eq!(row.idx, idx);
         assert_eq!(row.r#type, WalletTransactionType::Drain);
         assert_eq!(row.status, TransferStatus::Failed);
-        assert_eq!(row.expiration, Some(20));
         assert_eq!(row.inputs, vec![input]);
         assert_eq!((row.sent, row.received, row.fee), (5, 0, 0));
 
