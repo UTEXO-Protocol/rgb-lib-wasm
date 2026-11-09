@@ -203,6 +203,40 @@ async fn test_second_loader_cannot_overwrite_winner() {
     assert_eq!((after.writer, after.sequence), (nw, ns));
 }
 
+/// Test: one seed keeps a wallet on each network in one data directory.
+#[wasm_bindgen_test]
+async fn test_one_seed_on_two_networks_in_one_data_dir() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let regtest = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/two-networks-{}", js_sys::Date::now()),
+    );
+    let testnet = WalletData {
+        bitcoin_network: BitcoinNetwork::Testnet,
+        ..regtest.clone()
+    };
+
+    let mut wallet = Wallet::new(regtest.clone()).unwrap();
+    let regtest_addr = wallet.get_address().unwrap();
+    assert!(regtest_addr.starts_with("bcrt1"));
+    wallet.flush().await.unwrap();
+    drop(wallet);
+
+    let mut wallet = Wallet::restore(testnet.clone()).await.unwrap();
+    let testnet_addr = wallet.get_address().unwrap();
+    assert!(testnet_addr.starts_with("tb1"));
+    wallet.flush().await.unwrap();
+    drop(wallet);
+
+    let mut wallet = Wallet::restore(testnet).await.unwrap();
+    let addr = wallet.get_address().unwrap();
+    assert!(addr.starts_with("tb1") && addr != testnet_addr);
+    let mut wallet = Wallet::restore(regtest).await.unwrap();
+    let addr = wallet.get_address().unwrap();
+    assert!(addr.starts_with("bcrt1") && addr != regtest_addr);
+}
+
 /// Test: Address reuse pinned index survives page reload.
 #[wasm_bindgen_test]
 async fn test_address_reuse_persists_across_reload() {
