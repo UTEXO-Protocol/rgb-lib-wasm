@@ -3275,9 +3275,9 @@ impl Wallet {
         }
 
         for id in runtime.contracts_assigning(prev_outputs.clone())? {
-            if transfer_info_map.contains_key(&id.to_string()) {
-                continue;
-            }
+            let asset_txos = transfer_info_map
+                .get(&id.to_string())
+                .map(|t| &t.asset_spend.txo_map);
             let state = runtime.contract_assignments_for(id, prev_outputs.clone())?;
             let entry = extra_state.entry(id).or_default();
             for (explicit_seal, opout_state_map) in state {
@@ -3286,6 +3286,10 @@ impl Wallet {
                     .get_txo(&explicit_seal.to_outpoint().into())?
                     .expect("outpoint should be in the DB")
                     .idx;
+                // a batch asset moves the allocations on its own inputs: extra transitions move the others
+                if asset_txos.is_some_and(|m| m.contains_key(&txo_idx)) {
+                    continue;
+                }
                 entry.extend(opout_state_map.into_iter().map(|(o, s)| (txo_idx, o, s)));
             }
         }
