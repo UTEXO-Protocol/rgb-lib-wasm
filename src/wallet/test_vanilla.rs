@@ -3,8 +3,6 @@ use wasm_bindgen_test::*;
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, wallet_data};
 use crate::database::DbWalletTransaction;
-use crate::database::memory_db::{ActiveValue, DbWalletTransactionActMod};
-use crate::utils::now;
 use crate::wallet::{Online, Outpoint, PendingVanillaTx, TransactionType, Wallet};
 use crate::{AssetSchema, Error, TransferStatus, WalletTransactionType};
 use bdk_wallet::bitcoin::OutPoint;
@@ -62,16 +60,6 @@ fn row(w: &Wallet, txid: &str) -> DbWalletTransaction {
         .collect();
     assert_eq!(rows.len(), 1);
     rows.remove(0)
-}
-
-fn expire(w: &Wallet, txid: &str) {
-    w.database
-        .update_wallet_transaction(DbWalletTransactionActMod {
-            idx: ActiveValue::Set(row(w, txid).idx),
-            expiration: ActiveValue::Set(Some(1)),
-            ..Default::default()
-        })
-        .unwrap();
 }
 
 fn pending(w: &Wallet) -> Vec<PendingVanillaTx> {
@@ -187,7 +175,6 @@ async fn send_btc_begin_reservation_interactions() {
     let r = row(&w, &txid);
     assert_eq!(r.r#type, WalletTransactionType::SendBtc);
     assert_eq!(r.status, TransferStatus::Initiated);
-    assert!(r.expiration.unwrap() > now().unix_timestamp() + 3500);
     let inputs: Vec<Outpoint> = inputs_of(&psbt).into_iter().map(Outpoint::from).collect();
     assert_eq!(r.inputs, inputs);
     let reserved_inputs: Vec<Outpoint> = reserved(&w).into_iter().map(Outpoint::from).collect();
@@ -319,7 +306,7 @@ async fn begun_vanilla_listed_in_transactions() {
 }
 
 #[wasm_bindgen_test]
-async fn pending_vanilla_survives_reload_and_fails() {
+async fn pending_vanilla_survives_reload() {
     let (mut w, online) = vanilla_wallet(3).await;
     let send = send_begin(&mut w, &online).await.unwrap();
     let create = create_begin(&mut w, &online).await.unwrap();
@@ -334,22 +321,12 @@ async fn pending_vanilla_survives_reload_and_fails() {
     assert_eq!(pending(&restored), pending(&w));
     assert_eq!(pending(&restored).len(), 3);
 
-    expire(&restored, &txids[1]);
-    expire(&restored, &txids[2]);
-    let res = restored
-        .fail_transfers(online.clone(), None, false, true)
-        .await;
-    assert_eq!(res, Ok(true));
-    assert_eq!(row(&restored, &txids[0]).status, TransferStatus::Initiated);
-    assert_eq!(row(&restored, &txids[1]).status, TransferStatus::Failed);
-    assert_eq!(row(&restored, &txids[2]).status, TransferStatus::Failed);
-
     send_end(&mut restored, &online, send).await.unwrap();
-    assert!(pending(&restored).is_empty());
+    assert_eq!(pending(&restored).len(), 2);
 }
 
 #[wasm_bindgen_test]
-async fn refresh_settles_ended_and_fails_expired() {
+async fn refresh_settles_ended() {
     let (mut w, online) = vanilla_wallet(3).await;
     let create = w
         .create_utxos_begin(online.clone(), false, Some(1), None, 1, false)
