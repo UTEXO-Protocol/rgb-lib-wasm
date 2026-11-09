@@ -267,14 +267,20 @@ wallet.restoreBackup(backupBytes, 'my-password');
 
 ### VSS cloud backup
 
-[VSS](https://github.com/lightningdevkit/vss-server) (Versioned Storage Service) provides cloud backup with optimistic locking:
+[VSS](https://github.com/lightningdevkit/vss-server) (Versioned Storage Service) provides cloud backup with optimistic locking.
+VSS backups are manual: nothing uploads on its own. The app checks `backupInfo()` and calls `vssBackup()`.
 
 ```javascript
 // Configure (signing key is a 32-byte hex-encoded secp256k1 secret key)
 wallet.configureVssBackup('http://vss-server:8082/vss', 'my-store-id', signingKeyHex);
 
+// Upload the first backup, if the wallet has changes (returns null when none)
+await wallet.ensureInitialBackup();
+
 // Upload
-const version = await wallet.vssBackup();
+if (wallet.backupInfo()) {
+  const version = await wallet.vssBackup();
+}
 
 // Check status
 const info = await wallet.vssBackupInfo();
@@ -388,6 +394,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `configureVssBackup(url, storeId, keyHex)` | no | Configure VSS cloud backup |
 | `disableVssBackup()` | no | Disable VSS cloud backup |
 | `vssBackup()` | yes | Upload backup to VSS server |
+| `ensureInitialBackup()` | yes | Upload a VSS backup if the wallet has changes |
 | `vssRestoreBackup()` | yes | Restore from VSS server |
 | `vssBackupInfo()` | yes | Query VSS backup status |
 

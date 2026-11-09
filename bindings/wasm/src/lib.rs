@@ -1121,6 +1121,18 @@ impl WasmWallet {
         Ok(JsValue::from_f64(version as f64))
     }
 
+    /// Upload a backup when the wallet has changes not yet backed up.
+    /// Returns the server version, or null when no upload is needed.
+    #[wasm_bindgen(js_name = "ensureInitialBackup")]
+    pub async fn ensure_initial_backup(&self) -> Result<JsValue, JsValue> {
+        let wallet = self.inner.borrow();
+        let version = wallet
+            .ensure_initial_backup()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(version.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)))
+    }
+
     /// Download and restore wallet state from VSS server.
     #[wasm_bindgen(js_name = "vssRestoreBackup")]
     pub async fn vss_restore_backup(&self) -> Result<(), JsValue> {

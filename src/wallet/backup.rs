@@ -169,7 +169,7 @@ impl super::Wallet {
         self.restore_payload(&payload_json)?;
 
         // Persist restored state to IndexedDB so it survives page reloads
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         Ok(())
     }
@@ -178,6 +178,10 @@ impl super::Wallet {
     fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
         let payload: WalletBackupPayload =
             serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
+        // Without a BDK changeset the restore skips the descriptor check.
+        if payload.bdk_changeset.is_none() && self.bdk_database.get_data().is_some() {
+            return Err(Error::InvalidBackup);
+        }
 
         let snapshot = super::idb_store::WalletSnapshot {
             writer: 0,
@@ -270,11 +274,13 @@ impl super::Wallet {
             details: s!("VSS backup not configured"),
         })?;
 
-        let payload_json = client.download_backup().await?;
+        let payload_json = client
+            .download_backup(&self.wallet_data.master_fingerprint)
+            .await?;
         self.restore_payload(&payload_json)?;
 
         // Persist restored state to IndexedDB so it survives page reloads
-        self.trigger_auto_backup();
+        self.save_to_idb();
 
         Ok(())
     }
@@ -527,7 +533,7 @@ mod tests {
         drop(sender);
 
         let mut rebuilt = make_test_wallet_with_keys(keys, false);
-        // `restore_backup` ends in `trigger_auto_backup`, which panics on native once the state is restored.
+        // `restore_backup` ends in `save_to_idb`, which panics on native once the state is restored.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rebuilt.restore_backup(&backup_bytes, password)
         }));
@@ -891,9 +897,12 @@ mod tests {
         use crate::keys::generate_keys;
 
         let mut wallet = wallet_with_transfer(generate_keys(crate::BitcoinNetwork::Regtest));
-        let payload = backup_payload_of(generate_keys(crate::BitcoinNetwork::Regtest));
+        let mut payload = backup_payload_of(generate_keys(crate::BitcoinNetwork::Regtest));
         assert!(payload.bdk_changeset.is_some());
 
+        assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+
+        payload.bdk_changeset = None;
         assert_failed_restore_keeps_wallet(&mut wallet, &payload);
     }
 }

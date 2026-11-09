@@ -526,60 +526,45 @@ impl VssBackupClient {
         Ok(data_version + 1)
     }
 
-    /// Download and decrypt backup from VSS server.
-    pub async fn download_backup(&self) -> Result<Vec<u8>, Error> {
-        let manifest_resp = self
-            .client
-            .get_object(&GetObjectRequest {
-                store_id: self.store_id.clone(),
-                key: BACKUP_KEY_MANIFEST.to_string(),
-            })
-            .await
-            .map_err(Error::from)?;
-
-        let manifest_bytes = manifest_resp
-            .value
+    async fn get_value(&self, key: &str) -> Result<Vec<u8>, Error> {
+        let request = GetObjectRequest {
+            store_id: self.store_id.clone(),
+            key: key.to_string(),
+        };
+        let resp = self.client.get_object(&request).await?;
+        resp.value
             .map(|kv| kv.value)
-            .ok_or(Error::VssBackupNotFound)?;
+            .ok_or(Error::VssBackupNotFound)
+    }
+
+    /// Download, check and decrypt the backup of the wallet with this fingerprint.
+    pub async fn download_backup(&self, fingerprint: &str) -> Result<Vec<u8>, Error> {
+        let manifest_bytes = self.get_value(BACKUP_KEY_MANIFEST).await?;
         let manifest: BackupManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| Error::Internal {
                 details: format!("Failed to parse manifest: {e}"),
             })?;
-
-        let data_resp = self
-            .client
-            .get_object(&GetObjectRequest {
-                store_id: self.store_id.clone(),
-                key: BACKUP_KEY_DATA.to_string(),
-            })
-            .await
-            .map_err(Error::from)?;
-        let raw_data = data_resp
-            .value
-            .map(|kv| kv.value)
-            .ok_or(Error::VssBackupNotFound)?;
-
-        if manifest.encrypted {
-            let meta_resp = self
-                .client
-                .get_object(&GetObjectRequest {
-                    store_id: self.store_id.clone(),
-                    key: BACKUP_KEY_METADATA.to_string(),
-                })
-                .await
-                .map_err(Error::from)?;
-            let meta_bytes = meta_resp
-                .value
-                .map(|kv| kv.value)
-                .ok_or(Error::VssBackupNotFound)?;
-            let enc_metadata: VssEncryptionMetadata =
-                serde_json::from_slice(&meta_bytes).map_err(|e| Error::Internal {
-                    details: format!("Failed to parse encryption metadata: {e}"),
-                })?;
-            decrypt_data(&raw_data, &self.signing_key, &enc_metadata, None)
-        } else {
-            Ok(raw_data)
+        if manifest.version != VSS_BACKUP_VERSION {
+            return Err(Error::UnsupportedBackupVersion {
+                version: manifest.version.to_string(),
+            });
         }
+        if !manifest.encrypted || manifest.chunk_count != 1 {
+            return Err(Error::InvalidBackup);
+        }
+        if self.get_value(BACKUP_KEY_FINGERPRINT).await? != fingerprint.as_bytes() {
+            return Err(Error::FingerprintMismatch);
+        }
+        let raw_data = self.get_value(BACKUP_KEY_DATA).await?;
+        if raw_data.len() != manifest.total_size {
+            return Err(Error::InvalidBackup);
+        }
+        let meta_bytes = self.get_value(BACKUP_KEY_METADATA).await?;
+        let enc_metadata: VssEncryptionMetadata =
+            serde_json::from_slice(&meta_bytes).map_err(|e| Error::Internal {
+                details: format!("Failed to parse encryption metadata: {e}"),
+            })?;
+        decrypt_data(&raw_data, &self.signing_key, &enc_metadata, None)
     }
 
     /// Get the server-side backup version, or None if no backup exists.

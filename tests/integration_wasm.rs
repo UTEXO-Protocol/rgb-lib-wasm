@@ -1217,7 +1217,7 @@ async fn test_full_wallet_flow() {
     // Restore into a fresh wallet on an empty data directory: IFA units and inflation rights must survive
     let mut restored = Wallet::new(WalletData {
         data_dir: "/tmp/rgb_integration_restored".to_string(),
-        ..wd
+        ..wd.clone()
     })
     .unwrap();
     restored.restore_backup(&backup_bytes, password).unwrap();
@@ -1283,24 +1283,32 @@ async fn test_full_wallet_flow() {
     assert!(info_after.backup_exists, "Backup should exist after upload");
     assert!(info_after.server_version.is_some());
 
-    // Restore from VSS into the same wallet
-    wallet.vss_restore_backup().await.unwrap();
-
-    // Verify state after VSS restore
-    let vss_assets = wallet.list_assets(vec![AssetSchema::Nia]).unwrap();
-    let vss_nia = vss_assets.nia.unwrap();
+    // Restore from VSS into a fresh wallet with the same keys
+    let mut vss_restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_vss_restored".to_string(),
+        ..wd
+    })
+    .unwrap();
+    let has_test_nia = |w: &Wallet| {
+        w.list_assets(vec![AssetSchema::Nia])
+            .unwrap()
+            .nia
+            .is_some_and(|nia| nia.iter().any(|a| a.ticker == "TEST"))
+    };
+    let btc_total = |w: &mut Wallet| {
+        let b = w.get_btc_balance(None, true).unwrap();
+        b.vanilla.settled + b.vanilla.future + b.colored.settled + b.colored.future
+    };
+    assert!(!has_test_nia(&vss_restored));
+    assert_eq!(btc_total(&mut vss_restored), 0);
+    vss_restored.configure_vss_backup(&vss_config);
+    vss_restored.vss_restore_backup().await.unwrap();
     assert!(
-        vss_nia.iter().any(|a| a.ticker == "TEST"),
+        has_test_nia(&vss_restored),
         "NIA asset should survive VSS backup/restore"
     );
-
-    let vss_balance = wallet.get_btc_balance(None, true).unwrap();
-    let vss_total = vss_balance.vanilla.settled
-        + vss_balance.vanilla.future
-        + vss_balance.colored.settled
-        + vss_balance.colored.future;
     assert!(
-        vss_total > 0,
+        btc_total(&mut vss_restored) > 0,
         "BTC balance should survive VSS backup/restore"
     );
 
@@ -1329,13 +1337,13 @@ async fn test_full_wallet_flow() {
         fresh_store_id,
         signing_key,
     );
-    wallet.configure_vss_backup(&fresh_config);
-    let initial = wallet.ensure_initial_backup().await.unwrap();
+    vss_restored.configure_vss_backup(&fresh_config);
+    let initial = vss_restored.ensure_initial_backup().await.unwrap();
     assert!(
         initial.is_some(),
         "ensure_initial_backup must upload when changes are pending"
     );
-    let noop = wallet.ensure_initial_backup().await.unwrap();
+    let noop = vss_restored.ensure_initial_backup().await.unwrap();
     assert!(
         noop.is_none(),
         "ensure_initial_backup must no-op right after a backup"

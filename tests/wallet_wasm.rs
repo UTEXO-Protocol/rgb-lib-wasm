@@ -4,10 +4,15 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
+use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, rand::rngs::OsRng};
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
+use rgb_lib_wasm::wallet::vss::{
+    GetObjectRequest, KeyValue, PutObjectRequest, VssBackupConfig, VssEncryptionMetadata,
+    WasmVssClient, decrypt_data,
+};
 use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Invoice, Wallet, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
-use utils::{PROXY_URL, go_online_options, transport_endpoint};
+use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, transport_endpoint};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -526,4 +531,183 @@ fn test_reuse_addresses_serde_default() {
     );
     let wd: WalletData = serde_json::from_str(&json).unwrap();
     assert!(!wd.reuse_addresses, "missing field should default to false");
+}
+
+struct VssStore {
+    client: WasmVssClient,
+    store_id: String,
+    key: SecretKey,
+}
+
+impl VssStore {
+    fn new() -> Self {
+        let (key, public_key) = Secp256k1::new().generate_keypair(&mut OsRng);
+        Self {
+            client: WasmVssClient::new(VSS_SERVER_URL.to_string(), key),
+            store_id: format!("restore-checks-{public_key}"),
+            key,
+        }
+    }
+
+    fn config(&self) -> VssBackupConfig {
+        VssBackupConfig::new(VSS_SERVER_URL.to_string(), self.store_id.clone(), self.key)
+    }
+
+    async fn get(&self, key: &str) -> KeyValue {
+        let request = GetObjectRequest {
+            store_id: self.store_id.clone(),
+            key: key.to_string(),
+        };
+        self.client
+            .get_object(&request)
+            .await
+            .unwrap()
+            .value
+            .unwrap()
+    }
+
+    async fn put(&self, key: &str, value: Vec<u8>) {
+        let request = PutObjectRequest {
+            store_id: self.store_id.clone(),
+            global_version: None,
+            transaction_items: vec![KeyValue {
+                key: key.to_string(),
+                version: self.get(key).await.version,
+                value,
+            }],
+            delete_items: vec![],
+        };
+        self.client.put_object(&request).await.unwrap();
+    }
+
+    async fn metadata(&self) -> VssEncryptionMetadata {
+        serde_json::from_slice(&self.get("backup/metadata").await.value).unwrap()
+    }
+
+    async fn manifest(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.get("backup/manifest").await.value).unwrap()
+    }
+
+    async fn plaintext(&self) -> serde_json::Value {
+        let data = self.get("backup/data").await.value;
+        let plain = decrypt_data(&data, &self.key, &self.metadata().await, None).unwrap();
+        serde_json::from_slice(&plain).unwrap()
+    }
+
+    async fn set_manifest(&self, field: &str, value: serde_json::Value) {
+        let mut manifest = self.manifest().await;
+        manifest[field] = value;
+        self.put("backup/manifest", serde_json::to_vec(&manifest).unwrap())
+            .await;
+    }
+
+    async fn put_data(&self, data: Vec<u8>) {
+        let len = data.len();
+        self.put("backup/data", data).await;
+        self.set_manifest("total_size", len.into()).await;
+    }
+}
+
+async fn wallet_with_vss_backup() -> (Wallet, VssStore) {
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let store = VssStore::new();
+    wallet.configure_vss_backup(&store.config());
+    wallet.vss_backup().await.unwrap();
+    (wallet, store)
+}
+
+async fn witness_receive_on(wallet: &mut Wallet) -> String {
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
+    wallet
+        .witness_receive(
+            Some(online),
+            None,
+            Assignment::Any,
+            rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+            None,
+        )
+        .await
+        .unwrap()
+        .recipient_id
+}
+
+fn has_transfer(wallet: &Wallet, recipient_id: &str) -> bool {
+    wallet
+        .list_transfers(AssetFilter::NoAsset, None)
+        .unwrap()
+        .iter()
+        .any(|t| t.recipient_id.as_deref() == Some(recipient_id))
+}
+
+/// A VSS store that holds another wallet's plaintext state does not restore.
+#[wasm_bindgen_test]
+async fn test_vss_restore_refuses_other_wallet_state() {
+    let (mut a, store_a) = wallet_with_vss_backup().await;
+    let recv_id = witness_receive_on(&mut a).await;
+    let (b, store_b) = wallet_with_vss_backup().await;
+
+    let mut payload = store_b.plaintext().await;
+    payload["bdk_changeset"] = serde_json::Value::Null;
+    store_a
+        .put_data(serde_json::to_vec(&payload).unwrap())
+        .await;
+    store_a.set_manifest("encrypted", false.into()).await;
+    store_a.set_manifest("version", 99.into()).await;
+    let fingerprint = b.get_wallet_data().master_fingerprint;
+    store_a
+        .put("backup/fingerprint", fingerprint.into_bytes())
+        .await;
+
+    let result = a.vss_restore_backup().await;
+    assert!(result.is_err(), "restore of a tampered store succeeded");
+    assert!(has_transfer(&a, &recv_id));
+}
+
+#[wasm_bindgen_test]
+async fn test_vss_restore_refuses_unencrypted_data() {
+    let (mut wallet, store) = wallet_with_vss_backup().await;
+    let data = serde_json::to_vec(&store.plaintext().await).unwrap();
+    store.put_data(data).await;
+    store.set_manifest("encrypted", false.into()).await;
+    let err = wallet.vss_restore_backup().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidBackup), "{err:?}");
+}
+
+#[wasm_bindgen_test]
+async fn test_vss_restore_refuses_other_fingerprint() {
+    let (mut wallet, store) = wallet_with_vss_backup().await;
+    let other = generate_keys(BitcoinNetwork::Regtest).master_fingerprint;
+    store.put("backup/fingerprint", other.into_bytes()).await;
+    let err = wallet.vss_restore_backup().await.unwrap_err();
+    assert!(matches!(err, Error::FingerprintMismatch), "{err:?}");
+}
+
+#[wasm_bindgen_test]
+async fn test_vss_restore_refuses_unknown_version() {
+    let (mut wallet, store) = wallet_with_vss_backup().await;
+    store.set_manifest("version", 99.into()).await;
+    let err = wallet.vss_restore_backup().await.unwrap_err();
+    assert!(
+        matches!(err, Error::UnsupportedBackupVersion { .. }),
+        "{err:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_vss_restore_refuses_wrong_chunk_count() {
+    let (mut wallet, store) = wallet_with_vss_backup().await;
+    store.set_manifest("chunk_count", 2.into()).await;
+    let err = wallet.vss_restore_backup().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidBackup), "{err:?}");
+}
+
+#[wasm_bindgen_test]
+async fn test_vss_restore_refuses_wrong_total_size() {
+    let (mut wallet, store) = wallet_with_vss_backup().await;
+    let size = store.manifest().await["total_size"].as_u64().unwrap();
+    store.set_manifest("total_size", (size + 1).into()).await;
+    let err = wallet.vss_restore_backup().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidBackup), "{err:?}");
 }
