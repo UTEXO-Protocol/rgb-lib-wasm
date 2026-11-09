@@ -791,18 +791,13 @@ async fn test_vss_restore_refuses_wrong_total_size() {
 
 /// Return `None` when `fut` is not ready within `ms`.
 async fn within<F: std::future::Future>(ms: u32, fut: F) -> Option<F::Output> {
-    let timer = js_sys::Function::new_with_args("ms", "return new Promise(r => setTimeout(r, ms))")
-        .call1(&JsValue::NULL, &ms.into())
-        .unwrap();
-    let mut timer = std::pin::pin!(wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(
-        timer
-    )));
+    let mut timer = std::pin::pin!(utils::sleep_ms(ms));
     let mut fut = std::pin::pin!(fut);
     std::future::poll_fn(|cx| {
         if let std::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
             return std::task::Poll::Ready(Some(out));
         }
-        timer.as_mut().poll(cx).map(|_| None)
+        timer.as_mut().poll(cx).map(|()| None)
     })
     .await
 }
