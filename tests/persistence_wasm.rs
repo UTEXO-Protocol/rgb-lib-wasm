@@ -2,7 +2,7 @@
 //!
 //! Each test simulates a browser reload by:
 //! 1. Performing operations on a wallet
-//! 2. Explicitly flushing the wallet to IndexedDB
+//! 2. Saving the wallet to IndexedDB, by flush or by the call itself
 //! 3. Dropping the wallet
 //! 4. Restoring through the production IndexedDB API
 //! 5. Verifying state survived
@@ -17,7 +17,9 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::idb_store::{load_snapshot, save_snapshot};
-use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, Recipient, Wallet, WalletData, WitnessData};
+use rgb_lib_wasm::wallet::{
+    AssetFilter, DatabaseType, Online, Recipient, Wallet, WalletData, WitnessData,
+};
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferStatus, generate_keys,
 };
@@ -752,4 +754,209 @@ async fn test_initiated_send_completes_after_reload() {
         .unwrap();
     settle(&mut wallet_b, &online_b, &[receive.recipient_id.clone()]).await;
     wallet_a.flush().await.unwrap();
+}
+
+/// Settled balance of a NIA asset; 0 when the wallet does not know the asset.
+fn settled_nia(wallet: &Wallet, asset_id: &str) -> u64 {
+    wallet
+        .list_assets(vec![AssetSchema::Nia])
+        .unwrap()
+        .nia
+        .unwrap_or_default()
+        .iter()
+        .find(|a| a.asset_id == asset_id)
+        .map_or(0, |a| a.balance.settled)
+}
+
+/// Send 100 NIA units from a new sender to a new receiver up to the sender's send_end.
+/// Return the receiver, its Online, the recipient id and the asset id.
+async fn incoming_nia(case: &str) -> (Wallet, Online, String, String) {
+    let now = js_sys::Date::now();
+    let keys_a = generate_keys(BitcoinNetwork::Regtest);
+    let keys_b = generate_keys(BitcoinNetwork::Regtest);
+    let wd_a = test_wallet_data(
+        &keys_a,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-{case}-a-{now}"),
+    );
+    let wd_b = test_wallet_data(
+        &keys_b,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-{case}-b-{now}"),
+    );
+    let mut a = Wallet::new(wd_a).unwrap();
+    let mut b = Wallet::new(wd_b).unwrap();
+    let online_a = a.go_online(go_online_options(false)).await.unwrap();
+    let online_b = b.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut a, &online_a, "1.0").await;
+    create_utxos(&mut a, &online_a, 5).await;
+    let asset = a
+        .issue_asset_nia("INC".into(), "Incoming".into(), 0, vec![1000])
+        .unwrap();
+    let rid = witness_rcv(
+        &mut b,
+        &online_b,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport_endpoint()],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![utils::recipient(&rid, 100, Some(2000), PROXY_URL)],
+    )]);
+    let unsigned = a
+        .send_begin(
+            online_a.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint()),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt;
+    let signed = a.sign_psbt(unsigned, None).unwrap();
+    a.send_end(online_a, signed, false).await.unwrap();
+    (b, online_b, rid, asset.asset_id)
+}
+
+/// Test: two changes in a row are both saved.
+#[wasm_bindgen_test]
+async fn test_issue_after_issue_is_saved() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-issues-{}", js_sys::Date::now()),
+    );
+    let mut wallet = Wallet::new(wd).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 2).await;
+    let one = wallet
+        .issue_asset_nia("ONE".into(), "One".into(), 0, vec![100])
+        .unwrap();
+    let two = wallet
+        .issue_asset_nia("TWO".into(), "Two".into(), 0, vec![200])
+        .unwrap();
+    sleep_ms(3000).await;
+    let (saved, _) = saved_wallet(&wallet).await;
+    let ids: Vec<String> = saved
+        .list_assets(vec![AssetSchema::Nia])
+        .unwrap()
+        .nia
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.asset_id)
+        .collect();
+    assert!(
+        ids.contains(&one.asset_id) && ids.contains(&two.asset_id),
+        "saved assets {ids:?}, issued {} and {}",
+        one.asset_id,
+        two.asset_id
+    );
+}
+
+/// Test: a sync is saved.
+#[wasm_bindgen_test]
+async fn test_synced_balance_is_saved() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/persist-sync-{}", js_sys::Date::now()),
+    );
+    let mut wallet = Wallet::new(wd).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    let live = wallet.get_btc_balance(None, true).unwrap();
+    assert!(live.vanilla.future > 0);
+    let (mut saved, _) = saved_wallet(&wallet).await;
+    let stored = saved.get_btc_balance(None, true).unwrap();
+    assert_eq!(stored, live, "saved balance {stored:?}, live {live:?}");
+}
+
+/// Test: a refresh of an incoming transfer is saved.
+#[wasm_bindgen_test]
+async fn test_received_transfer_is_saved() {
+    let (mut b, online_b, rid, asset_id) = incoming_nia("rcv").await;
+    b.refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    let live = transfer_of(&b, &rid).status;
+    assert_eq!(live, TransferStatus::WaitingConfirmations);
+    let (saved, _) = saved_wallet(&b).await;
+    let stored = transfer_of(&saved, &rid).status;
+    assert_eq!(stored, live, "saved status {stored:?}, live {live:?}");
+    drop(saved);
+
+    settle(&mut b, &online_b, &[rid]).await;
+    let (saved, _) = saved_wallet(&b).await;
+    assert_eq!(
+        settled_nia(&saved, &asset_id),
+        100,
+        "saved balance, live {}",
+        settled_nia(&b, &asset_id)
+    );
+}
+
+/// Test: a transfer that a refused fail moves forward is saved.
+#[wasm_bindgen_test]
+async fn test_transfer_progressed_by_refused_fail_is_saved() {
+    let (mut b, online_b, rid, _) = incoming_nia("fail").await;
+    let idx = transfer_of(&b, &rid).batch_transfer_idx;
+    let res = b.fail_transfers(online_b, Some(idx), false, false).await;
+    assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+    let live = transfer_of(&b, &rid).status;
+    assert_eq!(live, TransferStatus::WaitingConfirmations);
+    let (saved, _) = saved_wallet(&b).await;
+    let stored = transfer_of(&saved, &rid).status;
+    assert_eq!(stored, live, "saved status {stored:?}, live {live:?}");
+}
+
+/// Test: a sync call returns the error of an earlier save that failed.
+#[wasm_bindgen_test]
+async fn test_failed_queued_save_is_an_error() {
+    let wd = flushed_empty_wallet("persist-qfail").await;
+    // this wallet did not load the snapshot, so IndexedDB refuses its writes
+    let mut second = Wallet::new(wd).unwrap();
+    second.get_address().unwrap();
+    sleep_ms(3000).await;
+    let res = second.get_address();
+    assert!(
+        matches!(res, Err(Error::Persistence { .. })),
+        "get_address returned {res:?} after a failed save"
+    );
+}
+
+/// Test: an async call returns the error of its failed save.
+#[wasm_bindgen_test]
+async fn test_failed_save_of_an_async_call_is_an_error() {
+    let wd = flushed_empty_wallet("persist-afail").await;
+    // this wallet did not load the snapshot, so IndexedDB refuses its writes
+    let mut second = Wallet::new(wd).unwrap();
+    let online = second.go_online(go_online_options(false)).await.unwrap();
+    let res = second
+        .witness_receive(
+            Some(online),
+            None,
+            Assignment::Fungible(100),
+            default_rcv_expiration(),
+            vec![transport_endpoint()],
+            1,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(res, Err(Error::Persistence { .. })),
+        "witness_receive returned {res:?} with a failed save"
+    );
 }
