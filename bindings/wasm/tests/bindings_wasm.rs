@@ -175,6 +175,21 @@ fn get_received_mint_is_null_when_unknown() {
 }
 
 #[wasm_bindgen_test]
+fn get_wallet_data_hides_mnemonic() {
+    let mut wd: WalletData = serde_json::from_str(&wallet_json(vec![AssetSchema::Nia])).unwrap();
+    wd.vanilla_keychain = Some(1);
+    let wallet = WasmWallet::new(&serde_json::to_string(&wd).unwrap()).unwrap();
+    let data = wallet.get_wallet_data().unwrap();
+    let mnemonic = js_sys::Reflect::get(&data, &JsValue::from_str("mnemonic")).unwrap();
+    assert!(mnemonic.is_null(), "getWalletData returns the mnemonic");
+    wd.mnemonic = None;
+    assert_eq!(
+        String::from(js_sys::JSON::stringify(&data).unwrap()),
+        serde_json::to_string(&wd).unwrap()
+    );
+}
+
+#[wasm_bindgen_test]
 fn pending_vanilla_txs_list_and_abort() {
     let wallet = wallet();
     let pending = js_sys::Array::from(&wallet.list_pending_vanilla_txs().unwrap());
