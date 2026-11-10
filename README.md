@@ -358,7 +358,7 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 | `new(walletDataJson)` | no | Create wallet (no IndexedDB restore) |
 | `create(walletDataJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
 | `flush()` | yes | Durably commit current wallet state to IndexedDB |
-| `getWalletData()` | no | Return WalletData as JS object |
+| `getWalletData()` | no | Return WalletData as JS object; the mnemonic is not returned (`mnemonic` is null) |
 | `getAddress()` | no | Get a new Bitcoin address |
 | `getBtcBalance()` | no | Get BTC balance |
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
