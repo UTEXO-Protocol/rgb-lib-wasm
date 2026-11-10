@@ -332,6 +332,16 @@ const signed = wallet.signPsbt(unsignedPsbtBase64);
 const finalized = wallet.finalizePsbt(signedPsbtBase64);
 ```
 
+## Security
+
+The wallet trusts every script on its page. A script in the same page can call every wallet method, read the wasm memory, which holds the mnemonic while the wallet exists, and read the IndexedDB snapshot, which holds the wallet database without the mnemonic. `getWalletData` and `Debug` output do not show the mnemonic. This stops accidental leaks, not a hostile script.
+
+To protect a wallet:
+
+- Load no third-party scripts on the wallet's origin. Set a strict Content Security Policy and use Subresource Integrity on the scripts you load.
+- Run the wallet on its own origin, for example in an iframe on a dedicated subdomain, and talk to it with `postMessage`. Scripts on the main page then cannot reach its memory or its storage.
+- To keep the mnemonic out of the page, create the wallet with `mnemonic: null` (watch-only). Sign the PSBT of each `*Begin` call elsewhere, for example on a hardware wallet, and pass the signed PSBT to the matching `*End` call.
+
 ## API reference
 
 ### Standalone functions
