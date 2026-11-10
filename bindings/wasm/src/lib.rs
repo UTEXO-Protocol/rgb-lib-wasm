@@ -8,7 +8,7 @@ use std::panic;
 use wasm_bindgen::prelude::*;
 
 use rgb_lib_wasm::Wallet;
-use rgb_lib_wasm::wallet::{Online, Recipient, RefreshFilter, WalletData};
+use rgb_lib_wasm::wallet::{Online, OnlineOptions, Recipient, RefreshFilter, WalletData};
 
 /// Serialize to JsValue using BigInt for u64/i64 values that exceed Number.MAX_SAFE_INTEGER.
 fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
@@ -16,6 +16,37 @@ fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
         serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
     val.serialize(&serializer)
         .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Parse an optional encryption preference: "Required", "Unsupported" or "Optional".
+fn parse_encryption(
+    encryption: Option<String>,
+) -> Result<Option<rgb_lib_wasm::Encryption>, JsValue> {
+    encryption
+        .map(|e| {
+            serde_wasm_bindgen::from_value(JsValue::from_str(&e))
+                .map_err(|_| JsValue::from_str(&format!("Invalid encryption: {e}")))
+        })
+        .transpose()
+}
+
+/// Parse an optional Online object, `null` and `undefined` meaning none.
+fn js_to_online_opt(value: JsValue) -> Result<Option<Online>, JsValue> {
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    serde_wasm_bindgen::from_value(value)
+        .map(Some)
+        .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))
+}
+
+/// Read a u64 from a JS number, BigInt or decimal string.
+fn js_to_u64(value: JsValue) -> Result<u64, JsValue> {
+    match value.as_string() {
+        Some(s) => s.parse::<u64>().map_err(|e| e.to_string()),
+        None => serde_wasm_bindgen::from_value::<u64>(value).map_err(|e| e.to_string()),
+    }
+    .map_err(|e| JsValue::from_str(&format!("Invalid expiration timestamp: {e}")))
 }
 
 #[wasm_bindgen(js_namespace = console)]
@@ -27,23 +58,26 @@ extern "C" {
 #[wasm_bindgen(start)]
 pub fn init() {
     let _ = instant::Instant::now();
-    panic::set_hook(Box::new(move |info| {
-        let location = info
-            .location()
-            .map(|l| {
-                format!(
-                    "at {}:{}",
-                    l.file().rsplit('/').next().unwrap_or("unknown"),
-                    l.line()
-                )
-            })
-            .unwrap_or_default();
-        let msg = format!("[rgb-lib WASM panic] {location}");
-        console_error(&msg);
-    }));
+    static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK.call_once(|| {
+        panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| {
+                    format!(
+                        "at {}:{}",
+                        l.file().rsplit('/').next().unwrap_or("unknown"),
+                        l.line()
+                    )
+                })
+                .unwrap_or_default();
+            let msg = format!("[rgb-lib WASM panic] {location}");
+            console_error(&msg);
+        }));
+    });
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen(js_name = "generateKeys")]
 pub fn generate_keys(network: &str) -> Result<JsValue, JsValue> {
     let bitcoin_network = network
         .parse::<rgb_lib_wasm::BitcoinNetwork>()
@@ -52,7 +86,7 @@ pub fn generate_keys(network: &str) -> Result<JsValue, JsValue> {
     to_js(&keys)
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen(js_name = "restoreKeys")]
 pub fn restore_keys(network: &str, mnemonic: &str) -> Result<JsValue, JsValue> {
     let bitcoin_network = network
         .parse::<rgb_lib_wasm::BitcoinNetwork>()
@@ -70,6 +104,7 @@ pub struct WasmWallet {
 #[wasm_bindgen]
 impl WasmWallet {
     /// Create a new RGB wallet from a JSON-encoded WalletData.
+    /// It does not load IndexedDB and cannot save over a stored snapshot; use `create()`.
     #[wasm_bindgen(constructor)]
     pub fn new(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
@@ -84,30 +119,36 @@ impl WasmWallet {
     ///
     /// Like `new()`, but asynchronously checks IndexedDB for a previously saved
     /// snapshot and restores it, so wallet state survives page refreshes.
+    #[wasm_bindgen(js_name = "create")]
     pub async fn create(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid WalletData JSON: {e}")))?;
-        let mut wallet = Wallet::new(wd).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let idb_key = wallet.idb_key();
-        match rgb_lib_wasm::wallet::idb_store::load_snapshot(&idb_key).await {
-            Ok(Some(snapshot)) => {
-                wallet
-                    .restore_from_snapshot(snapshot)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                web_sys::console::warn_1(
-                    &format!("IDB load warning (continuing fresh): {e}").into(),
-                );
-            }
-        }
+        let wallet = Wallet::restore(wd)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmWallet {
             inner: RefCell::new(wallet),
         })
     }
 
+    /// Durably persist current wallet state to IndexedDB.
+    #[wasm_bindgen(js_name = "flush")]
+    pub async fn flush(&self) -> Result<(), JsValue> {
+        self.inner
+            .borrow()
+            .flush()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Return the error of the last failed IndexedDB save, until a save commits.
+    #[wasm_bindgen(js_name = "lastSaveError")]
+    pub fn last_save_error(&self) -> Option<String> {
+        self.inner.borrow().last_save_error()
+    }
+
     /// Return the WalletData as a JS object.
+    #[wasm_bindgen(js_name = "getWalletData")]
     pub fn get_wallet_data(&self) -> Result<JsValue, JsValue> {
         let wd = self.inner.borrow().get_wallet_data();
         to_js(&wd)
@@ -116,6 +157,7 @@ impl WasmWallet {
     /// Issue a new NIA (Non-Inflatable Asset).
     ///
     /// `amounts_js` is a JS array of u64 values.
+    #[wasm_bindgen(js_name = "issueAssetNia")]
     pub fn issue_asset_nia(
         &self,
         ticker: &str,
@@ -137,6 +179,8 @@ impl WasmWallet {
     ///
     /// `amounts_js` is a JS array of u64 values.
     /// `inflation_amounts_js` is a JS array of u64 values for inflation allowances.
+    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from.
+    #[wasm_bindgen(js_name = "issueAssetIfa")]
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
@@ -145,8 +189,9 @@ impl WasmWallet {
         precision: u8,
         amounts_js: JsValue,
         inflation_amounts_js: JsValue,
-        replace_rights_num: u8,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<JsValue, JsValue> {
         let amounts: Vec<u64> = serde_wasm_bindgen::from_value(amounts_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid amounts array: {e}")))?;
@@ -161,14 +206,53 @@ impl WasmWallet {
                 precision,
                 amounts,
                 inflation_amounts,
-                replace_rights_num,
                 reject_list_url,
+                link_right,
+                linked_from_contract,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&asset)
+    }
+
+    /// Issue a new BFA (Bridged Fungible Asset) with `mint_rights` mint rights and no units.
+    ///
+    /// `contract_address` is the bridge contract on the EVM chain `chain_id`.
+    /// `reject_list_address` is an optional reject list contract on the same chain.
+    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from.
+    #[wasm_bindgen(js_name = "issueAssetBfa")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_asset_bfa(
+        &self,
+        ticker: &str,
+        name: &str,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: &str,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let asset = self
+            .inner
+            .borrow()
+            .issue_asset_bfa(
+                ticker.to_string(),
+                name.to_string(),
+                precision,
+                mint_rights,
+                chain_id,
+                contract_address.to_string(),
+                reject_list_address,
+                link_right,
+                linked_from_contract,
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&asset)
     }
 
     /// Return the BTC balance. Always skips sync on wasm32.
+    #[wasm_bindgen(js_name = "getBtcBalance")]
     pub fn get_btc_balance(&self) -> Result<JsValue, JsValue> {
         let balance = self
             .inner
@@ -178,7 +262,19 @@ impl WasmWallet {
         to_js(&balance)
     }
 
+    /// Return metadata for a specific asset (name, ticker, precision, supply, etc.).
+    #[wasm_bindgen(js_name = "getAssetMetadata")]
+    pub fn get_asset_metadata(&self, asset_id: &str) -> Result<JsValue, JsValue> {
+        let metadata = self
+            .inner
+            .borrow()
+            .get_asset_metadata(asset_id.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&metadata)
+    }
+
     /// Return the balance for a specific asset.
+    #[wasm_bindgen(js_name = "getAssetBalance")]
     pub fn get_asset_balance(&self, asset_id: &str) -> Result<JsValue, JsValue> {
         let balance = self
             .inner
@@ -189,6 +285,7 @@ impl WasmWallet {
     }
 
     /// List known RGB assets. Pass a JS array of schema strings to filter, or empty for all.
+    #[wasm_bindgen(js_name = "listAssets")]
     pub fn list_assets(&self, filter_asset_schemas_js: JsValue) -> Result<JsValue, JsValue> {
         let schemas: Vec<rgb_lib_wasm::AssetSchema> =
             serde_wasm_bindgen::from_value(filter_asset_schemas_js)
@@ -201,17 +298,27 @@ impl WasmWallet {
         to_js(&assets)
     }
 
-    /// List RGB transfers, optionally filtered by asset ID.
-    pub fn list_transfers(&self, asset_id: Option<String>) -> Result<JsValue, JsValue> {
+    /// List RGB transfers matching an asset filter ("Any", "NoAsset" or {"Id": "<asset_id>"}),
+    /// optionally restricted to the transfers of an on-chain txid.
+    #[wasm_bindgen(js_name = "listTransfers")]
+    pub fn list_transfers(
+        &self,
+        filter_js: JsValue,
+        txid: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let filter: rgb_lib_wasm::wallet::AssetFilter =
+            serde_wasm_bindgen::from_value(filter_js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid filter: {e}")))?;
         let transfers = self
             .inner
             .borrow()
-            .list_transfers(asset_id)
+            .list_transfers(filter, txid)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&transfers)
     }
 
     /// List unspent outputs. Always skips sync on wasm32.
+    #[wasm_bindgen(js_name = "listUnspents")]
     pub fn list_unspents(&self, settled_only: bool) -> Result<JsValue, JsValue> {
         let unspents = self
             .inner
@@ -222,6 +329,7 @@ impl WasmWallet {
     }
 
     /// List Bitcoin transactions. Always skips sync on wasm32.
+    #[wasm_bindgen(js_name = "listTransactions")]
     pub fn list_transactions(&self) -> Result<JsValue, JsValue> {
         let txs = self
             .inner
@@ -231,7 +339,28 @@ impl WasmWallet {
         to_js(&txs)
     }
 
+    /// List begun vanilla operations that are not ended or aborted.
+    #[wasm_bindgen(js_name = "listPendingVanillaTxs")]
+    pub fn list_pending_vanilla_txs(&self) -> Result<JsValue, JsValue> {
+        let txs = self
+            .inner
+            .borrow()
+            .list_pending_vanilla_txs()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&txs)
+    }
+
+    /// Fail a begun vanilla operation and release its inputs.
+    #[wasm_bindgen(js_name = "abortPendingVanillaTx")]
+    pub fn abort_pending_vanilla_tx(&self, txid: &str) -> Result<(), JsValue> {
+        self.inner
+            .borrow()
+            .abort_pending_vanilla_tx(txid.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Sign a PSBT (base64-encoded). Returns the signed PSBT string.
+    #[wasm_bindgen(js_name = "signPsbt")]
     pub fn sign_psbt(&self, unsigned_psbt: &str) -> Result<String, JsValue> {
         self.inner
             .borrow()
@@ -240,6 +369,7 @@ impl WasmWallet {
     }
 
     /// Finalize a signed PSBT (base64-encoded). Returns the finalized PSBT string.
+    #[wasm_bindgen(js_name = "finalizePsbt")]
     pub fn finalize_psbt(&self, signed_psbt: &str) -> Result<String, JsValue> {
         self.inner
             .borrow()
@@ -249,64 +379,91 @@ impl WasmWallet {
 
     /// Blind an UTXO to receive RGB assets. Returns ReceiveData as a JS object.
     ///
+    /// `online_js` is the Online object returned by `goOnline` (the wallet reserves the invoice on
+    /// its proxies).
     /// `assignment_js` is a JS object like `{ "Fungible": 100 }` or `"NonFungible"` or `"Any"`.
+    /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `transport_endpoints_js` is a JS array of endpoint strings.
-    pub fn blind_receive(
+    /// `encryption` is "Required" (default), "Unsupported" or "Optional".
+    #[wasm_bindgen(js_name = "blindReceive")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blind_receive(
         &self,
+        online_js: JsValue,
         asset_id: Option<String>,
         assignment_js: JsValue,
-        duration_seconds: Option<u32>,
+        expiration_timestamp_js: JsValue,
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
+        encryption: Option<String>,
     ) -> Result<JsValue, JsValue> {
+        let online = js_to_online_opt(online_js)?;
+        let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let assignment: rgb_lib_wasm::Assignment = serde_wasm_bindgen::from_value(assignment_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid assignment: {e}")))?;
         let transport_endpoints: Vec<String> =
             serde_wasm_bindgen::from_value(transport_endpoints_js)
                 .map_err(|e| JsValue::from_str(&format!("Invalid transport endpoints: {e}")))?;
-        let data = self
-            .inner
-            .borrow()
+        let encryption = parse_encryption(encryption)?;
+        let mut wallet = self.inner.borrow_mut();
+        let data = wallet
             .blind_receive(
+                online,
                 asset_id,
                 assignment,
-                duration_seconds,
+                expiration_timestamp,
                 transport_endpoints,
                 min_confirmations,
+                encryption,
             )
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&data)
     }
 
     /// Create an address to receive RGB assets via witness TX. Returns ReceiveData as a JS object.
-    pub fn witness_receive(
+    ///
+    /// `online_js` is the Online object returned by `goOnline`.
+    /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
+    /// `encryption` is "Required" (default), "Unsupported" or "Optional".
+    #[wasm_bindgen(js_name = "witnessReceive")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn witness_receive(
         &self,
+        online_js: JsValue,
         asset_id: Option<String>,
         assignment_js: JsValue,
-        duration_seconds: Option<u32>,
+        expiration_timestamp_js: JsValue,
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
+        encryption: Option<String>,
     ) -> Result<JsValue, JsValue> {
+        let online = js_to_online_opt(online_js)?;
+        let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let assignment: rgb_lib_wasm::Assignment = serde_wasm_bindgen::from_value(assignment_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid assignment: {e}")))?;
         let transport_endpoints: Vec<String> =
             serde_wasm_bindgen::from_value(transport_endpoints_js)
                 .map_err(|e| JsValue::from_str(&format!("Invalid transport endpoints: {e}")))?;
-        let data = self
-            .inner
-            .borrow_mut()
+        let encryption = parse_encryption(encryption)?;
+        let mut wallet = self.inner.borrow_mut();
+        let data = wallet
             .witness_receive(
+                online,
                 asset_id,
                 assignment,
-                duration_seconds,
+                expiration_timestamp,
                 transport_endpoints,
                 min_confirmations,
+                encryption,
             )
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&data)
     }
 
     /// Return a new Bitcoin address from the vanilla wallet.
+    #[wasm_bindgen(js_name = "getAddress")]
     pub fn get_address(&self) -> Result<String, JsValue> {
         self.inner
             .borrow_mut()
@@ -314,7 +471,27 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Rotate the pinned address for the given keychain.
+    /// keychain: 0 = External (colored), 1 = Internal (vanilla)
+    #[wasm_bindgen(js_name = "rotateAddress")]
+    pub fn rotate_address(&self, keychain: u32) -> Result<String, JsValue> {
+        let kc = match keychain {
+            0 => rgb_lib_wasm::bdk_wallet::KeychainKind::External,
+            1 => rgb_lib_wasm::bdk_wallet::KeychainKind::Internal,
+            _ => {
+                return Err(JsValue::from_str(
+                    "Invalid keychain: use 0 (External) or 1 (Internal)",
+                ));
+            }
+        };
+        self.inner
+            .borrow_mut()
+            .rotate_address(kc)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Delete failed transfers. Returns true if any were deleted.
+    #[wasm_bindgen(js_name = "deleteTransfers")]
     pub fn delete_transfers(
         &self,
         batch_transfer_idx: Option<i32>,
@@ -326,21 +503,24 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Go online: connect to an indexer. Returns Online data as a JS object.
-    pub async fn go_online(
-        &self,
-        skip_consistency_check: bool,
-        indexer_url: &str,
-    ) -> Result<JsValue, JsValue> {
+    /// Go online: connect to an indexer. Takes the online options as a JS object and returns
+    /// Online data as a JS object.
+    #[wasm_bindgen(js_name = "goOnline")]
+    pub async fn go_online(&self, online_options: JsValue) -> Result<JsValue, JsValue> {
+        let online_options: OnlineOptions = serde_wasm_bindgen::from_value(online_options)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let mut wallet = self.inner.borrow_mut();
         let online = wallet
-            .go_online(skip_consistency_check, indexer_url.to_string())
+            .go_online(online_options)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&online)
     }
 
     /// Sync the wallet with the indexer.
+    ///
+    /// Incremental: re-queries only already-revealed SPKs. Use `fullScan` to recover a thin
+    /// restored state.
     pub async fn sync(&self, online_js: JsValue) -> Result<(), JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
@@ -351,8 +531,24 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Run a BIP44 stop-gap full scan against the indexer.
+    ///
+    /// Rebuilds a thin BDK state (no revealed SPKs) after a restore, recovering the BTC balance
+    /// when an incremental `sync` cannot.
+    #[wasm_bindgen(js_name = "fullScan")]
+    pub async fn full_scan(&self, online_js: JsValue) -> Result<(), JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .full_scan(online)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Create UTXOs (begin): prepare a PSBT to create new UTXOs for RGB allocations.
     /// Returns the unsigned PSBT string.
+    #[wasm_bindgen(js_name = "createUtxosBegin")]
     pub async fn create_utxos_begin(
         &self,
         online_js: JsValue,
@@ -373,6 +569,7 @@ impl WasmWallet {
 
     /// Create UTXOs (end): broadcast a signed PSBT to create new UTXOs.
     /// Returns the number of created UTXOs.
+    #[wasm_bindgen(js_name = "createUtxosEnd")]
     pub async fn create_utxos_end(
         &self,
         online_js: JsValue,
@@ -388,9 +585,16 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Send RGB assets (begin): prepare a PSBT. Returns the unsigned PSBT string.
+    /// Send RGB assets (begin): prepare a PSBT. Returns a SendBeginResult JS object
+    /// `{ psbt, batchTransferIdx, details }`.
     ///
     /// `recipient_map_js` is a JS object mapping asset IDs to arrays of Recipient objects.
+    /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
+    /// `sender_transport_endpoint` is the sender's own proxy (e.g. `rpc://127.0.0.1:3000/json-rpc`),
+    /// where the recipients post their ACK.
+    /// If `dry_run` is true, the wallet does not save the transfer as Initiated.
+    #[wasm_bindgen(js_name = "sendBegin")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_begin(
         &self,
         online_js: JsValue,
@@ -398,20 +602,37 @@ impl WasmWallet {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
-    ) -> Result<String, JsValue> {
+        expiration_timestamp_js: JsValue,
+        sender_transport_endpoint: Option<String>,
+        lock_time: Option<u32>,
+        dry_run: bool,
+    ) -> Result<JsValue, JsValue> {
+        let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let recipient_map: HashMap<String, Vec<Recipient>> =
             serde_wasm_bindgen::from_value(recipient_map_js)
                 .map_err(|e| JsValue::from_str(&format!("Invalid recipient map: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
-        wallet
-            .send_begin(online, recipient_map, donation, fee_rate, min_confirmations)
+        let result = wallet
+            .send_begin(
+                online,
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                expiration_timestamp,
+                sender_transport_endpoint,
+                lock_time,
+                dry_run,
+            )
             .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
     }
 
     /// Send RGB assets (end): broadcast a signed PSBT. Returns an OperationResult JS object.
+    #[wasm_bindgen(js_name = "sendEnd")]
     pub async fn send_end(
         &self,
         online_js: JsValue,
@@ -429,6 +650,7 @@ impl WasmWallet {
     }
 
     /// Send BTC (begin): prepare a PSBT. Returns the unsigned PSBT string.
+    #[wasm_bindgen(js_name = "sendBtcBegin")]
     pub async fn send_btc_begin(
         &self,
         online_js: JsValue,
@@ -447,6 +669,7 @@ impl WasmWallet {
     }
 
     /// Send BTC (end): broadcast a signed PSBT. Returns the txid string.
+    #[wasm_bindgen(js_name = "sendBtcEnd")]
     pub async fn send_btc_end(
         &self,
         online_js: JsValue,
@@ -485,6 +708,7 @@ impl WasmWallet {
     }
 
     /// Fail pending transfers. Returns true if any transfers were failed.
+    #[wasm_bindgen(js_name = "failTransfers")]
     pub async fn fail_transfers(
         &self,
         online_js: JsValue,
@@ -502,6 +726,7 @@ impl WasmWallet {
     }
 
     /// Get fee estimation for a target number of blocks.
+    #[wasm_bindgen(js_name = "getFeeEstimation")]
     pub async fn get_fee_estimation(
         &self,
         online_js: JsValue,
@@ -517,6 +742,7 @@ impl WasmWallet {
     }
 
     /// Drain all wallet funds (begin): prepare a PSBT. Returns the unsigned PSBT string.
+    #[wasm_bindgen(js_name = "drainToBegin")]
     pub async fn drain_to_begin(
         &self,
         online_js: JsValue,
@@ -534,6 +760,7 @@ impl WasmWallet {
     }
 
     /// Drain all wallet funds (end): broadcast a signed PSBT. Returns the txid string.
+    #[wasm_bindgen(js_name = "drainToEnd")]
     pub async fn drain_to_end(
         &self,
         online_js: JsValue,
@@ -552,6 +779,7 @@ impl WasmWallet {
     ///
     /// `inflation_amounts_js` is a JS array of u64 values.
     #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = "inflateBegin")]
     pub async fn inflate_begin(
         &self,
         online_js: JsValue,
@@ -578,6 +806,7 @@ impl WasmWallet {
     }
 
     /// Inflate an IFA asset (end): broadcast a signed PSBT. Returns an OperationResult JS object.
+    #[wasm_bindgen(js_name = "inflateEnd")]
     pub async fn inflate_end(
         &self,
         online_js: JsValue,
@@ -593,7 +822,221 @@ impl WasmWallet {
         to_js(&result)
     }
 
+    /// Burn RGB assets: begin, sign with the wallet keys and end. Returns an OperationResult JS
+    /// object.
+    ///
+    /// `burn_reason` is an optional hex-encoded 32-byte value.
+    #[wasm_bindgen(js_name = "burn")]
+    pub async fn burn(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .burn(
+                online,
+                asset_id.to_string(),
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Burn RGB assets (begin): prepare a PSBT. Returns a BurnBeginResult JS object.
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = "burnBegin")]
+    pub async fn burn_begin(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .burn_begin(
+                online,
+                asset_id.to_string(),
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Burn RGB assets (end): broadcast a signed PSBT. Returns an OperationResult JS object.
+    #[wasm_bindgen(js_name = "burnEnd")]
+    pub async fn burn_end(
+        &self,
+        online_js: JsValue,
+        signed_psbt: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .burn_end(online, signed_psbt.to_string())
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Link an IFA or BFA asset to another contract: begin, sign with the wallet keys and end.
+    /// Returns an OperationResult JS object.
+    #[wasm_bindgen(js_name = "link")]
+    pub async fn link(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        linked_to_contract: &str,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .link(
+                online,
+                asset_id.to_string(),
+                linked_to_contract.to_string(),
+                fee_rate,
+                min_confirmations,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Link an IFA or BFA asset to another contract (begin): prepare a PSBT. Returns a
+    /// LinkBeginResult JS object.
+    #[wasm_bindgen(js_name = "linkBegin")]
+    pub async fn link_begin(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        linked_to_contract: &str,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .link_begin(
+                online,
+                asset_id.to_string(),
+                linked_to_contract.to_string(),
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Link an IFA or BFA asset to another contract (end): broadcast a signed PSBT. Returns an
+    /// OperationResult JS object.
+    #[wasm_bindgen(js_name = "linkEnd")]
+    pub async fn link_end(
+        &self,
+        online_js: JsValue,
+        signed_psbt: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .link_end(online, signed_psbt.to_string())
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Begin a BFA mint. Returns a MintBeginResult object.
+    #[wasm_bindgen(js_name = "mintBegin")]
+    pub async fn mint_begin(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        recipient_js: JsValue,
+        before_block: u64,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let recipient: Recipient = serde_wasm_bindgen::from_value(recipient_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Recipient object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .mint_begin(
+                online,
+                asset_id.to_string(),
+                recipient,
+                before_block,
+                fee_rate,
+                min_confirmations,
+                sender_transport_endpoint.to_string(),
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Complete a BFA mint. Returns an OperationResult object.
+    #[wasm_bindgen(js_name = "mintEnd")]
+    pub async fn mint_end(
+        &self,
+        online_js: JsValue,
+        signed_psbt: &str,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .mint_end(online, signed_psbt.to_string())
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Return the checked mint received on a recipient ID as a ReceivedMint object, or null.
+    #[wasm_bindgen(js_name = "getReceivedMint")]
+    pub fn get_received_mint(&self, recipient_id: &str) -> Result<JsValue, JsValue> {
+        let received_mint = self
+            .inner
+            .borrow()
+            .get_received_mint(recipient_id.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        received_mint.map_or(Ok(JsValue::NULL), |m| to_js(&m))
+    }
+
     /// List vanilla (non-colored) unspent outputs. Returns a JS array of LocalOutput objects.
+    #[wasm_bindgen(js_name = "listUnspentsVanilla")]
     pub async fn list_unspents_vanilla(
         &self,
         online_js: JsValue,
@@ -619,6 +1062,7 @@ impl WasmWallet {
     }
 
     /// Restore wallet state from an encrypted backup.
+    #[wasm_bindgen(js_name = "restoreBackup")]
     pub fn restore_backup(&self, backup_bytes: &[u8], password: &str) -> Result<(), JsValue> {
         self.inner
             .borrow_mut()
@@ -627,6 +1071,7 @@ impl WasmWallet {
     }
 
     /// Check if the wallet needs a backup. Returns true if modified since last backup.
+    #[wasm_bindgen(js_name = "backupInfo")]
     pub fn backup_info(&self) -> Result<bool, JsValue> {
         self.inner
             .borrow()
@@ -641,6 +1086,7 @@ impl WasmWallet {
     /// **Security note:** The signing key crosses the JS/WASM boundary as a string. It will
     /// exist in V8's string pool and cannot be zeroed from Rust. Callers should avoid storing
     /// the key in JS longer than necessary (e.g., don't keep it in a global variable).
+    #[wasm_bindgen(js_name = "configureVssBackup")]
     pub fn configure_vss_backup(
         &self,
         server_url: &str,
@@ -668,11 +1114,13 @@ impl WasmWallet {
     }
 
     /// Disable VSS (cloud) backup.
+    #[wasm_bindgen(js_name = "disableVssBackup")]
     pub fn disable_vss_backup(&self) {
         self.inner.borrow_mut().disable_vss_backup();
     }
 
     /// Upload an encrypted backup to the configured VSS server. Returns the server version.
+    #[wasm_bindgen(js_name = "vssBackup")]
     pub async fn vss_backup(&self) -> Result<JsValue, JsValue> {
         let wallet = self.inner.borrow();
         let version = wallet
@@ -682,7 +1130,20 @@ impl WasmWallet {
         Ok(JsValue::from_f64(version as f64))
     }
 
+    /// Upload a backup when the wallet has changes not yet backed up.
+    /// Returns the server version, or null when no upload is needed.
+    #[wasm_bindgen(js_name = "ensureInitialBackup")]
+    pub async fn ensure_initial_backup(&self) -> Result<JsValue, JsValue> {
+        let wallet = self.inner.borrow();
+        let version = wallet
+            .ensure_initial_backup()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(version.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)))
+    }
+
     /// Download and restore wallet state from VSS server.
+    #[wasm_bindgen(js_name = "vssRestoreBackup")]
     pub async fn vss_restore_backup(&self) -> Result<(), JsValue> {
         self.inner
             .borrow_mut()
@@ -692,6 +1153,7 @@ impl WasmWallet {
     }
 
     /// Query VSS backup status. Returns { backup_exists, server_version, backup_required }.
+    #[wasm_bindgen(js_name = "vssBackupInfo")]
     pub async fn vss_backup_info(&self) -> Result<JsValue, JsValue> {
         let wallet = self.inner.borrow();
         let info = wallet
@@ -702,10 +1164,70 @@ impl WasmWallet {
     }
 }
 
-/// Check whether the provided URL points to a valid RGB proxy server.
+/// An RGB invoice parsed from a string. Exposes structured invoice data to JavaScript.
 #[wasm_bindgen]
+pub struct WasmInvoice {
+    inner: rgb_lib_wasm::wallet::Invoice,
+}
+
+#[wasm_bindgen]
+impl WasmInvoice {
+    /// Parse an RGB invoice string. Throws if the string is not a valid RGB invoice.
+    #[wasm_bindgen(constructor)]
+    pub fn new(invoice_string: &str) -> Result<WasmInvoice, JsValue> {
+        let invoice = rgb_lib_wasm::wallet::Invoice::new(invoice_string.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(WasmInvoice { inner: invoice })
+    }
+
+    /// Return the parsed invoice data as a JS object.
+    #[wasm_bindgen(js_name = "invoiceData")]
+    pub fn invoice_data(&self) -> Result<JsValue, JsValue> {
+        // to_js keeps JS maps because refresh has integer keys. These keys are strings.
+        let serializer = serde_wasm_bindgen::Serializer::new()
+            .serialize_large_number_types_as_bigints(true)
+            .serialize_maps_as_objects(true);
+        self.inner
+            .invoice_data()
+            .serialize(&serializer)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Return the original invoice string.
+    #[wasm_bindgen(js_name = "invoiceString")]
+    pub fn invoice_string(&self) -> String {
+        self.inner.invoice_string()
+    }
+}
+
+/// Check whether the provided URL points to a valid RGB proxy server.
+#[wasm_bindgen(js_name = "checkProxyUrl")]
 pub async fn check_proxy_url(proxy_url: &str) -> Result<(), JsValue> {
     rgb_lib_wasm::wallet::rust_only::check_proxy_url(proxy_url)
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Validate an RGB consignment using witness data bundled in the consignment (offchain).
+///
+/// Works before the witness transaction is broadcast. Takes the raw consignment
+/// bytes (strict-encoded, not base64), the witness transaction ID, and the Bitcoin network.
+///
+/// Returns a JS object: `{ valid: boolean, warnings?: string[], error?: string, details?: string }`
+#[wasm_bindgen(js_name = "validateConsignmentOffchain")]
+pub fn validate_consignment_offchain(
+    consignment_bytes: &[u8],
+    txid: &str,
+    network: &str,
+) -> Result<JsValue, JsValue> {
+    let bitcoin_network = network
+        .parse::<rgb_lib_wasm::BitcoinNetwork>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let result = rgb_lib_wasm::wallet::rust_only::validate_consignment_offchain(
+        consignment_bytes,
+        txid,
+        bitcoin_network,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&result)
 }

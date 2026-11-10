@@ -2,12 +2,8 @@
 
 use amplify::s;
 use base64::{Engine as _, engine::general_purpose};
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
-use generic_array::GenericArray;
-use scrypt::{
-    Scrypt,
-    password_hash::{PasswordHasher, Salt, SaltString, rand_core::OsRng},
-};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use scrypt::{Params, phc::Salt, scrypt};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
@@ -30,33 +26,46 @@ pub(crate) struct BackupPubData {
 pub(crate) struct WalletBackupPayload {
     pub(crate) db: crate::database::memory_db::InMemoryDb,
     pub(crate) bdk_changeset: Option<bdk_wallet::ChangeSet>,
-    /// Strict-encoded MemStash, base64
-    pub(crate) stock_stash_b64: String,
-    /// Strict-encoded MemState, base64
-    pub(crate) stock_state_b64: String,
-    /// Strict-encoded MemIndex, base64
-    pub(crate) stock_index_b64: String,
+    /// Encoded RGB store, base64
+    pub(crate) rgb_store: String,
+    /// Pinned derivation index per keychain for address reuse.
+    #[serde(default)]
+    pub(crate) reuse_address_index: std::collections::HashMap<bdk_wallet::KeychainKind, u32>,
+    /// Artifacts of sends not yet broadcast, keyed by TXID.
+    #[serde(default)]
+    pub(crate) transfer_artifacts:
+        std::collections::HashMap<String, super::online::TransferArtifacts>,
+    pub(crate) received_consignments: std::collections::HashMap<String, Vec<u8>>,
+    pub(crate) received_consignment_meta:
+        std::collections::HashMap<String, super::ReceivedConsignmentMeta>,
+    pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
+    /// Received mints, keyed by recipient_id.
+    pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
-pub(crate) fn derive_key(
-    password: &str,
-    salt_b64: &str,
-) -> Result<GenericArray<u8, typenum::U32>, Error> {
+pub(crate) fn derive_key(password: &str, salt_b64: &str) -> Result<Key, Error> {
     let salt = Salt::from_b64(salt_b64).map_err(InternalError::from)?;
-    let password_hash = Scrypt
-        .hash_password_customized(
-            password.as_bytes(),
-            None,
-            None,
-            scrypt::Params::default(),
-            salt,
-        )
-        .map_err(InternalError::from)?;
-    let hash_output = password_hash
-        .hash
-        .ok_or(InternalError::NoPasswordHashError)?;
-    Ok(*GenericArray::from_slice(hash_output.as_bytes()))
+    let mut key = [0u8; 32];
+    scrypt(
+        password.as_bytes(),
+        salt.as_ref(),
+        &Params::RECOMMENDED,
+        &mut key,
+    )
+    .map_err(|e| Error::Internal {
+        details: e.to_string(),
+    })?;
+    Ok(key.into())
+}
+
+/// Generate a random base64 salt.
+fn generate_salt() -> Result<String, Error> {
+    let mut bytes = [0u8; Salt::RECOMMENDED_LENGTH];
+    getrandom::getrandom(&mut bytes).map_err(|e| Error::Internal {
+        details: format!("RNG unavailable: {e}"),
+    })?;
+    Ok(Salt::new(&bytes).map_err(InternalError::from)?.to_string())
 }
 
 /// Encrypt plaintext bytes using XChaCha20Poly1305.
@@ -64,22 +73,22 @@ pub(crate) fn encrypt_payload(
     plaintext: &[u8],
     password: &str,
 ) -> Result<(Vec<u8>, BackupPubData), Error> {
-    let salt = SaltString::generate(&mut OsRng);
-    let key = derive_key(password, salt.as_str())?;
+    let salt = generate_salt()?;
+    let key = derive_key(password, &salt)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce_bytes).map_err(|e| Error::Internal {
         details: format!("RNG unavailable: {e}"),
     })?;
-    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let nonce = XNonce::from(nonce_bytes);
 
     let cipher = XChaCha20Poly1305::new(&key);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| InternalError::AeadError(e.to_string()))?;
 
     let pub_data = BackupPubData {
-        salt: salt.to_string(),
+        salt,
         nonce: hex::encode(nonce_bytes),
         version: BACKUP_VERSION,
     };
@@ -100,11 +109,11 @@ pub(crate) fn decrypt_payload(
     let key = derive_key(password, &pub_data.salt)?;
     let nonce_bytes =
         hex::decode(&pub_data.nonce).map_err(|e| InternalError::HexError(e.to_string()))?;
-    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let nonce = XNonce::try_from(nonce_bytes.as_slice()).map_err(|_| Error::InvalidBackup)?;
 
     let cipher = XChaCha20Poly1305::new(&key);
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| Error::WrongPassword)
 }
 
@@ -121,20 +130,14 @@ pub(crate) fn encode_backup(ciphertext: &[u8], pub_data: &BackupPubData) -> Resu
 
 /// Decode: split backup bytes into (BackupPubData, ciphertext).
 pub(crate) fn decode_backup(data: &[u8]) -> Result<(BackupPubData, &[u8]), Error> {
-    if data.len() < 4 {
-        return Err(Error::InvalidBackup);
-    }
-    let pub_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + pub_len {
-        return Err(Error::InvalidBackup);
-    }
+    let (len, rest) = data.split_first_chunk::<4>().ok_or(Error::InvalidBackup)?;
+    let pub_len = u32::from_le_bytes(*len) as usize;
+    let (pub_json, ciphertext) = rest.split_at_checked(pub_len).ok_or(Error::InvalidBackup)?;
     let pub_data: BackupPubData =
-        serde_json::from_slice(&data[4..4 + pub_len]).map_err(|_| Error::InvalidBackup)?;
-    let ciphertext = &data[4 + pub_len..];
+        serde_json::from_slice(pub_json).map_err(|_| Error::InvalidBackup)?;
     Ok((pub_data, ciphertext))
 }
 
-use rgbstd::persistence::{MemIndex, MemStash, MemState};
 use strict_encoding::{StrictDeserialize, StrictSerialize};
 
 impl super::Wallet {
@@ -147,62 +150,51 @@ impl super::Wallet {
         let backup_bytes = encode_backup(&ciphertext, &pub_data)?;
 
         self.update_backup_info(true)?;
+        // A failed save does not stop the export. The next call returns the save error.
+        let _ = self.queue_save();
 
         Ok(backup_bytes)
     }
 
     /// Restore wallet state from an encrypted backup.
     /// The wallet must be created first via `Wallet::new()` with the same mnemonic/xpubs.
+    /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()`, or its data directory holds no snapshot.
+    /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
-        // 1. Decode envelope
         let (pub_data, ciphertext) = decode_backup(backup_bytes)?;
-
-        // 2. Decrypt
         let payload_json = decrypt_payload(ciphertext, password, &pub_data)?;
+        self.restore_payload(&payload_json)?;
 
-        // 3. Deserialize payload
-        let payload: WalletBackupPayload =
-            serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
-
-        // 4. Restore InMemoryDb + BDK via existing snapshot mechanism
-        let snapshot = super::idb_store::WalletSnapshot {
-            db: payload.db,
-            bdk_changeset: payload.bdk_changeset,
-        };
-        self.restore_from_snapshot(snapshot)?;
-
-        // 5. Restore RGB stock from strict-encoded components
-        let stash_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_stash_b64)
-            .map_err(InternalError::from)?;
-        let state_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_state_b64)
-            .map_err(InternalError::from)?;
-        let index_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_index_b64)
-            .map_err(InternalError::from)?;
-
-        const MAX: usize = u32::MAX as usize;
-        let stash = MemStash::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(stash_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let state = MemState::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(state_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let index = MemIndex::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(index_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-
-        let stock = rgbstd::persistence::Stock::with(stash, state, index);
-        *self.rgb_stock.borrow_mut() = Some(stock);
+        // Persist restored state to IndexedDB so it survives page reloads
+        self.queue_save()?;
+        super::idb_store::request_persistent_storage();
 
         Ok(())
+    }
+
+    /// Restore the wallet and the RGB stock from a backup payload. Both restore paths use it.
+    fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
+        let payload: WalletBackupPayload =
+            serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
+        // Without a BDK changeset the restore skips the descriptor check.
+        if payload.bdk_changeset.is_none() && self.bdk_database.get_data().is_some() {
+            return Err(Error::InvalidBackup);
+        }
+
+        let snapshot = super::idb_store::WalletSnapshot {
+            writer: 0,
+            sequence: 0,
+            db: payload.db,
+            bdk_changeset: payload.bdk_changeset,
+            transfer_artifacts: payload.transfer_artifacts,
+            received_consignments: payload.received_consignments,
+            received_consignment_meta: payload.received_consignment_meta,
+            received_signed_txs: payload.received_signed_txs,
+            received_mints: payload.received_mints,
+            rgb_store: payload.rgb_store,
+            reuse_address_index: payload.reuse_address_index,
+        };
+        self.restore_from_snapshot(snapshot)
     }
 
     /// Returns true if the wallet has been modified since the last backup.
@@ -245,60 +237,51 @@ impl super::Wallet {
         let fingerprint = self.wallet_data.master_fingerprint.clone();
 
         self.update_backup_info(true)?;
-        match client.upload_backup(&payload_json, &fingerprint).await {
-            Ok(version) => Ok(version),
+        let res = match client.upload_backup(&payload_json, &fingerprint).await {
+            Ok(version) => {
+                *self.last_vss_backup_error.borrow_mut() = None;
+                Ok(version)
+            }
             Err(e) => {
                 let _ = self.update_backup_info(false);
+                *self.last_vss_backup_error.borrow_mut() = Some(e.to_string());
                 Err(e)
             }
+        };
+        self.flush().await?;
+        res
+    }
+
+    /// Upload a backup if the wallet has changes not yet backed up. Call after
+    /// `configure_vss_backup` so enabling backups never leaves an empty store.
+    /// Returns the new server version, or `None` when no upload was needed.
+    pub async fn ensure_initial_backup(&self) -> Result<Option<i64>, Error> {
+        if self.vss_client.is_none() {
+            return Err(Error::Internal {
+                details: s!("VSS backup not configured"),
+            });
         }
+        if !self.backup_info()? {
+            return Ok(None);
+        }
+        self.vss_backup().await.map(Some)
     }
 
     /// Download and restore wallet state from VSS server.
+    /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
     pub async fn vss_restore_backup(&mut self) -> Result<(), Error> {
         let client = self.vss_client.as_ref().ok_or(Error::Internal {
             details: s!("VSS backup not configured"),
         })?;
 
-        let payload_json = client.download_backup().await?;
-        let payload: WalletBackupPayload =
-            serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
+        let payload_json = client
+            .download_backup(&self.wallet_data.master_fingerprint)
+            .await?;
+        self.restore_payload(&payload_json)?;
 
-        let snapshot = super::idb_store::WalletSnapshot {
-            db: payload.db,
-            bdk_changeset: payload.bdk_changeset,
-        };
-        self.restore_from_snapshot(snapshot)?;
-
-        const MAX: usize = u32::MAX as usize;
-        let stash_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_stash_b64)
-            .map_err(InternalError::from)?;
-        let state_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_state_b64)
-            .map_err(InternalError::from)?;
-        let index_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_index_b64)
-            .map_err(InternalError::from)?;
-
-        let stash = MemStash::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(stash_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let state = MemState::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(state_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let index = MemIndex::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(index_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-
-        let stock = rgbstd::persistence::Stock::with(stash, state, index);
-        *self.rgb_stock.borrow_mut() = Some(stock);
+        // Persist restored state to IndexedDB so it survives page reloads
+        self.flush().await?;
+        super::idb_store::request_persistent_storage();
 
         Ok(())
     }
@@ -315,6 +298,7 @@ impl super::Wallet {
             backup_exists: server_version.is_some(),
             server_version,
             backup_required,
+            last_backup_error: self.last_vss_backup_error.borrow().clone(),
         })
     }
 
@@ -325,27 +309,23 @@ impl super::Wallet {
             details: s!("RGB stock is currently in use (runtime active)"),
         })?;
 
-        let stash_bytes = stock
-            .as_stash_provider()
-            .to_strict_serialized::<{ u32::MAX as usize }>()
-            .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let state_bytes = stock
-            .as_state_provider()
-            .to_strict_serialized::<{ u32::MAX as usize }>()
-            .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let index_bytes = stock
-            .as_index_provider()
-            .to_strict_serialized::<{ u32::MAX as usize }>()
-            .map_err(|e| InternalError::StockError(e.to_string()))?;
+        let rgb_store =
+            super::idb_store::serialize_stock(stock).ok_or_else(|| Error::Internal {
+                details: s!("failed to serialize RGB stock"),
+            })?;
 
         drop(stock_ref);
 
         let payload = WalletBackupPayload {
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
-            stock_stash_b64: general_purpose::STANDARD.encode(stash_bytes.as_unconfined()),
-            stock_state_b64: general_purpose::STANDARD.encode(state_bytes.as_unconfined()),
-            stock_index_b64: general_purpose::STANDARD.encode(index_bytes.as_unconfined()),
+            rgb_store,
+            reuse_address_index: self.reuse_address_index.clone(),
+            transfer_artifacts: self.transfer_artifacts.clone(),
+            received_consignments: self.received_consignments.clone(),
+            received_consignment_meta: self.received_consignment_meta.clone(),
+            received_signed_txs: self.received_signed_txs.clone(),
+            received_mints: self.received_mints.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -376,6 +356,15 @@ mod tests {
 
         let result = decrypt_payload(&ciphertext, "wrong", &pub_data);
         assert!(matches!(result, Err(Error::WrongPassword)));
+    }
+
+    #[test]
+    fn decrypt_wrong_nonce_length_fails() {
+        let (ciphertext, mut pub_data) = encrypt_payload(b"data", "pw").unwrap();
+        pub_data.nonce = s!("00");
+
+        let result = decrypt_payload(&ciphertext, "pw", &pub_data);
+        assert!(matches!(result, Err(Error::InvalidBackup)));
     }
 
     #[test]
@@ -424,12 +413,476 @@ mod tests {
 
     #[test]
     fn derive_key_deterministic() {
-        let salt = SaltString::generate(&mut OsRng);
-        let k1 = derive_key("password", salt.as_str()).unwrap();
-        let k2 = derive_key("password", salt.as_str()).unwrap();
+        let salt = generate_salt().unwrap();
+        let k1 = derive_key("password", &salt).unwrap();
+        let k2 = derive_key("password", &salt).unwrap();
         assert_eq!(k1, k2);
 
-        let k3 = derive_key("different", salt.as_str()).unwrap();
+        let k3 = derive_key("different", &salt).unwrap();
         assert_ne!(k1, k3);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    // A sender proxy that has no ACK to serve.
+    fn ack_proxy() -> (mockito::ServerGuard, mockito::Mock) {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!("ack.get")))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","id":null,"result":{"acks":{},"signatures":{}}}"#)
+            .create();
+        (server, mock)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    // Rows of one outgoing transfer after the ACK. `asset_id` is `None` for a sats-only send.
+    fn seed_acknowledged_transfer(
+        wallet: &mut crate::wallet::Wallet,
+        txid: &str,
+        asset_id: Option<&str>,
+        sender_proxy: &str,
+    ) -> i32 {
+        use crate::database::enums::{AssetSchema, TransferStatus};
+        use crate::database::memory_db::{
+            ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
+            DbTransferActMod,
+        };
+
+        let batch_idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+                expiration: ActiveValue::Set(Some(i64::MAX)),
+                min_confirmations: ActiveValue::Set(1),
+                operation_secret_key: ActiveValue::Set(Some(vec![7; 32])),
+                ..Default::default()
+            })
+            .unwrap();
+        if let Some(id) = asset_id {
+            wallet
+                .database
+                .set_asset(DbAssetActMod {
+                    id: ActiveValue::Set(id.to_string()),
+                    schema: ActiveValue::Set(AssetSchema::Nia),
+                    added_at: ActiveValue::Set(1000),
+                    name: ActiveValue::Set(s!("Test Asset")),
+                    precision: ActiveValue::Set(8),
+                    initial_supply: ActiveValue::Set(s!("1000")),
+                    timestamp: ActiveValue::Set(1000),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let asset_transfer_idx = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                asset_id: ActiveValue::Set(asset_id.map(String::from)),
+                ..Default::default()
+            })
+            .unwrap();
+        let transfer_idx = wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                incoming: ActiveValue::Set(false),
+                recipient_id: ActiveValue::Set(Some(s!("recipient"))),
+                ack: ActiveValue::Set(Some(true)),
+                proxy_transfer_id: ActiveValue::Set(Some(s!("transfer"))),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .save_sender_transport_endpoint(transfer_idx, sender_proxy)
+            .unwrap();
+        batch_idx
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
+        use crate::keys::generate_keys;
+        use crate::utils::MemStock;
+        use crate::wallet::Online;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::online::{OnlineData, TransferArtifacts};
+
+        let txid = "1".repeat(64);
+        let indexer_url = "http://127.0.0.1:1";
+        let password = "pw";
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+
+        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
+        *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
+        let (proxy, _mock) = ack_proxy();
+        let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id, &proxy.url());
+        // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
+        sender.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_psbt: Some(s!("not a psbt")),
+                ..Default::default()
+            },
+        );
+
+        // The payload, encrypted and encoded as `backup()` does.
+        let payload = sender.serialize_backup_payload().unwrap();
+        let (ciphertext, pub_data) = encrypt_payload(&payload, password).unwrap();
+        let backup_bytes = encode_backup(&ciphertext, &pub_data).unwrap();
+        drop(sender);
+
+        let mut rebuilt = make_test_wallet_with_keys(keys, false);
+        rebuilt.restore_backup(&backup_bytes, password).unwrap();
+
+        rebuilt.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(rebuilt.refresh(online, None, vec![], true))
+            .unwrap();
+
+        let refreshed = &result[&batch_idx];
+        assert!(
+            matches!(refreshed.failure, Some(Error::InvalidPsbt { .. })),
+            "rebuilt wallet lost the signed PSBT: {:?}",
+            refreshed.failure
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_after_restore_backup_reads_signed_psbt() {
+        refresh_after_restore_backup_reads_signed_psbt_impl(None);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_after_restore_backup_reads_signed_psbt_for_rgb_asset() {
+        refresh_after_restore_backup_reads_signed_psbt_impl(Some("rgb:test-asset"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_fails_transfer_without_signed_psbt_impl(asset_id: Option<&str>) {
+        use crate::database::enums::TransferStatus;
+        use crate::wallet::Online;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::online::OnlineData;
+
+        let txid = "1".repeat(64);
+        let indexer_url = "http://127.0.0.1:1";
+        // A wallet restored from a backup without artifacts, ACK already received.
+        let mut wallet = make_test_wallet(false);
+        let (proxy, _mock) = ack_proxy();
+        let batch_idx = seed_acknowledged_transfer(&mut wallet, &txid, asset_id, &proxy.url());
+        let seeded_expiration = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .iter()
+            .find(|t| t.idx == batch_idx)
+            .unwrap()
+            .expiration;
+
+        wallet.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt
+            .block_on(wallet.refresh(online.clone(), None, vec![], true))
+            .unwrap();
+
+        let refreshed = &result[&batch_idx];
+        assert!(
+            matches!(&refreshed.failure, Some(Error::MissingTransferArtifacts { txid: t }) if *t == txid),
+            "unexpected failure: {:?}",
+            refreshed.failure
+        );
+        assert_eq!(refreshed.updated_status, Some(TransferStatus::Failed));
+        let failed_expiration = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .iter()
+            .find(|t| t.idx == batch_idx)
+            .unwrap()
+            .expiration;
+        assert_ne!(
+            failed_expiration, seeded_expiration,
+            "expiration was not refreshed when the transfer failed"
+        );
+        let result = rt
+            .block_on(wallet.refresh(online, None, vec![], true))
+            .unwrap();
+        assert!(!result.contains_key(&batch_idx));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_fails_transfer_without_signed_psbt() {
+        refresh_fails_transfer_without_signed_psbt_impl(None);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_fails_transfer_without_signed_psbt_for_rgb_asset() {
+        refresh_fails_transfer_without_signed_psbt_impl(Some("rgb:test-asset"));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_skips_and_fail_transfers_fails_expired_initiated_sends() {
+        use crate::database::enums::TransferStatus;
+        use crate::database::memory_db::{ActiveValue, DbBatchTransferActMod};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::online::{
+            OnlineData, RefreshFilter, RefreshTransferStatus, TransferArtifacts,
+        };
+        use crate::wallet::{Online, Outpoint};
+
+        let indexer_url = "http://127.0.0.1:1";
+        let mut wallet = make_test_wallet(false);
+        let (proxy, _mock) = ack_proxy();
+        let mut seeded = vec![];
+        for (txid, expiration) in [("1".repeat(64), 1), ("2".repeat(64), i64::MAX)] {
+            let asset_id = format!("rgb:{}", &txid[..1]);
+            let batch_idx =
+                seed_acknowledged_transfer(&mut wallet, &txid, Some(&asset_id), &proxy.url());
+            let batch_transfer = wallet
+                .database
+                .get_db_data(false)
+                .unwrap()
+                .batch_transfers
+                .into_iter()
+                .find(|t| t.idx == batch_idx)
+                .unwrap();
+            let mut updated: DbBatchTransferActMod = batch_transfer.into();
+            updated.status = ActiveValue::Set(TransferStatus::Initiated);
+            updated.expiration = ActiveValue::Set(Some(expiration));
+            wallet.database.update_batch_transfer(&mut updated).unwrap();
+            let input = Outpoint {
+                txid: txid.clone(),
+                vout: 0,
+            };
+            wallet.transfer_artifacts.insert(
+                txid,
+                TransferArtifacts {
+                    inputs: vec![input.clone()],
+                    ..Default::default()
+                },
+            );
+            seeded.push((batch_idx, input));
+        }
+        let [(expired_idx, _), (pending_idx, pending_input)] = <[_; 2]>::try_from(seeded).unwrap();
+
+        wallet.online_data = Some(OnlineData::for_test(indexer_url));
+        let online = Online {
+            id: 1,
+            indexer_url: indexer_url.to_string(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let filter = vec![RefreshFilter {
+            status: RefreshTransferStatus::WaitingCounterparty,
+            incoming: false,
+        }];
+        let result = rt
+            .block_on(wallet.refresh(online.clone(), None, filter, true))
+            .unwrap();
+        assert!(result.is_empty());
+
+        assert!(
+            rt.block_on(wallet.fail_transfers(online, None, false, true))
+                .unwrap()
+        );
+        let statuses: Vec<(i32, TransferStatus)> = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .iter()
+            .map(|t| (t.idx, t.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (expired_idx, TransferStatus::Failed),
+                (pending_idx, TransferStatus::Initiated)
+            ]
+        );
+        assert_eq!(
+            wallet.get_reserved_outpoints().unwrap(),
+            vec![pending_input]
+        );
+    }
+
+    // The backup, which VSS shares, and the IndexedDB snapshot carry the transfer artifacts and
+    // the data of the proxy v1 flow.
+    #[test]
+    fn vss_restore_payload_keeps_transfer_artifacts() {
+        // vss_restore_backup uses restore_payload, so this covers the VSS path.
+        use crate::keys::generate_keys;
+        use crate::utils::MemStock;
+        use crate::wallet::offline::ReceivedConsignmentMeta;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::online::TransferArtifacts;
+
+        let txid = "2".repeat(64);
+        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+
+        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
+        *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
+        sender.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                signed_psbt: Some(s!("psbt")),
+                ..Default::default()
+            },
+        );
+        let meta = ReceivedConsignmentMeta {
+            proxy_url: Some(s!("http://127.0.0.1:3000")),
+            transfer_id: Some(s!("transfer")),
+            sender_transport_endpoint: s!("rpc://127.0.0.1:3000"),
+            sender_pubkey: "11".repeat(32),
+            consignment_hash: "22".repeat(32),
+            batch: true,
+        };
+        sender
+            .received_consignments
+            .insert(s!("recipient"), vec![1, 2, 3]);
+        sender
+            .received_consignment_meta
+            .insert(s!("recipient"), meta.clone());
+        sender
+            .received_signed_txs
+            .insert(s!("recipient"), vec![4, 5, 6]);
+        let payload_json = sender.serialize_backup_payload().unwrap();
+
+        let mut restored = make_test_wallet_with_keys(keys.clone(), false);
+        restored.restore_payload(&payload_json).unwrap();
+        let mut from_snapshot = make_test_wallet_with_keys(keys, false);
+        from_snapshot
+            .restore_from_snapshot(sender.snapshot().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            restored
+                .transfer_artifacts
+                .get(&txid)
+                .and_then(|a| a.signed_psbt.clone()),
+            Some(s!("psbt"))
+        );
+        for restored in [&restored, &from_snapshot] {
+            assert_eq!(
+                restored.received_consignments.get("recipient"),
+                Some(&vec![1, 2, 3])
+            );
+            assert_eq!(
+                restored.received_consignment_meta.get("recipient"),
+                Some(&meta)
+            );
+            assert_eq!(
+                restored.received_signed_txs.get("recipient"),
+                Some(&vec![4, 5, 6])
+            );
+        }
+    }
+
+    // A wallet with one transfer, its artifacts and received data.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wallet_with_transfer(keys: crate::keys::Keys) -> crate::wallet::Wallet {
+        use crate::utils::MemStock;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::online::TransferArtifacts;
+
+        let mut wallet = make_test_wallet_with_keys(keys, false);
+        *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
+        seed_acknowledged_transfer(
+            &mut wallet,
+            &"3".repeat(64),
+            Some("rgb:test-asset"),
+            "rpc://127.0.0.1:1",
+        );
+        wallet.transfer_artifacts.insert(
+            "3".repeat(64),
+            TransferArtifacts {
+                signed_psbt: Some(s!("psbt")),
+                ..Default::default()
+            },
+        );
+        wallet
+            .received_consignments
+            .insert(s!("recipient"), vec![1, 2, 3]);
+        wallet
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_payload_of(keys: crate::keys::Keys) -> WalletBackupPayload {
+        use crate::utils::MemStock;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+
+        let source = make_test_wallet_with_keys(keys, false);
+        *source.rgb_stock.borrow_mut() = Some(MemStock::default());
+        serde_json::from_slice(&source.serialize_backup_payload().unwrap()).unwrap()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_failed_restore_keeps_wallet(
+        wallet: &mut crate::wallet::Wallet,
+        payload: &WalletBackupPayload,
+    ) {
+        let before = wallet.serialize_backup_payload().unwrap();
+        let (ciphertext, pub_data) =
+            encrypt_payload(&serde_json::to_vec(payload).unwrap(), "pw").unwrap();
+        let backup = encode_backup(&ciphertext, &pub_data).unwrap();
+
+        let result = wallet.restore_backup(&backup, "pw");
+
+        assert!(result.is_err(), "restore of a broken backup succeeded");
+        assert_eq!(
+            wallet.serialize_backup_payload().unwrap(),
+            before,
+            "the failed restore changed the wallet"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn failed_restore_with_bad_rgb_store_keeps_wallet() {
+        let keys = crate::keys::generate_keys(crate::BitcoinNetwork::Regtest);
+        let mut wallet = wallet_with_transfer(keys.clone());
+        let mut payload = backup_payload_of(keys);
+        payload.rgb_store = s!("not base64!");
+
+        assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn failed_restore_of_other_wallet_keeps_wallet() {
+        use crate::keys::generate_keys;
+
+        let mut wallet = wallet_with_transfer(generate_keys(crate::BitcoinNetwork::Regtest));
+        let mut payload = backup_payload_of(generate_keys(crate::BitcoinNetwork::Regtest));
+        assert!(payload.bdk_changeset.is_some());
+
+        assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+
+        payload.bdk_changeset = None;
+        assert_failed_restore_keeps_wallet(&mut wallet, &payload);
     }
 }

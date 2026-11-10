@@ -41,7 +41,7 @@ impl esplora_client::Sleeper for WasmSleeper {
 }
 
 #[cfg(feature = "esplora")]
-const PROXY_PROTOCOL_VERSION: &str = "0.2";
+const PROXY_V1_PROTOCOL_VERSION: &str = "1.0";
 
 /// Supported Bitcoin networks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -57,7 +57,7 @@ pub enum BitcoinNetwork {
     /// Bitcoin's regtest
     Regtest,
     /// Bitcoin's custom signet
-    SignetCustom([u8; 32]),
+    SignetCustom,
 }
 
 impl fmt::Display for BitcoinNetwork {
@@ -71,19 +71,13 @@ impl FromStr for BitcoinNetwork {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.to_lowercase();
-        if let Some(hash) = s.strip_prefix("signet-") {
-            return BlockHash::from_str(hash)
-                .map(|h| BitcoinNetwork::SignetCustom(*h.as_ref()))
-                .map_err(|_| Error::InvalidBitcoinNetwork {
-                    network: s.to_owned(),
-                });
-        }
         Ok(match s.as_str() {
             "mainnet" | "bitcoin" => BitcoinNetwork::Mainnet,
             "testnet" | "testnet3" => BitcoinNetwork::Testnet,
             "testnet4" => BitcoinNetwork::Testnet4,
             "regtest" => BitcoinNetwork::Regtest,
             "signet" => BitcoinNetwork::Signet,
+            "signetcustom" => BitcoinNetwork::SignetCustom,
             _ => {
                 return Err(Error::InvalidBitcoinNetwork {
                     network: s.to_string(),
@@ -103,7 +97,7 @@ impl TryFrom<ChainNet> for BitcoinNetwork {
             ChainNet::BitcoinTestnet4 => Ok(BitcoinNetwork::Testnet4),
             ChainNet::BitcoinSignet => Ok(BitcoinNetwork::Signet),
             ChainNet::BitcoinRegtest => Ok(BitcoinNetwork::Regtest),
-            ChainNet::BitcoinSignetCustom(h) => Ok(BitcoinNetwork::SignetCustom(*h.as_ref())),
+            ChainNet::BitcoinSignetCustom => Ok(BitcoinNetwork::SignetCustom),
             _ => Err(Error::UnsupportedLayer1 {
                 layer_1: x.layer1().to_string(),
             }),
@@ -119,7 +113,7 @@ impl From<BitcoinNetwork> for bitcoin::Network {
             BitcoinNetwork::Testnet4 => bitcoin::Network::Testnet4,
             BitcoinNetwork::Signet => bitcoin::Network::Signet,
             BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
-            BitcoinNetwork::SignetCustom(_) => bitcoin::Network::Signet,
+            BitcoinNetwork::SignetCustom => bitcoin::Network::Signet,
         }
     }
 }
@@ -141,7 +135,7 @@ impl From<BitcoinNetwork> for ChainNet {
             BitcoinNetwork::Testnet4 => ChainNet::BitcoinTestnet4,
             BitcoinNetwork::Signet => ChainNet::BitcoinSignet,
             BitcoinNetwork::Regtest => ChainNet::BitcoinRegtest,
-            BitcoinNetwork::SignetCustom(h) => ChainNet::BitcoinSignetCustom(ChainHash::from(h)),
+            BitcoinNetwork::SignetCustom => ChainNet::BitcoinSignetCustom,
         }
     }
 }
@@ -238,7 +232,7 @@ where
 pub(crate) fn str_to_xpub(xpub: &str, bdk_network: BdkNetwork) -> Result<Xpub, Error> {
     let pubkey_btc = Xpub::from_str(xpub)?;
     let extended_key_btc: ExtendedKey = ExtendedKey::from(pubkey_btc);
-    Ok(extended_key_btc.into_xpub(bdk_network, &Secp256k1::new()))
+    Ok(extended_key_btc.into_xpub(bdk_network.into(), &Secp256k1::new()))
 }
 
 pub(crate) fn get_coin_type(bitcoin_network: &BitcoinNetwork, rgb: bool) -> u32 {
@@ -465,36 +459,96 @@ pub(crate) fn calculate_descriptor_from_xpub(
     Ok(format!("tr({key})"))
 }
 
+/// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
+/// expiration it keeps the data awaiting retrieval. A proxy not advertising it is considered to
+/// grant none.
 #[cfg(feature = "esplora")]
-pub(crate) async fn check_proxy_async(proxy_url: &str) -> Result<(), Error> {
-    use crate::api::proxy::WasmProxyClient;
-    let client = WasmProxyClient::new()?;
-    let mut err_details = s!("unable to connect to proxy");
-    if let Ok(server_info) = client.get_info(proxy_url).await {
-        if let Some(info) = server_info.result {
-            if info.protocol_version == *PROXY_PROTOCOL_VERSION {
-                return Ok(());
-            } else {
-                return Err(Error::InvalidProxyProtocol {
-                    version: info.protocol_version,
-                });
-            }
-        }
-        if let Some(err) = server_info.error {
-            err_details = err.message;
+pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
+    info.retention_grace_secs
+        .as_ref()
+        .and_then(|grace| grace.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// The max number of media per transfer advertised by a proxy (`max_media`), `None` if it doesn't
+/// advertise a valid one.
+#[cfg(feature = "esplora")]
+pub(crate) fn proxy_max_media(info: &ServerInfoResponse) -> Option<usize> {
+    info.max_media.as_ref().and_then(|max| max.parse().ok())
+}
+
+/// Check that the proxy at `proxy_url` runs the supported protocol version, returning its info.
+#[cfg(feature = "esplora")]
+pub(crate) async fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, Error> {
+    let proxy_client = ProxyClient::new(proxy_url)?;
+    let server_info = proxy_client.get_info().await?;
+    if let Some(info) = server_info.result {
+        if info.protocol_version == *PROXY_V1_PROTOCOL_VERSION {
+            return Ok(info);
+        } else {
+            return Err(Error::InvalidProxyProtocol {
+                version: info.protocol_version,
+            });
         }
     }
-    Err(Error::Proxy {
-        details: err_details,
-    })
+    let details = match server_info.error {
+        Some(err) => err.message,
+        None => s!("proxy response has neither result nor error"),
+    };
+    Err(Error::Proxy { details })
 }
 
 #[cfg(feature = "esplora")]
 pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
     use crate::wallet::online::Indexer;
+    #[cfg(target_arch = "wasm32")]
+    no_store_fetch(indexer_url, u32::from(INDEXER_TIMEOUT) * 1000);
     let opts = esplora_client::Builder::new(indexer_url).timeout(INDEXER_TIMEOUT.into());
     let client = opts.build_async_with_sleeper::<WasmSleeper>().ok()?;
     Some(Indexer::EsploraAsync(Box::new(client)))
+}
+
+// Esplora sends `cache-control: max-age`, so the browser can serve stale chain data.
+// The client cannot set the fetch cache mode or a timeout on wasm32.
+// This wrapper sets `no-store` and a timeout on indexer requests. It compares normalized URLs.
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function no_store_fetch(base, timeout_ms) {
+    const g = globalThis;
+    if (!g.__rgbLibNoStoreUrls) {
+        g.__rgbLibNoStoreUrls = new Map();
+        const fetch = g.fetch;
+        g.fetch = function (input, init) {
+            const m = input instanceof Request && [...g.__rgbLibNoStoreUrls].find(([p]) => input.url.startsWith(p));
+            if (m) {
+                const signal = AbortSignal.any([input.signal, AbortSignal.timeout(m[1])]);
+                input = new Request(input, { cache: 'no-store', signal });
+            }
+            return fetch.call(this, input, init);
+        };
+    }
+    let key = base;
+    try { key = new URL(base).href; } catch (e) {}
+    g.__rgbLibNoStoreUrls.set(key, timeout_ms);
+}
+"#)]
+extern "C" {
+    fn no_store_fetch(base: &str, timeout_ms: u32);
+}
+
+#[cfg(feature = "esplora")]
+pub(crate) fn check_indexer_network(
+    bitcoin_network: BitcoinNetwork,
+    genesis_hash: &str,
+) -> Result<(), Error> {
+    let chain_net: ChainNet = bitcoin_network.into();
+    let expected = BlockHash::from_byte_array(chain_net.chain_hash().to_bytes());
+    if expected.to_string() != genesis_hash {
+        return Err(Error::InvalidIndexer {
+            details: WitnessResolverError::WrongChainNet.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn convert_time_fmt_error(cause: time::error::Format) -> io::Error {
@@ -520,10 +574,25 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
     Ok((logger, ()))
 }
 
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn now() -> OffsetDateTime {
     let ms = js_sys::Date::now();
     let secs = (ms / 1000.0).floor() as i64;
     OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn now() -> OffsetDateTime {
+    let now = OffsetDateTime::now_utc();
+    #[cfg(test)]
+    let now = now + time::Duration::seconds(CLOCK_OFFSET.with(std::cell::Cell::get));
+    now
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// Seconds a native test adds to the clock of its thread.
+    pub(crate) static CLOCK_OFFSET: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) struct DumbResolver;
@@ -538,22 +607,24 @@ impl ResolveWitness for DumbResolver {
     }
 }
 
+pub(crate) type MemStock = Stock<MemRgbStore>;
+
 /// Wrapper for the RGB stock.
 /// On drop, the stock is saved back to the shared RefCell for persistence across calls.
 pub(crate) struct RgbRuntime {
     /// The RGB stock
-    pub(crate) stock: Stock,
+    pub(crate) stock: MemStock,
     /// The wallet directory
     wallet_dir: PathBuf,
     /// Shared storage for persisting the stock back on drop (WASM in-memory persistence)
-    shared_stock: Option<std::rc::Rc<std::cell::RefCell<Option<Stock>>>>,
+    shared_stock: Option<std::rc::Rc<std::cell::RefCell<Option<MemStock>>>>,
 }
 
 impl RgbRuntime {
     pub(crate) fn with_shared_stock(
-        stock: Stock,
+        stock: MemStock,
         wallet_dir: PathBuf,
-        shared: std::rc::Rc<std::cell::RefCell<Option<Stock>>>,
+        shared: std::rc::Rc<std::cell::RefCell<Option<MemStock>>>,
     ) -> Self {
         Self {
             stock,
@@ -567,19 +638,18 @@ impl RgbRuntime {
         &mut self,
         contract: ValidTransfer,
         resolver: &R,
-    ) -> Result<Status, InternalError> {
+    ) -> Result<(), Error> {
         self.stock
             .accept_transfer(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn consume_fascia(
         &mut self,
         fascia: Fascia,
-        witness_id: RgbTxid,
         witness_ord: Option<WitnessOrd>,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         struct FasciaResolver {
             witness_id: RgbTxid,
             witness_ord: WitnessOrd,
@@ -592,51 +662,52 @@ impl RgbRuntime {
         }
 
         let resolver = FasciaResolver {
-            witness_id,
+            witness_id: fascia.witness_id(),
             witness_ord: witness_ord.unwrap_or(WitnessOrd::Tentative),
         };
 
         self.stock
             .consume_fascia(fascia, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn contracts(&self) -> Result<Vec<ContractInfo>, InternalError> {
-        Ok(self
-            .stock
+    pub(crate) fn contracts(&self) -> Result<Vec<ContractInfo>, Error> {
+        self.stock
             .contracts()
-            .map_err(InternalError::from)?
-            .collect())
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
     pub(crate) fn contract_wrapper<C: IssuerWrapper>(
         &self,
         contract_id: ContractId,
-    ) -> Result<C::Wrapper<MemContract<&MemContractState>>, InternalError> {
+    ) -> Result<C::Wrapper<ContractStateSnapshot>, Error> {
         self.stock
             .contract_wrapper::<C>(contract_id)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn contracts_assigning(
         &self,
         outputs: impl IntoIterator<Item = impl Into<OutPoint>>,
-    ) -> Result<BTreeSet<ContractId>, InternalError> {
+    ) -> Result<BTreeSet<ContractId>, Error> {
         Ok(FromIterator::from_iter(
             self.stock
                 .contracts_assigning(outputs)
-                .map_err(InternalError::from)?,
+                .map_err(Error::from)?,
         ))
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn genesis(&self, contract_id: ContractId) -> Result<&Genesis, InternalError> {
+    pub(crate) fn genesis(&self, contract_id: ContractId) -> Result<Genesis, Error> {
         self.stock
-            .as_stash_provider()
-            .genesis(contract_id)
-            .map_err(InternalError::from)
+            .as_store()
+            .genesis(contract_id)?
+            .ok_or_else(|| Error::Internal {
+                details: format!("genesis {contract_id} not found"),
+            })
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -644,14 +715,29 @@ impl RgbRuntime {
         &mut self,
         contract: ValidContract,
         resolver: &R,
-    ) -> Result<Status, InternalError> {
+    ) -> Result<(), Error> {
         self.stock
             .import_contract(contract, resolver)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
-    pub(crate) fn import_kit(&mut self, kit: ValidKit) -> Result<Status, InternalError> {
-        self.stock.import_kit(kit).map_err(InternalError::from)
+    pub(crate) fn import_schema_definition(
+        &mut self,
+        schema_def: SchemaDefinition,
+    ) -> Result<(), Error> {
+        self.stock
+            .import_schema_definition(schema_def)
+            .map_err(Error::from)
+    }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn consignment_data<const TRANSFER: bool>(
+        &self,
+        consignment: &ValidConsignment<TRANSFER>,
+    ) -> Result<ContractData<FilteredContractState>, Error> {
+        self.stock
+            .consignment_data(consignment)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -659,35 +745,31 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         outpoints: impl IntoIterator<Item = impl Into<OutPoint>>,
-    ) -> Result<HashMap<OutputSeal, HashMap<Opout, AllocatedState>>, InternalError> {
+    ) -> Result<ContractAssignments, Error> {
         self.stock
             .contract_assignments_for(contract_id, outpoints)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn contract_schema(
-        &self,
-        contract_id: ContractId,
-    ) -> Result<&Schema, InternalError> {
+    pub(crate) fn contract_schema(&self, contract_id: ContractId) -> Result<Schema, Error> {
         self.stock
-            .as_stash_provider()
-            .contract_schema(contract_id)
-            .map_err(InternalError::from)
+            .as_store()
+            .contract_schema(contract_id)?
+            .ok_or_else(|| Error::Internal {
+                details: format!("schema for contract {contract_id} not found"),
+            })
     }
 
-    pub(crate) fn schemata(&self) -> Result<Vec<SchemaInfo>, InternalError> {
-        Ok(self
-            .stock
+    pub(crate) fn schemata(&self) -> Result<Vec<SchemaInfo>, Error> {
+        self.stock
             .schemata()
-            .map_err(InternalError::from)?
-            .collect())
+            .map(|r| r.map_err(Error::from))
+            .collect()
     }
 
-    pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<bool, InternalError> {
-        self.stock
-            .store_secret_seal(seal)
-            .map_err(InternalError::from)
+    pub(crate) fn store_secret_seal(&mut self, seal: GraphSeal) -> Result<(), Error> {
+        self.stock.store_secret_seal(seal).map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -697,10 +779,11 @@ impl RgbRuntime {
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
         witness_id: Option<RgbTxid>,
-    ) -> Result<RgbTransfer, InternalError> {
+    ) -> Result<RgbTransfer, Error> {
         self.stock
-            .transfer(contract_id, outputs, secret_seals, [], witness_id)
-            .map_err(InternalError::from)
+            .transfer(contract_id, outputs, secret_seals, [], witness_id, None)
+            .map(|(consignment, _)| consignment)
+            .map_err(Error::from)
     }
 
     #[cfg(feature = "esplora")]
@@ -709,11 +792,43 @@ impl RgbRuntime {
         contract_id: ContractId,
         outputs: impl AsRef<[OutputSeal]>,
         secret_seals: impl AsRef<[SecretSeal]>,
+        opids: impl IntoIterator<Item = OpId>,
         witness_id: Option<RgbTxid>,
-    ) -> Result<(RgbTransfer, OpoutsDagData), InternalError> {
+    ) -> Result<(RgbTransfer, OpsDag), Error> {
         self.stock
-            .transfer_with_dag(contract_id, outputs, secret_seals, [], witness_id)
-            .map_err(InternalError::from)
+            .transfer_with_dag(contract_id, outputs, secret_seals, opids, witness_id, None)
+            .map(|(consignment, dag, _)| (consignment, dag))
+            .map_err(Error::from)
+    }
+
+    #[cfg(feature = "esplora")]
+    pub(crate) fn transfer_from_fascia(
+        &self,
+        contract_id: ContractId,
+        outputs: impl AsRef<[OutputSeal]>,
+        secret_seals: impl AsRef<[SecretSeal]>,
+        opids: impl IntoIterator<Item = OpId>,
+        fascia: &Fascia,
+    ) -> Result<RgbTransfer, Error> {
+        self.stock
+            .transfer_from_fascia(contract_id, outputs, secret_seals, opids, fascia, None)
+            .map(|(consignment, _)| consignment)
+            .map_err(Error::from)
+    }
+
+    #[cfg(feature = "esplora")]
+    pub(crate) fn transfer_from_fascia_with_dag(
+        &self,
+        contract_id: ContractId,
+        outputs: impl AsRef<[OutputSeal]>,
+        secret_seals: impl AsRef<[SecretSeal]>,
+        opids: impl IntoIterator<Item = OpId>,
+        fascia: &Fascia,
+    ) -> Result<(RgbTransfer, OpsDag), Error> {
+        self.stock
+            .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, opids, fascia, None)
+            .map(|(consignment, dag, _)| (consignment, dag))
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -721,10 +836,10 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         transition_name: impl Into<FieldName>,
-    ) -> Result<TransitionBuilder, InternalError> {
+    ) -> Result<TransitionBuilder, Error> {
         self.stock
             .transition_builder(contract_id, transition_name)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -732,10 +847,10 @@ impl RgbRuntime {
         &self,
         contract_id: ContractId,
         transition_type: TransitionType,
-    ) -> Result<TransitionBuilder, InternalError> {
+    ) -> Result<TransitionBuilder, Error> {
         self.stock
             .transition_builder_raw(contract_id, transition_type)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -744,10 +859,10 @@ impl RgbRuntime {
         resolver: &R,
         after_height: u32,
         force_witnesses: Vec<RgbTxid>,
-    ) -> Result<UpdateRes, InternalError> {
+    ) -> Result<UpdateRes, Error> {
         self.stock
             .update_witnesses(resolver, after_height, force_witnesses)
-            .map_err(InternalError::from)
+            .map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -755,7 +870,7 @@ impl RgbRuntime {
         &mut self,
         witness_id: RgbTxid,
         witness_ord: WitnessOrd,
-    ) -> Result<(), InternalError> {
+    ) -> Result<(), Error> {
         self.stock.upsert_witness(witness_id, witness_ord)?;
         Ok(())
     }
@@ -764,14 +879,14 @@ impl RgbRuntime {
 impl Drop for RgbRuntime {
     fn drop(&mut self) {
         if let Some(shared) = self.shared_stock.take() {
-            let stock = std::mem::replace(&mut self.stock, Stock::in_memory());
+            let stock = std::mem::take(&mut self.stock);
             *shared.borrow_mut() = Some(stock);
         }
     }
 }
 
 pub(crate) fn load_rgb_runtime(_wallet_dir: PathBuf) -> Result<RgbRuntime, Error> {
-    let stock = Stock::in_memory();
+    let stock = MemStock::default();
     Ok(RgbRuntime {
         stock,
         wallet_dir: PathBuf::new(),
@@ -809,57 +924,7 @@ pub(crate) async fn fetch_esplora_broadcast_async(
 
 /// Pre-fetched witness resolver for wasm32.
 ///
-/// Resolves witness transactions from a cache populated from consignment bundles.
-#[cfg(feature = "esplora")]
-pub(crate) struct WasmResolver {
-    witness_cache: HashMap<RgbTxid, WitnessStatus>,
-    chain_net: ChainNet,
-}
-
-#[cfg(feature = "esplora")]
-impl WasmResolver {
-    /// Build resolver by pre-fetching all witness IDs from a consignment.
-    pub(crate) fn from_consignment<const TRANSFER: bool>(
-        consignment: &Consignment<TRANSFER>,
-        chain_net: ChainNet,
-    ) -> Self {
-        let mut cache = HashMap::new();
-        for bw in consignment.bundled_witnesses() {
-            let wid = bw.witness_id();
-            if let Some(tx) = bw.pub_witness.tx().cloned() {
-                cache.insert(wid, WitnessStatus::Resolved(tx, WitnessOrd::Tentative));
-            }
-        }
-        Self {
-            witness_cache: cache,
-            chain_net,
-        }
-    }
-}
-
-#[cfg(feature = "esplora")]
-impl ResolveWitness for WasmResolver {
-    fn resolve_witness(&self, witness_id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
-        self.witness_cache
-            .get(&witness_id)
-            .cloned()
-            .ok_or(WitnessResolverError::ResolverIssue(
-                Some(witness_id),
-                s!("witness not found in cache"),
-            ))
-    }
-    fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
-        if self.chain_net == chain_net {
-            Ok(())
-        } else {
-            Err(WitnessResolverError::WrongChainNet)
-        }
-    }
-}
-
-/// Pre-fetched witness resolver for update_witnesses in wasm32.
-///
-/// Resolves witness transactions from a cache pre-populated via async esplora queries.
+/// Resolves witness transactions from a pre-populated cache.
 #[cfg(feature = "esplora")]
 pub(crate) struct PreFetchResolver {
     witness_cache: HashMap<RgbTxid, WitnessStatus>,
@@ -898,12 +963,12 @@ impl ResolveWitness for PreFetchResolver {
 
 /// Offchain resolver variant for wasm32.
 ///
-/// Checks the consignment first for the specific witness ID, then falls back to WasmResolver.
+/// Checks the consignment first for the specific witness ID, then falls back to PreFetchResolver.
 #[cfg(feature = "esplora")]
 pub(crate) struct OffchainResolverWasm<'a, 'cons, const TRANSFER: bool> {
     pub(crate) witness_id: RgbTxid,
     pub(crate) consignment: &'cons Consignment<TRANSFER>,
-    pub(crate) fallback: &'a WasmResolver,
+    pub(crate) fallback: &'a PreFetchResolver,
 }
 
 #[cfg(feature = "esplora")]
@@ -915,7 +980,7 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolverWasm<'_, '_, TRANS
         self.consignment
             .bundled_witnesses()
             .find(|bw| bw.witness_id() == witness_id)
-            .and_then(|p| p.pub_witness.tx().cloned())
+            .map(|p| p.tx.clone())
             .map_or_else(
                 || self.fallback.resolve_witness(witness_id),
                 |tx| Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
@@ -1035,7 +1100,7 @@ mod tests {
         );
         // SignetCustom maps to Signet
         assert_eq!(
-            bitcoin::Network::from(BitcoinNetwork::SignetCustom([0u8; 32])),
+            bitcoin::Network::from(BitcoinNetwork::SignetCustom),
             bitcoin::Network::Signet
         );
     }
@@ -1348,7 +1413,7 @@ mod tests {
     fn generate_and_restore_keys_round_trip() {
         let keys = fresh_keys();
         let restored =
-            crate::keys::restore_keys(BitcoinNetwork::Regtest, keys.mnemonic.clone()).unwrap();
+            crate::keys::restore_keys(BitcoinNetwork::Regtest, keys.mnemonic.to_string()).unwrap();
         assert_eq!(keys.xpub, restored.xpub);
         assert_eq!(keys.account_xpub_vanilla, restored.account_xpub_vanilla);
         assert_eq!(keys.account_xpub_colored, restored.account_xpub_colored);
@@ -1360,5 +1425,137 @@ mod tests {
         let keys = fresh_keys();
         let result = str_to_xpub(&keys.xpub, BdkNetwork::Testnet);
         assert!(result.is_ok());
+    }
+
+    #[cfg(all(feature = "esplora", not(target_arch = "wasm32")))]
+    mod check_proxy_tests {
+        use super::*;
+
+        #[test]
+        fn test_check_proxy_json_rpc_error() {
+            // server returns HTTP 200 with result=null and a JSON-RPC error field
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":null,"error":{"code":-32601,"message":"method not found"}}"#,
+                )
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details == "method not found")
+            );
+            mock.assert();
+        }
+
+        #[test]
+        fn test_check_proxy_invalid_body_error_details() {
+            // server returns HTTP 200 with a body that is not a JSON-RPC response: the transport
+            // error (body decoding) must be reported, not the generic connection message
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body("not json")
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details.starts_with("error decoding response body"))
+            );
+            mock.assert();
+        }
+
+        #[test]
+        fn test_check_proxy_connection_error_details() {
+            // bind then drop a listener to get a port that refuses connections: the transport error
+            // (connection refused) must be reported, not the generic connection message
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let result = block_on(check_proxy(&format!("http://127.0.0.1:{port}")));
+            let expected = format!("error sending request for url (http://127.0.0.1:{port}/");
+            assert!(
+                matches!(result, Err(Error::Proxy { details }) if details.starts_with(&expected))
+            );
+        }
+
+        #[test]
+        fn test_check_proxy_version() {
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"0.4.0","uptime":1,"max_media":"3"}}"#,
+                )
+                .create();
+            let info = block_on(check_proxy(&server.url())).unwrap();
+            assert_eq!(proxy_max_media(&info), Some(3));
+            assert_eq!(proxy_retention_grace(&info), 0);
+            mock.assert();
+
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"0.2","version":"0.3.0","uptime":1}}"#,
+                )
+                .create();
+            let result = block_on(check_proxy(&server.url()));
+            assert!(
+                matches!(result, Err(Error::InvalidProxyProtocol { version }) if version == "0.2")
+            );
+            mock.assert();
+        }
+    }
+
+    #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+    mod no_store_fetch_browser {
+        use super::super::no_store_fetch;
+        use wasm_bindgen_test::*;
+
+        // Stub fetch, register indexers, and record what reaches the stub.
+        #[wasm_bindgen_test]
+        async fn no_store_only_on_registered_indexers() {
+            js_sys::Function::new_no_args(
+                "const g = globalThis; g.__realUrls = g.__rgbLibNoStoreUrls; delete g.__rgbLibNoStoreUrls; g.__realFetch = g.fetch; g.__seen = []; \
+                 g.fetch = (input, init) => { g.__seen.push([input, init]); return Promise.resolve(new Response('')); };",
+            )
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .unwrap();
+            no_store_fetch("http://INDEXER-A.test:80/api", 10_000);
+            no_store_fetch("http://indexer-b.test/", 1);
+            no_store_fetch("not a url", 10_000);
+            let out = js_sys::Function::new_no_args(
+                "return (async () => { const g = globalThis; const init = { method: 'POST', body: 'x' }; \
+                 const other = new Request('http://other.test/x'); \
+                 g.fetch(new Request('http://indexer-a.test/api/blocks/tip/height')); \
+                 g.fetch(new Request('http://indexer-b.test/tx', { method: 'POST', body: 'tx' })); \
+                 g.fetch(other); g.fetch('http://other.test/y', init); \
+                 const c = new AbortController(); g.fetch(new Request('http://indexer-a.test/api/x', { signal: c.signal })); c.abort(); \
+                 const s = g.__seen; g.fetch = g.__realFetch; g.__rgbLibNoStoreUrls = g.__realUrls; \
+                 const text = await s[1][0].text(); await new Promise(r => setTimeout(r, 50)); \
+                 return [s.length, s[0][0].cache, s[1][0].cache, s[1][0].method, text, \
+                   s[2][0] === other && s[2][0].cache === 'default', \
+                   s[3][0] === 'http://other.test/y' && s[3][1] === init, \
+                   s[0][0].signal.aborted, s[1][0].signal.reason.name, s[4][0].signal.reason.name].join(); })();",
+            )
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .unwrap();
+            let out = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(out))
+                .await
+                .unwrap();
+            assert_eq!(
+                out.as_string().unwrap(),
+                "5,no-store,no-store,POST,tx,true,true,false,TimeoutError,AbortError"
+            );
+        }
     }
 }

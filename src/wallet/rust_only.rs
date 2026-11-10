@@ -40,7 +40,31 @@ impl fmt::Display for IndexerProtocol {
     }
 }
 
+/// Result of consignment validation (offchain or indexer-based).
+#[cfg(feature = "esplora")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateConsignmentResult {
+    /// Whether the consignment is valid.
+    pub valid: bool,
+    /// Warnings from validation (when valid).
+    pub warnings: Option<Vec<String>>,
+    /// Error category (when invalid): "invalid" or "resolver".
+    pub error: Option<String>,
+    /// Detailed error/failure description (when invalid).
+    pub details: Option<String>,
+}
+
 impl Wallet {
+    /// Return all contract IDs currently held in the RGB stock.
+    pub fn rgb_contract_ids(&self) -> Result<Vec<ContractId>, Error> {
+        let runtime = self.rgb_runtime()?;
+        Ok(runtime
+            .contracts()?
+            .into_iter()
+            .map(|contract| contract.id)
+            .collect())
+    }
+
     /// Color a PSBT.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
@@ -133,7 +157,7 @@ impl Wallet {
                 beneficiaries.push(seal);
 
                 match schema {
-                    AssetSchema::Nia | AssetSchema::Ifa => {
+                    AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa => {
                         asset_transition_builder = asset_transition_builder.add_fungible_state(
                             assignment_name.clone(),
                             seal,
@@ -175,11 +199,8 @@ impl Wallet {
                 .map_err(InternalError::from)?;
         }
 
-        for (contract_id, transition) in all_transitions {
-            for opout in transition.inputs() {
-                psbt.set_rgb_contract_consumer(contract_id, opout, transition.id())
-                    .map_err(InternalError::from)?;
-            }
+        // pushing a transition also sets it as the consumer of all of its inputs
+        for transition in all_transitions.into_values() {
             psbt.push_rgb_transition(transition)
                 .map_err(InternalError::from)?;
         }
@@ -198,7 +219,7 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    pub fn color_psbt_and_consume(
+    pub async fn color_psbt_and_consume(
         &self,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
@@ -209,7 +230,7 @@ impl Wallet {
         let witness_txid = psbt.get_txid();
 
         let mut runtime = self.rgb_runtime()?;
-        runtime.consume_fascia(fascia, witness_txid, None)?;
+        runtime.consume_fascia(fascia, None)?;
 
         let mut transfers = vec![];
         for (contract_id, beneficiaries) in asset_beneficiaries {
@@ -233,6 +254,8 @@ impl Wallet {
                 Some(witness_txid),
             )?);
         }
+        drop(runtime);
+        self.flush().await?;
 
         info!(self.logger, "Color PSBT and consume completed");
         Ok(transfers)
@@ -242,15 +265,28 @@ impl Wallet {
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
-    pub fn consume_fascia(
+    pub fn consume_fascia_in_memory(
         &self,
         fascia: Fascia,
-        witness_txid: RgbTxid,
+        witness_ord: Option<WitnessOrd>,
+    ) -> Result<(), Error> {
+        let mut runtime = self.rgb_runtime()?;
+        runtime.consume_fascia(fascia, witness_ord)?;
+        Ok(())
+    }
+
+    /// Consume an RGB fascia and durably flush the updated stock.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub async fn consume_fascia(
+        &self,
+        fascia: Fascia,
         witness_ord: Option<WitnessOrd>,
     ) -> Result<(), Error> {
         info!(self.logger, "Consuming fascia...");
-        self.rgb_runtime()?
-            .consume_fascia(fascia.clone(), witness_txid, witness_ord)?;
+        self.consume_fascia_in_memory(fascia, witness_ord)?;
+        self.flush().await?;
         info!(self.logger, "Consume fascia completed");
         Ok(())
     }
@@ -267,7 +303,31 @@ impl Wallet {
     ) -> Result<(), Error> {
         let mut runtime = self.rgb_runtime()?;
         runtime.upsert_witness(witness_id, witness_ord)?;
+        drop(runtime);
+        self.queue_save()?;
         Ok(())
+    }
+
+    /// Return `true` if the batch transfer with this `txid` was ended by `send_end`.
+    /// Its status is then neither `Initiated` nor `Failed`, so the broadcast already happened.
+    /// Use it to detect a replay of `send_end` after a reload.
+    pub fn is_batch_transfer_sent(&self, txid: &str) -> Result<bool, Error> {
+        let batch_transfers = self.database.iter_batch_transfers()?;
+        Ok(batch_transfers.iter().any(|bt| {
+            bt.txid.as_deref() == Some(txid)
+                && !matches!(
+                    bt.status,
+                    TransferStatus::Initiated | TransferStatus::Failed
+                )
+        }))
+    }
+
+    /// Return the current `Online` handle if the wallet has gone online, or `None` otherwise.
+    pub fn get_online(&self) -> Option<Online> {
+        self.online_data.as_ref().map(|od| Online {
+            id: od.id,
+            indexer_url: od.indexer_url.clone(),
+        })
     }
 
     #[cfg(feature = "esplora")]
@@ -307,6 +367,7 @@ impl Wallet {
                     max_supply: None,
                     known_circulating_supply: None,
                     reject_list_url: None,
+                    linked_from_contract: None,
                 }
             }
             AssetSchema::Ifa => {
@@ -326,9 +387,10 @@ impl Wallet {
                 };
                 let initial_supply = contract.total_issued_supply().into();
                 let max_supply = contract.max_supply().into();
-                let known_circulating_supply = IfaWrapper::with(valid_transfer.contract_data())
-                    .total_issued_supply()
-                    .into();
+                let known_circulating_supply =
+                    IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
+                        .total_issued_supply()
+                        .into();
                 let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
                 LocalAssetData {
                     name,
@@ -340,6 +402,35 @@ impl Wallet {
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
                     reject_list_url,
+                    linked_from_contract: contract_link(contract.link_from())?,
+                }
+            }
+            AssetSchema::Bfa => {
+                let contract = runtime.contract_wrapper::<BridgedFungibleAsset>(contract_id)?;
+                let media_idx = if let Some(attachment) = contract.contract_terms().media {
+                    Some(self.get_or_insert_media(
+                        hex::encode(attachment.digest),
+                        attachment.ty.to_string(),
+                    )?)
+                } else {
+                    None
+                };
+                // the DB keeps only a reject list URL
+                let reject_list_url = match contract.reject_list() {
+                    Some(RejectListLocation::Url(url)) => Some(url.to_string()),
+                    _ => None,
+                };
+                LocalAssetData {
+                    name: contract.name().to_string(),
+                    precision: contract.precision().into(),
+                    ticker: Some(contract.ticker().to_string()),
+                    details: contract.details().map(|d| d.to_string()),
+                    media_idx,
+                    initial_supply: 0,
+                    max_supply: None,
+                    known_circulating_supply: None,
+                    reject_list_url,
+                    linked_from_contract: contract_link(contract.link_from())?,
                 }
             }
         };
@@ -365,50 +456,36 @@ impl Wallet {
         asset_transfer_dir.join(CONSIGNMENT_FILE)
     }
 
-    /// Post a consignment to the proxy server.
-    ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
-    #[cfg(feature = "esplora")]
-    pub async fn post_consignment(
-        &self,
-        proxy_url: &str,
-        recipient_id: String,
-        consignment_bytes: &[u8],
-        txid: String,
-        vout: Option<u32>,
+    /// The consignment bytes of a pending send, for tests.
+    #[doc(hidden)]
+    pub fn send_consignment_bytes(&self, txid: &str, asset_id: &str) -> Option<Vec<u8>> {
+        self.transfer_artifacts
+            .get(txid)
+            .and_then(|a| a.consignment_bytes.get(asset_id).cloned())
+    }
+
+    /// Replace the consignment bytes of a pending send, for tests. [`Wallet::send_end`] then
+    /// hashes, encrypts and posts the replaced bytes.
+    #[doc(hidden)]
+    pub fn set_send_consignment_bytes(
+        &mut self,
+        txid: &str,
+        asset_id: &str,
+        bytes: Vec<u8>,
     ) -> Result<(), Error> {
-        info!(self.logger, "Posting consignment...");
-        let consignment_res = self
-            .wasm_proxy_client
-            .post_consignment(
-                proxy_url,
-                recipient_id.clone(),
-                consignment_bytes,
-                txid.clone(),
-                vout,
-            )
-            .await?;
-        debug!(
-            self.logger,
-            "Consignment POST response: {:?}", consignment_res
-        );
-
-        if let Some(err) = consignment_res.error {
-            if err.code == -101 {
-                return Err(Error::RecipientIDAlreadyUsed);
-            }
-            return Err(Error::InvalidTransportEndpoint {
-                details: format!("proxy error: {}", err.message),
-            });
-        }
-        if consignment_res.result.is_none() {
-            return Err(Error::InvalidTransportEndpoint {
-                details: s!("invalid result"),
-            });
-        }
-
-        info!(self.logger, "Post consignment completed");
+        let artifacts =
+            self.transfer_artifacts
+                .get_mut(txid)
+                .ok_or_else(|| Error::UnknownTransfer {
+                    txid: txid.to_string(),
+                })?;
+        let entry = artifacts
+            .consignment_bytes
+            .get_mut(asset_id)
+            .ok_or_else(|| Error::Internal {
+                details: s!("missing consignment bytes"),
+            })?;
+        *entry = bytes;
         Ok(())
     }
 
@@ -424,94 +501,6 @@ impl Wallet {
         let height = self.indexer().get_tx_height(&txid).await?;
         info!(self.logger, "Get TX height completed");
         Ok(height)
-    }
-
-    /// Accept an RGB transfer by retrieving and validating its consignment from a proxy server.
-    ///
-    /// <div class="warning">This method is meant for special usage and is normally not needed, use
-    /// it only if you know what you're doing</div>
-    #[cfg(feature = "esplora")]
-    pub async fn accept_transfer(
-        &mut self,
-        online: Online,
-        txid: String,
-        vout: u32,
-        consignment_endpoint: RgbTransport,
-        blinding: u64,
-    ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
-        info!(self.logger, "Accepting transfer...");
-        self.check_online(online)?;
-        let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
-        let proxy_url = TransportEndpoint::try_from(consignment_endpoint)?.endpoint;
-
-        let consignment_res = self
-            ._get_consignment_async(&proxy_url, txid.clone())
-            .await?;
-        let consignment_bytes = general_purpose::STANDARD
-            .decode(consignment_res.consignment)
-            .map_err(InternalError::from)?;
-        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-
-        let schema_id = consignment.schema_id().to_string();
-        let asset_schema: AssetSchema = schema_id.try_into()?;
-        self.check_schema_support(&asset_schema)?;
-        debug!(
-            self.logger,
-            "Got consignment for asset with {} schema", asset_schema
-        );
-
-        let mut runtime = self.rgb_runtime()?;
-
-        let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
-        runtime.store_secret_seal(graph_seal)?;
-
-        let wasm_resolver =
-            crate::utils::WasmResolver::from_consignment(&consignment, self.chain_net());
-        let resolver = crate::utils::OffchainResolverWasm {
-            witness_id,
-            consignment: &consignment,
-            fallback: &wasm_resolver,
-        };
-
-        debug!(self.logger, "Validating consignment...");
-        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-        let trusted_typesystem = asset_schema.types();
-        let validation_config = ValidationConfig {
-            chain_net: self.chain_net(),
-            trusted_typesystem,
-            ..Default::default()
-        };
-        let valid_consignment = match consignment.clone().validate(&resolver, &validation_config) {
-            Ok(consignment) => consignment,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger, "Consignment is invalid: {}", e);
-                return Err(Error::InvalidConsignment);
-            }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger, "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-        };
-        let validity = valid_consignment.validation_status().validity();
-        debug!(self.logger, "Consignment validity: {:?}", validity);
-
-        let valid_contract = valid_consignment.clone().into_valid_contract();
-        runtime
-            .import_contract(valid_contract, &resolver)
-            .expect("failure importing validated contract");
-
-        let received_rgb_assignments =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
-
-        let _status = runtime.accept_transfer(valid_consignment, &resolver)?;
-
-        info!(self.logger, "Accept transfer completed");
-        Ok((
-            consignment,
-            received_rgb_assignments.into_values().collect(),
-        ))
     }
 
     /// Update RGB witnesses.
@@ -530,35 +519,11 @@ impl Wallet {
         info!(self.logger, "Updating witnesses...");
         self.check_online(online)?;
 
-        let mut cache = HashMap::new();
-        for witness_id in &force_witnesses {
-            let txid_str = witness_id.to_string();
-            let txid = Txid::from_str(&txid_str).map_err(|_| Error::InvalidTxid)?;
-            if let Some((tx, block_height, block_time)) =
-                self.indexer().get_tx_with_status(&txid).await?
-            {
-                let witness_ord = match block_height.and_then(|h| block_time.map(|t| (h, t))) {
-                    Some((h, t)) => {
-                        if let Some(height) = NonZeroU32::new(h) {
-                            if let Some(pos) = WitnessPos::bitcoin(height, t as i64) {
-                                WitnessOrd::Mined(pos)
-                            } else {
-                                WitnessOrd::Tentative
-                            }
-                        } else {
-                            WitnessOrd::Tentative
-                        }
-                    }
-                    None => WitnessOrd::Tentative,
-                };
-                cache.insert(*witness_id, WitnessStatus::Resolved(tx, witness_ord));
-            }
-        }
-
-        let resolver = crate::utils::PreFetchResolver::new(cache, self.chain_net());
+        let resolver = self.prefetch_witnesses(force_witnesses.clone()).await?;
         let update_res =
             self.rgb_runtime()?
                 .update_witnesses(&resolver, after_height, force_witnesses)?;
+        self.flush().await?;
 
         info!(self.logger, "Update witnesses completed");
         Ok(update_res)
@@ -571,5 +536,186 @@ impl Wallet {
 /// unsupported protocol version.
 #[cfg(feature = "esplora")]
 pub async fn check_proxy_url(proxy_url: &str) -> Result<(), Error> {
-    crate::utils::check_proxy_async(proxy_url).await
+    crate::utils::check_proxy(proxy_url).await.map(|_| ())
+}
+
+/// Validate a consignment using the witness bundled in the consignment (offchain).
+///
+/// This works before the witness transaction is broadcast. The consignment bytes are
+/// the raw strict-encoded consignment (not base64). The `txid` is the witness
+/// transaction ID. The fallback resolver uses witness data from the consignment itself.
+///
+/// Returns a `ValidateConsignmentResult` with validity status, warnings, and error details.
+///
+/// The mints in a BFA history are checked only online: a consignment that holds one gives the
+/// `external_anchors` error.
+#[cfg(feature = "esplora")]
+pub fn validate_consignment_offchain(
+    consignment_bytes: &[u8],
+    txid: &str,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<ValidateConsignmentResult, Error> {
+    let consignment = RgbTransfer::load(consignment_bytes).map_err(|e| Error::Internal {
+        details: format!("Failed to load consignment: {e}"),
+    })?;
+
+    let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+    let chain_net: ChainNet = bitcoin_network.into();
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+    let schema_rules = asset_schema.schema_rules();
+
+    let mut cache = HashMap::new();
+    for bw in consignment.bundled_witnesses() {
+        cache.insert(
+            bw.witness_id(),
+            WitnessStatus::Resolved(bw.tx.clone(), WitnessOrd::Tentative),
+        );
+    }
+    let wasm_resolver = crate::utils::PreFetchResolver::new(cache, chain_net);
+    let resolver = crate::utils::OffchainResolverWasm {
+        witness_id,
+        consignment: &consignment,
+        fallback: &wasm_resolver,
+    };
+
+    let validation_config = ValidationConfig {
+        chain_net,
+        ..Default::default()
+    };
+
+    match consignment
+        .clone()
+        .validate(&schema_rules, &resolver, &validation_config)
+    {
+        Ok(valid_consignment) => {
+            let status = valid_consignment.validation_status();
+            Ok(ValidateConsignmentResult {
+                valid: true,
+                warnings: Some(
+                    status
+                        .warnings
+                        .iter()
+                        .map(|w| w.to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                error: None,
+                details: None,
+            })
+        }
+        Err(ValidationError::InvalidConsignment(failure)) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("invalid".to_string()),
+            details: Some(failure.to_string()),
+        }),
+        Err(ValidationError::ResolverError(e)) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("resolver".to_string()),
+            details: Some(e.to_string()),
+        }),
+        Err(ValidationError::PendingClaims(count)) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("external_anchors".to_string()),
+            details: Some(format!("{count} mint claim(s) to check online")),
+        }),
+        Err(e) => Ok(ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("unexpected".to_string()),
+            details: Some(e.to_string()),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_consignment_offchain_invalid_bytes() {
+        let result = validate_consignment_offchain(
+            b"not a valid consignment",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            BitcoinNetwork::Regtest,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::Internal { details: ref d } if d.contains("Failed to load consignment")),
+            "expected Internal error with load failure, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_consignment_offchain_invalid_txid() {
+        let result = validate_consignment_offchain(
+            b"not a valid consignment",
+            "not-a-txid",
+            BitcoinNetwork::Regtest,
+        );
+        // Will fail on consignment load before txid parsing
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_consignment_result_serde_roundtrip() {
+        let result = ValidateConsignmentResult {
+            valid: true,
+            warnings: Some(vec!["warn1".to_string()]),
+            error: None,
+            details: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: ValidateConsignmentResult = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.valid);
+        assert_eq!(deserialized.warnings.unwrap(), vec!["warn1".to_string()]);
+        assert!(deserialized.error.is_none());
+
+        let result_invalid = ValidateConsignmentResult {
+            valid: false,
+            warnings: None,
+            error: Some("invalid".to_string()),
+            details: Some("schema mismatch".to_string()),
+        };
+        let json = serde_json::to_string(&result_invalid).unwrap();
+        let deserialized: ValidateConsignmentResult = serde_json::from_str(&json).unwrap();
+        assert!(!deserialized.valid);
+        assert_eq!(deserialized.error.unwrap(), "invalid");
+    }
+
+    #[test]
+    fn batch_transfer_sent_only_after_send_end() {
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+        // send_begin saves the send as Initiated
+        let idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::Initiated),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!wallet.is_batch_transfer_sent(txid).unwrap());
+
+        // send_end moves it to WaitingCounterparty
+        wallet
+            .database
+            .update_batch_transfer(&mut DbBatchTransferActMod {
+                idx: ActiveValue::Set(idx),
+                status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(wallet.is_batch_transfer_sent(txid).unwrap());
+    }
+
+    #[test]
+    fn indexer_protocol_display() {
+        assert_eq!(IndexerProtocol::Esplora.to_string(), "Esplora");
+    }
 }

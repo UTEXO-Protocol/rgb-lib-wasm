@@ -76,8 +76,10 @@ jobs:
         run: cargo install wasm-pack@0.14.0
       - name: Run key tests
         run: wasm-pack test --headless --firefox --release -- --test keys_wasm
-      - name: Run wallet tests
-        run: wasm-pack test --headless --firefox --release -- --test wallet_wasm
+      - name: Run proof of work tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        run: wasm-pack test --headless --firefox --release -- --test pow_wasm
 
   integration-tests:
     name: Integration tests (Firefox + regtest)
@@ -154,10 +156,63 @@ jobs:
             sleep 1
           done
 
+      - name: Run wallet tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
+        run: wasm-pack test --headless --firefox --release -- --test wallet_wasm
+
+      - name: Run binding tests
+        run: wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
+
       - name: Run integration tests
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test integration_wasm
+
+      - name: Run receive tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 600
+        run: wasm-pack test --headless --firefox --release --test receive_wasm
+
+      - name: Run persistence tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: wasm-pack test --headless --firefox --release --test persistence_wasm
+
+      - name: Run send tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 3600
+        run: wasm-pack test --headless --firefox --release --test send_wasm
+
+      # The BFA lib browser tests run one test file per Firefox session, so a session holds
+      # only a part of the suite in memory
+      - name: Run BFA tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_bfa::'
+
+      - name: Run BFA burn tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_burn::'
+
+      - name: Run BFA mint tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 3600
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_mint::'
+
+      - name: Run receive check tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
+      - name: Run link tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_link::'
+      - name: Run vanilla tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_vanilla::'
 
       - name: Stop regtest services
         if: always()

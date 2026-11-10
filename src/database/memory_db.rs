@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::database::enums::{
-    AssetSchema, Assignment, ColoringType, RecipientTypeFull, TransferStatus, TransportType,
-    WalletTransactionType,
+    AssetSchema, Assignment, ColoringType, Encryption, RecipientTypeFull, TransferStatus,
+    TransportEndpointKind, TransportType, TypeOfTransition, WalletTransactionType,
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
@@ -23,7 +23,7 @@ pub enum ActiveValue<T> {
     NotSet,
 }
 
-impl<T: Default> Default for ActiveValue<T> {
+impl<T> Default for ActiveValue<T> {
     fn default() -> Self {
         ActiveValue::NotSet
     }
@@ -70,6 +70,8 @@ pub struct DbAsset {
     pub max_supply: Option<String>,
     pub known_circulating_supply: Option<String>,
     pub reject_list_url: Option<String>,
+    pub linked_from_contract: Option<String>,
+    pub linked_to_contract: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -88,6 +90,8 @@ pub struct DbAssetActMod {
     pub max_supply: ActiveValue<Option<String>>,
     pub known_circulating_supply: ActiveValue<Option<String>>,
     pub reject_list_url: ActiveValue<Option<String>>,
+    pub linked_from_contract: ActiveValue<Option<String>>,
+    pub linked_to_contract: ActiveValue<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +100,7 @@ pub struct DbAssetTransfer {
     pub user_driven: bool,
     pub batch_transfer_idx: i32,
     pub asset_id: Option<String>,
+    pub transition_type: Option<TypeOfTransition>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -104,6 +109,7 @@ pub struct DbAssetTransferActMod {
     pub user_driven: ActiveValue<bool>,
     pub batch_transfer_idx: ActiveValue<i32>,
     pub asset_id: ActiveValue<Option<String>>,
+    pub transition_type: ActiveValue<Option<TypeOfTransition>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +126,7 @@ pub struct DbBackupInfoActMod {
     pub last_operation_timestamp: ActiveValue<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbBatchTransfer {
     pub idx: i32,
     pub txid: Option<String>,
@@ -129,9 +135,32 @@ pub struct DbBatchTransfer {
     pub updated_at: i64,
     pub expiration: Option<i64>,
     pub min_confirmations: u8,
+    pub operation_secret_key: Option<Vec<u8>>,
+    pub broadcast_deadline: Option<i64>,
+    pub retention_deadline: Option<i64>,
 }
 
-#[derive(Clone, Debug, Default)]
+impl std::fmt::Debug for DbBatchTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbBatchTransfer")
+            .field("idx", &self.idx)
+            .field("txid", &self.txid)
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("expiration", &self.expiration)
+            .field("min_confirmations", &self.min_confirmations)
+            .field(
+                "operation_secret_key",
+                &self.operation_secret_key.as_ref().map(|_| crate::REDACTED),
+            )
+            .field("broadcast_deadline", &self.broadcast_deadline)
+            .field("retention_deadline", &self.retention_deadline)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct DbBatchTransferActMod {
     pub idx: ActiveValue<i32>,
     pub txid: ActiveValue<Option<String>>,
@@ -140,6 +169,26 @@ pub struct DbBatchTransferActMod {
     pub updated_at: ActiveValue<i64>,
     pub expiration: ActiveValue<Option<i64>>,
     pub min_confirmations: ActiveValue<u8>,
+    pub operation_secret_key: ActiveValue<Option<Vec<u8>>>,
+    pub broadcast_deadline: ActiveValue<Option<i64>>,
+    pub retention_deadline: ActiveValue<Option<i64>>,
+}
+
+impl std::fmt::Debug for DbBatchTransferActMod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbBatchTransferActMod")
+            .field("idx", &self.idx)
+            .field("txid", &self.txid)
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("expiration", &self.expiration)
+            .field("min_confirmations", &self.min_confirmations)
+            .field("operation_secret_key", &crate::REDACTED)
+            .field("broadcast_deadline", &self.broadcast_deadline)
+            .field("retention_deadline", &self.retention_deadline)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +245,13 @@ pub struct DbTransfer {
     pub recipient_id: Option<String>,
     pub ack: Option<bool>,
     pub invoice_string: Option<String>,
+    pub recipient_pubkey: Option<Vec<u8>>,
+    pub consignment_hash: Option<String>,
+    pub recipient_encryption: Encryption,
+    pub ack_signature: Option<Vec<u8>>,
+    pub proxy_transfer_id: Option<String>,
+    pub invoice_expiration: Option<i64>,
+    pub burn_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -208,6 +264,13 @@ pub struct DbTransferActMod {
     pub recipient_id: ActiveValue<Option<String>>,
     pub ack: ActiveValue<Option<bool>>,
     pub invoice_string: ActiveValue<Option<String>>,
+    pub recipient_pubkey: ActiveValue<Option<Vec<u8>>>,
+    pub consignment_hash: ActiveValue<Option<String>>,
+    pub recipient_encryption: ActiveValue<Encryption>,
+    pub ack_signature: ActiveValue<Option<Vec<u8>>>,
+    pub proxy_transfer_id: ActiveValue<Option<String>>,
+    pub invoice_expiration: ActiveValue<Option<i64>>,
+    pub burn_reason: ActiveValue<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +279,7 @@ pub struct DbTransferTransportEndpoint {
     pub transfer_idx: i32,
     pub transport_endpoint_idx: i32,
     pub used: bool,
+    pub kind: TransportEndpointKind,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -224,6 +288,7 @@ pub struct DbTransferTransportEndpointActMod {
     pub transfer_idx: ActiveValue<i32>,
     pub transport_endpoint_idx: ActiveValue<i32>,
     pub used: ActiveValue<bool>,
+    pub kind: ActiveValue<TransportEndpointKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +346,11 @@ pub struct DbWalletTransaction {
     pub idx: i32,
     pub txid: String,
     pub r#type: WalletTransactionType,
+    pub status: TransferStatus,
+    pub inputs: Vec<Outpoint>,
+    pub sent: u64,
+    pub received: u64,
+    pub fee: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -288,6 +358,11 @@ pub struct DbWalletTransactionActMod {
     pub idx: ActiveValue<i32>,
     pub txid: ActiveValue<String>,
     pub r#type: ActiveValue<WalletTransactionType>,
+    pub status: ActiveValue<TransferStatus>,
+    pub inputs: ActiveValue<Vec<Outpoint>>,
+    pub sent: ActiveValue<u64>,
+    pub received: ActiveValue<u64>,
+    pub fee: ActiveValue<u64>,
 }
 
 impl Default for AssetSchema {
@@ -343,6 +418,8 @@ impl DbAssetActMod {
             max_supply: av(self.max_supply),
             known_circulating_supply: av(self.known_circulating_supply),
             reject_list_url: av(self.reject_list_url),
+            linked_from_contract: av(self.linked_from_contract),
+            linked_to_contract: av(self.linked_to_contract),
         })
     }
 }
@@ -357,6 +434,9 @@ impl From<DbBatchTransfer> for DbBatchTransferActMod {
             updated_at: ActiveValue::Unchanged(m.updated_at),
             expiration: ActiveValue::Unchanged(m.expiration),
             min_confirmations: ActiveValue::Unchanged(m.min_confirmations),
+            operation_secret_key: ActiveValue::Unchanged(m.operation_secret_key),
+            broadcast_deadline: ActiveValue::Unchanged(m.broadcast_deadline),
+            retention_deadline: ActiveValue::Unchanged(m.retention_deadline),
         }
     }
 }
@@ -378,6 +458,7 @@ impl From<DbAssetTransfer> for DbAssetTransferActMod {
             user_driven: ActiveValue::Unchanged(m.user_driven),
             batch_transfer_idx: ActiveValue::Unchanged(m.batch_transfer_idx),
             asset_id: ActiveValue::Unchanged(m.asset_id),
+            transition_type: ActiveValue::Unchanged(m.transition_type),
         }
     }
 }
@@ -393,6 +474,13 @@ impl From<DbTransfer> for DbTransferActMod {
             recipient_id: ActiveValue::Unchanged(m.recipient_id),
             ack: ActiveValue::Unchanged(m.ack),
             invoice_string: ActiveValue::Unchanged(m.invoice_string),
+            recipient_pubkey: ActiveValue::Unchanged(m.recipient_pubkey),
+            consignment_hash: ActiveValue::Unchanged(m.consignment_hash),
+            recipient_encryption: ActiveValue::Unchanged(m.recipient_encryption),
+            ack_signature: ActiveValue::Unchanged(m.ack_signature),
+            proxy_transfer_id: ActiveValue::Unchanged(m.proxy_transfer_id),
+            invoice_expiration: ActiveValue::Unchanged(m.invoice_expiration),
+            burn_reason: ActiveValue::Unchanged(m.burn_reason),
         }
     }
 }
@@ -404,6 +492,7 @@ impl From<DbTransferTransportEndpoint> for DbTransferTransportEndpointActMod {
             transfer_idx: ActiveValue::Unchanged(m.transfer_idx),
             transport_endpoint_idx: ActiveValue::Unchanged(m.transport_endpoint_idx),
             used: ActiveValue::Unchanged(m.used),
+            kind: ActiveValue::Unchanged(m.kind),
         }
     }
 }
@@ -425,6 +514,8 @@ impl From<DbAsset> for DbAssetActMod {
             max_supply: ActiveValue::Unchanged(m.max_supply),
             known_circulating_supply: ActiveValue::Unchanged(m.known_circulating_supply),
             reject_list_url: ActiveValue::Unchanged(m.reject_list_url),
+            linked_from_contract: ActiveValue::Unchanged(m.linked_from_contract),
+            linked_to_contract: ActiveValue::Unchanged(m.linked_to_contract),
         }
     }
 }
@@ -514,6 +605,8 @@ impl InMemoryDb {
             max_supply: av(a.max_supply),
             known_circulating_supply: av(a.known_circulating_supply),
             reject_list_url: av(a.reject_list_url),
+            linked_from_contract: av(a.linked_from_contract),
+            linked_to_contract: av(a.linked_to_contract),
         };
         self.assets.borrow_mut().push(row);
         Ok(idx)
@@ -530,6 +623,7 @@ impl InMemoryDb {
             user_driven: av(a.user_driven),
             batch_transfer_idx: av(a.batch_transfer_idx),
             asset_id: av(a.asset_id),
+            transition_type: av(a.transition_type),
         };
         self.asset_transfers.borrow_mut().push(row);
         Ok(idx)
@@ -562,6 +656,9 @@ impl InMemoryDb {
             updated_at: av_or(b.updated_at, created),
             expiration: av(b.expiration),
             min_confirmations: av(b.min_confirmations),
+            operation_secret_key: av(b.operation_secret_key),
+            broadcast_deadline: av(b.broadcast_deadline),
+            retention_deadline: av(b.retention_deadline),
         };
         self.batch_transfers.borrow_mut().push(row);
         Ok(idx)
@@ -634,6 +731,13 @@ impl InMemoryDb {
             recipient_id: av(t.recipient_id),
             ack: av(t.ack),
             invoice_string: av(t.invoice_string),
+            recipient_pubkey: av(t.recipient_pubkey),
+            consignment_hash: av(t.consignment_hash),
+            recipient_encryption: av_or(t.recipient_encryption, Encryption::Required),
+            ack_signature: av(t.ack_signature),
+            proxy_transfer_id: av(t.proxy_transfer_id),
+            invoice_expiration: av(t.invoice_expiration),
+            burn_reason: av(t.burn_reason),
         };
         self.transfers.borrow_mut().push(row);
         Ok(idx)
@@ -650,6 +754,7 @@ impl InMemoryDb {
             transfer_idx: av(t.transfer_idx),
             transport_endpoint_idx: av(t.transport_endpoint_idx),
             used: av_or(t.used, false),
+            kind: av_or(t.kind, TransportEndpointKind::RecipientProxy),
         };
         self.transfer_transport_endpoints.borrow_mut().push(row);
         Ok(idx)
@@ -700,6 +805,11 @@ impl InMemoryDb {
             idx,
             txid: av(w.txid),
             r#type: av_or(w.r#type, WalletTransactionType::CreateUtxos),
+            status: av_or(w.status, TransferStatus::Initiated),
+            inputs: av(w.inputs),
+            sent: av(w.sent),
+            received: av(w.received),
+            fee: av(w.fee),
         };
         self.wallet_transactions.borrow_mut().push(row);
         Ok(idx)
@@ -736,6 +846,27 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &t.invoice_string {
             row.invoice_string = v.clone();
+        }
+        if let ActiveValue::Set(v) = &t.recipient_pubkey {
+            row.recipient_pubkey = v.clone();
+        }
+        if let ActiveValue::Set(v) = &t.consignment_hash {
+            row.consignment_hash = v.clone();
+        }
+        if let ActiveValue::Set(v) = t.recipient_encryption {
+            row.recipient_encryption = v;
+        }
+        if let ActiveValue::Set(v) = &t.ack_signature {
+            row.ack_signature = v.clone();
+        }
+        if let ActiveValue::Set(v) = &t.proxy_transfer_id {
+            row.proxy_transfer_id = v.clone();
+        }
+        if let ActiveValue::Set(v) = t.invoice_expiration {
+            row.invoice_expiration = v;
+        }
+        if let ActiveValue::Set(v) = &t.burn_reason {
+            row.burn_reason = v.clone();
         }
         Ok(row.clone())
     }
@@ -774,6 +905,12 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &a.reject_list_url {
             row.reject_list_url = v.clone();
+        }
+        if let ActiveValue::Set(v) = &a.linked_from_contract {
+            row.linked_from_contract = v.clone();
+        }
+        if let ActiveValue::Set(v) = &a.linked_to_contract {
+            row.linked_to_contract = v.clone();
         }
         Ok(row.clone())
     }
@@ -840,6 +977,15 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &b.expiration {
             row.expiration = *v;
+        }
+        if let ActiveValue::Set(v) = &b.operation_secret_key {
+            row.operation_secret_key = v.clone();
+        }
+        if let ActiveValue::Set(v) = b.broadcast_deadline {
+            row.broadcast_deadline = v;
+        }
+        if let ActiveValue::Set(v) = b.retention_deadline {
+            row.retention_deadline = v;
         }
         Ok(row.clone())
     }
@@ -929,6 +1075,32 @@ impl InMemoryDb {
             bts.shrink_to_fit();
         }
         Ok(())
+    }
+
+    /// Count the incoming colorings of the asset with ID `asset_id` on the TXO with index
+    /// `txo_idx`, from transfers that did not fail.
+    pub(crate) fn count_txo_incoming_asset_colorings(
+        &self,
+        txo_idx: i32,
+        asset_id: &str,
+    ) -> Result<usize, InternalError> {
+        let asset_transfers = self.asset_transfers.borrow();
+        let batch_transfers = self.batch_transfers.borrow();
+        Ok(self
+            .colorings
+            .borrow()
+            .iter()
+            .filter(|c| c.txo_idx == txo_idx && ColoringType::INCOMING.contains(&c.r#type))
+            .filter(|c| {
+                asset_transfers.iter().any(|at| {
+                    at.idx == c.asset_transfer_idx
+                        && at.asset_id.as_deref() == Some(asset_id)
+                        && batch_transfers.iter().any(|bt| {
+                            bt.idx == at.batch_transfer_idx && bt.status != TransferStatus::Failed
+                        })
+                })
+            })
+            .count())
     }
 
     pub(crate) fn del_coloring(&self, asset_transfer_idx: i32) -> Result<(), InternalError> {
@@ -1040,6 +1212,16 @@ impl InMemoryDb {
         Ok(self.pending_witness_scripts.borrow().clone())
     }
 
+    pub(crate) fn iter_pending_witness_txos(&self) -> Result<Vec<DbTxo>, InternalError> {
+        Ok(self
+            .txos
+            .borrow()
+            .iter()
+            .filter(|t| t.pending_witness)
+            .cloned()
+            .collect())
+    }
+
     pub(crate) fn iter_transfers(&self) -> Result<Vec<DbTransfer>, InternalError> {
         Ok(self.transfers.borrow().clone())
     }
@@ -1052,6 +1234,34 @@ impl InMemoryDb {
         &self,
     ) -> Result<Vec<DbWalletTransaction>, InternalError> {
         Ok(self.wallet_transactions.borrow().clone())
+    }
+
+    pub(crate) fn get_wallet_transaction_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<Option<DbWalletTransaction>, InternalError> {
+        Ok(self
+            .wallet_transactions
+            .borrow()
+            .iter()
+            .find(|w| w.txid == txid)
+            .cloned())
+    }
+
+    pub(crate) fn update_wallet_transaction(
+        &self,
+        w: DbWalletTransactionActMod,
+    ) -> Result<(), InternalError> {
+        let idx = av(w.idx);
+        let mut wallet_transactions = self.wallet_transactions.borrow_mut();
+        let row = wallet_transactions
+            .iter_mut()
+            .find(|r| r.idx == idx)
+            .ok_or(InternalError::Unexpected)?;
+        if let ActiveValue::Set(v) = w.status {
+            row.status = v;
+        }
+        Ok(())
     }
 
     pub(crate) fn get_transfer_transport_endpoints_data(
@@ -1241,6 +1451,34 @@ impl InMemoryDb {
             .find(|t| t.idx == idx)
             .cloned()
             .ok_or(Error::BatchTransferNotFound { idx })
+    }
+
+    /// The transfers of a batch transfer for an asset.
+    pub(crate) fn get_transfers_for_asset(
+        &self,
+        batch_transfer_idx: i32,
+        asset_id: &str,
+    ) -> Result<Vec<DbTransfer>, Error> {
+        let Some(asset_transfer_idx) = self
+            .asset_transfers
+            .borrow()
+            .iter()
+            .find(|t| {
+                t.batch_transfer_idx == batch_transfer_idx
+                    && t.user_driven
+                    && t.asset_id.as_deref() == Some(asset_id)
+            })
+            .map(|t| t.idx)
+        else {
+            return Ok(vec![]);
+        };
+        Ok(self
+            .transfers
+            .borrow()
+            .iter()
+            .filter(|t| t.asset_transfer_idx == asset_transfer_idx)
+            .cloned()
+            .collect())
     }
 
     pub(crate) fn get_incoming_transfer(
@@ -1829,6 +2067,47 @@ mod tests {
         assert_eq!(items[0].asset_transfer_idx, 20);
     }
 
+    #[test]
+    fn test_count_txo_incoming_asset_colorings() {
+        let db = make_db();
+        let bt_ok = db
+            .set_batch_transfer(make_batch_transfer_mod(
+                TransferStatus::WaitingConfirmations,
+            ))
+            .unwrap();
+        let bt_failed = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Failed))
+            .unwrap();
+        let at = |bt, asset_id| {
+            db.set_asset_transfer(make_asset_transfer_mod(bt, asset_id))
+                .unwrap()
+        };
+        let at1 = at(bt_ok, Some("a"));
+        let at2 = at(bt_failed, Some("a"));
+        let at3 = at(bt_ok, Some("b"));
+        let at4 = at(bt_ok, None);
+        let txo1 = db.set_txo(make_txo_mod("t", 0, "1000")).unwrap();
+        let txo2 = db.set_txo(make_txo_mod("t", 1, "1000")).unwrap();
+        for (txo, at, ty) in [
+            (txo1, at1, ColoringType::Receive),
+            (txo1, at1, ColoringType::Change),
+            (txo1, at1, ColoringType::Issue),
+            (txo1, at1, ColoringType::Input),
+            (txo1, at2, ColoringType::Receive),
+            (txo1, at3, ColoringType::Receive),
+            (txo1, at4, ColoringType::Receive),
+            (txo2, at1, ColoringType::Receive),
+        ] {
+            db.set_coloring(make_coloring_mod(txo, at, ty, 1)).unwrap();
+        }
+
+        // inputs, failed transfers and other assets do not count
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "a").unwrap(), 3);
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo2, "a").unwrap(), 1);
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "b").unwrap(), 1);
+        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "c").unwrap(), 0);
+    }
+
     // ── Media ──────────────────────────────────────────────────────
 
     #[test]
@@ -2000,17 +2279,51 @@ mod tests {
             .unwrap();
         assert_eq!(idx, 1);
 
-        db.set_wallet_transaction(DbWalletTransactionActMod {
-            txid: ActiveValue::Set("wtx2".to_string()),
-            r#type: ActiveValue::Set(WalletTransactionType::Drain),
-            ..Default::default()
-        })
-        .unwrap();
+        let input = Outpoint {
+            txid: "in".to_string(),
+            vout: 1,
+        };
+        let idx = db
+            .set_wallet_transaction(DbWalletTransactionActMod {
+                txid: ActiveValue::Set("wtx2".to_string()),
+                r#type: ActiveValue::Set(WalletTransactionType::Drain),
+                inputs: ActiveValue::Set(vec![input.clone()]),
+                sent: ActiveValue::Set(5),
+                ..Default::default()
+            })
+            .unwrap();
 
         let items = db.iter_wallet_transactions().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].r#type, WalletTransactionType::CreateUtxos);
         assert_eq!(items[1].r#type, WalletTransactionType::Drain);
+        assert_eq!(items[0].status, TransferStatus::Initiated);
+        assert!(items[0].inputs.is_empty());
+        assert_eq!((items[0].sent, items[0].received, items[0].fee), (0, 0, 0));
+
+        assert!(
+            db.get_wallet_transaction_by_txid("other")
+                .unwrap()
+                .is_none()
+        );
+        db.update_wallet_transaction(DbWalletTransactionActMod {
+            idx: ActiveValue::Set(idx),
+            status: ActiveValue::Set(TransferStatus::Failed),
+            ..Default::default()
+        })
+        .unwrap();
+        let row = db.get_wallet_transaction_by_txid("wtx2").unwrap().unwrap();
+        assert_eq!(row.idx, idx);
+        assert_eq!(row.r#type, WalletTransactionType::Drain);
+        assert_eq!(row.status, TransferStatus::Failed);
+        assert_eq!(row.inputs, vec![input]);
+        assert_eq!((row.sent, row.received, row.fee), (5, 0, 0));
+
+        let missing = DbWalletTransactionActMod {
+            idx: ActiveValue::Set(idx + 1),
+            ..Default::default()
+        };
+        assert!(db.update_wallet_transaction(missing).is_err());
     }
 
     // ── BackupInfo ─────────────────────────────────────────────────

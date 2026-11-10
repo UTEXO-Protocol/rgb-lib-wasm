@@ -2,22 +2,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UPSTREAM_COMPOSE="$(cd "$SCRIPT_DIR/../../rgb-lib/dev/tests" && pwd)/compose.yaml"
-
-if [ ! -f "$UPSTREAM_COMPOSE" ]; then
-    echo "Error: upstream compose.yaml not found at $UPSTREAM_COMPOSE"
-    exit 1
-fi
-
-# Generate override with absolute path for regtest-helper build context
-GENERATED_OVERRIDE=$(mktemp /tmp/compose-override-XXXXXX.yml)
-sed -e "s|context: ./regtest-helper|context: $SCRIPT_DIR/regtest-helper|" \
-    -e "s|\./vss-server/nginx-cors.conf|$SCRIPT_DIR/vss-server/nginx-cors.conf|" \
-    "$SCRIPT_DIR/compose.override.yml" > "$GENERATED_OVERRIDE"
-trap "rm -f $GENERATED_OVERRIDE" EXIT
-
-COMPOSE="docker compose -f $UPSTREAM_COMPOSE -f $GENERATED_OVERRIDE"
-SERVICES="bitcoind esplora proxy regtest-helper vss-postgres vss-server vss-cors-proxy"
+COMPOSE="docker compose -p rgb-lib-wasm -f $SCRIPT_DIR/docker-compose.ci.yml"
+SERVICES="bitcoind esplora proxy proxy-b proxy-auth anvil regtest-helper vss-postgres vss-server vss-cors-proxy"
 
 case "$1" in
     start)
@@ -32,12 +18,12 @@ case "$1" in
             sleep 1
         done
 
-        BCLI="docker compose -f $UPSTREAM_COMPOSE -f $GENERATED_OVERRIDE exec -T bitcoind bitcoin-cli -regtest -rpcuser=user -rpcpassword=default_password"
-        BCLI_ESPLORA="docker compose -f $UPSTREAM_COMPOSE -f $GENERATED_OVERRIDE exec -T esplora cli"
+        BCLI="$COMPOSE exec -T bitcoind bitcoin-cli -regtest -rpcuser=user -rpcpassword=default_password"
+        BCLI_ESPLORA="$COMPOSE exec -T esplora cli"
 
         echo "Waiting for esplora to start..."
         for i in $(seq 1 120); do
-            if docker compose -f $UPSTREAM_COMPOSE -f $GENERATED_OVERRIDE logs esplora 2>&1 | grep -q 'run: nginx:'; then
+            if $COMPOSE logs esplora 2>&1 | grep -q 'run: nginx:'; then
                 break
             fi
             if [ $i -eq 120 ]; then
@@ -80,6 +66,9 @@ case "$1" in
         echo "  bitcoind RPC:    http://127.0.0.1:18443"
         echo "  esplora:         http://127.0.0.1:8094/regtest/api"
         echo "  RGB proxy:       http://127.0.0.1:3000/json-rpc"
+        echo "  RGB proxy B:     http://127.0.0.1:3010/json-rpc"
+        echo "  RGB proxy auth:  http://127.0.0.1:3020/json-rpc"
+        echo "  anvil:           http://127.0.0.1:8545"
         echo "  regtest-helper:  http://127.0.0.1:8080"
         echo "  VSS server:      http://127.0.0.1:8081 (direct), http://127.0.0.1:8082 (CORS proxy)"
         ;;

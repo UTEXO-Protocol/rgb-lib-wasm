@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::{get, post}};
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -105,10 +110,7 @@ impl AppState {
         if load_result.is_err() {
             // Wallet doesn't exist or already loaded — try create
             let create_result = self
-                .rpc_call(
-                    "createwallet",
-                    serde_json::json!(["miner"]),
-                )
+                .rpc_call("createwallet", serde_json::json!(["miner"]))
                 .await;
             // Ignore "already exists/loaded" errors
             if let Err(e) = &create_result {
@@ -264,8 +266,7 @@ async fn fund_handler(
 async fn main() {
     let rpc_url =
         std::env::var("BITCOIND_RPC_URL").unwrap_or_else(|_| "http://bitcoind:18443".to_string());
-    let rpc_user =
-        std::env::var("BITCOIND_RPC_USER").unwrap_or_else(|_| "user".to_string());
+    let rpc_user = std::env::var("BITCOIND_RPC_USER").unwrap_or_else(|_| "user".to_string());
     let rpc_pass =
         std::env::var("BITCOIND_RPC_PASS").unwrap_or_else(|_| "default_password".to_string());
 
@@ -282,6 +283,29 @@ async fn main() {
         .route("/height", get(height_handler))
         .route("/mine", post(mine_handler))
         .route("/fund", post(fund_handler))
+        // a valid reject list larger than one read chunk
+        .route(
+            "/reject-list/valid",
+            get(|| async {
+                (0..10_000)
+                    .map(|i| format!("{i:064x}/1/0\n"))
+                    .collect::<String>()
+            }),
+        )
+        // reject lists the wallet must refuse
+        .route(
+            "/reject-list/redirect",
+            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/status")]) }),
+        )
+        .route(
+            "/reject-list/missing",
+            get(|| async { StatusCode::NOT_FOUND }),
+        )
+        // one byte more than the 7_900_000 bytes a wallet reads
+        .route(
+            "/reject-list/oversized",
+            get(|| async { "a".repeat(7_900_001) }),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 

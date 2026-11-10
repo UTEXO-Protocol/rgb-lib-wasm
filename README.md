@@ -15,11 +15,12 @@ rgb-lib-wasm lets you issue, send, and receive RGB assets from a web browser. It
 
 Supported asset types:
 - **NIA** (Non-Inflatable Asset)
-- **IFA** (Inflatable Fungible Asset).
+- **IFA** (Inflatable Fungible Asset)
+- **BFA** (Bridged Fungible Asset): issue, send, receive, burn and mint.
 
 ## Prerequisites
 
-- Rust 1.85.0+ with the `wasm32-unknown-unknown` target
+- Rust 1.88.0+ with the `wasm32-unknown-unknown` target
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/) 0.14+
 
 ```bash
@@ -59,7 +60,11 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 ## Usage
 
 ```javascript
-import init, { generate_keys, restore_keys, check_proxy_url, WasmWallet } from './pkg/rgb_lib_wasm.js';
+import init, {
+  generateKeys, restoreKeys, checkProxyUrl,
+  validateConsignmentOffchain,
+  WasmWallet, WasmInvoice,
+} from './pkg/rgb_lib_wasm.js';
 
 await init();
 ```
@@ -67,36 +72,71 @@ await init();
 ### Key generation
 
 ```javascript
-const keys = generate_keys('Regtest');
-// keys: { mnemonic, account_xpub_vanilla, account_xpub_colored, master_fingerprint }
+const keys = generateKeys('Regtest');
+// keys: { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint }
 
-const restored = restore_keys('Regtest', keys.mnemonic);
+const restored = restoreKeys('Regtest', keys.mnemonic);
 ```
 
 ### Creating a wallet
 
 ```javascript
 const walletData = {
-  data_dir: ':memory:',
-  bitcoin_network: 'Regtest',
-  database_type: 'Sqlite',
-  max_allocations_per_utxo: 5,
-  account_xpub_vanilla: keys.account_xpub_vanilla,
-  account_xpub_colored: keys.account_xpub_colored,
+  dataDir: ':memory:',
+  bitcoinNetwork: 'Regtest',
+  databaseType: 'Sqlite',
+  maxAllocationsPerUtxo: 5,
+  accountXpubVanilla: keys.accountXpubVanilla,
+  accountXpubColored: keys.accountXpubColored,
   mnemonic: keys.mnemonic,
-  master_fingerprint: keys.master_fingerprint,
-  vanilla_keychain: null,
-  supported_schemas: ['Nia', 'Ifa'],
+  masterFingerprint: keys.masterFingerprint,
+  vanillaKeychain: null,
+  supportedSchemas: ['Nia', 'Ifa'],
 };
 
 // create() restores state from IndexedDB if available
 const wallet = await WasmWallet.create(JSON.stringify(walletData));
+
+// Await durable IndexedDB commit before persisting dependent application state.
+await wallet.flush();
 ```
+
+### Persistence ordering
+
+`WasmWallet.create()` and Rust `Wallet::restore()` finish IndexedDB restoration
+before returning. They return an error instead of silently starting from fresh
+state when a stored snapshot cannot be read or decoded.
+
+Rust `Wallet::flush()` and JavaScript `wallet.flush()` resolve only after the
+IndexedDB read-write transaction commits. Persist dependent application state,
+acknowledge accepted RGB funding, or broadcast a transaction that depends on an
+RGB mutation only after the flush succeeds. A failed flush leaves the current
+in-memory wallet state intact and can be retried. A flush that writes nothing
+fails. A wallet saves over a stored snapshot only if it loaded that snapshot
+through `create()` or `Wallet::restore()`, or wrote it itself. A wallet built with
+`new` on a data directory that holds a snapshot cannot save: its saves fail and
+its calls return a persistence error.
+
+Every call that changes the wallet saves it. Saves are written in order, and
+none is dropped. An async call returns after its save commits, and returns a
+persistence error if the save fails. `sync`, `full_scan`, `refresh`,
+`fail_transfers` and the begins that sync first also save when they keep a
+change and then fail. `backup` and `vss_backup` save the backup time. A sync call
+(`issue_asset_*`, `get_address`, `rotate_address`, `delete_transfers`,
+`abort_pending_vanilla_tx`, `restore_backup`) queues its save
+and returns before the write. It returns a persistence error when an earlier save
+failed and no save since has committed. Its change stays in memory and its save
+is queued again. Await `flush()` to know that the state is stored.
+`backup` returns its bytes also when a save failed. `lastSaveError()` returns
+the error of the last failed save, until a save commits.
+
+Lightning-specific `consume_fascia` and `color_psbt_and_consume` operations
+await this durable commit before returning success.
 
 ### Going online
 
 ```javascript
-const online = await wallet.go_online(true, 'http://localhost:8094/regtest/api');
+const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
 await wallet.sync(online);
 ```
 
@@ -105,19 +145,19 @@ await wallet.sync(online);
 RGB allocations live on UTXOs. Before issuing or receiving assets you need colored UTXOs:
 
 ```javascript
-const unsignedPsbt = await wallet.create_utxos_begin(online, true, 5, 1000, 1n, false);
-const signedPsbt = wallet.sign_psbt(unsignedPsbt);
-const count = await wallet.create_utxos_end(online, signedPsbt, false);
+const unsignedPsbt = await wallet.createUtxosBegin(online, true, 5, 1000, 1n, false);
+const signedPsbt = wallet.signPsbt(unsignedPsbt);
+const count = await wallet.createUtxosEnd(online, signedPsbt, false);
 ```
 
 ### Issuing assets
 
 ```javascript
 // NIA (fixed supply)
-const nia = wallet.issue_asset_nia('TICK', 'My Token', 0, [1000]);
+const nia = wallet.issueAssetNia('TICK', 'My Token', 0, [1000]);
 
 // IFA (inflatable supply)
-const ifa = wallet.issue_asset_ifa('IFAT', 'Inflatable', 0, [1000], [500], 1, undefined);
+const ifa = wallet.issueAssetIfa('IFAT', 'Inflatable', 0, [1000], [500], undefined, false, null);
 ```
 
 ### Sending RGB assets
@@ -127,70 +167,101 @@ All send operations follow a three-step PSBT workflow: **begin** (build unsigned
 ```javascript
 const recipientMap = {
   [assetId]: [{
-    recipient_id: invoiceString,
-    witness_data: { amount_sat: 1000, blinding: null },
+    recipientId: invoiceString,
+    witnessData: { amountSat: 1000, blinding: null },
     amount: 100,
-    transport_endpoints: ['rpc://localhost:3000/json-rpc'],
+    transportEndpoints: ['rpc://localhost:3000/json-rpc'],
+    // from the invoice: its `pk` and `enc` fields and its expiration
+    publicKey: invoiceData.publicKey,
+    encryption: invoiceData.encryption,
+    expirationTimestamp: invoiceData.expirationTimestamp,
   }]
 };
-const psbt = await wallet.send_begin(online, recipientMap, false, 1n, 1);
-const signed = wallet.sign_psbt(psbt);
-const result = await wallet.send_end(online, signed, false);
-// result: { txid, batch_transfer_idx }
+// the sender's own proxy, where the recipients post their ACK and get the signed TX from
+const senderEndpoint = 'rpc://localhost:3000/json-rpc';
+const begin = await wallet.sendBegin(online, recipientMap, false, 1n, 1, Math.floor(Date.now() / 1000) + 3600, senderEndpoint, null, false);
+// begin: { psbt, batchTransferIdx, details }; dryRun = true saves nothing and gives batchTransferIdx null
+const signed = wallet.signPsbt(begin.psbt);
+const result = await wallet.sendEnd(online, signed, false);
+// result: { txid, batchTransferIdx }
 ```
 
 ### Sending BTC
 
 ```javascript
-const psbt = await wallet.send_btc_begin(online, address, 50000n, 1n, false);
-const signed = wallet.sign_psbt(psbt);
-const txid = await wallet.send_btc_end(online, signed, false);
+const psbt = await wallet.sendBtcBegin(online, address, 50000n, 1n, false);
+const signed = wallet.signPsbt(psbt);
+const txid = await wallet.sendBtcEnd(online, signed, false);
 ```
 
 ### Receiving assets
 
 ```javascript
 // Blind receive (UTXO-based)
-const blind = wallet.blind_receive(null, 'Any', null, ['rpc://localhost:3000/json-rpc'], 1);
-// blind: { invoice, recipient_id, expiration_timestamp, ... }
+// The wallet reserves the invoice on its proxies, so it takes the Online object. The last argument
+// is the encryption preference ('Required' by default, 'Unsupported' or 'Optional').
+const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+// blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey }
 
 // Witness receive (address-based)
-const witness = wallet.witness_receive(null, { Fungible: 100 }, null, ['rpc://localhost:3000/json-rpc'], 1);
+const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+```
+
+### Parsing invoices
+
+```javascript
+const invoice = new WasmInvoice(invoiceString);
+const data = invoice.invoiceData();
+// data: { recipientId, assetSchema, assetId, assignment, assignmentName, network, expirationTimestamp, transportEndpoints, publicKey, encryption, unknownQueryParams }
+// expirationTimestamp is a BigInt and unknownQueryParams is a plain object
+const str = invoice.invoiceString(); // original string
 ```
 
 ### Querying wallet state
 
 ```javascript
-const btcBalance = wallet.get_btc_balance();
-const assetBalance = wallet.get_asset_balance(assetId);
-const assets = wallet.list_assets([]);              // all schemas
-const transfers = wallet.list_transfers(null);       // all assets
-const unspents = wallet.list_unspents(false);
-const transactions = wallet.list_transactions();
-const address = wallet.get_address();
+const btcBalance = wallet.getBtcBalance();
+const assetBalance = wallet.getAssetBalance(assetId);
+const metadata = wallet.getAssetMetadata(assetId);
+// metadata: { assetSchema, name, ticker, precision, initialSupply, maxSupply, knownCirculatingSupply, timestamp, ... }
+const assets = wallet.listAssets([]);              // all schemas
+const transfers = wallet.listTransfers(null);       // all assets
+const unspents = wallet.listUnspents(false);
+const transactions = wallet.listTransactions();
+const address = wallet.getAddress();
 ```
 
 ### Fee estimation
 
 ```javascript
-const feeRate = await wallet.get_fee_estimation(online, 6); // target 6 blocks
+const feeRate = await wallet.getFeeEstimation(online, 6); // target 6 blocks
 ```
 
 ### Draining the wallet
 
 ```javascript
-const psbt = await wallet.drain_to_begin(online, destinationAddress, true, 1n);
-const signed = wallet.sign_psbt(psbt);
-const txid = await wallet.drain_to_end(online, signed);
+const psbt = await wallet.drainToBegin(online, destinationAddress, true, 1n);
+const signed = wallet.signPsbt(psbt);
+const txid = await wallet.drainToEnd(online, signed);
 ```
 
 ### Inflating an IFA asset
 
 ```javascript
-const psbt = await wallet.inflate_begin(online, assetId, [200], 1n, 1);
-const signed = wallet.sign_psbt(psbt);
-const result = await wallet.inflate_end(online, signed);
+const psbt = await wallet.inflateBegin(online, assetId, [200], 1n, 1);
+const signed = wallet.signPsbt(psbt);
+const result = await wallet.inflateEnd(online, signed);
 ```
+
+### Burning IFA or BFA units
+
+```javascript
+// the reason is optional: a hex-encoded 32-byte value, shown on the transfer as `burnReason`
+const result = await wallet.burn(online, assetId, 50n, reason, 1n, 1);
+```
+
+`sendEnd`, `inflateEnd`, `burn`, `burnEnd` and `mintEnd` return `{ txid, batchTransferIdx, entropy }`,
+where `entropy` is the MPC entropy of the commitment.
 
 ### Local encrypted backup
 
@@ -202,51 +273,63 @@ const bytes = wallet.backup('my-password');
 // bytes is a Uint8Array — save it as a file download
 
 // Check if backup is needed
-const needed = wallet.backup_info(); // true if wallet changed since last backup
+const needed = wallet.backupInfo(); // true if wallet changed since last backup
 
-// Restore (wallet must be created first with the same mnemonic)
-wallet.restore_backup(backupBytes, 'my-password');
+// Restore (create the wallet with create() and the same mnemonic)
+wallet.restoreBackup(backupBytes, 'my-password');
 ```
 
 ### VSS cloud backup
 
-[VSS](https://github.com/lightningdevkit/vss-server) (Versioned Storage Service) provides cloud backup with optimistic locking:
+[VSS](https://github.com/lightningdevkit/vss-server) (Versioned Storage Service) provides cloud backup with optimistic locking.
+VSS backups are manual: nothing uploads on its own. The app checks `backupInfo()` and calls `vssBackup()`.
 
 ```javascript
 // Configure (signing key is a 32-byte hex-encoded secp256k1 secret key)
-wallet.configure_vss_backup('http://vss-server:8082/vss', 'my-store-id', signingKeyHex);
+wallet.configureVssBackup('http://vss-server:8082/vss', 'my-store-id', signingKeyHex);
+
+// Upload the first backup, if the wallet has changes (returns null when none)
+await wallet.ensureInitialBackup();
 
 // Upload
-const version = await wallet.vss_backup();
+if (wallet.backupInfo()) {
+  const version = await wallet.vssBackup();
+}
 
 // Check status
-const info = await wallet.vss_backup_info();
-// info: { backup_exists, server_version, backup_required }
+const info = await wallet.vssBackupInfo();
+// info: { backupExists, serverVersion, backupRequired }
 
 // Restore
-await wallet.vss_restore_backup();
+await wallet.vssRestoreBackup();
 
 // Disable
-wallet.disable_vss_backup();
+wallet.disableVssBackup();
 ```
 
 ### Transfer management
 
 ```javascript
 const refreshResult = await wallet.refresh(online, null, [], false);
-const failed = await wallet.fail_transfers(online, null, false, false);
-const deleted = wallet.delete_transfers(null, false);
+const failed = await wallet.failTransfers(online, null, false, false);
+const deleted = wallet.deleteTransfers(null, false);
 ```
 
 ### Utilities
 
 ```javascript
 // Validate an RGB proxy server
-await check_proxy_url('http://localhost:3000/json-rpc');
+await checkProxyUrl('http://localhost:3000/json-rpc');
+
+// Validate an RGB consignment offchain (before TX is broadcast)
+// consignmentBytes is a Uint8Array of the strict-encoded consignment
+const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
+// result: { valid: true, warnings: [...] }
+// result: { valid: false, error: "invalid", details: "..." }
 
 // PSBT signing and finalization (standalone)
-const signed = wallet.sign_psbt(unsignedPsbtBase64);
-const finalized = wallet.finalize_psbt(signedPsbtBase64);
+const signed = wallet.signPsbt(unsignedPsbtBase64);
+const finalized = wallet.finalizePsbt(signedPsbtBase64);
 ```
 
 ## API reference
@@ -255,62 +338,86 @@ const finalized = wallet.finalize_psbt(signedPsbtBase64);
 
 | Function | Description |
 |----------|-------------|
-| `generate_keys(network)` | Generate a new BIP39 mnemonic and derive xpubs |
-| `restore_keys(network, mnemonic)` | Restore xpubs from a mnemonic |
-| `check_proxy_url(url)` | Validate an RGB proxy server URL |
+| `generateKeys(network)` | Generate a new BIP39 mnemonic and derive xpubs |
+| `restoreKeys(network, mnemonic)` | Restore xpubs from a mnemonic |
+| `checkProxyUrl(url)` | Validate an RGB proxy server URL |
+| `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
+
+### `WasmInvoice`
+
+| Method | Description |
+|--------|-------------|
+| `new(invoiceString)` | Parse and validate an RGB invoice string |
+| `invoiceData()` | Return parsed `InvoiceData` as a JS object |
+| `invoiceString()` | Return the original invoice string |
 
 ### `WasmWallet` methods
 
 | Method | Async | Description |
 |--------|-------|-------------|
 | `new(walletDataJson)` | no | Create wallet (no IndexedDB restore) |
-| `create(walletDataJson)` | yes | Create wallet with IndexedDB restore |
-| `get_wallet_data()` | no | Return WalletData as JS object |
-| `get_address()` | no | Get a new Bitcoin address |
-| `get_btc_balance()` | no | Get BTC balance |
-| `get_asset_balance(assetId)` | no | Get balance for an RGB asset |
-| `list_assets(schemas)` | no | List known RGB assets |
-| `list_transfers(assetId?)` | no | List RGB transfers |
-| `list_unspents(settledOnly)` | no | List unspent outputs with RGB allocations |
-| `list_transactions()` | no | List Bitcoin transactions |
-| `go_online(skipCheck, indexerUrl)` | yes | Connect to an Esplora indexer |
+| `create(walletDataJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
+| `flush()` | yes | Durably commit current wallet state to IndexedDB |
+| `getWalletData()` | no | Return WalletData as JS object |
+| `getAddress()` | no | Get a new Bitcoin address |
+| `getBtcBalance()` | no | Get BTC balance |
+| `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
+| `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
+| `listAssets(schemas)` | no | List known RGB assets |
+| `listTransfers(assetId?)` | no | List RGB transfers |
+| `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
+| `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
+| `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
+| `abortPendingVanillaTx(txid)` | no | Fail a begun vanilla operation and release its inputs |
+| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. |
 | `sync(online)` | yes | Sync wallet with indexer |
-| `create_utxos_begin(...)` | yes | Prepare PSBT to create colored UTXOs |
-| `create_utxos_end(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
-| `issue_asset_nia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
-| `issue_asset_ifa(...)` | no | Issue an Inflatable Fungible Asset |
-| `blind_receive(...)` | no | Create a blind receive invoice |
-| `witness_receive(...)` | no | Create a witness receive invoice |
-| `send_begin(...)` | yes | Prepare RGB send PSBT |
-| `send_end(online, psbt, skipSync)` | yes | Broadcast RGB send PSBT |
-| `send_btc_begin(...)` | yes | Prepare BTC send PSBT |
-| `send_btc_end(online, psbt, skipSync)` | yes | Broadcast BTC send PSBT |
-| `get_fee_estimation(online, blocks)` | yes | Estimate fee rate for target blocks |
-| `drain_to_begin(online, addr, destroyAssets, feeRate)` | yes | Prepare drain PSBT |
-| `drain_to_end(online, psbt)` | yes | Broadcast drain PSBT |
-| `inflate_begin(...)` | yes | Prepare IFA inflation PSBT |
-| `inflate_end(online, psbt)` | yes | Broadcast IFA inflation PSBT |
-| `list_unspents_vanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
-| `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers |
-| `fail_transfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
-| `delete_transfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
-| `sign_psbt(psbt)` | no | Sign a PSBT |
-| `finalize_psbt(psbt)` | no | Finalize a signed PSBT |
+| `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
+| `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
+| `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
+| `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight` |
+| `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight` |
+| `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
+| `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
+| `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
+| `sendEnd(online, psbt, skipSync)` | yes | Broadcast RGB send PSBT |
+| `sendBtcBegin(...)` | yes | Prepare BTC send PSBT |
+| `sendBtcEnd(online, psbt, skipSync)` | yes | Broadcast BTC send PSBT |
+| `getFeeEstimation(online, blocks)` | yes | Estimate fee rate for target blocks |
+| `drainToBegin(online, addr, destroyAssets, feeRate)` | yes | Prepare drain PSBT |
+| `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
+| `inflateBegin(...)` | yes | Prepare IFA inflation PSBT |
+| `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
+| `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
+| `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
+| `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
+| `link(online, assetId, linkedToContract, feeRate, minConf)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
+| `linkBegin(online, assetId, linkedToContract, feeRate, minConf, dryRun)` | yes | Prepare link PSBT |
+| `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
+| `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
+| `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
+| `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
+| `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
+| `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers and settle ended vanilla operations |
+| `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
+| `deleteTransfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
+| `signPsbt(psbt)` | no | Sign a PSBT |
+| `finalizePsbt(psbt)` | no | Finalize a signed PSBT |
 | `backup(password)` | no | Create encrypted backup (returns bytes) |
-| `restore_backup(bytes, password)` | no | Restore from encrypted backup |
-| `backup_info()` | no | Check if backup is needed |
-| `configure_vss_backup(url, storeId, keyHex)` | no | Configure VSS cloud backup |
-| `disable_vss_backup()` | no | Disable VSS cloud backup |
-| `vss_backup()` | yes | Upload backup to VSS server |
-| `vss_restore_backup()` | yes | Restore from VSS server |
-| `vss_backup_info()` | yes | Query VSS backup status |
+| `restoreBackup(bytes, password)` | no | Restore from encrypted backup |
+| `backupInfo()` | no | Check if backup is needed |
+| `configureVssBackup(url, storeId, keyHex)` | no | Configure VSS cloud backup |
+| `disableVssBackup()` | no | Disable VSS cloud backup |
+| `vssBackup()` | yes | Upload backup to VSS server |
+| `ensureInitialBackup()` | yes | Upload a VSS backup if the wallet has changes |
+| `vssRestoreBackup()` | yes | Restore from VSS server |
+| `vssBackupInfo()` | yes | Query VSS backup status |
 
 ## Cargo features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `esplora` | yes | Online operations via Esplora HTTP indexer |
-| `camel_case` | no | camelCase JSON serialization for all types |
+| `camel_case` | yes | camelCase JSON serialization for all types |
 
 
 ## Running tests
@@ -321,11 +428,15 @@ cargo test --lib
 
 # WASM unit tests (headless Firefox)
 wasm-pack test --headless --firefox --release -- --test keys_wasm
-wasm-pack test --headless --firefox --release -- --test wallet_wasm
+WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --headless --firefox --release -- --test pow_wasm
 
 # Integration tests (requires regtest Docker services)
 cd tests && bash regtest.sh start
-cd .. && wasm-pack test --headless --firefox --release -- --test integration_wasm
+cd .. && wasm-pack test --headless --firefox --release -- --test wallet_wasm
+wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
+wasm-pack test --headless --firefox --release -- --test integration_wasm
+wasm-pack test --headless --firefox --release -- --test receive_wasm
+wasm-pack test --headless --firefox --release -- --test send_wasm
 cd tests && bash regtest.sh stop
 ```
 

@@ -1,6 +1,6 @@
 [package]
 name = "rgb-lib-wasm-bindings"
-version = "0.3.0-beta.4"
+version = "1.0.0-beta.4"
 edition = "2024"
 description = "RGB wallet library WASM bindings for browsers"
 
@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 name = "rgb_lib_wasm_bindings"
 
 [dependencies]
-rgb-lib-wasm = { path = "../../", default-features = false, features = ["esplora"] }
+rgb-lib-wasm = { path = "../../", default-features = false, features = ["esplora", "camel_case"] }
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -21,3 +21,6 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 js-sys = "0.3"
 instant = { version = "0.1", features = ["wasm-bindgen"] }
 web-sys = { version = "0.3", features = ["console"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

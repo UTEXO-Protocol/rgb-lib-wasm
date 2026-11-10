@@ -1,0 +1,176 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.3.0-beta.4)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check branch
+        if: github.ref != 'refs/heads/master'
+        run: |
+          echo "::error::Release runs from master only, not ${GITHUB_REF}"
+          exit 1
+
+      - name: Normalize version
+        id: version
+        env:
+          RAW: ${{ inputs.version }}
+        run: |
+          VERSION="${RAW#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Invalid version: $RAW"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check that the tag is new
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG exists"
+            exit 1
+          fi
+
+      - name: Check that CI passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
+          if [ "$RUNS" = 0 ]; then
+            echo "::error::No successful CI run on $GITHUB_SHA"
+            exit 1
+          fi
+
+  build:
+    name: Build WASM
+    needs: verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack@0.14.0 --locked
+
+      - name: Build WASM package
+        working-directory: bindings/wasm
+        run: wasm-pack build --target web --out-dir pkg -- --locked
+
+      - name: Set package version and name
+        working-directory: bindings/wasm/pkg
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            pkg.name = '@utexo/rgb-lib-wasm';
+            pkg.version = process.env.VERSION;
+            pkg.repository = { type: 'git', url: 'git+https://github.com/UTEXO-Protocol/rgb-lib-wasm.git' };
+            // wasm-pack does not list the inline JS snippets, which the bindings import.
+            if (require('fs').existsSync('snippets') && !pkg.files.includes('snippets')) pkg.files.push('snippets');
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+          "
+          cat package.json
+
+      - name: Copy README into package
+        run: cp README.md bindings/wasm/pkg/README.md
+
+      - name: Package artifact
+        run: |
+          cd bindings/wasm
+          tar -czvf ../../rgb-lib-wasm-pkg.tar.gz pkg/
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rgb-lib-wasm-pkg
+          path: rgb-lib-wasm-pkg.tar.gz
+          retention-days: 5
+
+  release:
+    name: Create GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rgb-lib-wasm-pkg
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Release ${{ needs.verify.outputs.tag }}
+          body: |
+            ## rgb-lib-wasm ${{ needs.verify.outputs.tag }}
+
+            ### Installation
+
+            ```bash
+            npm install @utexo/rgb-lib-wasm@${{ needs.verify.outputs.version }}
+            ```
+          draft: false
+          prerelease: ${{ contains(needs.verify.outputs.version, 'alpha') || contains(needs.verify.outputs.version, 'beta') || contains(needs.verify.outputs.version, 'rc') }}
+          files: rgb-lib-wasm-pkg.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rgb-lib-wasm-pkg
+
+      - name: Unpack
+        run: tar -xzf rgb-lib-wasm-pkg.tar.gz
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish
+        working-directory: pkg
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

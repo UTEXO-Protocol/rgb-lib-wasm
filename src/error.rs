@@ -6,8 +6,12 @@
 use super::*;
 
 /// The error variants returned by functions.
-#[derive(Debug, Clone, PartialEq, thiserror::Error, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Deserialize, Serialize)]
 pub enum Error {
+    /// Address rotation called when reuse_addresses is false
+    #[error("Address reuse is not enabled")]
+    AddressReuseDisabled,
+
     /// No need to create more allocations
     #[error("Allocations already available")]
     AllocationsAlreadyAvailable,
@@ -30,6 +34,10 @@ pub enum Error {
     #[error("Bitcoin network mismatch")]
     BitcoinNetworkMismatch,
 
+    /// Requested pending vanilla TX cannot be aborted
+    #[error("Pending vanilla TX cannot be aborted")]
+    CannotAbortPendingVanillaTx,
+
     /// A wallet cannot go online twice with different data
     #[error("Cannot change online object")]
     CannotChangeOnline,
@@ -42,6 +50,13 @@ pub enum Error {
     #[error("Cannot estimate fees")]
     CannotEstimateFees,
 
+    /// The transfer has failed, expired or progressed, so it cannot be ended
+    #[error("Transfer cannot be ended: {txid}")]
+    CannotEndTransfer {
+        /// Transfer TXID
+        txid: String,
+    },
+
     /// Requested batch transfer cannot be failed
     #[error("Batch transfer cannot be set to failed status")]
     CannotFailBatchTransfer,
@@ -50,9 +65,33 @@ pub enum Error {
     #[error("The given PSBT cannot be finalized")]
     CannotFinalizePsbt,
 
+    /// An asset cannot be linked to itself
+    #[error("An asset cannot be linked to itself")]
+    CannotLinkToItself,
+
+    /// Cannot use BFA schema on mainnet
+    #[error("Cannot use BFA schema on mainnet")]
+    CannotUseBfaOnMainnet,
+
     /// Cannot use IFA schema on mainnet
     #[error("Cannot use IFA schema on mainnet")]
     CannotUseIfaOnMainnet,
+
+    /// Two proxy authentication key entries resolve to the same proxy URL
+    #[error("Duplicate proxy authentication key: {details}")]
+    DuplicateProxyAuthKey {
+        /// Error details
+        details: String,
+    },
+
+    /// The EVM RPC endpoint is on a chain other than the configured one
+    #[error("EVM chain ID mismatch: expected {expected}, the RPC endpoint is on {actual}")]
+    EvmChainIdMismatch {
+        /// Configured chain ID
+        expected: u64,
+        /// Chain ID reported by the EVM RPC endpoint
+        actual: u64,
+    },
 
     /// The provided file is empty
     #[error("Empty file: {file_path}")]
@@ -60,6 +99,10 @@ pub enum Error {
         /// File path
         file_path: String,
     },
+
+    /// The provided expiration is invalid (in the past or too far in the future)
+    #[error("Invalid expiration")]
+    ExpirationInvalid,
 
     /// Syncing BDK with the blockchain has failed
     #[error("Failed bdk sync: {details}")]
@@ -89,9 +132,13 @@ pub enum Error {
         path: String,
     },
 
-    /// The master fingerprint derived from the mnemonic doesn't match the provided one
+    /// A master fingerprint does not match the wallet's
     #[error("Fingerprint mismatch")]
     FingerprintMismatch,
+
+    /// A proxy payload, decrypted if it was encrypted, doesn't match its expected hash
+    #[error("Hash mismatch")]
+    HashMismatch,
 
     /// An I/O error has been encountered
     #[error("I/O error: {details}")]
@@ -104,6 +151,58 @@ pub enum Error {
     /// (BDK, RGB) data
     #[error("Data is inconsistent ({details}). Please check its integrity.")]
     Inconsistency {
+        /// Error details
+        details: String,
+    },
+
+    /// The content signature was rejected as invalid
+    #[error("Invalid content signature")]
+    InvalidContentSignature,
+
+    /// A proxy payload is malformed or cannot be decrypted
+    #[error("Invalid encrypted blob: {details}")]
+    InvalidEncryptedBlob {
+        /// Error details
+        details: String,
+    },
+
+    /// The endpoint signature was rejected as invalid
+    #[error("Invalid endpoint auth signature")]
+    InvalidEndpointAuthSignature,
+
+    /// The proxy auth signature was rejected as invalid
+    #[error("Invalid proxy auth signature")]
+    InvalidProxyAuthSignature,
+
+    /// The recipient proxy refused the transfer as the invoice has expired, the invoice expiration
+    /// has passed before the transfer could be created, or it leaves too little time for a mint
+    /// lock
+    #[error("Invoice expired")]
+    InvoiceExpired,
+
+    /// The invoice has not been reserved on the recipient proxy
+    #[error("Invoice not reserved")]
+    InvoiceNotReserved,
+
+    /// The invoice cannot accept more transfers on the recipient proxy
+    #[error("Invoice quota exceeded")]
+    InvoiceQuotaExceeded,
+
+    /// No media found
+    #[error("No media found")]
+    NoMedia,
+
+    /// The proxy operation has expired
+    #[error("Operation expired")]
+    OperationExpired,
+
+    /// The proxy operation was not found
+    #[error("Operation not found")]
+    OperationNotFound,
+
+    /// Durable wallet persistence failed
+    #[error("Persistence error: {details}")]
+    Persistence {
         /// Error details
         details: String,
     },
@@ -171,6 +270,14 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided external chain block, before which the lock of a mint has to be included,
+    /// leaves no block for it
+    #[error("Invalid before block: {details}")]
+    InvalidBeforeBlock {
+        /// Error details
+        details: String,
+    },
+
     /// Keys derived from the provided data do not match
     #[error("Invalid bitcoin keys")]
     InvalidBitcoinKeys,
@@ -197,6 +304,20 @@ pub enum Error {
     #[error("Invalid consignment")]
     InvalidConsignment,
 
+    /// The provided burn reason is invalid
+    #[error("Invalid burn reason: {details}")]
+    InvalidBurnReason {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided contract ID is invalid
+    #[error("Invalid contract ID: {contract_id}")]
+    InvalidContractId {
+        /// The invalid contract ID
+        contract_id: String,
+    },
+
     /// The provided asset details is invalid
     #[error("Invalid details: {details}")]
     InvalidDetails {
@@ -219,6 +340,33 @@ pub enum Error {
     /// Trying to request fee estimation for an invalid block number, it must be between 1 and 1008
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
+
+    /// The provided expiration is invalid
+    #[error("Invalid expiration")]
+    InvalidExpiration,
+
+    /// The provided EVM contract address is invalid
+    #[error("Invalid EVM contract address: {details}")]
+    InvalidEvmContractAddress {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided EVM chain configuration is invalid (see `OnlineOptions::evm_chains`)
+    #[error("Invalid EVM chain: {details}")]
+    InvalidEvmChain {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided EVM RPC URL is invalid, the endpoint cannot be reached or it does not serve
+    /// what confirming mint locks needs (the latest finalized block and the contract state as of
+    /// it)
+    #[error("Invalid EVM RPC URL: {details}")]
+    InvalidEvmRpcUrl {
+        /// Error details
+        details: String,
+    },
 
     /// The provided fee rate is invalid
     #[error("Invalid fee rate: {details}")]
@@ -273,6 +421,13 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided proxy authentication key is invalid
+    #[error("Invalid proxy authentication key: {details}")]
+    InvalidProxyAuthKey {
+        /// Error details
+        details: String,
+    },
+
     /// The provided proxy URL points to a proxy running an unsupported protocol version
     #[error("Invalid proxy protocol version: {version}")]
     InvalidProxyProtocol {
@@ -300,6 +455,10 @@ pub enum Error {
         /// Error details
         details: String,
     },
+
+    /// The provided recipient map is invalid
+    #[error("The provided recipient map is invalid")]
+    InvalidRecipientMap,
 
     /// The provided recipient ID is neither a blinded UTXO or a script
     #[error("The provided recipient ID is neither a blinded UTXO or a script")]
@@ -359,6 +518,36 @@ pub enum Error {
         txid: String,
     },
 
+    /// A mint cannot spend the last mint right of the wallet, which would be left unable to mint
+    #[error("Cannot mint with the last mint right")]
+    LastMintRight,
+
+    /// The lock of the mint operation was not included on the external chain before the block the
+    /// mint commits to, and never will be: the mint will never be confirmed
+    #[error("Lock for mint operation {opid} not included before block {before_block}")]
+    MintLockExpired {
+        /// ID of the mint operation
+        opid: String,
+        /// External chain block the lock had to be included before
+        before_block: u64,
+    },
+
+    /// No confirmed mint lock committing to the mint operation and to the TX including it (see
+    /// [`ReceivedMint::lock_id`](crate::wallet::ReceivedMint::lock_id)) was found on the external
+    /// chain (yet): it may still be, e.g. once the lock is made or finalized
+    #[error("Lock for mint operation {opid} not found on the external chain")]
+    MintLockNotFound {
+        /// ID of the mint operation
+        opid: String,
+    },
+
+    /// The signed PSBT of a transfer is missing, so the transfer has failed
+    #[error("Signed PSBT not found for transfer with TXID: {txid}, the transfer has failed")]
+    MissingTransferArtifacts {
+        /// TXID of the failed transfer
+        txid: String,
+    },
+
     /// A network error occurred
     #[error("Network error: {details}")]
     Network {
@@ -366,9 +555,20 @@ pub enum Error {
         details: String,
     },
 
+    /// Cannot burn an asset with zero amount
+    #[error("Burn request with zero amount")]
+    NoBurnAmount,
+
     /// No consignment found
     #[error("No consignment found")]
     NoConsignment,
+
+    /// No EVM RPC URL is configured for the chain
+    #[error("No EVM RPC URL configured for chain ID {chain_id}")]
+    NoEvmRpcUrl {
+        /// EVM chain ID
+        chain_id: u64,
+    },
 
     /// Cannot inflate an asset with unknown o zero amounts
     #[error("Inflation request with no amounts or zero amounts")]
@@ -377,6 +577,10 @@ pub enum Error {
     /// Cannot issue an asset without knowing the amounts
     #[error("Issuance request with no provided amounts")]
     NoIssuanceAmounts,
+
+    /// Cannot issue an asset with zero mint rights
+    #[error("Issuance request with zero mint rights")]
+    NoMintRights,
 
     /// Cannot create a wallet with no supported schemas
     #[error("Cannot create a wallet with no supported schemas")]
@@ -405,6 +609,25 @@ pub enum Error {
         details: String,
     },
 
+    /// The proxy rejected a change to immutable operation data
+    #[error("Proxy cannot change: {details}")]
+    ProxyCannotChange {
+        /// Error details
+        details: String,
+    },
+
+    /// The proxy is draining and doesn't accept new transfers
+    #[error("Proxy draining")]
+    ProxyDraining,
+
+    /// The proxy doesn't accept any more media for the transfer
+    #[error("Proxy doesn't accept so many media")]
+    ProxyTooManyMedia,
+
+    /// The signed TX was already released to a recipient, so it can no longer be revoked
+    #[error("TX already released")]
+    ProxyTxAlreadyReleased,
+
     /// Provided recipient ID has already been used for another transfer
     #[error("Recipient ID already used")]
     RecipientIDAlreadyUsed,
@@ -427,6 +650,10 @@ pub enum Error {
         details: String,
     },
 
+    /// The proxy's registered signed TX for this operation was previously cleared
+    #[error("Signed TX was cleared")]
+    SignedTxCleared,
+
     /// The inflation amount exceeds the max possible supply
     #[error("The inflation amount exceeds the max possible supply")]
     TooHighInflationAmounts,
@@ -435,12 +662,24 @@ pub enum Error {
     #[error("Trying to issue too many assets")]
     TooHighIssuanceAmounts,
 
+    /// The transfer ID has been deleted on the recipient proxy and cannot be reused
+    #[error("Transfer ID deleted")]
+    TransferIDDeleted,
+
+    /// The transfer ID is already in use by a different operation on the sender proxy
+    #[error("Transfer ID in use")]
+    TransferIDInUse,
+
     /// The detected RGB schema is unknown
     #[error("Unknown RGB schema: {schema_id}")]
     UnknownRgbSchema {
         /// RGB schema ID
         schema_id: String,
     },
+
+    /// The transfer has expired
+    #[error("Transfer expired")]
+    TransferExpired,
 
     /// The detected transfer is unknown
     #[error("Unknown transfer: {txid}")]
@@ -456,6 +695,20 @@ pub enum Error {
         version: String,
     },
 
+    /// The schema doesn't support burn transitions
+    #[error("Burn not supported")]
+    UnsupportedBurn {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
+    /// The schema doesn't support mint transitions
+    #[error("Mint not supported")]
+    UnsupportedMint {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
     /// The schema doesn't support inflation
     #[error("Inflation not supported")]
     UnsupportedInflation {
@@ -468,6 +721,13 @@ pub enum Error {
     UnsupportedLayer1 {
         /// Layer 1
         layer_1: String,
+    },
+
+    /// The schema doesn't support link transitions
+    #[error("Link not supported")]
+    UnsupportedLink {
+        /// Asset schema
+        asset_schema: AssetSchema,
     },
 
     /// The given schema is not supported
@@ -516,6 +776,13 @@ pub enum Error {
     /// The requested operation cannot be processed by a watch-only wallet
     #[error("Operation not allowed on watch only wallet")]
     WatchOnly,
+
+    /// The PSBT belongs to a different kind of operation than the expected one
+    #[error("PSBT belongs to a different operation: {txid}")]
+    WrongOperation {
+        /// TXID of the PSBT
+        txid: String,
+    },
 
     /// The provided password is incorrect
     #[error("The provided password is incorrect")]
@@ -570,16 +837,13 @@ pub(crate) enum InternalError {
     FromSlice(#[from] amplify::FromSliceError),
 
     #[error("Hash error: {0}")]
-    HashError(#[from] scrypt::password_hash::Error),
+    HashError(#[from] scrypt::password_hash::phc::Error),
 
     #[error("Hex decode error: {0}")]
     HexError(String),
 
     #[error("Infallible error: {0}")]
     Infallible(#[from] std::convert::Infallible),
-
-    #[error("No password hash returned")]
-    NoPasswordHashError,
 
     #[error("PSBT parse error: {0}")]
     PsbtParse(#[from] bdk_wallet::bitcoin::psbt::PsbtParseError),
@@ -595,12 +859,6 @@ pub(crate) enum InternalError {
 
     #[error("Serde JSON error: {0}")]
     SerdeJSON(#[from] serde_json::Error),
-
-    #[error("Stash error: {0}")]
-    StashError(String),
-
-    #[error("Stock error: {0}")]
-    StockError(String),
 
     #[error("Strip prefix error: {0}")]
     StripPrefix(#[from] std::path::StripPrefixError),
@@ -668,59 +926,17 @@ impl From<psrgbt::MpcPsbtError> for InternalError {
     }
 }
 
-impl From<rgbstd::persistence::StashProviderError<std::convert::Infallible>> for InternalError {
-    fn from(e: rgbstd::persistence::StashProviderError<std::convert::Infallible>) -> Self {
-        InternalError::StashError(e.to_string())
-    }
-}
-
-impl From<rgbstd::persistence::StockError> for InternalError {
-    fn from(e: rgbstd::persistence::StockError) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    > for InternalError
-{
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::ConsignError,
-        >,
-    ) -> Self {
-        InternalError::StockError(e.to_string())
-    }
-}
-
-impl
-    From<
-        rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    > for InternalError
-{
-    fn from(
-        e: rgbstd::persistence::StockError<
-            rgbstd::persistence::MemStash,
-            rgbstd::persistence::MemState,
-            rgbstd::persistence::MemIndex,
-            rgbstd::persistence::FasciaError,
-        >,
-    ) -> Self {
-        InternalError::StockError(e.to_string())
+impl<E: std::error::Error> From<rgbstd::persistence::StockError<MemRgbStore, E>> for Error {
+    fn from(e: rgbstd::persistence::StockError<MemRgbStore, E>) -> Self {
+        match e {
+            rgbstd::persistence::StockError::Resolver(details) => Error::Indexer { details },
+            rgbstd::persistence::StockError::WitnessUnresolved(txid, e) => Error::Indexer {
+                details: format!("cannot resolve witness {txid}: {e}"),
+            },
+            e => Error::Internal {
+                details: format!("Stock err: {e}"),
+            },
+        }
     }
 }
 
@@ -767,6 +983,24 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<ClaimResolverError> for Error {
+    fn from(e: ClaimResolverError) -> Self {
+        match e {
+            ClaimResolverError::WrongChainId { expected, actual } => {
+                Error::EvmChainIdMismatch { expected, actual }
+            }
+            ClaimResolverError::Unconfirmed(opid) => Error::MintLockNotFound {
+                opid: opid.to_string(),
+            },
+            ClaimResolverError::ResolverIssue(details) => Error::Network { details },
+            // only the claims the validation asks about are resolved
+            e @ ClaimResolverError::Validation(_) => Error::Internal {
+                details: format!("unexpected claim resolution error: {e}"),
+            },
+        }
+    }
+}
+
 impl From<InternalError> for Error {
     fn from(e: InternalError) -> Self {
         Error::Internal {
@@ -780,5 +1014,76 @@ impl From<rgbstd::contract::BuilderError> for Error {
         Error::Internal {
             details: e.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stock_errors_map_to_rgb_lib_errors() {
+        type StockErr = rgbstd::persistence::StockError<MemRgbStore, std::convert::Infallible>;
+
+        let e: Error = StockErr::Resolver(s!("down")).into();
+        assert_eq!(
+            e,
+            Error::Indexer {
+                details: s!("down")
+            }
+        );
+
+        let id = format!("{}1", "0".repeat(63));
+        let txid = RgbTxid::from_str(&id).unwrap();
+        let e: Error = StockErr::WitnessUnresolved(txid, WitnessResolverError::NotSupported).into();
+        assert_eq!(
+            e,
+            Error::Indexer {
+                details: format!(
+                    "cannot resolve witness {id}: operation is not supported by this resolver"
+                )
+            }
+        );
+
+        let e: Error = StockErr::AbsentValidWitness.into();
+        assert_eq!(
+            e,
+            Error::Internal {
+                details: s!("Stock err: AbsentValidWitness")
+            }
+        );
+    }
+
+    #[test]
+    fn claim_resolver_errors_map() {
+        let e: Error = ClaimResolverError::WrongChainId {
+            expected: 1,
+            actual: 2,
+        }
+        .into();
+        assert_eq!(
+            e,
+            Error::EvmChainIdMismatch {
+                expected: 1,
+                actual: 2
+            }
+        );
+        let opid = OpId::from([1u8; 32]);
+        let e: Error = ClaimResolverError::Unconfirmed(opid).into();
+        assert_eq!(
+            e,
+            Error::MintLockNotFound {
+                opid: opid.to_string()
+            }
+        );
+        let e: Error = ClaimResolverError::ResolverIssue(s!("down")).into();
+        assert_eq!(
+            e,
+            Error::Network {
+                details: s!("down")
+            }
+        );
+        let e: Error = ClaimResolverError::Validation(ValidationError::UnknownClaim).into();
+        assert!(matches!(e, Error::Internal { .. }));
     }
 }

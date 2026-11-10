@@ -5,11 +5,11 @@
 use super::*;
 
 /// A set of Bitcoin keys used by the wallet.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct Keys {
     /// Mnemonic phrase
-    pub mnemonic: String,
+    pub mnemonic: Zeroizing<String>,
     /// Master xPub
     pub xpub: String,
     /// Account-level xPub of the vanilla-side of the wallet
@@ -20,17 +20,28 @@ pub struct Keys {
     pub master_fingerprint: String,
 }
 
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keys")
+            .field("mnemonic", &crate::REDACTED)
+            .field("xpub", &self.xpub)
+            .field("account_xpub_vanilla", &self.account_xpub_vanilla)
+            .field("account_xpub_colored", &self.account_xpub_colored)
+            .field("master_fingerprint", &self.master_fingerprint)
+            .finish()
+    }
+}
+
 /// Generate a set of [`Keys`] for the given Bitcoin network.
 pub fn generate_keys(bitcoin_network: BitcoinNetwork) -> Keys {
-    let bdk_network = BdkNetwork::from(bitcoin_network);
     let mnemonic = Mnemonic::generate((WordCount::Words12, Language::English))
         .expect("to be able to generate a new mnemonic");
     let xkey: ExtendedKey = mnemonic
         .clone()
         .into_extended_key()
         .expect("a valid key should have been provided");
-    let xpub = &xkey.into_xpub(bdk_network, &Secp256k1::new());
-    let mnemonic_str = mnemonic.to_string();
+    let xpub = &xkey.into_xpub(bitcoin_network.into(), &Secp256k1::new());
+    let mnemonic_str = Zeroizing::new(mnemonic.to_string());
     let (account_xpub_vanilla, account_xpub_colored) =
         get_account_xpubs(bitcoin_network, &mnemonic_str).unwrap();
     let master_fingerprint = xpub.fingerprint().to_string();
@@ -45,15 +56,15 @@ pub fn generate_keys(bitcoin_network: BitcoinNetwork) -> Keys {
 
 /// Recreate a set of [`Keys`] from the given mnemonic phrase.
 pub fn restore_keys(bitcoin_network: BitcoinNetwork, mnemonic: String) -> Result<Keys, Error> {
-    let bdk_network = BdkNetwork::from(bitcoin_network);
+    let mnemonic = Zeroizing::new(mnemonic);
     let (account_xpub_vanilla, account_xpub_colored) =
         get_account_xpubs(bitcoin_network, &mnemonic)?;
-    let mnemonic_parsed = Mnemonic::parse_in(Language::English, &mnemonic)?;
+    let mnemonic_parsed = Mnemonic::parse_in(Language::English, mnemonic.as_str())?;
     let xkey: ExtendedKey = mnemonic_parsed
         .clone()
         .into_extended_key()
         .expect("a valid key should have been provided");
-    let xpub = &xkey.into_xpub(bdk_network, &Secp256k1::new());
+    let xpub = &xkey.into_xpub(bitcoin_network.into(), &Secp256k1::new());
     let master_fingerprint = xpub.fingerprint().to_string();
     Ok(Keys {
         mnemonic,
@@ -67,6 +78,12 @@ pub fn restore_keys(bitcoin_network: BitcoinNetwork, mnemonic: String) -> Result
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn debug_hides_mnemonic() {
+        let keys = generate_keys(BitcoinNetwork::Regtest);
+        assert!(!format!("{keys:?}").contains(keys.mnemonic.as_str()));
+    }
 
     #[test]
     fn generate_success() {
@@ -102,7 +119,7 @@ mod test {
             master_fingerprint,
         } = generate_keys(network);
 
-        let keys = restore_keys(network, mnemonic).unwrap();
+        let keys = restore_keys(network, mnemonic.to_string()).unwrap();
         assert_eq!(keys.xpub, xpub);
         assert_eq!(keys.master_fingerprint, master_fingerprint);
         assert_eq!(keys.account_xpub_colored, account_xpub_colored);

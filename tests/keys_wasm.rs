@@ -25,7 +25,7 @@ fn test_generate_keys_all_networks() {
 #[wasm_bindgen_test]
 fn test_restore_keys_roundtrip() {
     let original = generate_keys(BitcoinNetwork::Regtest);
-    let restored = restore_keys(BitcoinNetwork::Regtest, original.mnemonic.clone()).unwrap();
+    let restored = restore_keys(BitcoinNetwork::Regtest, original.mnemonic.to_string()).unwrap();
     assert_eq!(original.mnemonic, restored.mnemonic);
     assert_eq!(original.xpub, restored.xpub);
     assert_eq!(original.master_fingerprint, restored.master_fingerprint);
@@ -37,7 +37,7 @@ fn test_restore_keys_roundtrip() {
 fn test_restore_keys_cross_network() {
     let mainnet_keys = generate_keys(BitcoinNetwork::Mainnet);
     let testnet_keys =
-        restore_keys(BitcoinNetwork::Testnet, mainnet_keys.mnemonic.clone()).unwrap();
+        restore_keys(BitcoinNetwork::Testnet, mainnet_keys.mnemonic.to_string()).unwrap();
     assert_eq!(mainnet_keys.mnemonic, testnet_keys.mnemonic);
     // xpubs differ because derivation path includes coin type
     assert_ne!(mainnet_keys.xpub, testnet_keys.xpub);

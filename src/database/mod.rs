@@ -1,4 +1,5 @@
 pub(crate) mod memory_db;
+pub(crate) mod rgb_store;
 
 use super::*;
 
@@ -74,9 +75,23 @@ impl DbBatchTransfer {
         self.status.failed()
     }
 
+    /// Whether the transfer expiration has passed at `now`.
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn pending(&self) -> bool {
-        self.status.pending()
+    pub(crate) fn is_expired(&self, now: i64) -> bool {
+        self.expiration.is_some_and(|expiration| expiration < now)
+    }
+
+    /// Whether the transfer expiration has passed at `now` by more than `margin` seconds, so it
+    /// has passed for a counterparty whose clock is up to `margin` seconds behind this wallet's too.
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn is_expired_with_margin(&self, now: i64, margin: u32) -> bool {
+        self.expiration
+            .is_some_and(|expiration| expiration.saturating_add(i64::from(margin)) < now)
+    }
+
+    #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
+    pub(crate) fn waiting(&self) -> bool {
+        self.status.waiting()
     }
 
     pub(crate) fn waiting_confirmations(&self) -> bool {
@@ -84,8 +99,8 @@ impl DbBatchTransfer {
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
-    pub(crate) fn waiting_counterparty(&self) -> bool {
-        self.status.waiting_counterparty()
+    pub(crate) fn is_fallible(&self) -> bool {
+        self.status.is_fallible()
     }
 }
 
@@ -96,12 +111,7 @@ pub(crate) struct DbBatchTransferData {
 
 impl DbColoring {
     pub(crate) fn incoming(&self) -> bool {
-        [
-            ColoringType::Receive,
-            ColoringType::Change,
-            ColoringType::Issue,
-        ]
-        .contains(&self.r#type)
+        ColoringType::INCOMING.contains(&self.r#type)
     }
 }
 
@@ -180,11 +190,21 @@ pub(crate) struct LocalUnspent {
     pub pending_blinded: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct LocalWitnessData {
     pub amount_sat: u64,
     pub blinding: Option<u64>,
     pub vout: u32,
+}
+
+impl std::fmt::Debug for LocalWitnessData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalWitnessData")
+            .field("amount_sat", &self.amount_sat)
+            .field("blinding", &self.blinding.as_ref().map(|_| crate::REDACTED))
+            .field("vout", &self.vout)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -210,6 +230,22 @@ pub(crate) struct LocalRecipient {
     pub local_recipient_data: LocalRecipientData,
     pub assignment: Assignment,
     pub transport_endpoints: Vec<LocalTransportEndpoint>,
+    /// Recipient's Ed25519 public key, empty when the recipient has no proxy
+    pub public_key: Vec<u8>,
+    pub encryption: Encryption,
+    /// Invoice expiration (UTC unix seconds), `None` when the recipient has no proxy
+    pub invoice_expiration: Option<i64>,
+}
+
+#[cfg(feature = "esplora")]
+impl LocalRecipient {
+    /// The IDs of the invoice and of the transfer to it on the proxy, given the hex-encoded pubkey
+    /// of the sender operation.
+    pub(crate) fn proxy_ids(&self, sender_pk_hex: &str) -> (String, String) {
+        let invoice_id = invoice_id(&self.recipient_id, &hex::encode(&self.public_key));
+        let transfer_id = transfer_id(&invoice_id, sender_pk_hex);
+        (invoice_id, transfer_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

@@ -1,12 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
-use rgb_lib_wasm::wallet::{DatabaseType, Recipient, Wallet, WalletData, WitnessData};
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
+use psrgbt::RgbOutExt;
+use rgb_lib_wasm::wallet::{
+    AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
+};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
+    bitcoin::Psbt, generate_keys,
+};
 use utils::*;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
@@ -22,6 +29,50 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
         master_fingerprint: keys.master_fingerprint,
         vanilla_keychain: None,
         supported_schemas: schemas,
+        reuse_addresses: false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum End {
+    Send,
+    SendBtc,
+    CreateUtxos,
+    Drain,
+    Inflate,
+}
+
+const VANILLA_ENDS: [End; 3] = [End::SendBtc, End::CreateUtxos, End::Drain];
+
+fn psbt_txid(signed: &str) -> String {
+    signed
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string()
+}
+
+async fn assert_refused(
+    wallet: &mut Wallet,
+    online: &rgb_lib_wasm::wallet::Online,
+    ends: &[End],
+    signed: &str,
+    error: Error,
+) {
+    for end in ends {
+        let (online, signed) = (online.clone(), signed.to_string());
+        let res = match end {
+            End::Send => wallet.send_end(online, signed, true).await.map(|_| ()),
+            End::SendBtc => wallet.send_btc_end(online, signed, true).await.map(|_| ()),
+            End::CreateUtxos => wallet
+                .create_utxos_end(online, signed, true)
+                .await
+                .map(|_| ()),
+            End::Drain => wallet.drain_to_end(online, signed).await.map(|_| ()),
+            End::Inflate => wallet.inflate_end(online, signed).await.map(|_| ()),
+        };
+        assert_eq!(res, Err(error.clone()));
     }
 }
 
@@ -52,13 +103,418 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
 }
 
 #[wasm_bindgen_test]
-async fn test_full_wallet_flow() {
-    let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
-    let mut wallet = Wallet::new(wd).unwrap();
-    let online = wallet
-        .go_online(false, ESPLORA_URL.to_string())
+async fn test_no_receive_on_pending_send_input() {
+    let transport = transport_endpoint();
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    let mut rcv_wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let rcv_online = rcv_wallet
+        .go_online(go_online_options(false))
         .await
         .unwrap();
+
+    // issue an NIA asset on a UTXO with not enough bitcoins for a send
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let asset = wallet
+        .issue_asset_nia(
+            "PSI".to_string(),
+            "Pending send input".to_string(),
+            0,
+            vec![1000],
+        )
+        .unwrap();
+
+    // create 1 UTXO with no allocations, to be used as additional bitcoin input
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let txid = psbt_txid(&signed);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::SendBtc, End::Drain],
+        &signed,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
+    wallet
+        .create_utxos_end(online.clone(), signed.clone(), true)
+        .await
+        .unwrap();
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::CreateUtxos],
+        &signed,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    let colored: HashSet<Outpoint> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert_eq!(colored.len(), 2);
+
+    // begin a witness send, without ending it
+    let receive_data = witness_rcv(
+        &mut rcv_wallet,
+        &rcv_online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![recipient(
+            &receive_data.recipient_id,
+            1,
+            Some(1000),
+            PROXY_URL,
+        )],
+    )]);
+    let psbt = wallet
+        .send_begin(
+            online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt
+        .parse::<Psbt>()
+        .unwrap();
+    let inputs: HashSet<Outpoint> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect();
+    assert_eq!(inputs, colored);
+
+    // the UTXO with no allocations is being spent by the pending send, so it cannot receive
+    let result = blind_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InsufficientAllocationSlots)),
+        "a receive must not use an input of a pending send, got: {:?}",
+        result.map(|r| r.recipient_id)
+    );
+
+    // another send cannot use the asset input of the pending send
+    let receive_data = witness_rcv(
+        &mut rcv_wallet,
+        &rcv_online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![recipient(
+            &receive_data.recipient_id,
+            1,
+            Some(1000),
+            PROXY_URL,
+        )],
+    )]);
+    let result = wallet
+        .send_begin(
+            online.clone(),
+            recipient_map.clone(),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport.clone()),
+            None,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::InsufficientAssignments { .. })),
+        "a send must not use an input of a pending send, got: {result:?}"
+    );
+
+    // a pending send can be ended only by send_end
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let signed = wallet.sign_psbt(psbt.to_string(), None).unwrap();
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::SendBtc, End::CreateUtxos, End::Drain, End::Inflate],
+        &signed,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
+
+    // a failed send cannot be ended and frees its inputs, also after it is deleted
+    let transfers = wallet
+        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid.clone()))
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].status, TransferStatus::Initiated);
+    let batch_transfer_idx = transfers[0].batch_transfer_idx;
+    assert!(
+        wallet
+            .fail_transfers(online.clone(), Some(batch_transfer_idx), false, false)
+            .await
+            .unwrap()
+    );
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::Send],
+        &signed,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
+    assert!(
+        wallet
+            .delete_transfers(Some(batch_transfer_idx), false)
+            .unwrap()
+    );
+    blind_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
+
+    // an expired send fails with no index
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let txid = wallet
+        .send_begin(
+            online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
+        .unwrap();
+    let result = wallet
+        .fail_transfers(online.clone(), None, false, false)
+        .await;
+    js_sys::eval("Date.now = realDateNow").unwrap();
+    assert!(result.unwrap());
+    let transfers = wallet
+        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid))
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].status, TransferStatus::Failed);
+}
+
+#[wasm_bindgen_test]
+async fn test_no_inflate_end_after_expiration() {
+    let transport = transport_endpoint();
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+
+    // issue IFA inflation rights on a UTXO with not enough bitcoins for an inflation
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let asset = wallet
+        .issue_asset_ifa(
+            "EXP".to_string(),
+            "Expired inflation".to_string(),
+            0,
+            vec![],
+            vec![1000],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+    // create 1 UTXO with no allocations, to be used as additional bitcoin input
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    let colored: HashSet<Outpoint> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert_eq!(colored.len(), 2);
+
+    // begin an inflation, without ending it
+    let unsigned = wallet
+        .inflate_begin(online.clone(), asset.asset_id.clone(), vec![500], 1, 1)
+        .await
+        .unwrap();
+    let psbt = unsigned.parse::<Psbt>().unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    assert_refused(
+        &mut saved,
+        &saved_online,
+        &[End::SendBtc],
+        &signed,
+        Error::WrongOperation {
+            txid: psbt_txid(&signed),
+        },
+    )
+    .await;
+    let inputs: HashSet<Outpoint> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| Outpoint::from(i.previous_output))
+        .collect();
+    assert_eq!(inputs, colored);
+    let result = blind_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InsufficientAllocationSlots)),
+        "a receive must not use an input of a begun inflation, got: {:?}",
+        result.map(|r| r.recipient_id)
+    );
+
+    // move the clock past the expiration and receive on an input of the inflation
+    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
+        .unwrap();
+    let receive_data = blind_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
+    let result = wallet.inflate_end(online.clone(), signed).await;
+    js_sys::eval("Date.now = realDateNow").unwrap();
+    assert!(
+        matches!(result, Err(Error::CannotEndTransfer { .. })),
+        "an expired inflation must not be ended, got: {:?}",
+        result.map(|r| r.txid)
+    );
+
+    // the received allocation is intact
+    let receive = wallet
+        .list_transfers(AssetFilter::Any, None)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.recipient_id.as_ref() == Some(&receive_data.recipient_id))
+        .unwrap();
+    assert_eq!(receive.status, TransferStatus::WaitingCounterparty);
+    assert!(inputs.contains(&receive.receive_utxo.unwrap()));
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let unspents: HashSet<Outpoint> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert_eq!(unspents, colored);
+}
+
+#[wasm_bindgen_test]
+async fn test_full_wallet_flow() {
+    let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet, &online, "1.0").await;
 
@@ -113,7 +569,8 @@ async fn test_full_wallet_flow() {
             0,
             vec![1000],
             vec![5000],
-            1,
+            None,
+            false,
             None,
         )
         .unwrap();
@@ -125,25 +582,23 @@ async fn test_full_wallet_flow() {
 
     // Two-wallet NIA send: wallet A → wallet B
     // Must happen before blind_receive which locks the NIA UTXO via pending_blinded
-    let wd_b = test_wallet_data(vec![AssetSchema::Nia]);
-    let mut wallet_b = Wallet::new(wd_b).unwrap();
-    let online_b = wallet_b
-        .go_online(false, ESPLORA_URL.to_string())
-        .await
-        .unwrap();
+    let wd_b = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
+    let mut wallet_b = Wallet::new(wd_b.clone()).unwrap();
+    let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
     create_utxos(&mut wallet_b, &online_b, 5).await;
 
-    let recv_b = wallet_b
-        .witness_receive(
-            None,
-            Assignment::Fungible(200),
-            None,
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let recv_b = witness_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(200),
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
 
     // 2000 sats witness amount covers the dust output for the RGB transfer
     let recipient = Recipient {
@@ -154,34 +609,131 @@ async fn test_full_wallet_flow() {
         }),
         assignment: Assignment::Fungible(200),
         transport_endpoints: vec![transport.clone()],
+        public_key: Some(recv_b.public_key.clone()),
+        encryption: Encryption::Required,
+        expiration_timestamp: Some(recv_b.expiration_timestamp),
     };
     let mut recipient_map = HashMap::new();
     recipient_map.insert(nia.asset_id.clone(), vec![recipient]);
 
+    let send_exp = default_send_expiration() + 1800;
     let unsigned_psbt = wallet
-        .send_begin(online.clone(), recipient_map, false, 1, 1)
+        .send_begin(
+            online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            send_exp,
+            Some(transport.clone()),
+            None,
+            false,
+        )
         .await
+        .unwrap()
+        .psbt;
+    let begin_txid = unsigned_psbt
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let begun = wallet
+        .list_transfers(AssetFilter::Any, Some(begin_txid))
         .unwrap();
-    let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
+    assert!(!begun.is_empty());
+    assert!(begun.iter().all(|t| t.status == TransferStatus::Initiated));
+    // A signer that never synced has no chain data
+    let signer = Wallet::new(wd.clone()).unwrap();
+    let signed_psbt = signer.sign_psbt(unsigned_psbt, None).unwrap();
+    let signed_txid = rgb_lib_wasm::bitcoin::psbt::Psbt::from_str(&signed_psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    // the consignment is validated before the broadcast
+    let consignment_bytes = wallet
+        .send_consignment_bytes(&signed_txid, &nia.asset_id)
+        .unwrap();
     let send_result = wallet
         .send_end(online.clone(), signed_psbt, false)
         .await
         .unwrap();
     assert!(!send_result.txid.is_empty());
+    let sent = wallet
+        .list_transfers(
+            AssetFilter::Id(nia.asset_id.clone()),
+            Some(send_result.txid.clone()),
+        )
+        .unwrap();
+    let sent = sent.iter().find(|t| t.kind == TransferKind::Send).unwrap();
+    assert_eq!(sent.expiration_timestamp, Some(send_exp));
+    // send_end updates the begun records and adds none
+    let ended = wallet
+        .list_transfers(AssetFilter::Any, Some(send_result.txid.clone()))
+        .unwrap();
+    assert_eq!(
+        ended.iter().map(|t| t.idx).collect::<Vec<_>>(),
+        begun.iter().map(|t| t.idx).collect::<Vec<_>>()
+    );
+    assert!(
+        ended
+            .iter()
+            .all(|t| t.status == TransferStatus::WaitingCounterparty
+                && t.batch_transfer_idx == begun[0].batch_transfer_idx)
+    );
+
+    // validate_consignment_offchain: validate the consignment before broadcast
+    assert!(!consignment_bytes.is_empty());
+    assert_eq!(signed_txid, send_result.txid);
+    let validation = rgb_lib_wasm::wallet::rust_only::validate_consignment_offchain(
+        &consignment_bytes,
+        &send_result.txid,
+        BitcoinNetwork::Regtest,
+    )
+    .unwrap();
+    assert!(
+        validation.valid,
+        "Consignment should be valid, got error: {:?} details: {:?}",
+        validation.error, validation.details,
+    );
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
     wallet_b.sync(online_b.clone()).await.unwrap();
 
-    wallet
-        .refresh(online.clone(), None, vec![], false)
-        .await
-        .unwrap();
-    wallet_b
+    // Receiver refreshes first: picks up consignment from proxy, validates, ACKs
+    let recv_refresh = wallet_b
         .refresh(online_b.clone(), None, vec![], false)
         .await
         .unwrap();
+    for (idx, refreshed) in &recv_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Receiver refresh failed for transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
+
+    // Mine the ACK so sender can see it
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    // Sender refreshes: sees ACK, broadcasts TX → WaitingConfirmations
+    // This is the exact flow that failed with "signed PSBT not found in transfer artifacts"
+    let send_refresh = wallet
+        .refresh(online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for (idx, refreshed) in &send_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Sender refresh failed for transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
 
     let a_assets = wallet.list_assets(vec![AssetSchema::Nia]).unwrap();
     let a_nia = a_assets
@@ -198,10 +750,41 @@ async fn test_full_wallet_flow() {
     );
 
     // list_transfers: verify NIA send created transfer records
-    let a_transfers = wallet.list_transfers(Some(nia.asset_id.clone())).unwrap();
+    let a_transfers = wallet
+        .list_transfers(AssetFilter::Id(nia.asset_id.clone()), None)
+        .unwrap();
     assert!(
         !a_transfers.is_empty(),
         "Sender should have NIA transfer records"
+    );
+
+    // txid filter: the send tx's transfers
+    let by_txid = wallet
+        .list_transfers(AssetFilter::Any, Some(send_result.txid.clone()))
+        .unwrap();
+    assert!(!by_txid.is_empty(), "Send txid should resolve to transfers");
+    assert!(
+        by_txid
+            .iter()
+            .all(|t| t.txid == Some(send_result.txid.clone()))
+    );
+
+    // asset + txid intersection
+    let nia_by_txid = wallet
+        .list_transfers(
+            AssetFilter::Id(nia.asset_id.clone()),
+            Some(send_result.txid.clone()),
+        )
+        .unwrap();
+    assert!(!nia_by_txid.is_empty(), "NIA + send txid should intersect");
+
+    // unknown txid: empty
+    let unknown = "0000000000000000000000000000000000000000000000000000000000000000";
+    assert!(
+        wallet
+            .list_transfers(AssetFilter::Any, Some(unknown.to_string()))
+            .unwrap()
+            .is_empty()
     );
     // At least one transfer should be settled or waiting confirmations
     assert!(
@@ -237,16 +820,66 @@ async fn test_full_wallet_flow() {
     let total_before = btc_before.vanilla.settled + btc_before.vanilla.future;
 
     // 50_000 sats
+    wallet.backup("pw").unwrap();
+    assert!(!wallet.backup_info().unwrap());
+    // backup timestamps compare as text, which is only safe across seconds
+    sleep_ms(1100).await;
     let unsigned_btc = wallet
         .send_btc_begin(online.clone(), addr_b2, 50_000, 1, false)
         .await
         .unwrap();
-    let signed_btc = wallet.sign_psbt(unsigned_btc, None).unwrap();
+    assert!(wallet.backup_info().unwrap());
+    let signed_btc = signer.sign_psbt(unsigned_btc, None).unwrap();
+    let txid = psbt_txid(&signed_btc);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::CreateUtxos, End::Drain],
+        &signed_btc,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    assert_refused(
+        &mut saved,
+        &saved_online,
+        &[End::CreateUtxos],
+        &signed_btc,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
+    wallet.backup("pw").unwrap();
+    assert!(!wallet.backup_info().unwrap());
+    sleep_ms(1100).await;
+    // backup saves its time
+    let (saved, _) = saved_wallet(&wallet).await;
+    assert!(!saved.backup_info().unwrap());
+    drop(saved);
     let btc_txid = wallet
-        .send_btc_end(online.clone(), signed_btc, false)
+        .send_btc_end(online.clone(), signed_btc.clone(), false)
         .await
         .unwrap();
+    // send_btc_end saves the end before it returns
+    let (mut saved, saved_online) = saved_wallet(&wallet).await;
+    assert_refused(
+        &mut saved,
+        &saved_online,
+        &[End::SendBtc],
+        &signed_btc,
+        Error::CannotEndTransfer { txid: txid.clone() },
+    )
+    .await;
+    drop(saved);
     assert!(!btc_txid.is_empty());
+    assert!(wallet.backup_info().unwrap());
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::SendBtc],
+        &signed_btc,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
@@ -273,12 +906,55 @@ async fn test_full_wallet_flow() {
         .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
         .await
         .unwrap();
+    let inflate_entropy = Psbt::from_str(&unsigned_inflate)
+        .unwrap()
+        .outputs
+        .iter()
+        .find_map(|o| o.mpc_entropy())
+        .unwrap();
     let signed_inflate = wallet.sign_psbt(unsigned_inflate, None).unwrap();
+    let txid = psbt_txid(&signed_inflate);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::Send, End::SendBtc, End::CreateUtxos, End::Drain],
+        &signed_inflate,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
     let inflate_result = wallet
-        .inflate_end(online.clone(), signed_inflate)
+        .inflate_end(online.clone(), signed_inflate.clone())
         .await
         .unwrap();
     assert!(!inflate_result.txid.is_empty());
+    assert_eq!(inflate_result.entropy, inflate_entropy);
+    assert_refused(
+        &mut wallet,
+        &online,
+        &[End::Inflate, End::Send],
+        &signed_inflate,
+        Error::CannotEndTransfer { txid: txid.clone() },
+    )
+    .await;
+    assert_refused(
+        &mut wallet,
+        &online,
+        &VANILLA_ENDS,
+        &signed_inflate,
+        Error::WrongOperation { txid },
+    )
+    .await;
+    let inflation = wallet
+        .list_transfers(
+            AssetFilter::Id(ifa.asset_id.clone()),
+            Some(inflate_result.txid.clone()),
+        )
+        .unwrap();
+    let inflation = inflation
+        .iter()
+        .find(|t| t.kind == TransferKind::Inflation)
+        .unwrap();
+    assert_eq!(inflation.expiration_timestamp, None);
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
@@ -298,6 +974,123 @@ async fn test_full_wallet_flow() {
         "IFA balance should increase after inflation, got: {:?}",
         ifa_after.balance,
     );
+    assert_eq!(
+        ifa_after.known_circulating_supply,
+        ifa.known_circulating_supply + 500
+    );
+
+    // Two-wallet IFA send: wallet A → wallet B via a blank blinded invoice.
+    // Regression test for UTEXO-Protocol/rgb-lightning-node#126: the receiver
+    // must recognize the IFA schema, accept the consignment and post the ack.
+    let recv_ifa = blind_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
+
+    let ifa_recipient = Recipient {
+        recipient_id: recv_ifa.recipient_id.clone(),
+        witness_data: None,
+        assignment: Assignment::Fungible(5),
+        transport_endpoints: vec![transport.clone()],
+        public_key: Some(recv_ifa.public_key.clone()),
+        encryption: Encryption::Required,
+        expiration_timestamp: Some(recv_ifa.expiration_timestamp),
+    };
+    let mut ifa_recipient_map = HashMap::new();
+    ifa_recipient_map.insert(ifa.asset_id.clone(), vec![ifa_recipient]);
+
+    let unsigned_ifa = wallet
+        .send_begin(
+            online.clone(),
+            ifa_recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt;
+    let signed_ifa = wallet.sign_psbt(unsigned_ifa, None).unwrap();
+    let ifa_send = wallet
+        .send_end(online.clone(), signed_ifa, false)
+        .await
+        .unwrap();
+    assert!(!ifa_send.txid.is_empty());
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    wallet_b.sync(online_b.clone()).await.unwrap();
+
+    // Receiver refreshes: must accept the IFA consignment and ACK it
+    let ifa_recv_refresh = wallet_b
+        .refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for (idx, refreshed) in &ifa_recv_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Receiver refresh failed for IFA transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+
+    // Sender refreshes: must see the ACK and leave WaitingCounterparty
+    let ifa_send_refresh = wallet
+        .refresh(online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for (idx, refreshed) in &ifa_send_refresh {
+        assert!(
+            refreshed.failure.is_none(),
+            "Sender refresh failed for IFA transfer {idx}: {:?}",
+            refreshed.failure,
+        );
+    }
+    let ifa_transfers = wallet
+        .list_transfers(
+            AssetFilter::Id(ifa.asset_id.clone()),
+            Some(ifa_send.txid.clone()),
+        )
+        .unwrap();
+    assert!(!ifa_transfers.is_empty(), "Sender should have IFA transfer");
+    assert!(
+        ifa_transfers
+            .iter()
+            .all(|t| t.status != TransferStatus::WaitingCounterparty),
+        "Sender IFA transfer must leave WaitingCounterparty, got: {:?}",
+        ifa_transfers.iter().map(|t| &t.status).collect::<Vec<_>>(),
+    );
+
+    // Receiver must see the received IFA asset in list_assets and its balance
+    let b_ifa_assets = wallet_b.list_assets(vec![AssetSchema::Ifa]).unwrap();
+    let b_ifa = b_ifa_assets
+        .ifa
+        .unwrap()
+        .into_iter()
+        .find(|a| a.asset_id == ifa.asset_id)
+        .expect("receiver must list the received IFA asset");
+    assert_eq!(b_ifa.ticker, "TIFA");
+    let b_ifa_balance = wallet_b.get_asset_balance(ifa.asset_id.clone()).unwrap();
+    assert!(
+        b_ifa_balance.settled + b_ifa_balance.future + b_ifa_balance.spendable >= 5,
+        "Receiver IFA balance should include the received amount, got: {:?}",
+        b_ifa_balance,
+    );
 
     // List unspents vanilla
     let unspents = wallet
@@ -312,12 +1105,30 @@ async fn test_full_wallet_flow() {
         .drain_to_begin(online_b.clone(), drain_addr, false, 1)
         .await
         .unwrap();
-    let signed_drain = wallet_b.sign_psbt(unsigned_drain, None).unwrap();
+    let signer_b = Wallet::new(wd_b).unwrap();
+    let signed_drain = signer_b.sign_psbt(unsigned_drain, None).unwrap();
+    let txid = psbt_txid(&signed_drain);
+    assert_refused(
+        &mut wallet_b,
+        &online_b,
+        &[End::SendBtc, End::CreateUtxos],
+        &signed_drain,
+        Error::WrongOperation { txid: txid.clone() },
+    )
+    .await;
     let drain_txid = wallet_b
-        .drain_to_end(online_b.clone(), signed_drain)
+        .drain_to_end(online_b.clone(), signed_drain.clone())
         .await
         .unwrap();
     assert!(!drain_txid.is_empty());
+    assert_refused(
+        &mut wallet_b,
+        &online_b,
+        &[End::Drain],
+        &signed_drain,
+        Error::CannotEndTransfer { txid },
+    )
+    .await;
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
@@ -362,6 +1173,15 @@ async fn test_full_wallet_flow() {
     // Wallet has state, so backup should be required
     assert!(needs_backup, "backup_info should indicate backup needed");
 
+    let ifa_before_backup = wallet
+        .list_assets(vec![AssetSchema::Ifa])
+        .unwrap()
+        .ifa
+        .unwrap()
+        .into_iter()
+        .find(|a| a.asset_id == ifa.asset_id)
+        .unwrap();
+
     let password = "test_password_123";
     let backup_bytes = wallet.backup(password).unwrap();
     assert!(!backup_bytes.is_empty(), "Backup should produce bytes");
@@ -398,6 +1218,46 @@ async fn test_full_wallet_flow() {
         "BTC balance should survive backup/restore"
     );
 
+    // Restore into a fresh wallet on an empty data directory: IFA units and inflation rights must survive
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored".to_string(),
+        ..wd.clone()
+    })
+    .unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    let restored_ifa = restored
+        .list_assets(vec![AssetSchema::Ifa])
+        .unwrap()
+        .ifa
+        .unwrap()
+        .into_iter()
+        .find(|a| a.asset_id == ifa.asset_id)
+        .expect("IFA asset should survive backup/restore");
+    assert_eq!(restored_ifa.balance, ifa_before_backup.balance);
+    assert_eq!(restored_ifa.max_supply, ifa_before_backup.max_supply);
+    assert_eq!(
+        restored_ifa.known_circulating_supply,
+        ifa_before_backup.known_circulating_supply
+    );
+
+    // The restored RGB state must allow a new inflation
+    let online_r = restored.go_online(go_online_options(false)).await.unwrap();
+    restored.sync(online_r.clone()).await.unwrap();
+    let unsigned_inflate = restored
+        .inflate_begin(online_r.clone(), ifa.asset_id.clone(), vec![200], 1, 1)
+        .await
+        .unwrap();
+    let signed_inflate = restored.sign_psbt(unsigned_inflate, None).unwrap();
+    restored
+        .inflate_end(online_r.clone(), signed_inflate)
+        .await
+        .unwrap();
+    let restored_ifa_balance = restored.get_asset_balance(ifa.asset_id.clone()).unwrap();
+    assert_eq!(
+        restored_ifa_balance.future,
+        ifa_before_backup.balance.future + 200
+    );
+
     // VSS Cloud Backup: full round-trip against real server
     use bdk_wallet::bitcoin::secp256k1::{Secp256k1 as Secp, rand::rngs::OsRng as SecpRng};
     use rgb_lib_wasm::wallet::vss::VssBackupConfig;
@@ -421,30 +1281,64 @@ async fn test_full_wallet_flow() {
     // Upload backup
     let version = wallet.vss_backup().await.unwrap();
     assert!(version > 0, "Backup version should be positive");
+    // vss_backup saves its time
+    let (saved, _) = saved_wallet(&wallet).await;
+    assert!(!saved.backup_info().unwrap());
+    drop(saved);
 
     // Check info after backup
     let info_after = wallet.vss_backup_info().await.unwrap();
     assert!(info_after.backup_exists, "Backup should exist after upload");
     assert!(info_after.server_version.is_some());
 
-    // Restore from VSS into the same wallet
-    wallet.vss_restore_backup().await.unwrap();
-
-    // Verify state after VSS restore
-    let vss_assets = wallet.list_assets(vec![AssetSchema::Nia]).unwrap();
-    let vss_nia = vss_assets.nia.unwrap();
-    assert!(
-        vss_nia.iter().any(|a| a.ticker == "TEST"),
-        "NIA asset should survive VSS backup/restore"
+    // Restore from VSS into a fresh wallet with the same keys
+    let mut vss_restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_vss_restored".to_string(),
+        ..wd
+    })
+    .unwrap();
+    let has_test_nia = |w: &Wallet| {
+        w.list_assets(vec![AssetSchema::Nia])
+            .unwrap()
+            .nia
+            .is_some_and(|nia| nia.iter().any(|a| a.ticker == "TEST"))
+    };
+    let btc_total = |w: &mut Wallet| {
+        let b = w.get_btc_balance(None, true).unwrap();
+        b.vanilla.settled + b.vanilla.future + b.colored.settled + b.colored.future
+    };
+    assert!(!has_test_nia(&vss_restored));
+    assert_eq!(btc_total(&mut vss_restored), 0);
+    vss_restored.configure_vss_backup(&vss_config);
+    // The restore asks for persistent storage
+    js_sys::Function::new_no_args(
+        "globalThis.__persistCalls = 0;
+        navigator.storage.persist = function () {
+            globalThis.__persistCalls += 1;
+            return Promise.resolve(false);
+        };",
+    )
+    .call0(&wasm_bindgen::JsValue::NULL)
+    .unwrap();
+    vss_restored.vss_restore_backup().await.unwrap();
+    let persist_calls = js_sys::Reflect::get(&js_sys::global(), &"__persistCalls".into())
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    js_sys::Function::new_no_args("delete navigator.storage.persist;")
+        .call0(&wasm_bindgen::JsValue::NULL)
+        .unwrap();
+    assert_eq!(
+        persist_calls, 1.0,
+        "vss_restore_backup should request persistent storage"
     );
 
-    let vss_balance = wallet.get_btc_balance(None, true).unwrap();
-    let vss_total = vss_balance.vanilla.settled
-        + vss_balance.vanilla.future
-        + vss_balance.colored.settled
-        + vss_balance.colored.future;
     assert!(
-        vss_total > 0,
+        has_test_nia(&vss_restored),
+        "NIA asset should survive VSS backup/restore"
+    );
+    assert!(
+        btc_total(&mut vss_restored) > 0,
         "BTC balance should survive VSS backup/restore"
     );
 
@@ -465,28 +1359,84 @@ async fn test_full_wallet_flow() {
     // Restore correct config for cleanup
     wallet.configure_vss_backup(&vss_config);
 
+    // ensure_initial_backup: uploads when the wallet has unsaved changes,
+    // no-ops when it does not.
+    let fresh_store_id = format!("test-wallet-init-{}", js_sys::Date::now() as u64);
+    let fresh_config = VssBackupConfig::new(
+        utils::VSS_SERVER_URL.to_string(),
+        fresh_store_id,
+        signing_key,
+    );
+    vss_restored.configure_vss_backup(&fresh_config);
+    let initial = vss_restored.ensure_initial_backup().await.unwrap();
+    assert!(
+        initial.is_some(),
+        "ensure_initial_backup must upload when changes are pending"
+    );
+    let noop = vss_restored.ensure_initial_backup().await.unwrap();
+    assert!(
+        noop.is_none(),
+        "ensure_initial_backup must no-op right after a backup"
+    );
+
+    // A failed upload is recorded and surfaces in vss_backup_info; the next
+    // successful one clears it.
+    let dead_config = VssBackupConfig::new(
+        "http://127.0.0.1:9/vss".to_string(),
+        "dead-store".to_string(),
+        signing_key,
+    );
+    wallet.configure_vss_backup(&dead_config);
+    assert!(wallet.vss_backup().await.is_err());
+    // a failed upload saves its backup times
+    let (saved, _) = saved_wallet(&wallet).await;
+    assert_eq!(saved.backup_info(), wallet.backup_info());
+    drop(saved);
+    wallet.configure_vss_backup(&fresh_config);
+    let info_err = wallet.vss_backup_info().await.unwrap();
+    assert!(
+        info_err.last_backup_error.is_some(),
+        "failed upload must be visible in vss_backup_info"
+    );
+    let _ = wallet.vss_backup().await.unwrap();
+    let info_ok = wallet.vss_backup_info().await.unwrap();
+    assert!(
+        info_ok.last_backup_error.is_none(),
+        "successful upload must clear the recorded error"
+    );
+
     // disable_vss_backup: verify it doesn't crash
     wallet.disable_vss_backup();
 
     // Receive API tests (after send, since blind_receive locks NIA UTXO)
-    let blind_recv = wallet
-        .blind_receive(
-            Some(nia.asset_id.clone()),
-            Assignment::Fungible(100),
-            Some(3600),
-            vec![transport.clone()],
-            1,
-        )
-        .unwrap();
+    let blind_exp = default_rcv_expiration();
+    let blind_recv = blind_rcv(
+        &mut wallet,
+        &online,
+        Some(nia.asset_id.clone()),
+        Assignment::Fungible(100),
+        blind_exp,
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
     assert!(!blind_recv.invoice.is_empty());
     assert!(!blind_recv.recipient_id.is_empty());
-    assert!(blind_recv.expiration_timestamp.is_some());
+    assert_eq!(blind_recv.expiration_timestamp, blind_exp);
 
-    let witness_recv = wallet
-        .witness_receive(None, Assignment::Any, Some(0), vec![transport.clone()], 1)
-        .unwrap();
+    let witness_exp = default_rcv_expiration();
+    let witness_recv = witness_rcv(
+        &mut wallet,
+        &online,
+        None,
+        Assignment::Any,
+        witness_exp,
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
     assert!(!witness_recv.invoice.is_empty());
-    assert!(witness_recv.expiration_timestamp.is_none());
+    assert_eq!(witness_recv.expiration_timestamp, witness_exp);
 
     // fail_transfers: no pending transfers to fail — should succeed with false
     let failed = wallet
@@ -500,5 +1450,293 @@ async fn test_full_wallet_flow() {
     assert!(
         !deleted,
         "No failed transfers to delete should return false"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_go_online_other_network() {
+    let mut wallet = Wallet::new(WalletData {
+        bitcoin_network: BitcoinNetwork::Testnet,
+        ..test_wallet_data(vec![AssetSchema::Nia])
+    })
+    .unwrap();
+    let result = wallet.go_online(go_online_options(false)).await;
+    assert!(
+        matches!(&result, Err(Error::InvalidIndexer { details }) if details == "resolver is for another chain-network pair"),
+        "a testnet wallet must be refused by a regtest indexer, got: {result:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_sync_after_block_sees_new_utxo() {
+    spy_esplora_cache();
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    let addr = wallet.get_address().unwrap();
+    wallet.sync(online.clone()).await.unwrap();
+
+    fund_address(&addr, "0.001").await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    assert_eq!(
+        wallet.get_btc_balance(None, true).unwrap().vanilla.settled,
+        100_000
+    );
+
+    let modes = esplora_cache_modes();
+    assert!(
+        !modes.is_empty() && modes.iter().all(|m| m == "no-store"),
+        "esplora fetch cache modes: {modes:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_restored_wallet_inflates_after_inflation() {
+    let wd = test_wallet_data(vec![AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 5).await;
+    let ifa = wallet
+        .issue_asset_ifa(
+            "TIFA".to_string(),
+            "Test IFA".to_string(),
+            0,
+            vec![1000],
+            vec![5000],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+    let unsigned = wallet
+        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let inflate_txid = wallet
+        .inflate_end(online.clone(), signed)
+        .await
+        .unwrap()
+        .txid;
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    refresh(&mut wallet, &online).await;
+    let height = wallet
+        .get_tx_height(online.clone(), inflate_txid)
+        .await
+        .unwrap();
+
+    let states = |w: &Wallet| -> Vec<(TransferKind, TransferStatus)> {
+        w.list_transfers(AssetFilter::Id(ifa.asset_id.clone()), None)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.kind, t.status))
+            .collect()
+    };
+    let original = states(&wallet);
+    let password = "test_password_123";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored_inflate".to_string(),
+        ..wd
+    })
+    .unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    assert_eq!(
+        states(&restored),
+        original,
+        "restored transfers must match the original"
+    );
+
+    let online_r = restored.go_online(go_online_options(false)).await.unwrap();
+    restored.sync(online_r.clone()).await.unwrap();
+    let r = restored
+        .inflate_begin(online_r.clone(), ifa.asset_id.clone(), vec![200], 1, 1)
+        .await;
+    assert!(
+        r.is_ok(),
+        "restored inflate_begin: {:?}; inflation tx height: {height:?}; transfers: {original:?}",
+        r.as_ref().err()
+    );
+    let signed_r = restored.sign_psbt(r.unwrap(), None).unwrap();
+    restored
+        .inflate_end(online_r.clone(), signed_r)
+        .await
+        .unwrap();
+    assert!(height.is_some(), "the inflation transaction must be mined");
+}
+
+#[wasm_bindgen_test]
+async fn test_go_online_checks_outputs_spent_after_backup() {
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 1).await;
+    wallet.go_online(go_online_options(false)).await.unwrap();
+    let colored: Vec<String> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable && u.utxo.exists)
+        .map(|u| u.utxo.outpoint.to_string())
+        .collect();
+    assert!(!colored.is_empty());
+    let password = "test_password_123";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    // spend every output after the backup
+    let addr = Wallet::new(test_wallet_data(vec![AssetSchema::Nia]))
+        .unwrap()
+        .get_address()
+        .unwrap();
+    let unsigned = wallet
+        .drain_to_begin(online.clone(), addr, true, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let inputs: HashSet<String> = signed
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| i.previous_output.to_string())
+        .collect();
+    assert!(
+        colored.iter().all(|o| inputs.contains(o)),
+        "{colored:?} {inputs:?}"
+    );
+    wallet.drain_to_end(online.clone(), signed).await.unwrap();
+    mine_blocks(1).await;
+
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored_consistency".to_string(),
+        ..wd
+    })
+    .unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    for _ in 0..2 {
+        let res = restored.go_online(go_online_options(false)).await;
+        assert!(
+            matches!(res, Err(Error::Inconsistency { ref details })
+                if details.starts_with("spent bitcoins with another wallet: ")
+                    && colored.iter().all(|o| details.contains(o.as_str()))),
+            "{res:?}"
+        );
+    }
+    restored.go_online(go_online_options(true)).await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_go_online_checks_own_spends() {
+    let transport = transport_endpoint();
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 2).await;
+    let asset = wallet
+        .issue_asset_nia("OWN".to_string(), "Own spends".to_string(), 0, vec![1000])
+        .unwrap();
+    let mut rcv_wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let rcv_online = rcv_wallet
+        .go_online(go_online_options(false))
+        .await
+        .unwrap();
+    let receive_data = witness_rcv(
+        &mut rcv_wallet,
+        &rcv_online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport.clone()],
+    )
+    .await
+    .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![recipient(
+            &receive_data.recipient_id,
+            100,
+            Some(1000),
+            PROXY_URL,
+        )],
+    )]);
+    let unsigned = wallet
+        .send_begin(
+            online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport.clone()),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt;
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let send_txid = psbt_txid(&signed);
+    wallet.send_end(online.clone(), signed, true).await.unwrap();
+    let password = "test_password_123";
+    let backup_bytes = wallet.backup(password).unwrap();
+
+    // the recipient broadcasts the send before the sender refreshes
+    refresh(&mut rcv_wallet, &rcv_online).await;
+    assert_eq!(
+        transfer_of(&rcv_wallet, &receive_data.recipient_id).status,
+        TransferStatus::WaitingConfirmations
+    );
+    mine_blocks(1).await;
+    assert_eq!(
+        transfer_of(&wallet, &receive_data.recipient_id).status,
+        TransferStatus::WaitingCounterparty
+    );
+    wallet.go_online(go_online_options(false)).await.unwrap();
+
+    // a drain before the refresh spends the send's change
+    let addr = rcv_wallet.get_address().unwrap();
+    let unsigned = wallet
+        .drain_to_begin(online.clone(), addr, true, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    let change: Vec<String> = signed
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .filter(|i| i.previous_output.txid.to_string() == send_txid)
+        .map(|i| i.previous_output.to_string())
+        .collect();
+    assert!(!change.is_empty());
+    wallet.drain_to_end(online.clone(), signed).await.unwrap();
+    mine_blocks(1).await;
+    assert_eq!(
+        transfer_of(&wallet, &receive_data.recipient_id).status,
+        TransferStatus::WaitingCounterparty
+    );
+    wallet.go_online(go_online_options(false)).await.unwrap();
+
+    // the backup does not hold the drain that spends the send's change
+    let mut restored = Wallet::new(WalletData {
+        data_dir: "/tmp/rgb_integration_restored_own_spends".to_string(),
+        ..wd
+    })
+    .unwrap();
+    restored.restore_backup(&backup_bytes, password).unwrap();
+    let res = restored.go_online(go_online_options(false)).await;
+    assert!(
+        matches!(res, Err(Error::Inconsistency { ref details })
+            if change.iter().all(|o| details.contains(o.as_str()))),
+        "{change:?} {res:?}"
     );
 }

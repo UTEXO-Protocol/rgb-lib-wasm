@@ -8,17 +8,18 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use bdk_wallet::bitcoin::hashes::{Hash as _, sha256::Hash as Sha256};
 use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1, SecretKey, SignOnly};
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, aead::stream};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use hkdf::Hkdf;
 use prost::Message as ProstMessage; // trait (for .decode() etc.)
 use serde::{Deserialize, Serialize};
 use sha2::Sha256 as HkdfSha256;
 
 use crate::Error;
+use crate::encryption::chunk_nonce;
 use crate::error::InternalError;
 
 // --- Protobuf types (matching vss-server proto) ---
@@ -84,7 +85,7 @@ pub enum ErrorCode {
 // --- VSS Error handling ---
 
 #[derive(Debug)]
-pub(crate) enum VssError {
+pub enum VssError {
     NoSuchKey(String),
     InvalidRequest(String),
     Conflict(String),
@@ -162,7 +163,7 @@ fn build_auth_token(secret_key: &SecretKey, secp_ctx: &Secp256k1<SignOnly>) -> S
 
 const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 
-pub(crate) struct WasmVssClient {
+pub struct WasmVssClient {
     base_url: String,
     signing_key: SecretKey,
     secp_ctx: Secp256k1<SignOnly>,
@@ -170,7 +171,7 @@ pub(crate) struct WasmVssClient {
 }
 
 impl WasmVssClient {
-    pub(crate) fn new(base_url: String, signing_key: SecretKey) -> Self {
+    pub fn new(base_url: String, signing_key: SecretKey) -> Self {
         Self {
             base_url,
             signing_key,
@@ -194,6 +195,10 @@ impl WasmVssClient {
             .header("content-type", APPLICATION_OCTET_STREAM)
             .header("Authorization", auth_token)
             .body(body)
+            // VSS uses the indexer timeout.
+            .timeout(std::time::Duration::from_secs(
+                crate::utils::INDEXER_TIMEOUT.into(),
+            ))
             .send()
             .await
             .map_err(|e| VssError::Internal(format!("HTTP error: {e}")))?;
@@ -212,18 +217,40 @@ impl WasmVssClient {
         }
     }
 
-    pub(crate) async fn get_object(
+    pub async fn get_object(
         &self,
         request: &GetObjectRequest,
     ) -> Result<GetObjectResponse, VssError> {
         self.post_request(request, "getObject").await
     }
 
-    pub(crate) async fn put_object(
+    pub async fn put_object(
         &self,
         request: &PutObjectRequest,
     ) -> Result<PutObjectResponse, VssError> {
         self.post_request(request, "putObjects").await
+    }
+
+    /// Delete a single key at its current `version`. VSS honors deletes only
+    /// against the object's current version, so callers must read it first
+    /// (a blind delete is rejected with a version conflict).
+    pub async fn remove_object(
+        &self,
+        store_id: &str,
+        key: &str,
+        version: i64,
+    ) -> Result<PutObjectResponse, VssError> {
+        let request = PutObjectRequest {
+            store_id: store_id.to_string(),
+            global_version: None,
+            transaction_items: vec![],
+            delete_items: vec![KeyValue {
+                key: key.to_string(),
+                version,
+                value: vec![],
+            }],
+        };
+        self.put_object(&request).await
     }
 }
 
@@ -233,9 +260,15 @@ impl WasmVssClient {
 const BACKUP_BUFFER_LEN_ENCRYPT: usize = 239;
 const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
-/// 19-byte nonce for streaming XChaCha20Poly1305 (EncryptorBE32)
-const BACKUP_NONCE_LENGTH: usize = 19;
-const BACKUP_SALT_LENGTH: usize = 32;
+/// 19-byte nonce prefix for chunked XChaCha20Poly1305.
+///
+/// Public because external consumers of [`encrypt_data`]/[`decrypt_data`] (e.g. the
+/// rgb-lightning-node wasm-sdk VSS KV store) build [`VssEncryptionMetadata`] by hand
+/// and must agree on this length to parse their wire envelopes.
+pub const BACKUP_NONCE_LENGTH: usize = 19;
+/// HKDF salt length used by [`encrypt_data`]/[`decrypt_data`]. Public for the same
+/// reason as [`BACKUP_NONCE_LENGTH`].
+pub const BACKUP_SALT_LENGTH: usize = 32;
 const VSS_BACKUP_VERSION: u8 = 1;
 
 const HKDF_INFO: &[u8] = b"rgb-lib-vss-backup-encryption-v1";
@@ -268,106 +301,88 @@ impl VssEncryptionMetadata {
         let bytes = hex::decode(&self.nonce).map_err(|e| Error::Internal {
             details: format!("Invalid nonce hex: {e}"),
         })?;
-        bytes[..BACKUP_NONCE_LENGTH]
-            .try_into()
-            .map_err(|_| Error::Internal {
-                details: "Invalid nonce length".to_string(),
-            })
+        bytes.try_into().map_err(|_| Error::InvalidBackup)
     }
 }
 
 fn derive_encryption_key(
     signing_key: &SecretKey,
     metadata: &VssEncryptionMetadata,
+    info: Option<&[u8]>,
 ) -> Result<Key, Error> {
     let salt_bytes = hex::decode(&metadata.salt).map_err(|e| Error::Internal {
         details: format!("Invalid salt hex: {e}"),
     })?;
     let hk = Hkdf::<HkdfSha256>::new(Some(&salt_bytes), &signing_key.secret_bytes());
     let mut key_bytes = [0u8; BACKUP_KEY_LENGTH];
-    hk.expand(HKDF_INFO, &mut key_bytes)
+    hk.expand(info.unwrap_or(HKDF_INFO), &mut key_bytes)
         .map_err(|e| Error::Internal {
             details: format!("HKDF expansion failed: {e}"),
         })?;
-    Ok(Key::clone_from_slice(&key_bytes))
+    Ok(key_bytes.into())
 }
 
-pub(crate) fn encrypt_data(
+/// Encrypt `data` for VSS storage. `info` domain-separates the derived key via
+/// HKDF; pass `None` to use the default wallet-backup tag (`HKDF_INFO`), or a
+/// distinct tag (e.g. for an LDK KV stream) so its keys never collide with the
+/// wallet-backup stream even under the same signing key.
+pub fn encrypt_data(
     data: &[u8],
     signing_key: &SecretKey,
     metadata: &VssEncryptionMetadata,
+    info: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
-    let key = derive_encryption_key(signing_key, metadata)?;
+    let key = derive_encryption_key(signing_key, metadata, info)?;
     let aead = XChaCha20Poly1305::new(&key);
     let nonce = metadata.nonce_bytes()?;
-    let nonce = chacha20poly1305::aead::generic_array::GenericArray::from_slice(&nonce);
 
-    let mut stream_encryptor = stream::EncryptorBE32::from_aead(aead, nonce);
+    let (chunks, last) = data.as_chunks::<BACKUP_BUFFER_LEN_ENCRYPT>();
     let mut encrypted = Vec::new();
-    let mut buffer = [0u8; BACKUP_BUFFER_LEN_ENCRYPT];
-    let mut reader = std::io::Cursor::new(data);
-
-    loop {
-        let read_count = reader.read(&mut buffer).map_err(|e| Error::Internal {
-            details: format!("Read error: {e}"),
-        })?;
-        if read_count == BACKUP_BUFFER_LEN_ENCRYPT {
-            let ciphertext = stream_encryptor
-                .encrypt_next(buffer.as_slice())
+    for (position, (chunk, is_last)) in chunks
+        .iter()
+        .map(|c| (c.as_slice(), false))
+        .chain([(last, true)])
+        .enumerate()
+    {
+        let chunk_nonce = XNonce::from(chunk_nonce(&nonce, position as u32, is_last));
+        encrypted.extend(
+            aead.encrypt(&chunk_nonce, chunk)
                 .map_err(|e| Error::Internal {
                     details: format!("Encryption error: {e}"),
-                })?;
-            encrypted.extend(ciphertext);
-        } else {
-            let ciphertext = stream_encryptor
-                .encrypt_last(&buffer[..read_count])
-                .map_err(|e| Error::Internal {
-                    details: format!("Encryption error: {e}"),
-                })?;
-            encrypted.extend(ciphertext);
-            break;
-        }
+                })?,
+        );
     }
     Ok(encrypted)
 }
 
-pub(crate) fn decrypt_data(
+/// Decrypt VSS-stored `encrypted` data. `info` must match the tag passed to
+/// [`encrypt_data`] (`None` = default `HKDF_INFO`) for the round-trip to succeed.
+pub fn decrypt_data(
     encrypted: &[u8],
     signing_key: &SecretKey,
     metadata: &VssEncryptionMetadata,
+    info: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
-    let key = derive_encryption_key(signing_key, metadata)?;
+    let key = derive_encryption_key(signing_key, metadata, info)?;
     let aead = XChaCha20Poly1305::new(&key);
     let nonce = metadata.nonce_bytes()?;
-    let nonce = chacha20poly1305::aead::generic_array::GenericArray::from_slice(&nonce);
 
-    let mut stream_decryptor = stream::DecryptorBE32::from_aead(aead, nonce);
+    let (chunks, last) = encrypted.as_chunks::<BACKUP_BUFFER_LEN_DECRYPT>();
+    let last = (!last.is_empty()).then_some((last, true));
     let mut decrypted = Vec::new();
-    let mut buffer = [0u8; BACKUP_BUFFER_LEN_DECRYPT];
-    let mut reader = std::io::Cursor::new(encrypted);
-
-    loop {
-        let read_count = reader.read(&mut buffer).map_err(|e| Error::Internal {
-            details: format!("Read error: {e}"),
-        })?;
-        if read_count == BACKUP_BUFFER_LEN_DECRYPT {
-            let cleartext = stream_decryptor
-                .decrypt_next(buffer.as_slice())
+    for (position, (chunk, is_last)) in chunks
+        .iter()
+        .map(|c| (c.as_slice(), false))
+        .chain(last)
+        .enumerate()
+    {
+        let chunk_nonce = XNonce::from(chunk_nonce(&nonce, position as u32, is_last));
+        decrypted.extend(
+            aead.decrypt(&chunk_nonce, chunk)
                 .map_err(|_| Error::VssError {
                     details: "Decryption failed: wrong signing key or corrupted data".to_string(),
-                })?;
-            decrypted.extend(cleartext);
-        } else if read_count == 0 {
-            break;
-        } else {
-            let cleartext = stream_decryptor
-                .decrypt_last(&buffer[..read_count])
-                .map_err(|_| Error::VssError {
-                    details: "Decryption failed: wrong signing key or corrupted data".to_string(),
-                })?;
-            decrypted.extend(cleartext);
-            break;
-        }
+                })?,
+        );
     }
     Ok(decrypted)
 }
@@ -412,6 +427,8 @@ pub struct VssBackupInfo {
     pub backup_exists: bool,
     pub server_version: Option<i64>,
     pub backup_required: bool,
+    /// Error of the most recent failed backup upload, cleared on success
+    pub last_backup_error: Option<String>,
 }
 
 /// WASM-compatible VSS backup client.
@@ -445,7 +462,7 @@ impl VssBackupClient {
     /// Upload encrypted backup data to VSS server. Returns the new version.
     pub async fn upload_backup(&self, plaintext: &[u8], fingerprint: &str) -> Result<i64, Error> {
         let metadata = VssEncryptionMetadata::new()?;
-        let encrypted = encrypt_data(plaintext, &self.signing_key, &metadata)?;
+        let encrypted = encrypt_data(plaintext, &self.signing_key, &metadata, None)?;
 
         let data_version = self
             .get_current_version(BACKUP_KEY_DATA)
@@ -509,60 +526,45 @@ impl VssBackupClient {
         Ok(data_version + 1)
     }
 
-    /// Download and decrypt backup from VSS server.
-    pub async fn download_backup(&self) -> Result<Vec<u8>, Error> {
-        let manifest_resp = self
-            .client
-            .get_object(&GetObjectRequest {
-                store_id: self.store_id.clone(),
-                key: BACKUP_KEY_MANIFEST.to_string(),
-            })
-            .await
-            .map_err(Error::from)?;
-
-        let manifest_bytes = manifest_resp
-            .value
+    async fn get_value(&self, key: &str) -> Result<Vec<u8>, Error> {
+        let request = GetObjectRequest {
+            store_id: self.store_id.clone(),
+            key: key.to_string(),
+        };
+        let resp = self.client.get_object(&request).await?;
+        resp.value
             .map(|kv| kv.value)
-            .ok_or(Error::VssBackupNotFound)?;
+            .ok_or(Error::VssBackupNotFound)
+    }
+
+    /// Download, check and decrypt the backup of the wallet with this fingerprint.
+    pub async fn download_backup(&self, fingerprint: &str) -> Result<Vec<u8>, Error> {
+        let manifest_bytes = self.get_value(BACKUP_KEY_MANIFEST).await?;
         let manifest: BackupManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| Error::Internal {
                 details: format!("Failed to parse manifest: {e}"),
             })?;
-
-        let data_resp = self
-            .client
-            .get_object(&GetObjectRequest {
-                store_id: self.store_id.clone(),
-                key: BACKUP_KEY_DATA.to_string(),
-            })
-            .await
-            .map_err(Error::from)?;
-        let raw_data = data_resp
-            .value
-            .map(|kv| kv.value)
-            .ok_or(Error::VssBackupNotFound)?;
-
-        if manifest.encrypted {
-            let meta_resp = self
-                .client
-                .get_object(&GetObjectRequest {
-                    store_id: self.store_id.clone(),
-                    key: BACKUP_KEY_METADATA.to_string(),
-                })
-                .await
-                .map_err(Error::from)?;
-            let meta_bytes = meta_resp
-                .value
-                .map(|kv| kv.value)
-                .ok_or(Error::VssBackupNotFound)?;
-            let enc_metadata: VssEncryptionMetadata =
-                serde_json::from_slice(&meta_bytes).map_err(|e| Error::Internal {
-                    details: format!("Failed to parse encryption metadata: {e}"),
-                })?;
-            decrypt_data(&raw_data, &self.signing_key, &enc_metadata)
-        } else {
-            Ok(raw_data)
+        if manifest.version != VSS_BACKUP_VERSION {
+            return Err(Error::UnsupportedBackupVersion {
+                version: manifest.version.to_string(),
+            });
         }
+        if !manifest.encrypted || manifest.chunk_count != 1 {
+            return Err(Error::InvalidBackup);
+        }
+        if self.get_value(BACKUP_KEY_FINGERPRINT).await? != fingerprint.as_bytes() {
+            return Err(Error::FingerprintMismatch);
+        }
+        let raw_data = self.get_value(BACKUP_KEY_DATA).await?;
+        if raw_data.len() != manifest.total_size {
+            return Err(Error::InvalidBackup);
+        }
+        let meta_bytes = self.get_value(BACKUP_KEY_METADATA).await?;
+        let enc_metadata: VssEncryptionMetadata =
+            serde_json::from_slice(&meta_bytes).map_err(|e| Error::Internal {
+                details: format!("Failed to parse encryption metadata: {e}"),
+            })?;
+        decrypt_data(&raw_data, &self.signing_key, &enc_metadata, None)
     }
 
     /// Get the server-side backup version, or None if no backup exists.
@@ -621,9 +623,9 @@ mod tests {
         let data = b"Hello, VSS backup!".to_vec();
         let key = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let encrypted = encrypt_data(&data, &key, &metadata).unwrap();
+        let encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
         assert_ne!(encrypted, data);
-        let decrypted = decrypt_data(&encrypted, &key, &metadata).unwrap();
+        let decrypted = decrypt_data(&encrypted, &key, &metadata, None).unwrap();
         assert_eq!(decrypted, data);
     }
 
@@ -632,8 +634,8 @@ mod tests {
         let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let key = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let encrypted = encrypt_data(&data, &key, &metadata).unwrap();
-        let decrypted = decrypt_data(&encrypted, &key, &metadata).unwrap();
+        let encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
+        let decrypted = decrypt_data(&encrypted, &key, &metadata, None).unwrap();
         assert_eq!(decrypted, data);
     }
 
@@ -644,8 +646,8 @@ mod tests {
             .collect();
         let key = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let encrypted = encrypt_data(&data, &key, &metadata).unwrap();
-        let decrypted = decrypt_data(&encrypted, &key, &metadata).unwrap();
+        let encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
+        let decrypted = decrypt_data(&encrypted, &key, &metadata, None).unwrap();
         assert_eq!(decrypted, data);
     }
 
@@ -656,9 +658,14 @@ mod tests {
             .collect();
         let key = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let encrypted = encrypt_data(&data, &key, &metadata).unwrap();
-        let decrypted = decrypt_data(&encrypted, &key, &metadata).unwrap();
+        let mut encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
+        let decrypted = decrypt_data(&encrypted, &key, &metadata, None).unwrap();
         assert_eq!(decrypted, data);
+
+        // Each chunk has its own nonce, so swapped chunks fail.
+        let (first, rest) = encrypted.split_at_mut(BACKUP_BUFFER_LEN_DECRYPT);
+        first.swap_with_slice(&mut rest[..BACKUP_BUFFER_LEN_DECRYPT]);
+        assert!(decrypt_data(&encrypted, &key, &metadata, None).is_err());
     }
 
     #[test]
@@ -666,8 +673,8 @@ mod tests {
         let data: Vec<u8> = vec![];
         let key = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let encrypted = encrypt_data(&data, &key, &metadata).unwrap();
-        let decrypted = decrypt_data(&encrypted, &key, &metadata).unwrap();
+        let encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
+        let decrypted = decrypt_data(&encrypted, &key, &metadata, None).unwrap();
         assert_eq!(decrypted, data);
     }
 
@@ -677,8 +684,8 @@ mod tests {
         let key1 = test_signing_key();
         let key2 = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let encrypted = encrypt_data(&data, &key1, &metadata).unwrap();
-        let result = decrypt_data(&encrypted, &key2, &metadata);
+        let encrypted = encrypt_data(&data, &key1, &metadata, None).unwrap();
+        let result = decrypt_data(&encrypted, &key2, &metadata, None);
         assert!(result.is_err());
     }
 
@@ -687,12 +694,31 @@ mod tests {
         let data = b"Test data".to_vec();
         let key = test_signing_key();
         let metadata = VssEncryptionMetadata::new().unwrap();
-        let mut encrypted = encrypt_data(&data, &key, &metadata).unwrap();
+        let mut encrypted = encrypt_data(&data, &key, &metadata, None).unwrap();
         if !encrypted.is_empty() {
             let mid = encrypted.len() / 2;
             encrypted[mid] ^= 0xFF;
         }
-        assert!(decrypt_data(&encrypted, &key, &metadata).is_err());
+        assert!(decrypt_data(&encrypted, &key, &metadata, None).is_err());
+    }
+
+    #[test]
+    fn wrong_nonce_length_fails() {
+        let key = test_signing_key();
+        for nonce in ["00".to_string(), "00".repeat(BACKUP_NONCE_LENGTH + 1)] {
+            let metadata = VssEncryptionMetadata {
+                nonce,
+                ..VssEncryptionMetadata::new().unwrap()
+            };
+            assert!(matches!(
+                decrypt_data(&[], &key, &metadata, None),
+                Err(Error::InvalidBackup)
+            ));
+            assert!(matches!(
+                encrypt_data(&[], &key, &metadata, None),
+                Err(Error::InvalidBackup)
+            ));
+        }
     }
 
     #[test]
@@ -700,8 +726,8 @@ mod tests {
         let key = test_signing_key();
         let m1 = VssEncryptionMetadata::new().unwrap();
         let m2 = VssEncryptionMetadata::new().unwrap();
-        let k1 = derive_encryption_key(&key, &m1).unwrap();
-        let k2 = derive_encryption_key(&key, &m2).unwrap();
+        let k1 = derive_encryption_key(&key, &m1, None).unwrap();
+        let k2 = derive_encryption_key(&key, &m2, None).unwrap();
         assert_ne!(k1, k2);
     }
 
