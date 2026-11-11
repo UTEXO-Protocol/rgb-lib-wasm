@@ -17,6 +17,9 @@ use rgb_lib_wasm::{
 };
 use utils::*;
 
+// the maximum the wallet accepts
+const MAX_EXPIRATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
     WalletData {
@@ -154,11 +157,21 @@ async fn begin_dry(
     map: HashMap<String, Vec<Recipient>>,
     expiration: u64,
 ) -> Result<SendBeginResult, Error> {
+    begin_dry_as(wallet, online, map, false, expiration).await
+}
+
+async fn begin_dry_as(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    donation: bool,
+    expiration: u64,
+) -> Result<SendBeginResult, Error> {
     wallet
         .send_begin(
             online.clone(),
             map,
-            false,
+            donation,
             1,
             1,
             expiration,
@@ -248,6 +261,22 @@ async fn begin_end() {
         begin_dry(&mut wallet, &online, two, latest + 1).await,
         Err(Error::InvalidExpiration)
     ));
+    // the operation expires at least the clock-skew margin and at most the maximum from now
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map.clone(), now_secs() + 240).await,
+        Err(Error::InvalidExpiration)
+    ));
+    // a donation has no invoice bound, only the maximum
+    let far = now_secs() + MAX_EXPIRATION_SECS;
+    assert!(matches!(
+        begin_dry_as(&mut wallet, &online, map.clone(), true, far + 60).await,
+        Err(Error::InvalidExpiration)
+    ));
+    assert!(
+        begin_dry_as(&mut wallet, &online, map.clone(), true, far - 60)
+            .await
+            .is_ok()
+    );
 
     sleep_ms(1100).await;
     let (res, signed, txid) = begin(&mut wallet, &online, map.clone(), false, false).await;
