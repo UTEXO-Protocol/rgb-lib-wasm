@@ -400,6 +400,15 @@ pub enum Error {
         details: String,
     },
 
+    /// The contract that is linked from or to cannot be linked
+    #[error("Contract {contract_id} cannot be linked: {details}")]
+    InvalidLinkedContract {
+        /// Contract ID
+        contract_id: String,
+        /// Error details
+        details: String,
+    },
+
     /// The provided mnemonic phrase is invalid
     #[error("Invalid mnemonic error: {details}")]
     InvalidMnemonic {
@@ -669,6 +678,13 @@ pub enum Error {
     /// The transfer ID is already in use by a different operation on the sender proxy
     #[error("Transfer ID in use")]
     TransferIDInUse,
+
+    /// The contract that is linked from or to is not known to the wallet
+    #[error("Contract {contract_id} is not known to the wallet")]
+    UnknownLinkedContract {
+        /// Contract ID
+        contract_id: String,
+    },
 
     /// The detected RGB schema is unknown
     #[error("Unknown RGB schema: {schema_id}")]

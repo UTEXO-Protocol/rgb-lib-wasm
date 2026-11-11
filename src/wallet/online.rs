@@ -8187,7 +8187,8 @@ impl Wallet {
     ///
     /// The link spends the link right of the asset, which the wallet needs to hold, and commits the
     /// contract it links to (`linkedToContract`), which can't be the asset's own one. As the asset
-    /// has at most one link right, an asset can be linked only once.
+    /// has at most one link right, an asset can be linked only once. The wallet needs to know the
+    /// contract `linked_to_contract`, and it needs to have been issued linked from the asset.
     ///
     /// If `dry_run` is false, the wallet saves the transfer in [`TransferStatus::Initiated`] and
     /// returns its batch transfer idx.
@@ -8225,6 +8226,13 @@ impl Wallet {
         // the link right can be spent only once, linking the asset to itself would waste it
         if linked_to_contract.to_string() == asset.id {
             return Err(Error::CannotLinkToItself);
+        }
+        let linked_to = self.check_linked_contract_known(&linked_to_contract)?;
+        if linked_to.linked_from_contract.as_deref() != Some(asset.id.as_str()) {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: linked_to.id,
+                details: format!("it has not been issued linked from contract {}", asset.id),
+            });
         }
 
         let assignments_needed = AssignmentsCollection {
@@ -11625,6 +11633,54 @@ mod bfa_tests {
             Some(s!("invalid")),
         );
         assert_eq!(res.unwrap_err(), invalid);
+
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+        let nia = ContractId::copy_from_slice([1; 32]).unwrap().to_string();
+        let linked = ContractId::copy_from_slice([2; 32]).unwrap().to_string();
+        let unknown = ContractId::copy_from_slice([3; 32]).unwrap().to_string();
+        for (id, schema, linked_to) in [
+            (&nia, AssetSchema::Nia, None),
+            (&linked, AssetSchema::Ifa, Some(unknown.clone())),
+        ] {
+            wallet
+                .database
+                .set_asset(DbAssetActMod {
+                    id: ActiveValue::Set(id.clone()),
+                    schema: ActiveValue::Set(schema),
+                    linked_to_contract: ActiveValue::Set(linked_to),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let cases = [
+            (
+                &nia,
+                Error::InvalidLinkedContract {
+                    contract_id: nia.clone(),
+                    details: s!("schema Nia doesn't support links"),
+                },
+            ),
+            (
+                &linked,
+                Error::InvalidLinkedContract {
+                    contract_id: linked.clone(),
+                    details: format!("it's already linked to contract {unknown}"),
+                },
+            ),
+        ];
+        for (linked_from, expected) in cases {
+            let res = wallet.issue_asset_ifa(
+                s!("IFA"),
+                s!("Name"),
+                0,
+                vec![10],
+                vec![],
+                None,
+                true,
+                Some(linked_from.clone()),
+            );
+            assert_eq!(res.unwrap_err(), expected);
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -11642,20 +11698,25 @@ mod bfa_tests {
             indexer_url: url.to_string(),
         };
         let ifa = ContractId::copy_from_slice([9; 32]).unwrap().to_string();
-        for (id, schema) in [
-            (ifa.as_str(), AssetSchema::Ifa),
-            ("rgb:nia", AssetSchema::Nia),
+        let unrelated = ContractId::copy_from_slice([7; 32]).unwrap().to_string();
+        let mislinked = ContractId::copy_from_slice([6; 32]).unwrap().to_string();
+        let other = ContractId::copy_from_slice([8; 32]).unwrap().to_string();
+        for (id, schema, linked_from) in [
+            (ifa.as_str(), AssetSchema::Ifa, None),
+            ("rgb:nia", AssetSchema::Nia, None),
+            (unrelated.as_str(), AssetSchema::Ifa, None),
+            (mislinked.as_str(), AssetSchema::Ifa, Some(other.clone())),
         ] {
             wallet
                 .database
                 .set_asset(DbAssetActMod {
                     id: ActiveValue::Set(id.to_string()),
                     schema: ActiveValue::Set(schema),
+                    linked_from_contract: ActiveValue::Set(linked_from),
                     ..Default::default()
                 })
                 .unwrap();
         }
-        let other = ContractId::copy_from_slice([8; 32]).unwrap().to_string();
         let cases = [
             (
                 "rgb:unknown",
@@ -11679,6 +11740,29 @@ mod bfa_tests {
                 },
             ),
             (ifa.as_str(), ifa.as_str(), Error::CannotLinkToItself),
+            (
+                ifa.as_str(),
+                other.as_str(),
+                Error::UnknownLinkedContract {
+                    contract_id: other.clone(),
+                },
+            ),
+            (
+                ifa.as_str(),
+                unrelated.as_str(),
+                Error::InvalidLinkedContract {
+                    contract_id: unrelated.clone(),
+                    details: format!("it has not been issued linked from contract {ifa}"),
+                },
+            ),
+            (
+                ifa.as_str(),
+                mislinked.as_str(),
+                Error::InvalidLinkedContract {
+                    contract_id: mislinked.clone(),
+                    details: format!("it has not been issued linked from contract {ifa}"),
+                },
+            ),
         ];
         for (id, linked_to, expected) in cases {
             let err = block_on(wallet.link_begin(

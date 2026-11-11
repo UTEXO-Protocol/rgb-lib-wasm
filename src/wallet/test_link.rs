@@ -191,17 +191,32 @@ fn issue_ifa_link(wallet: &Wallet, linked_from: Option<String>) -> String {
 }
 
 #[wasm_bindgen_test]
+async fn issue_linked_from_unknown_contract() {
+    let (wallet, _online) = funded_wallet(nia_ifa(), 2).await;
+    let unknown = contract(1);
+    let err = wallet
+        .issue_asset_ifa(
+            s("IFA"),
+            s("Inflatable"),
+            0,
+            vec![100],
+            vec![],
+            None,
+            true,
+            Some(unknown.clone()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("Contract {unknown} is not known to the wallet")
+    );
+}
+
+#[wasm_bindgen_test]
 async fn ifa_link_right_sent_and_linked() {
     let (mut a, a_online) = funded_wallet(nia_ifa(), 5).await;
-    let (mut b, b_online) = funded_wallet(nia_ifa(), 2).await;
-    let linked_from = a
-        .issue_asset_nia(s("FROM"), s("From"), 0, vec![10])
-        .unwrap()
-        .asset_id;
-    let linked_to = a
-        .issue_asset_nia(s("TO"), s("To"), 0, vec![10])
-        .unwrap()
-        .asset_id;
+    let (mut b, b_online) = funded_wallet(nia_ifa(), 3).await;
+    let linked_from = issue_ifa_link(&a, None);
 
     // issue with the link right
     let asset_id = issue_ifa_link(&a, Some(linked_from.clone()));
@@ -229,6 +244,7 @@ async fn ifa_link_right_sent_and_linked() {
     );
 
     // the receiver links the asset, spending the link right
+    let linked_to = issue_ifa_link(&b, Some(asset_id.clone()));
     let (_, txid) = link_and_settle(&mut b, &b_online, &asset_id, &linked_to).await;
     assert_link_transition(&b, &asset_id, &txid, &linked_to);
     assert_eq!(
@@ -239,7 +255,8 @@ async fn ifa_link_right_sent_and_linked() {
 
 #[wasm_bindgen_test]
 async fn bfa_link_keeps_mint_rights() {
-    let (mut wallet, online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let (mut wallet, online) =
+        funded_wallet(wallet_data(vec![AssetSchema::Bfa, AssetSchema::Ifa]), 5).await;
     let bridge = new_evm_address();
     deploy_bridge(&bridge).await;
     let asset_id = wallet
@@ -264,11 +281,12 @@ async fn bfa_link_keeps_mint_rights() {
     assert!(issued.contains(&Assignment::LinkRight));
     assert!(issued.contains(&Assignment::MintRight));
 
-    link_and_settle(&mut wallet, &online, &asset_id, &contract(2)).await;
+    let replacement = issue_ifa_link(&wallet, Some(asset_id.clone()));
+    link_and_settle(&mut wallet, &online, &asset_id, &replacement).await;
     assert_eq!(mint_rights(&mut wallet, &asset_id), 1);
     assert_eq!(
         metadata_links(&wallet, &asset_id),
-        (Some(contract(1)), Some(contract(2)))
+        (Some(contract(1)), Some(replacement))
     );
 }
 
@@ -334,7 +352,7 @@ async fn link_right_sent_beside_fungible() {
 
 #[wasm_bindgen_test]
 async fn link_fails() {
-    let (mut a, a_online) = funded_wallet(nia_ifa(), 6).await;
+    let (mut a, a_online) = funded_wallet(nia_ifa(), 9).await;
     let (mut b, b_online) = funded_wallet(nia_ifa(), 2).await;
     let nia = a
         .issue_asset_nia(s("NIA"), s("Fixed"), 0, vec![10])
@@ -354,10 +372,12 @@ async fn link_fails() {
         .unwrap()
         .asset_id;
     let asset_id = issue_ifa_link(&a, None);
+    let replacement = issue_ifa_link(&a, Some(asset_id.clone()));
+    let no_link_replacement = issue_ifa_link(&a, Some(no_link.clone()));
 
     // no link right
     let res = a
-        .link_begin(a_online.clone(), no_link, nia.clone(), 1, 1, true)
+        .link_begin(a_online.clone(), no_link, no_link_replacement, 1, 1, true)
         .await;
     assert!(matches!(res, Err(Error::InsufficientAssignments { .. })));
 
@@ -367,7 +387,14 @@ async fn link_fails() {
 
     // a link the wallet doesn't know
     let begin = a
-        .link_begin(a_online.clone(), asset_id.clone(), nia.clone(), 1, 1, true)
+        .link_begin(
+            a_online.clone(),
+            asset_id.clone(),
+            replacement.clone(),
+            1,
+            1,
+            true,
+        )
         .await
         .unwrap();
     let signed_link = a.sign_psbt(begin.psbt, None).unwrap();
@@ -408,17 +435,18 @@ async fn link_fails() {
     assert!(matches!(res, Err(Error::InvalidAssignment)));
 
     // an asset already linked
-    link_and_settle(&mut a, &a_online, &asset_id, &nia).await;
+    link_and_settle(&mut a, &a_online, &asset_id, &replacement).await;
     let res = a
-        .link_begin(a_online.clone(), asset_id, nia, 1, 1, true)
+        .link_begin(a_online.clone(), asset_id.clone(), replacement, 1, 1, true)
         .await;
     assert!(matches!(res, Err(Error::InsufficientAssignments { .. })));
 }
 
 #[wasm_bindgen_test]
 async fn link_begin_end() {
-    let (mut wallet, online) = funded_wallet(nia_ifa(), 3).await;
+    let (mut wallet, online) = funded_wallet(nia_ifa(), 5).await;
     let asset_id = issue_ifa_link(&wallet, None);
+    let replacement = issue_ifa_link(&wallet, Some(asset_id.clone()));
     let last_operation = |wallet: &Wallet| {
         wallet
             .database
@@ -430,14 +458,28 @@ async fn link_begin_end() {
     // a dry run records no operation
     let before = last_operation(&wallet);
     wallet
-        .link_begin(online.clone(), asset_id.clone(), contract(1), 1, 1, true)
+        .link_begin(
+            online.clone(),
+            asset_id.clone(),
+            replacement.clone(),
+            1,
+            1,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(last_operation(&wallet), before);
 
     // begin saves the link, end records it
     let begin = wallet
-        .link_begin(online.clone(), asset_id.clone(), contract(1), 1, 1, false)
+        .link_begin(
+            online.clone(),
+            asset_id.clone(),
+            replacement.clone(),
+            1,
+            1,
+            false,
+        )
         .await
         .unwrap();
     let idx = begin.batch_transfer_idx.unwrap();
@@ -454,7 +496,7 @@ async fn link_begin_end() {
     assert_ne!(last_operation(&wallet), before);
     assert_eq!(
         metadata_links(&wallet, &asset_id),
-        (None, Some(contract(1)))
+        (None, Some(replacement))
     );
 
     mine_and_refresh(&mut wallet, &online).await;
@@ -467,7 +509,8 @@ async fn link_begin_end() {
 #[wasm_bindgen_test]
 async fn bfa_link_right_received_rejected_and_linked() {
     let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
-    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
+    let (mut b, b_online) =
+        funded_wallet(wallet_data(vec![AssetSchema::Bfa, AssetSchema::Ifa]), 3).await;
     let bridge = new_evm_address();
     let reject_list = new_evm_address();
     deploy_bridge(&bridge).await;
@@ -504,11 +547,18 @@ async fn bfa_link_right_received_rejected_and_linked() {
         vec![Assignment::LinkRight]
     );
     assert_eq!(metadata_links(&b, &asset_id), (Some(contract(1)), None));
+    let replacement = issue_ifa_link(&b, Some(asset_id.clone()));
 
     // a rejected link right is not spent
     deploy_reject_list_opouts(&reject_list, &[opout]).await;
     let res = b
-        .link(b_online.clone(), asset_id.clone(), contract(2), 1, 1)
+        .link(
+            b_online.clone(),
+            asset_id.clone(),
+            replacement.clone(),
+            1,
+            1,
+        )
         .await;
     assert!(
         matches!(res, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if *id == asset_id),
@@ -518,12 +568,12 @@ async fn bfa_link_right_received_rejected_and_linked() {
 
     // once allowed, the link right is spent
     deploy_reject_list_opouts(&reject_list, &[]).await;
-    let (_, txid) = link_and_settle(&mut b, &b_online, &asset_id, &contract(2)).await;
+    let (_, txid) = link_and_settle(&mut b, &b_online, &asset_id, &replacement).await;
     assert_eq!(
         metadata_links(&b, &asset_id),
-        (Some(contract(1)), Some(contract(2)))
+        (Some(contract(1)), Some(replacement.clone()))
     );
-    assert_link_transition(&b, &asset_id, &txid, &contract(2));
+    assert_link_transition(&b, &asset_id, &txid, &replacement);
 }
 
 #[wasm_bindgen_test]
