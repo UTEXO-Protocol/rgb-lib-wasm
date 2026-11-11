@@ -191,6 +191,28 @@ fn issue_ifa_link(wallet: &Wallet, linked_from: Option<String>) -> String {
 }
 
 #[wasm_bindgen_test]
+async fn issue_linked_from_unknown_contract() {
+    let (wallet, _online) = funded_wallet(nia_ifa(), 2).await;
+    let unknown = contract(1);
+    let err = wallet
+        .issue_asset_ifa(
+            s("IFA"),
+            s("Inflatable"),
+            0,
+            vec![100],
+            vec![],
+            None,
+            true,
+            Some(unknown.clone()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("Contract {unknown} is not known to the wallet")
+    );
+}
+
+#[wasm_bindgen_test]
 async fn ifa_link_right_sent_and_linked() {
     let (mut a, a_online) = funded_wallet(nia_ifa(), 5).await;
     let (mut b, b_online) = funded_wallet(nia_ifa(), 2).await;
