@@ -92,6 +92,7 @@ const walletData = {
   masterFingerprint: keys.masterFingerprint,
   vanillaKeychain: null,
   supportedSchemas: ['Nia', 'Ifa'],
+  allowRecklessSchemas: false,
 };
 
 // create() restores state from IndexedDB if available
@@ -100,6 +101,10 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));
 // Await durable IndexedDB commit before persisting dependent application state.
 await wallet.flush();
 ```
+
+On `Mainnet`, a wallet that supports `Ifa` or `Bfa` fails with `Cannot use <schema> schema on mainnet`.
+Set `allowRecklessSchemas: true` to allow it. The wallet then logs a warning.
+The field is optional and defaults to `false`. Other networks allow every schema.
 
 ### Persistence ordering
 
