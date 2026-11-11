@@ -374,8 +374,6 @@ pub struct AssetBFA {
     pub details: Option<String>,
     /// Precision, also known as divisibility, of the asset
     pub precision: u8,
-    /// Initial issued supply
-    pub initial_supply: u64,
     /// Timestamp of asset genesis
     pub timestamp: i64,
     /// Timestamp of asset import
@@ -424,7 +422,6 @@ impl AssetBFA {
             name: asset.name.clone(),
             details: asset.details.clone(),
             precision: asset.precision,
-            initial_supply: asset.initial_supply.parse::<u64>().unwrap(),
             timestamp: asset.timestamp,
             added_at: asset.added_at,
             balance,

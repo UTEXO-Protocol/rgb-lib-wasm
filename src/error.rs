@@ -693,10 +693,6 @@ pub enum Error {
         schema_id: String,
     },
 
-    /// The transfer has expired
-    #[error("Transfer expired")]
-    TransferExpired,
-
     /// The detected transfer is unknown
     #[error("Unknown transfer: {txid}")]
     UnknownTransfer {
