@@ -23,6 +23,10 @@ pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 #[cfg(feature = "esplora")]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
+/// Maximum seconds in the future an outgoing operation can expire: about 10 years.
+#[cfg(feature = "esplora")]
+pub(crate) const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
+
 /// Minimum `retention_grace_secs` a recipient requires from the sender proxy to ACK a transfer.
 /// A transfer whose sender proxy grants less is NACKed.
 #[cfg(feature = "esplora")]
