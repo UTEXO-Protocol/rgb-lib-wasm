@@ -1551,6 +1551,17 @@ impl Wallet {
         Ok(())
     }
 
+    pub(crate) fn check_linked_contract_known(
+        &self,
+        contract_id: &ContractId,
+    ) -> Result<DbAsset, Error> {
+        self.database
+            .get_asset(contract_id.to_string())?
+            .ok_or_else(|| Error::UnknownLinkedContract {
+                contract_id: contract_id.to_string(),
+            })
+    }
+
     pub(crate) fn check_transport_endpoints(
         &self,
         transport_endpoints: &[String],
@@ -2154,7 +2165,8 @@ impl Wallet {
     #[cfg_attr(not(feature = "esplora"), doc = "`link`).")]
     ///
     /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
-    /// the one it replaces).
+    /// the one it replaces). The wallet needs to know this contract. Its schema needs to support
+    /// links and it cannot be linked yet.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
@@ -2187,6 +2199,21 @@ impl Wallet {
                     .map_err(|_| Error::InvalidContractId { contract_id })
             })
             .transpose()?;
+        if let Some(linked_from_contract) = &linked_from_contract {
+            let linked_from = self.check_linked_contract_known(linked_from_contract)?;
+            if !linked_from.schema.supports_link() {
+                return Err(Error::InvalidLinkedContract {
+                    contract_id: linked_from.id,
+                    details: format!("schema {} doesn't support links", linked_from.schema),
+                });
+            }
+            if let Some(linked_to_contract) = linked_from.linked_to_contract {
+                return Err(Error::InvalidLinkedContract {
+                    contract_id: linked_from.id,
+                    details: format!("it's already linked to contract {linked_to_contract}"),
+                });
+            }
+        }
 
         let settled = self._get_total_issue_amount(&amounts, true)?;
         let inflation_amt = self.get_total_inflation_amount(&inflation_amounts, settled)?;
