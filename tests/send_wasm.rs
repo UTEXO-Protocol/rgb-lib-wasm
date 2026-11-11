@@ -1,5 +1,6 @@
 use std::{collections::HashMap, str::FromStr};
 
+use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -16,6 +17,9 @@ use rgb_lib_wasm::{
     generate_keys,
 };
 use utils::*;
+
+// the maximum the wallet accepts
+const MAX_EXPIRATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -154,11 +158,21 @@ async fn begin_dry(
     map: HashMap<String, Vec<Recipient>>,
     expiration: u64,
 ) -> Result<SendBeginResult, Error> {
+    begin_dry_as(wallet, online, map, false, expiration).await
+}
+
+async fn begin_dry_as(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    donation: bool,
+    expiration: u64,
+) -> Result<SendBeginResult, Error> {
     wallet
         .send_begin(
             online.clone(),
             map,
-            false,
+            donation,
             1,
             1,
             expiration,
@@ -248,6 +262,22 @@ async fn begin_end() {
         begin_dry(&mut wallet, &online, two, latest + 1).await,
         Err(Error::InvalidExpiration)
     ));
+    // the operation expires at least the clock-skew margin and at most the maximum from now
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map.clone(), now_secs() + 240).await,
+        Err(Error::InvalidExpiration)
+    ));
+    // a donation has no invoice bound, only the maximum
+    let far = now_secs() + MAX_EXPIRATION_SECS;
+    assert!(matches!(
+        begin_dry_as(&mut wallet, &online, map.clone(), true, far + 60).await,
+        Err(Error::InvalidExpiration)
+    ));
+    assert!(
+        begin_dry_as(&mut wallet, &online, map.clone(), true, far - 60)
+            .await
+            .is_ok()
+    );
 
     sleep_ms(1100).await;
     let (res, signed, txid) = begin(&mut wallet, &online, map.clone(), false, false).await;
@@ -757,6 +787,32 @@ fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
+/// Shift the clock the wallet reads (`Date.now`) by `secs` seconds. Zero restores it.
+fn shift_clock(secs: i64) {
+    js_sys::Function::new_with_args(
+        "secs",
+        "if (!globalThis.__rgbDateNow) globalThis.__rgbDateNow = Date.now;
+        const real = globalThis.__rgbDateNow;
+        Date.now = secs === 0 ? real : () => real.call(Date) + secs * 1000;",
+    )
+    .call1(&JsValue::NULL, &JsValue::from_f64(secs as f64))
+    .unwrap();
+}
+
+/// Begin a send that expires at `expiration`, under the clock-skew margin from now.
+/// The wallet clock runs the margin behind during the begin, so the begin accepts it.
+async fn begin_short(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    expiration: u64,
+) -> (SendBeginResult, String, String) {
+    shift_clock(-300);
+    let res = begin_with(wallet, online, map, false, false, expiration).await;
+    shift_clock(0);
+    res
+}
+
 async fn sleep_until(timestamp: u64) {
     let now = js_sys::Date::now() as u64;
     if timestamp * 1000 > now {
@@ -937,7 +993,7 @@ async fn recipient_operation_expired() {
         ],
     )]);
     let expiration = now_secs() + 20;
-    let (_, signed, _) = begin_with(&mut wallet, &online, map, false, false, expiration).await;
+    let (_, signed, _) = begin_short(&mut wallet, &online, map, expiration).await;
     end(&mut wallet, &online, &signed).await.unwrap();
 
     // recipient 1 ACKs, recipient 2 never does, so the TX is not released
@@ -970,15 +1026,8 @@ async fn send_end_after_expiration() {
         vec![recipient(&other_rid, 66, None, PROXY_URL)],
     )]);
     let other_expiration = now_secs() + 10;
-    let (_, other_signed, _) = begin_with(
-        &mut other,
-        &other_online,
-        other_map,
-        false,
-        false,
-        other_expiration,
-    )
-    .await;
+    let (_, other_signed, _) =
+        begin_short(&mut other, &other_online, other_map, other_expiration).await;
     sleep_until(other_expiration + 1).await;
     assert!(matches!(
         end(&mut other, &other_online, &other_signed).await,
@@ -986,7 +1035,7 @@ async fn send_end_after_expiration() {
     ));
 
     let expiration = now_secs() + 10;
-    let (_, signed, txid) = begin_with(&mut wallet, &online2, map, false, false, expiration).await;
+    let (_, signed, txid) = begin_short(&mut wallet, &online2, map, expiration).await;
     // the operation is registered on the sender proxy, then the post fails
     rpc_fail(PROXY_URL, "consignment.post");
     assert!(matches!(
@@ -1050,7 +1099,7 @@ async fn fail_after_recipient_ack_refused() {
     let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
     let expiration = now_secs() + 20;
-    let (res, signed, _) = begin_with(&mut wallet, &online, map, false, false, expiration).await;
+    let (res, signed, _) = begin_short(&mut wallet, &online, map, expiration).await;
     let idx = res.batch_transfer_idx.unwrap();
     end(&mut wallet, &online, &signed).await.unwrap();
     refresh(&mut rcv, &rcv_online).await;

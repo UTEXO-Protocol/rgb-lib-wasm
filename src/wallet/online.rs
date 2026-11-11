@@ -6719,7 +6719,9 @@ impl Wallet {
     /// transfer. This should be set to the same value specified by the recipient's invoice. After it
     /// passes, the recipient can fail the transfer and the sender does not broadcast it, even when
     /// a late ACK arrives. In case of a batch transfer, set it to the minimum (earliest) expiration
-    /// across the recipients' invoices.
+    /// across the recipients' invoices. The expiration must be at least 5 minutes (the proxy
+    /// clock-skew margin) and at most about 10 years in the future, else
+    /// [`Error::InvalidExpiration`] is returned.
     ///
     /// If `dry_run` is true, the wallet does not save the transfer in
     /// [`TransferStatus::Initiated`]. The returned `batch_transfer_idx` is then None.
@@ -6740,6 +6742,13 @@ impl Wallet {
 
         if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
             return Err(Error::InvalidRecipientMap);
+        }
+        // a sooner expiration can already be past on the sender proxy's clock
+        let now_ts = now().unix_timestamp();
+        if (expiration_timestamp as i64) < now_ts + i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS)
+            || expiration_timestamp as i64 > now_ts + i64::from(MAX_EXPIRATION_SECS)
+        {
+            return Err(Error::InvalidExpiration);
         }
         // the recipients post their ACK to (and get the signed TX from) the sender proxy
         let Some(sender_transport_endpoint) = sender_transport_endpoint else {
