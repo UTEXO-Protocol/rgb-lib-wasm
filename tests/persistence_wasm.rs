@@ -42,6 +42,7 @@ fn test_wallet_data(
         vanilla_keychain: None,
         supported_schemas: schemas,
         reuse_addresses: false,
+        allow_reckless_schemas: false,
     }
 }
 
@@ -257,6 +258,7 @@ async fn test_address_reuse_persists_across_reload() {
         vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
         reuse_addresses: true,
+        allow_reckless_schemas: false,
     };
 
     // Session 1: get pinned address, rotate, verify new pinned address
@@ -331,6 +333,7 @@ async fn test_address_reuse_persists_across_backup_restore() {
         vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
         reuse_addresses: true,
+        allow_reckless_schemas: false,
     };
 
     // Create wallet, rotate address a few times
