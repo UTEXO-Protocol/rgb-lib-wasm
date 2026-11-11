@@ -69,13 +69,12 @@ pub enum Error {
     #[error("An asset cannot be linked to itself")]
     CannotLinkToItself,
 
-    /// Cannot use BFA schema on mainnet
-    #[error("Cannot use BFA schema on mainnet")]
-    CannotUseBfaOnMainnet,
-
-    /// Cannot use IFA schema on mainnet
-    #[error("Cannot use IFA schema on mainnet")]
-    CannotUseIfaOnMainnet,
+    /// The schema cannot be used on mainnet, unless `allow_reckless_schemas` is set (see `WalletData`)
+    #[error("Cannot use {schema} schema on mainnet")]
+    CannotUseSchemaOnMainnet {
+        /// Asset schema
+        schema: AssetSchema,
+    },
 
     /// Two proxy authentication key entries resolve to the same proxy URL
     #[error("Duplicate proxy authentication key: {details}")]

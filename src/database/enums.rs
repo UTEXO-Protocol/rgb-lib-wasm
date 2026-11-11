@@ -70,6 +70,13 @@ impl AssetSchema {
         }
     }
 
+    pub(crate) fn allowed_on_mainnet(&self) -> bool {
+        match self {
+            Self::Nia => true,
+            Self::Ifa | Self::Bfa => false,
+        }
+    }
+
     pub(crate) fn schema_rules(&self) -> SchemaRules {
         match self {
             Self::Nia => NonInflatableAsset::schema_rules(),
