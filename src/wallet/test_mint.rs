@@ -259,12 +259,18 @@ async fn bfa_mint_settles_and_is_spendable() {
         TransferStatus::Initiated
     );
 
+    // the test bridge gives the word of a zero lock ID and amount as its circulating supply
+    record_lock(&bridge, &LockId::from([0u8; 32]), 0, MINT_AMOUNT - 1).await;
     finalize_evm().await;
     let minted = mint_end(&mut a, &a_online, &res).await.unwrap();
     assert_eq!(minted.batch_transfer_idx, res.batch_transfer_idx);
     assert_eq!(minted.entropy, res.details.entropy);
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+    for wallet in [&a, &b] {
+        let metadata = wallet.get_asset_metadata(asset_id.clone()).unwrap();
+        assert_eq!(metadata.known_circulating_supply, MINT_AMOUNT);
+    }
 
     // a mint posts its consignment and makes no ACK call
     let calls = (
