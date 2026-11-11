@@ -35,6 +35,7 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
         vanilla_keychain: None,
         supported_schemas: schemas,
         reuse_addresses: false,
+        allow_reckless_schemas: false,
     }
 }
 

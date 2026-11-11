@@ -36,6 +36,7 @@ pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
         vanilla_keychain: None,
         supported_schemas: schemas,
         reuse_addresses: false,
+        allow_reckless_schemas: false,
     }
 }
 
@@ -237,19 +238,6 @@ pub(super) fn opouts_holding(
 #[wasm_bindgen_test]
 async fn bfa_issue_list_and_backup() {
     let wd = wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa]);
-    let keys = generate_keys(BitcoinNetwork::Mainnet);
-    let mainnet = WalletData {
-        bitcoin_network: BitcoinNetwork::Mainnet,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        ..wd.clone()
-    };
-    assert!(matches!(
-        Wallet::new(mainnet),
-        Err(Error::CannotUseBfaOnMainnet)
-    ));
 
     let (mut wallet, _online) = funded_wallet(wd.clone(), 3).await;
 

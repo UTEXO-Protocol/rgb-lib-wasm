@@ -30,6 +30,7 @@ fn wallet_json(supported_schemas: Vec<AssetSchema>) -> String {
         vanilla_keychain: None,
         supported_schemas,
         reuse_addresses: false,
+        allow_reckless_schemas: false,
     };
     serde_json::to_string(&wd).unwrap()
 }
@@ -187,6 +188,32 @@ fn get_wallet_data_hides_mnemonic() {
         String::from(js_sys::JSON::stringify(&data).unwrap()),
         serde_json::to_string(&wd).unwrap()
     );
+}
+
+#[wasm_bindgen_test]
+fn allow_reckless_schemas_opens_mainnet_ifa() {
+    let base: WalletData =
+        serde_json::from_str(&wallet_json(vec![AssetSchema::Nia, AssetSchema::Ifa])).unwrap();
+    let keys = generate_keys(BitcoinNetwork::Mainnet);
+    let wd = WalletData {
+        bitcoin_network: BitcoinNetwork::Mainnet,
+        account_xpub_vanilla: keys.account_xpub_vanilla,
+        account_xpub_colored: keys.account_xpub_colored,
+        mnemonic: Some(keys.mnemonic),
+        master_fingerprint: keys.master_fingerprint,
+        ..base
+    };
+    let mut json = serde_json::to_value(&wd).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("allowRecklessSchemas")
+        .unwrap();
+    assert_eq!(
+        err(WasmWallet::new(&json.to_string()).err().unwrap()),
+        "Cannot use Ifa schema on mainnet"
+    );
+    json["allowRecklessSchemas"] = true.into();
+    assert!(WasmWallet::new(&json.to_string()).is_ok());
 }
 
 #[wasm_bindgen_test]

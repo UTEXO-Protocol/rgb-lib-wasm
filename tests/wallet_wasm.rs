@@ -31,27 +31,14 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
         vanilla_keychain: None,
         supported_schemas: schemas,
         reuse_addresses: false,
+        allow_reckless_schemas: false,
     }
-}
-
-fn assert_bfa_refused_on_mainnet() {
-    let keys = generate_keys(BitcoinNetwork::Mainnet);
-    let wd = WalletData {
-        bitcoin_network: BitcoinNetwork::Mainnet,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        ..test_wallet_data(vec![AssetSchema::Bfa])
-    };
-    assert!(matches!(Wallet::new(wd), Err(Error::CannotUseBfaOnMainnet)));
 }
 
 #[wasm_bindgen_test]
 fn test_wallet_new_signing() {
     let wd = test_wallet_data(vec![AssetSchema::Nia]);
     assert!(Wallet::new(wd).is_ok());
-    assert_bfa_refused_on_mainnet();
 }
 
 #[wasm_bindgen_test]
@@ -69,6 +56,7 @@ fn test_wallet_new_watch_only() {
         vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
         reuse_addresses: false,
+        allow_reckless_schemas: false,
     };
     assert!(Wallet::new(wd).is_ok());
 }
@@ -88,6 +76,7 @@ fn test_wallet_new_fingerprint_mismatch() {
         vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
         reuse_addresses: false,
+        allow_reckless_schemas: false,
     };
     let result = Wallet::new(wd);
     assert!(result.is_err());
@@ -327,9 +316,6 @@ async fn test_errors_and_backup() {
     assert!(err.is_err());
     assert!(format!("{:?}", err.unwrap_err()).contains("AssetNotFound"));
 
-    // Wallet::new: BFA on mainnet
-    assert_bfa_refused_on_mainnet();
-
     // backup/restore round-trip: use witness_receive to create state
     let _recv = wallet
         .witness_receive(
@@ -477,6 +463,7 @@ fn test_wallet_data_reuse(schemas: Vec<AssetSchema>) -> WalletData {
         vanilla_keychain: None,
         supported_schemas: schemas,
         reuse_addresses: true,
+        allow_reckless_schemas: false,
     }
 }
 

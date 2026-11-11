@@ -1215,6 +1215,11 @@ pub struct WalletData {
     /// Default: `false`
     #[serde(default)]
     pub reuse_addresses: bool,
+    /// When `false`, a mainnet wallet that supports IFA or BFA fails with
+    /// [`crate::Error::CannotUseSchemaOnMainnet`]. When `true`, it is created and a warning is logged.
+    /// Default: `false`
+    #[serde(default)]
+    pub allow_reckless_schemas: bool,
 }
 
 impl std::fmt::Debug for WalletData {
@@ -1231,6 +1236,7 @@ impl std::fmt::Debug for WalletData {
             .field("vanilla_keychain", &self.vanilla_keychain)
             .field("supported_schemas", &self.supported_schemas)
             .field("reuse_addresses", &self.reuse_addresses)
+            .field("allow_reckless_schemas", &self.allow_reckless_schemas)
             .finish()
     }
 }
@@ -1415,12 +1421,16 @@ impl Wallet {
         if supported_schemas.is_empty() {
             return Err(Error::NoSupportedSchemas);
         }
-        if wdata.bitcoin_network == BitcoinNetwork::Mainnet {
-            if supported_schemas.contains(&AssetSchema::Ifa) {
-                return Err(Error::CannotUseIfaOnMainnet);
+        if wdata.bitcoin_network == BitcoinNetwork::Mainnet
+            && let Some(schema) = supported_schemas.iter().find(|s| !s.allowed_on_mainnet())
+        {
+            if !wdata.allow_reckless_schemas {
+                return Err(Error::CannotUseSchemaOnMainnet { schema: *schema });
             }
-            if supported_schemas.contains(&AssetSchema::Bfa) {
-                return Err(Error::CannotUseBfaOnMainnet);
+            let msg = format!("Reckless schema {schema} allowed on mainnet");
+            warn!(logger, "{msg}");
+            if cfg!(target_arch = "wasm32") {
+                web_sys::console::warn_1(&msg.into());
             }
         }
         let mut runtime = load_rgb_runtime(wallet_dir.clone())?;
@@ -4209,6 +4219,7 @@ pub(crate) mod address_reuse_tests {
             vanilla_keychain: None,
             supported_schemas: vec![AssetSchema::Nia],
             reuse_addresses: reuse,
+            allow_reckless_schemas: false,
         };
 
         let drain = slog::Discard;
@@ -4309,6 +4320,56 @@ mod debug_tests {
         let wd = make_test_wallet(false).get_wallet_data();
         let phrase = wd.mnemonic.clone().unwrap();
         assert!(!format!("{wd:?}").contains(phrase.as_str()));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod mainnet_schema_tests {
+    use super::*;
+    use crate::keys::generate_keys;
+    use AssetSchema::{Bfa, Ifa, Nia};
+
+    fn mainnet_schema_wallet_data(
+        network: BitcoinNetwork,
+        schemas: Vec<AssetSchema>,
+        reckless: bool,
+    ) -> WalletData {
+        let keys = generate_keys(network);
+        WalletData {
+            data_dir: s!(":memory:"),
+            bitcoin_network: network,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            account_xpub_vanilla: keys.account_xpub_vanilla,
+            account_xpub_colored: keys.account_xpub_colored,
+            mnemonic: Some(keys.mnemonic),
+            master_fingerprint: keys.master_fingerprint,
+            vanilla_keychain: None,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: reckless,
+        }
+    }
+
+    #[test]
+    fn mainnet_schema_refuses_ifa_and_bfa() {
+        for expected in [Ifa, Bfa] {
+            let wd =
+                mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, expected], false);
+            assert!(matches!(
+                Wallet::new(wd),
+                Err(Error::CannotUseSchemaOnMainnet { schema }) if schema == expected
+            ));
+        }
+        let wd = mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia], false);
+        assert!(Wallet::new(wd).is_ok());
+    }
+
+    #[test]
+    fn mainnet_schema_reckless_allowed() {
+        let wd = mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, Ifa, Bfa], true);
+        let wallet = Wallet::new(wd).unwrap();
+        assert!(wallet.get_wallet_data().allow_reckless_schemas);
     }
 }
 
