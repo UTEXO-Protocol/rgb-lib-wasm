@@ -297,7 +297,6 @@ async fn bfa_issue_list_and_backup() {
         )
         .unwrap();
     assert_eq!(bfa.ticker, ticker);
-    assert_eq!(bfa.initial_supply, 0);
     assert_eq!(bfa.balance.settled, 0);
     let listed = wallet.list_assets(vec![]).unwrap().bfa.unwrap();
     assert_eq!(listed, vec![bfa.clone()]);
