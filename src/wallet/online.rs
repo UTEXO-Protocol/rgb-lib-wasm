@@ -2209,30 +2209,28 @@ impl Wallet {
                 self.database.set_coloring(db_coloring)?;
             }
 
-            for recipient in transfer_info.recipients.clone() {
-                if matches!(
-                    transfer_info.main_transition,
-                    TypeOfTransition::Burn | TypeOfTransition::Link
-                ) {
-                    let requested_assignment =
-                        if transfer_info.main_transition == TypeOfTransition::Burn {
-                            Assignment::Fungible(transfer_info.original_assignments_needed.fungible)
-                        } else {
-                            Assignment::LinkRight
-                        };
-                    let transfer = DbTransferActMod {
-                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                        requested_assignment: ActiveValue::Set(Some(requested_assignment)),
-                        incoming: ActiveValue::Set(false),
-                        recipient_encryption: ActiveValue::Set(recipient.encryption),
-                        burn_reason: ActiveValue::Set(
-                            transfer_info.burn_reason.map(|r| r.to_string()),
-                        ),
-                        ..Default::default()
+            // a burn or a link has no recipient, but it gets one transfer row
+            if matches!(
+                transfer_info.main_transition,
+                TypeOfTransition::Burn | TypeOfTransition::Link
+            ) {
+                let requested_assignment =
+                    if transfer_info.main_transition == TypeOfTransition::Burn {
+                        Assignment::Fungible(transfer_info.original_assignments_needed.fungible)
+                    } else {
+                        Assignment::LinkRight
                     };
-                    self.database.set_transfer(transfer)?;
-                    continue;
-                }
+                let transfer = DbTransferActMod {
+                    asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                    requested_assignment: ActiveValue::Set(Some(requested_assignment)),
+                    incoming: ActiveValue::Set(false),
+                    burn_reason: ActiveValue::Set(transfer_info.burn_reason.map(|r| r.to_string())),
+                    ..Default::default()
+                };
+                self.database.set_transfer(transfer)?;
+            }
+
+            for recipient in transfer_info.recipients.clone() {
                 // the transfer ID on the proxies, only for a proxy recipient
                 let proxy_transfer_id = match &sender_pubkey_hex {
                     Some(sender_pk) if !recipient.public_key.is_empty() => {
@@ -3183,9 +3181,6 @@ impl Wallet {
 
             let mut beneficiaries = vec![];
             for recipient in &transfer_info.recipients {
-                if matches!(recipient.assignment, Assignment::Fungible(0)) {
-                    continue;
-                }
                 let seal: BuilderSeal<GraphSeal> = match &recipient.local_recipient_data {
                     LocalRecipientData::Blind(secret_seal) => BuilderSeal::Concealed(*secret_seal),
                     LocalRecipientData::Witness(witness_data) => {
@@ -7954,8 +7949,7 @@ impl Wallet {
     /// Prepare the PSBT of an operation that pays no one (a burn or a link), spending the
     /// `assignments_needed` of `asset` with the `main_transition`.
     ///
-    /// The operation still needs a witness output, so it sends dust to a new address of this
-    /// wallet.
+    /// The operation assigns nothing, so it has no recipient and no recipient output.
     #[allow(clippy::too_many_arguments)]
     async fn _begin_without_recipient(
         &mut self,
@@ -7979,38 +7973,13 @@ impl Wallet {
             input_unspents.clone(),
         )?;
 
-        let network: ChainNet = self.bitcoin_network().into();
-        let script_pubkey = self
-            ._get_new_address(KeychainKind::External)?
-            .script_pubkey();
-        let dust = self
-            .bdk_wallet
-            .public_descriptor(KeychainKind::External)
-            .dust_value()
-            .to_sat();
-        let witness_recipients = vec![(script_pubkey.clone(), dust)];
-        let beneficiary = beneficiary_from_script_buf(script_pubkey);
-        let local_recipient = LocalRecipient {
-            recipient_id: XChainNet::with(network, beneficiary).to_string(),
-            local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
-                amount_sat: dust,
-                blinding: None,
-                vout: 1,
-            }),
-            assignment: Assignment::Fungible(0),
-            transport_endpoints: vec![],
-            public_key: vec![],
-            encryption: Encryption::Required,
-            invoice_expiration: None,
-        };
-
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
         let transfer_info = InfoAssetTransfer {
             asset_info: AssetInfo {
                 contract_id,
                 reject_list_url: asset.reject_list_url,
             },
-            recipients: vec![local_recipient],
+            recipients: vec![],
             asset_spend,
             change: AssignmentsCollection::default(),
             original_assignments_needed: assignments_needed.clone(),
@@ -8026,7 +7995,7 @@ impl Wallet {
                 transfer_info,
                 unspents,
                 &input_unspents,
-                &witness_recipients,
+                &vec![],
                 fee_rate_checked,
                 min_confirmations,
                 None,

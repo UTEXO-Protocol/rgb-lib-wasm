@@ -215,6 +215,22 @@ async fn ifa_burn_with_and_without_reason_settles() {
     ));
     assert_eq!(begin.details.burn_reason, None);
     let psbt = Psbt::from_str(&begin.psbt).unwrap();
+    // a burn has no recipient and no output other than the OP_RETURN and the BTC change
+    let artifacts = &wallet.transfer_artifacts[&psbt.unsigned_tx.compute_txid().to_string()];
+    let change_vout =
+        serde_json::to_value(artifacts.batch_info.as_ref().unwrap()).unwrap()["btc_change"]["vout"]
+            .as_u64();
+    for (vout, output) in psbt.unsigned_tx.output.iter().enumerate() {
+        assert!(
+            output.script_pubkey.is_op_return() || Some(vout as u64) == change_vout,
+            "a burn pays a new address"
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(&artifacts.asset_infos[&asset_id]).unwrap()["recipients"],
+        serde_json::json!([]),
+        "a burn records a recipient"
+    );
     let opret = psbt
         .unsigned_tx
         .output
