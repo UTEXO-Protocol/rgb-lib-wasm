@@ -2557,6 +2557,11 @@ impl Wallet {
                     });
                 }
                 evm_client.check_mint_support().await?;
+                debug!(
+                    self.logger,
+                    "EVM RPC endpoint for chain ID {chain_id}: {}",
+                    evm_client.endpoint()
+                );
             }
         } else {
             evm_chains.clear();
@@ -5829,14 +5834,19 @@ impl Wallet {
                 .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
                 .and_then(|mut p| p.pending().resolve_all(&wasm_resolver).map(|_| p))
                 .map_err(|_| InternalError::Unexpected)?;
-            match self._resolve_claims(&mut pending).await? {
-                ClaimsResolution::NoClaims => {}
-                ClaimsResolution::Resolved { unconfirmed, .. } if unconfirmed.is_empty() => {}
+            let bridge = match self._resolve_claims(&mut pending).await? {
+                ClaimsResolution::NoClaims => None,
+                ClaimsResolution::Resolved {
+                    evm_client,
+                    address,
+                    unconfirmed,
+                    ..
+                } if unconfirmed.is_empty() => Some((evm_client, address)),
                 _ => {
                     warn!(self.logger, "Mint locks not confirmed yet, will retry");
                     return Ok(None);
                 }
-            }
+            };
             let valid_consignment = pending.finalize();
             let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
@@ -5846,7 +5856,7 @@ impl Wallet {
                 let contract_wrapper =
                     runtime.contract_wrapper::<InflatableFungibleAsset>(contract_id)?;
                 let known_circulating_supply = contract_wrapper.total_issued_supply().into();
-                let asset_id = asset_transfer.asset_id.unwrap();
+                let asset_id = asset_transfer.asset_id.clone().unwrap();
                 let db_asset = self.database.get_asset(asset_id).unwrap().unwrap();
                 let db_known_circulating_supply = db_asset
                     .known_circulating_supply
@@ -5860,6 +5870,14 @@ impl Wallet {
                         ActiveValue::Set(Some(known_circulating_supply.to_string()));
                     self.database.update_asset(&mut updated_asset)?;
                 }
+            }
+            if let Some((evm_client, address)) = &bridge {
+                self._update_bfa_known_circulating_supply(
+                    evm_client,
+                    address,
+                    asset_transfer.asset_id.clone().unwrap(),
+                )
+                .await?;
             }
 
             match validation_status.validity() {
@@ -8334,8 +8352,12 @@ impl Wallet {
 
     /// Check that the bridge records a finalized lock for `mint`, included before the block the
     /// mint commits to. Give [`Error::MintLockNotFound`] if there is none yet and
-    /// [`Error::MintLockExpired`] if there never will be.
-    async fn _check_mint_lock(&self, mint: &ReceivedMint) -> Result<(), Error> {
+    /// [`Error::MintLockExpired`] if there never will be. Return the EVM client and the bridge
+    /// address.
+    async fn _check_mint_lock(
+        &self,
+        mint: &ReceivedMint,
+    ) -> Result<(EvmClient, EvmAddress), Error> {
         let evm_client = self
             ._evm_client(mint.evm_chain_id)
             .ok_or(Error::NoEvmRpcUrl {
@@ -8347,11 +8369,18 @@ impl Wallet {
         let lock_id = LockId::from_str(&mint.lock_id).map_err(|e| Error::Internal {
             details: format!("invalid lock ID: {e}"),
         })?;
+        let finalized_block = evm_client.finalized_block_number().await?;
         match evm_client
-            .mint_lock_status(&address, &lock_id, mint.amount, mint.before_block)
+            .mint_lock_status(
+                &address,
+                &lock_id,
+                mint.amount,
+                mint.before_block,
+                finalized_block,
+            )
             .await?
         {
-            MintLockStatus::Confirmed => Ok(()),
+            MintLockStatus::Confirmed => Ok((evm_client, address)),
             MintLockStatus::Pending => Err(Error::MintLockNotFound {
                 opid: mint.opid.clone(),
             }),
@@ -8360,6 +8389,38 @@ impl Wallet {
                 before_block: mint.before_block,
             }),
         }
+    }
+
+    /// Set the known circulating supply of the BFA asset `asset_id` to the amount the bridge at
+    /// `contract` holds locked (see [`EvmClient::circulating_supply`]). The supply is only
+    /// informative: a failure to read it is logged.
+    async fn _update_bfa_known_circulating_supply(
+        &self,
+        evm_client: &EvmClient,
+        contract: &EvmAddress,
+        asset_id: String,
+    ) -> Result<(), Error> {
+        let supply = match evm_client.circulating_supply(contract).await {
+            Ok(Some(supply)) => supply,
+            Ok(None) => {
+                debug!(
+                    self.logger,
+                    "The bridge does not count the circulating supply"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    self.logger,
+                    "Cannot read the circulating supply of the bridge: {e}"
+                );
+                return Ok(());
+            }
+        };
+        let mut updated_asset: DbAssetActMod = self.database.check_asset_exists(asset_id)?.into();
+        updated_asset.known_circulating_supply = ActiveValue::Set(Some(supply.to_string()));
+        self.database.update_asset(&mut updated_asset)?;
+        Ok(())
     }
 
     /// Fail a sent mint, not ended yet, if its lock has expired. Return whether it was failed.
@@ -8382,7 +8443,7 @@ impl Wallet {
                 Ok(true)
             }
             // a confirmed lock completes the mint at mint_end, a pending one may still
-            Ok(()) | Err(Error::MintLockNotFound { .. }) => Ok(false),
+            Ok(_) | Err(Error::MintLockNotFound { .. }) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -8681,9 +8742,15 @@ impl Wallet {
             .entropy;
         let consignment_bytes = artifacts.consignment_bytes.clone();
         let mint = self._sent_mint(artifacts)?;
+        let asset_id = artifacts
+            .asset_infos
+            .iter()
+            .find(|(_, t)| t.main_transition == TypeOfTransition::Mint)
+            .map(|(asset_id, _)| asset_id.clone())
+            .expect("a mint transfer");
 
-        match self._check_mint_lock(&mint).await {
-            Ok(()) => {}
+        let (evm_client, address) = match self._check_mint_lock(&mint).await {
+            Ok(checked) => checked,
             Err(e @ Error::MintLockExpired { .. }) => {
                 self._fail_batch_transfer(&batch_transfer)?;
                 self.update_backup_info(false)?;
@@ -8691,7 +8758,7 @@ impl Wallet {
                 return Err(e);
             }
             Err(e) => return Err(e),
-        }
+        };
 
         let mut runtime = self.rgb_runtime()?;
         self._broadcast_psbt(psbt, false).await?;
@@ -8709,6 +8776,8 @@ impl Wallet {
                 ..Default::default()
             },
         );
+        self._update_bfa_known_circulating_supply(&evm_client, &address, asset_id)
+            .await?;
 
         self.update_backup_info(false)?;
         self.flush().await?;
@@ -11533,6 +11602,65 @@ mod send_end_tests {
 #[cfg(test)]
 mod bfa_tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bfa_known_circulating_supply_kept_when_unread() {
+        use crate::api::evm::tests::{block_on, mock_rpc};
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+
+        let wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let asset_id = ContractId::copy_from_slice([5; 32]).unwrap().to_string();
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(asset_id.clone()),
+                schema: ActiveValue::Set(AssetSchema::Bfa),
+                known_circulating_supply: ActiveValue::Set(Some(s!("42"))),
+                ..Default::default()
+            })
+            .unwrap();
+        let update = |call_body: Option<&str>| {
+            let mut server = mockito::Server::new();
+            let latest = match call_body {
+                Some(_) => r#""result":"0x10""#,
+                None => r#""error":{"code":-32000,"message":"node down"}"#,
+            };
+            let mut mocks = vec![mock_rpc(
+                &mut server,
+                r#"{"method":"eth_blockNumber"}"#,
+                latest,
+            )];
+            if let Some(body) = call_body {
+                mocks.push(mock_rpc(&mut server, r#"{"method":"eth_call"}"#, body));
+            }
+            let res = block_on(wallet._update_bfa_known_circulating_supply(
+                &EvmClient::new(&server.url()),
+                &EvmAddress::default(),
+                asset_id.clone(),
+            ));
+            mocks.iter().for_each(|m| m.assert());
+            assert_eq!(res, Ok(()));
+            wallet
+                .database
+                .check_asset_exists(asset_id.clone())
+                .unwrap()
+                .known_circulating_supply
+        };
+
+        // the bridge does not count the supply
+        assert_eq!(
+            update(Some(r#""error":{"code":3,"message":"execution reverted"}"#)),
+            Some(s!("42"))
+        );
+        // the node fails
+        assert_eq!(update(None), Some(s!("42")));
+        // a supply read replaces it
+        assert_eq!(
+            update(Some(&format!(r#""result":"0x{:064x}""#, 7))),
+            Some(s!("7"))
+        );
+    }
 
     #[test]
     fn mint_right_is_not_an_input_of_a_fungible_send() {

@@ -4,6 +4,8 @@ use reqwest::StatusCode;
 
 /// Selector of `getFundsInBlock(uint256,uint256)` on a bridge contract (`MinimalBridge`)
 const FUNDS_IN_BLOCK_SELECTOR: &str = "0x2ce06e2d";
+/// Selector of `circulatingSupply()` on a bridge contract (`MinimalBridge`)
+const CIRCULATING_SUPPLY_SELECTOR: &str = "0x9358928b";
 
 /// Selector of `length()` on a reject list contract (`IRgbRejectList`)
 pub(crate) const REJECT_LIST_LENGTH_SELECTOR: &str = "0x1f7b6d32";
@@ -20,15 +22,15 @@ const RPC_RETRY_PAUSE: Duration = Duration::from_secs(1);
 const RPC_RETRY_PAUSE: Duration = Duration::from_millis(10);
 /// The status of the lock confirming a mint, which has to be included on the external chain
 /// before the block the mint commits to (`before_block`), as recorded by the bridge contract as of
-/// the latest finalized block (see [`EvmClient::mint_lock_status`]).
+/// a finalized block (see [`EvmClient::mint_lock_status`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MintLockStatus {
     /// The lock is recorded, included before `before_block`
     Confirmed,
     /// No lock is recorded yet, but one may still be included before `before_block`
     Pending,
-    /// The lock is recorded, but not included before `before_block`, or none is and the blocks
-    /// before `before_block` are all finalized: the mint will never be confirmed
+    /// The lock is recorded but not before `before_block`, or the block at `before_block - 1` is
+    /// finalized and no lock is recorded in it or before it: the mint will never be confirmed
     Expired,
 }
 
@@ -42,13 +44,13 @@ pub(crate) struct EvmClient {
 
 fn strip_hex_prefix<'a>(value: &'a str, what: &str) -> Result<&'a str, Error> {
     value.strip_prefix("0x").ok_or_else(|| Error::Network {
-        details: format!("invalid EVM {what} {value}: missing 0x prefix"),
+        details: format!("invalid EVM {what}: missing 0x prefix"),
     })
 }
 
 fn parse_quantity(value: &str, what: &str) -> Result<u64, Error> {
     u64::from_str_radix(strip_hex_prefix(value, what)?, 16).map_err(|e| Error::Network {
-        details: format!("invalid EVM {what} {value}: {e}"),
+        details: format!("invalid EVM {what}: {e}"),
     })
 }
 
@@ -206,10 +208,43 @@ impl EvmClient {
         }
     }
 
+    /// Report a failure of the HTTP client without its URL (see [`Self::endpoint`]).
     fn req_err(e: reqwest::Error) -> Error {
         Error::Network {
-            details: format!("EVM RPC: {e}"),
+            details: format!("EVM RPC: {}", e.without_url()),
         }
+    }
+
+    /// The endpoint as scheme and host, with the port. Hosted endpoints put the API key in the
+    /// path, the query or the user info.
+    pub(crate) fn endpoint(&self) -> String {
+        match reqwest::Url::parse(&self.rpc_url) {
+            Ok(url) => url.origin().ascii_serialization(),
+            Err(_) => s!("<invalid URL>"),
+        }
+    }
+
+    /// The parts of the RPC URL that can hold an API key: the user info, the path segments and the
+    /// query keys and values.
+    fn url_parts(&self) -> Vec<String> {
+        // an invalid URL fails before any node answers
+        let Ok(url) = reqwest::Url::parse(&self.rpc_url) else {
+            return vec![];
+        };
+        let mut parts = vec![url.username().to_string()];
+        parts.extend(url.password().map(str::to_string));
+        parts.extend(
+            url.path_segments()
+                .into_iter()
+                .flatten()
+                .map(str::to_string),
+        );
+        parts.extend(
+            url.query_pairs()
+                .flat_map(|(k, v)| [k.into_owned(), v.into_owned()]),
+        );
+        parts.retain(|p| !p.is_empty());
+        parts
     }
 
     /// Post a JSON-RPC request. Send it again, up to [`RPC_RETRIES`] times after a pause, when it
@@ -256,10 +291,21 @@ impl EvmClient {
         }
     }
 
-    fn rpc_error(method: &str, err: RpcError) -> Error {
-        Error::Network {
-            details: format!("{method} error {}: {}", err.code, err.message),
-        }
+    /// Report an error from the node. Hide its message when it repeats part of the RPC URL.
+    fn rpc_error(&self, method: &str, err: RpcError) -> Error {
+        let details = if self
+            .url_parts()
+            .iter()
+            .any(|p| err.message.contains(p.as_str()))
+        {
+            format!(
+                "{method} error {}: <message hidden: it holds part of the RPC URL>",
+                err.code
+            )
+        } else {
+            format!("{method} error {}: {}", err.code, err.message)
+        };
+        Error::Network { details }
     }
 
     fn null_result(method: &str) -> Error {
@@ -276,7 +322,7 @@ impl EvmClient {
     ) -> Result<R, Error> {
         self.try_rpc(method, params)
             .await?
-            .map_err(|err| Self::rpc_error(method, err))?
+            .map_err(|err| self.rpc_error(method, err))?
             .ok_or_else(|| Self::null_result(method))
     }
 
@@ -379,16 +425,17 @@ impl EvmClient {
     }
 
     /// The status of the lock of `amount` with ID `lock_id`, which has to be included before
-    /// `before_block`, as recorded by the bridge contract at `contract` as of the latest finalized
-    /// block.
+    /// `before_block`, as recorded by the bridge contract at `contract` as of `finalized_block`
+    /// (see [`Self::finalized_block_number`]). The caller reads that block once for all the locks
+    /// it checks.
     pub(crate) async fn mint_lock_status(
         &self,
         contract: &EvmAddress,
         lock_id: &LockId,
         amount: u64,
         before_block: u64,
+        finalized_block: u64,
     ) -> Result<MintLockStatus, Error> {
-        let finalized_block = self.finalized_block_number().await?;
         Ok(
             match self
                 .funds_in_block(contract, lock_id, amount, finalized_block)
@@ -421,6 +468,32 @@ impl EvmClient {
         ))
     }
 
+    /// The amount the bridge at `contract` holds locked, read at the latest block. It is an upper
+    /// bound: it includes locks that a reorg can still drop. Return `None` if the contract does not
+    /// count it: there is no code at `contract` or the call reverts.
+    pub(crate) async fn circulating_supply(
+        &self,
+        contract: &EvmAddress,
+    ) -> Result<Option<u64>, Error> {
+        let block = self.block_number().await?;
+        let Some(result) = self
+            .eth_call_unless_reverted(contract, CIRCULATING_SUPPLY_SELECTOR.to_string(), block)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if result == "0x" {
+            return Ok(None);
+        }
+        // compare the exact hex length: trailing data is refused
+        if strip_hex_prefix(&result, "ABI data")?.len() != 64 {
+            return Err(abi_error("unexpected circulatingSupply result size"));
+        }
+        abi_word_u64(&result, 0)?
+            .map(Some)
+            .ok_or_else(|| abi_error("circulating supply doesn't fit in a u64"))
+    }
+
     /// The parameters of an `eth_call` of `contract` with `data` as of `block`.
     fn call_params(contract: &EvmAddress, data: String, block: u64) -> (CallObject, String) {
         let call = CallObject {
@@ -445,7 +518,7 @@ impl EvmClient {
             Ok(result) => result.map(Some).ok_or_else(|| Self::null_result(method)),
             // nodes report a revert with this message, then the reason if there is one
             Err(err) if err.message.starts_with("execution reverted") => Ok(None),
-            Err(err) => Err(Self::rpc_error(method, err)),
+            Err(err) => Err(self.rpc_error(method, err)),
         }
     }
 
@@ -543,7 +616,8 @@ pub(crate) struct MintClaimResolver {
 }
 
 impl MintClaimResolver {
-    /// Fetch the lock status of each of `claims` from the bridge at `location`. Fetch none when
+    /// Fetch the lock status of each of `claims` from the bridge at `location`, as of one finalized
+    /// block read once for all the claims. Fetch none when
     /// the node is on another chain, which the claim resolution then reports.
     pub(crate) async fn fetch(
         client: &EvmClient,
@@ -559,6 +633,7 @@ impl MintClaimResolver {
         if resolver.chain_id != *chain_id {
             return Ok(resolver);
         }
+        let finalized_block = client.finalized_block_number().await?;
         for claim in claims {
             let Claim::Lock {
                 opid,
@@ -568,7 +643,7 @@ impl MintClaimResolver {
             } = claim;
             let lock_id = LockId::from(claim);
             let status = client
-                .mint_lock_status(address, &lock_id, *amount, *before_block)
+                .mint_lock_status(address, &lock_id, *amount, *before_block, finalized_block)
                 .await?;
             if status == MintLockStatus::Expired {
                 resolver.expired.insert(*opid);
@@ -1000,15 +1075,83 @@ pub(crate) mod tests {
 
         // a request that cannot be sent is sent again, then reported
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        // its error holds no part of the URL that can carry a key
+        let url = format!(
+            "http://USERKEY:PASSKEY@{}/v3/PATHKEY?key=QUERYKEY",
+            listener.local_addr().unwrap()
+        );
         drop(listener);
         let start = std::time::Instant::now();
-        assert!(matches!(
-            block_on(EvmClient::new(&url).chain_id()),
-            Err(Error::Network { .. })
-        ));
+        let result = block_on(EvmClient::new(&url).chain_id());
+        assert!(
+            matches!(result, Err(Error::Network { ref details })
+                if URL_KEYS.iter().all(|k| !details.contains(k))),
+            "{result:?}"
+        );
         let pauses: u32 = (1..=RPC_RETRIES).sum();
         assert!(start.elapsed() >= RPC_RETRY_PAUSE * pauses);
+    }
+
+    /// The keys in the RPC URL of the tests that check it is not reported.
+    const URL_KEYS: [&str; 4] = ["USERKEY", "PASSKEY", "PATHKEY", "QUERYKEY"];
+
+    #[test]
+    fn rpc_url_secret_not_reported() {
+        let endpoint = |url: &str| EvmClient::new(url).endpoint();
+        assert_eq!(
+            endpoint("https://mainnet.example/v3/PATHKEY"),
+            "https://mainnet.example"
+        );
+        assert_eq!(
+            endpoint("https://USERKEY:PASSKEY@node.example:8545/v3/PATHKEY?key=QUERYKEY"),
+            "https://node.example:8545"
+        );
+        assert_eq!(endpoint("not a URL PATHKEY"), "<invalid URL>");
+
+        // the node answers eth_chainId with `body`
+        let chain_id_with = |body: &str| {
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("POST", mockito::Matcher::Any)
+                .match_body(mockito::Matcher::PartialJsonString(s!(
+                    r#"{"method":"eth_chainId"}"#
+                )))
+                .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,{body}}}"#))
+                .expect(1)
+                .create();
+            let url = format!(
+                "http://USERKEY:PASSKEY@{}/v3/PATHKEY?key=QUERYKEY",
+                server.host_with_port()
+            );
+            let result = block_on(EvmClient::new(&url).chain_id());
+            mock.assert();
+            result
+        };
+        // a node message that repeats part of the URL is hidden
+        for k in URL_KEYS {
+            let result =
+                chain_id_with(&format!(r#""error":{{"code":-32000,"message":"bad {k}"}}"#));
+            assert!(
+                matches!(result, Err(Error::Network { ref details })
+                    if details == "eth_chainId error -32000: <message hidden: it holds part of the RPC URL>"),
+                "{result:?}"
+            );
+        }
+        // another node message is kept
+        let result = chain_id_with(r#""error":{"code":-32000,"message":"header not found"}"#);
+        assert!(
+            matches!(result, Err(Error::Network { ref details })
+                if details == "eth_chainId error -32000: header not found"),
+            "{result:?}"
+        );
+        // a result string is not reported
+        for body in [r#""result":"PATHKEY""#, r#""result":"0xPATHKEY""#] {
+            let result = chain_id_with(body);
+            assert!(
+                matches!(result, Err(Error::Network { ref details }) if !details.contains("PATHKEY")),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1148,7 +1291,6 @@ pub(crate) mod tests {
         // the status of the lock, with the given record as of the finalized block 0x20
         let status = |record: u64, before_block: u64| {
             let mut server = mockito::Server::new();
-            let _finalized = mock_finalized_block(&mut server, 0x20);
             let call = mock_eth_call_hits(
                 &mut server,
                 0x20,
@@ -1161,6 +1303,7 @@ pub(crate) mod tests {
                 &lock_id,
                 7,
                 before_block,
+                0x20,
             ))
             .unwrap();
             call.assert();
@@ -1174,6 +1317,58 @@ pub(crate) mod tests {
         assert_eq!(status(0, 0x22), MintLockStatus::Pending);
         assert_eq!(status(0, 0x21), MintLockStatus::Expired);
         assert_eq!(status(0, 0x10), MintLockStatus::Expired);
+    }
+
+    #[test]
+    fn circulating_supply() {
+        let contract = EvmAddress::default();
+        // the latest block is 0x10 and the finalized block is 0x20, which is never read
+        let supply_of = |result: &str| {
+            let mut server = mockito::Server::new();
+            let latest = mock_rpc(
+                &mut server,
+                r#"{"method":"eth_blockNumber"}"#,
+                r#""result":"0x10""#,
+            );
+            let finalized = mock_finalized_block(&mut server, 0x20).expect(0);
+            let call =
+                mock_eth_call_hits(&mut server, 0x10, CIRCULATING_SUPPLY_SELECTOR, result, 1);
+            let supply = block_on(EvmClient::new(&server.url()).circulating_supply(&contract));
+            latest.assert();
+            finalized.assert();
+            call.assert();
+            supply
+        };
+
+        assert_eq!(supply_of(&format!("0x{:064x}", 0)).unwrap(), Some(0));
+        assert_eq!(
+            supply_of(&format!("0x{:064x}", u64::MAX)).unwrap(),
+            Some(u64::MAX)
+        );
+        // an address with no code does not count the supply
+        assert_eq!(supply_of("0x").unwrap(), None);
+        // a result that is not a single word is refused
+        assert!(supply_of(&format!("0x{:062x}", 1)).is_err());
+        assert!(supply_of(&format!("0x{:064x}{:064x}", 1, 0)).is_err());
+        // a supply that does not fit in a u64 is refused
+        assert!(supply_of(&format!("0x{}1{}", "0".repeat(47), "0".repeat(16))).is_err());
+
+        // a contract without the function reverts
+        let mut server = mockito::Server::new();
+        let latest = mock_rpc(
+            &mut server,
+            r#"{"method":"eth_blockNumber"}"#,
+            r#""result":"0x10""#,
+        );
+        let call = mock_rpc(
+            &mut server,
+            r#"{"method":"eth_call"}"#,
+            r#""error":{"code":3,"message":"execution reverted"}"#,
+        );
+        let supply = block_on(EvmClient::new(&server.url()).circulating_supply(&contract));
+        latest.assert();
+        call.assert();
+        assert_eq!(supply.unwrap(), None);
     }
 
     #[test]
@@ -1206,7 +1401,8 @@ pub(crate) mod tests {
             r#"{"method":"eth_chainId"}"#,
             r#""result":"0x7a69""#,
         );
-        let _finalized = mock_finalized_block(&mut server, 0x20);
+        // read once for all the claims
+        let finalized = mock_finalized_block(&mut server, 0x20);
         let record = mock_eth_call_hits(
             &mut server,
             0x20,
@@ -1239,6 +1435,7 @@ pub(crate) mod tests {
         assert!(!resolver.is_confirmed(&location, &claims[3]).unwrap());
         assert!(resolver.is_expired(&opid));
         chain_id.assert();
+        finalized.assert();
         record.assert();
         no_record.assert();
         other_tx_no_record.assert();
