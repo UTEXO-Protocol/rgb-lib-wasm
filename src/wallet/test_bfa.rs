@@ -108,7 +108,7 @@ pub(super) async fn send(
     receiver_online: &Online,
     asset_id: &str,
     assignment: Assignment,
-) {
+) -> String {
     let receive = blind_rcv(
         receiver,
         receiver_online,
@@ -147,7 +147,8 @@ pub(super) async fn send(
     sender
         .send_end(sender_online.clone(), signed, false)
         .await
-        .unwrap();
+        .unwrap()
+        .txid
 }
 
 /// Refresh both wallets and mine, three times. Return the new transfer statuses of the receiver.
