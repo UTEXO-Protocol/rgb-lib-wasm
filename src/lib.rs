@@ -104,6 +104,8 @@ use amplify::{Bytes32, Wrapper, bmap, confinement::Confined, s};
 use base64::{Engine as _, engine::general_purpose};
 #[cfg(feature = "esplora")]
 use bdk_wallet::bitcoin::Txid;
+#[cfg(feature = "esplora")]
+use bdk_wallet::bitcoin::{TxMerkleNode, block::Header as BlockHeader};
 use bdk_wallet::{
     ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions, Wallet as BdkWallet,
     bitcoin::{
@@ -175,7 +177,7 @@ use rgbstd::{
 #[cfg(feature = "esplora")]
 use rgbstd::{
     Assign, AssignmentType, KnownTransition, OpId, TransitionBundle,
-    containers::{CheckedClaimResolver, Consignment, PendingConsignment, WitnessBundle},
+    containers::{CheckedClaimResolver, Consignment, PendingConsignment, SpvProof, WitnessBundle},
     contract::{LinkError, LinkableSchemaWrapper, SchemaWrapper},
     txout::TxPtr,
     validation::{OpsDag, Validity, Warning},
@@ -214,7 +216,7 @@ use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
 #[cfg(feature = "esplora")]
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(feature = "esplora")]
-use crate::utils::{OffchainResolverWasm, PreFetchResolver};
+use crate::utils::{OffchainResolverWasm, PreFetchResolver, spv_proof_from_esplora};
 #[cfg(feature = "esplora")]
 use crate::{
     api::{
