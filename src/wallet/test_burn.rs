@@ -2,6 +2,7 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
+use super::test_send::{consignment as saved_consignment, proven};
 use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbOutExt, RgbTransfer,
@@ -250,9 +251,11 @@ async fn ifa_burn_with_and_without_reason_settles() {
         psbt.unsigned_tx.compute_txid().to_string()
     );
     let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
-    let res = wallet.burn_end(online.clone(), signed).await.unwrap();
-    assert_eq!(res.batch_transfer_idx, idx);
-    assert_eq!(res.entropy, begin.details.entropy);
+    let ended = wallet.burn_end(online.clone(), signed).await.unwrap();
+    assert_eq!(ended.batch_transfer_idx, idx);
+    assert_eq!(ended.entropy, begin.details.entropy);
+    // the second burn spends the change of the mined first burn and carries its proof
+    assert!(proven(&saved_consignment(&wallet, &asset_id, &ended.txid))[&res.txid]);
     mine_and_refresh(&mut wallet, &online).await;
     let burned = transfer(&wallet, &asset_id, idx);
     assert_eq!(burned.status, TransferStatus::Settled);
@@ -310,11 +313,13 @@ async fn bfa_burn_settles_and_keeps_send_receive() {
         .unwrap();
     assert_eq!(begin.batch_transfer_idx, None);
     let signed = a.sign_psbt(begin.psbt, None).unwrap();
-    let res = a.burn_end(a_online.clone(), signed).await.unwrap();
+    let ended = a.burn_end(a_online.clone(), signed).await.unwrap();
+    // the second burn spends the change of the mined first burn and carries its proof
+    assert!(proven(&saved_consignment(&a, &asset_id, &ended.txid))[&res.txid]);
     mine_and_refresh(&mut a, &a_online).await;
     assert_eq!(balance(&a, &asset_id), (50, 50, 50));
     assert_eq!(
-        transfer(&a, &asset_id, res.batch_transfer_idx).burn_reason,
+        transfer(&a, &asset_id, ended.batch_transfer_idx).burn_reason,
         None
     );
     assert_eq!(mint_rights(&mut a, &asset_id), 1);

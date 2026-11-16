@@ -969,6 +969,31 @@ impl Indexer {
         })
     }
 
+    pub(crate) async fn get_block_header(&self, height: NonZeroU32) -> Result<BlockHeader, Error> {
+        Ok(match self {
+            Indexer::EsploraAsync(client) => {
+                let hash = client
+                    .get_block_hash(height.get())
+                    .await
+                    .map_err(IndexerError::from)?;
+                client
+                    .get_header_by_hash(&hash)
+                    .await
+                    .map_err(IndexerError::from)?
+            }
+        })
+    }
+
+    pub(crate) async fn get_spv_proof(&self, txid: &Txid) -> Result<Option<SpvProof>, Error> {
+        Ok(match self {
+            Indexer::EsploraAsync(client) => client
+                .get_merkle_proof(txid)
+                .await
+                .map_err(IndexerError::from)?
+                .and_then(spv_proof_from_esplora),
+        })
+    }
+
     pub(crate) fn populate_tx_cache(
         &self,
         #[allow(unused)] bdk_wallet: &PersistedWallet<super::offline::BdkPersister>,
@@ -1234,6 +1259,85 @@ impl Wallet {
             cache.insert(witness_id, status);
         }
         Ok(PreFetchResolver::new(cache, self.chain_net()))
+    }
+
+    /// Return the header at `height`, fetching it once.
+    async fn memo_header(
+        &self,
+        headers: &mut HashMap<NonZeroU32, Option<BlockHeader>>,
+        height: NonZeroU32,
+    ) -> Option<BlockHeader> {
+        if let Some(header) = headers.get(&height) {
+            return *header;
+        }
+        let header = self.indexer().get_block_header(height).await.ok();
+        headers.insert(height, header);
+        header
+    }
+
+    /// Add an SPV proof to each mined history witness of the consignment and store it.
+    pub(crate) async fn attach_spv_proofs(
+        &self,
+        runtime: &mut RgbRuntime,
+        consignment: &mut RgbTransfer,
+        new_witness: RgbTxid,
+    ) -> Result<(), Error> {
+        if self.online_data.is_none() {
+            return Ok(());
+        }
+        let missing: BTreeSet<RgbTxid> = consignment
+            .bundled_witnesses()
+            .filter(|bw| bw.spv_proof.is_none())
+            .map(|bw| bw.witness_id())
+            .filter(|id| *id != new_witness)
+            .collect();
+        let mut proofs = RetrievedSpvProofs::new();
+        for id in missing {
+            let txid = Txid::from_str(&id.to_string()).map_err(|_| Error::InvalidTxid)?;
+            match self.indexer().get_spv_proof(&txid).await {
+                Ok(Some(proof)) => {
+                    proofs.insert(id, proof);
+                }
+                Ok(None) => {}
+                Err(e) => debug!(self.logger, "Cannot get SPV proof for {id}: {e}"),
+            }
+        }
+        for bw in consignment.bundles.iter_mut() {
+            if bw.spv_proof.is_none() {
+                bw.spv_proof = proofs.get(&bw.witness_id()).cloned();
+            }
+        }
+        runtime.stock.store_spv_proofs(proofs)?;
+        Ok(())
+    }
+
+    /// Prefetch the headers of the SPV proofs a consignment carries and the witnesses they do
+    /// not prove.
+    pub(crate) async fn prefetch_consignment_witnesses(
+        &self,
+        consignment: &RgbTransfer,
+    ) -> Result<PreFetchResolver, Error> {
+        let layer1 = self.chain_net().layer1();
+        let mut headers = HashMap::new();
+        let mut fetch = vec![];
+        for bw in consignment.bundled_witnesses() {
+            let id = bw.witness_id();
+            let proven = match &bw.spv_proof {
+                Some(proof) => match self.memo_header(&mut headers, proof.block_height).await {
+                    Some(header) => matches!(proof.verified_pos(id, &header, layer1), Ok(Some(_))),
+                    None => false,
+                },
+                None => false,
+            };
+            if !proven {
+                fetch.push(id);
+            }
+        }
+        let headers = headers
+            .into_iter()
+            .filter_map(|(height, header)| Some((height, header?)))
+            .collect();
+        Ok(self.prefetch_witnesses(fetch).await?.with_headers(headers))
     }
 
     fn _check_fee_rate(&self, fee_rate: u64) -> Result<FeeRate, Error> {
@@ -3514,7 +3618,7 @@ impl Wallet {
             // check every operation, so that none spends a rejected allocation
             let should_build_dag = reject_list_source.is_some();
 
-            let consignment = if should_build_dag {
+            let mut consignment = if should_build_dag {
                 let (consignment, ops_dag) = if without_recipient {
                     runtime.transfer_from_fascia_with_dag(
                         contract_id,
@@ -3574,6 +3678,10 @@ impl Wallet {
                     Some(witness_txid),
                 )?)
             };
+            if let Some(consignment) = &mut consignment {
+                self.attach_spv_proofs(runtime, consignment, witness_txid)
+                    .await?;
+            }
 
             let artifacts = self
                 .transfer_artifacts
@@ -4952,7 +5060,7 @@ impl Wallet {
         let donation_tx = Self::donation_signed_tx(&paying_bundle.tx);
 
         let chain_resolver = self
-            .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
+            .prefetch_consignment_witnesses(&consignment)
             .await
             .map_err(|e| Error::Network {
                 details: e.to_string(),
@@ -5822,9 +5930,7 @@ impl Wallet {
                 self.database.update_txo(txo)?;
             }
 
-            let wasm_resolver = self
-                .prefetch_witnesses(consignment.bundled_witnesses().map(|bw| bw.witness_id()))
-                .await?;
+            let wasm_resolver = self.prefetch_consignment_witnesses(&consignment).await?;
             let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
             let validation_config = ValidationConfig {
                 chain_net: self.chain_net(),
@@ -8085,13 +8191,19 @@ impl Wallet {
         let mut consignment_bytes = HashMap::new();
         for (asset_id, transfer_info) in &transfer_info_map {
             let contract_id = transfer_info.asset_info.contract_id;
-            let consignment = runtime.transfer_from_fascia(
+            let mut consignment = runtime.transfer_from_fascia(
                 contract_id,
                 [],
                 [],
                 transfer_info.requested_opids(&fascia),
                 &fascia,
             )?;
+            self.attach_spv_proofs(
+                &mut runtime,
+                &mut consignment,
+                RgbTxid::from_str(&txid).unwrap(),
+            )
+            .await?;
             let mut bytes = Vec::new();
             consignment.save(&mut bytes)?;
             consignment_bytes.insert(asset_id.clone(), bytes);

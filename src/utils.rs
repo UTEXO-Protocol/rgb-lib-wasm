@@ -928,6 +928,7 @@ pub(crate) async fn fetch_esplora_broadcast_async(
 #[cfg(feature = "esplora")]
 pub(crate) struct PreFetchResolver {
     witness_cache: HashMap<RgbTxid, WitnessStatus>,
+    headers: HashMap<NonZeroU32, BlockHeader>,
     chain_net: ChainNet,
 }
 
@@ -936,8 +937,14 @@ impl PreFetchResolver {
     pub(crate) fn new(cache: HashMap<RgbTxid, WitnessStatus>, chain_net: ChainNet) -> Self {
         Self {
             witness_cache: cache,
+            headers: HashMap::new(),
             chain_net,
         }
+    }
+
+    pub(crate) fn with_headers(mut self, headers: HashMap<NonZeroU32, BlockHeader>) -> Self {
+        self.headers = headers;
+        self
     }
 }
 
@@ -952,6 +959,13 @@ impl ResolveWitness for PreFetchResolver {
                 s!("witness not pre-fetched"),
             ))
     }
+    fn get_block_header(&self, height: NonZeroU32) -> Result<BlockHeader, WitnessResolverError> {
+        // a missing header makes the validator fetch the witness TX
+        self.headers
+            .get(&height)
+            .copied()
+            .ok_or(WitnessResolverError::NotSupported)
+    }
     fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
         if self.chain_net == chain_net {
             Ok(())
@@ -959,6 +973,22 @@ impl ResolveWitness for PreFetchResolver {
             Err(WitnessResolverError::WrongChainNet)
         }
     }
+}
+
+/// Converts an Esplora merkle proof to an SPV proof.
+#[cfg(feature = "esplora")]
+pub(crate) fn spv_proof_from_esplora(proof: esplora_client::MerkleProof) -> Option<SpvProof> {
+    // the nodes come as txids, so they are already in internal byte order
+    let merkle = proof
+        .merkle
+        .into_iter()
+        .map(|node| TxMerkleNode::from_byte_array(node.to_byte_array()))
+        .collect::<Vec<_>>();
+    Some(SpvProof {
+        block_height: NonZeroU32::new(proof.block_height)?,
+        pos: u32::try_from(proof.pos).ok()?,
+        merkle: Confined::try_from(merkle).ok()?,
+    })
 }
 
 /// Offchain resolver variant for wasm32.
@@ -985,6 +1015,9 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolverWasm<'_, '_, TRANS
                 || self.fallback.resolve_witness(witness_id),
                 |tx| Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
             )
+    }
+    fn get_block_header(&self, height: NonZeroU32) -> Result<BlockHeader, WitnessResolverError> {
+        self.fallback.get_block_header(height)
     }
     fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
         self.fallback.check_chain_net(chain_net)
@@ -1556,6 +1589,76 @@ mod tests {
                 out.as_string().unwrap(),
                 "5,no-store,no-store,POST,tx,true,true,false,TimeoutError,AbortError"
             );
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    mod spv {
+        use super::*;
+        use bdk_wallet::bitcoin::{
+            CompactTarget,
+            block::Version,
+            hashes::{Hash, HashEngine, sha256d},
+        };
+
+        const TXID: [u8; 32] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31,
+        ];
+        const SIBLING: [u8; 32] = [
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+            54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+        ];
+        // the sibling as the esplora API sends it: txid hex, reversed from the internal bytes
+        const MERKLE_PROOF_JSON: &str = r#"{"block_height":1,"merkle":["3f3e3d3c3b3a393837363534333231302f2e2d2c2b2a29282726252423222120"],"pos":0}"#;
+
+        fn header() -> BlockHeader {
+            let mut engine = sha256d::Hash::engine();
+            engine.input(&TXID);
+            engine.input(&SIBLING);
+            BlockHeader {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::from_raw_hash(sha256d::Hash::from_engine(engine)),
+                time: 1,
+                bits: CompactTarget::from_consensus(0),
+                nonce: 0,
+            }
+        }
+
+        #[test]
+        fn spv_proof_from_esplora_verifies() {
+            let parsed: esplora_client::MerkleProof =
+                serde_json::from_str(MERKLE_PROOF_JSON).unwrap();
+            let proof = spv_proof_from_esplora(parsed).unwrap();
+            assert_eq!(
+                proof.validate(RgbTxid::from_byte_array(TXID), &header()),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn spv_proof_from_esplora_rejects_bad_data() {
+            let proof = |block_height, nodes| esplora_client::MerkleProof {
+                block_height,
+                merkle: vec![Txid::from_byte_array(SIBLING); nodes],
+                pos: 0,
+            };
+            assert!(spv_proof_from_esplora(proof(0, 1)).is_none());
+            assert!(spv_proof_from_esplora(proof(1, 33)).is_none());
+        }
+
+        #[test]
+        fn prefetch_resolver_serves_headers() {
+            let header = header();
+            let one = NonZeroU32::new(1).unwrap();
+            let resolver = PreFetchResolver::new(HashMap::new(), ChainNet::BitcoinRegtest)
+                .with_headers(HashMap::from([(one, header)]));
+            assert_eq!(resolver.get_block_header(one).unwrap(), header);
+            assert!(matches!(
+                resolver.get_block_header(NonZeroU32::new(2).unwrap()),
+                Err(WitnessResolverError::NotSupported)
+            ));
         }
     }
 }

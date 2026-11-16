@@ -605,6 +605,43 @@ pub fn serve_reject_list(url: &str, body: &str) {
     .unwrap();
 }
 
+/// Make the page refuse every request for a transaction in `txids`. Reset the count of refused
+/// requests. An empty list stops the refusal.
+#[allow(dead_code)]
+pub fn refuse_tx_lookups(txids: &[&str]) {
+    let txids: js_sys::Array = txids.iter().map(|t| JsValue::from_str(t)).collect();
+    js_sys::Function::new_with_args(
+        "txids",
+        "if (!globalThis.__rgbTxLookups) {
+            globalThis.__rgbTxLookups = { txids: [], count: 0 };
+            const next = globalThis.fetch;
+            globalThis.fetch = function (input, init) {
+                const u = input instanceof Request ? input.url : String(input);
+                const state = globalThis.__rgbTxLookups;
+                if (state.txids.some((t) => u.includes('/tx/' + t))) {
+                    state.count += 1;
+                    return Promise.reject(new TypeError('witness lookup refused'));
+                }
+                return next.call(this, input, init);
+            };
+        }
+        globalThis.__rgbTxLookups.txids = txids;
+        globalThis.__rgbTxLookups.count = 0;",
+    )
+    .call1(&JsValue::NULL, &txids)
+    .unwrap();
+}
+
+/// The number of requests the page refused since the last call to `refuse_tx_lookups`.
+#[allow(dead_code)]
+pub fn refused_tx_lookups() -> u32 {
+    js_sys::Function::new_no_args("return (globalThis.__rgbTxLookups || { count: 0 }).count;")
+        .call0(&JsValue::NULL)
+        .unwrap()
+        .as_f64()
+        .unwrap() as u32
+}
+
 /// The number of times the page served the reject list at `url`.
 #[allow(dead_code)]
 pub fn reject_list_fetches(url: &str) -> u32 {

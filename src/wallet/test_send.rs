@@ -4,11 +4,19 @@ use super::online::{
     MOCK_MAX_UTXO_ASSET_ALLOCATIONS, MOCK_SPAM_HIDDEN_SPENDS, MOCK_SPAM_RECIPIENT_ASSIGNMENTS,
 };
 use super::test_bfa::utils::*;
-use super::test_bfa::{funded_wallet, s, send_and_settle, settle_both, wallet_data};
+use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
 use crate::wallet::{AssetFilter, Balance, Online, RgbAllocation, Transfer, Wallet};
-use crate::{AssetSchema, Assignment, Error, TransferKind, TransferStatus};
+use crate::{AssetSchema, Assignment, Error, RgbTransfer, TransferKind, TransferStatus};
+use amplify::confinement::Confined;
 use bdk_wallet::bitcoin::psbt::Psbt;
+use bdk_wallet::bitcoin::{TxMerkleNode, hashes::Hash};
+use rgbstd::Txid as RgbTxid;
+use rgbstd::containers::FileContent;
+use rgbstd::persistence::RgbStore;
+use rgbstd::validation::{ResolveWitness, WitnessStatus};
+use rgbstd::vm::WitnessOrd;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 const AMOUNT: u64 = 1000;
@@ -339,4 +347,150 @@ async fn utxo_freeze_concurrent_receives() {
     assert_eq!(sent(&a, &refused).status, TransferStatus::Failed);
     assert_eq!(colored_allocations(&mut r).len(), 1);
     assert_eq!(balance(&r, &asset_id).settled, 50);
+}
+
+pub(super) fn consignment(wallet: &Wallet, asset_id: &str, txid: &str) -> RgbTransfer {
+    let bytes = &wallet.transfer_artifacts[txid].consignment_bytes[asset_id];
+    RgbTransfer::load(&bytes[..]).unwrap()
+}
+
+pub(super) fn proven(consignment: &RgbTransfer) -> HashMap<String, bool> {
+    consignment
+        .bundles
+        .iter()
+        .map(|bw| (bw.witness_id().to_string(), bw.spv_proof.is_some()))
+        .collect()
+}
+
+fn stored_proof(wallet: &Wallet, txid: &str) -> bool {
+    let runtime = wallet.rgb_runtime().unwrap();
+    let txid = RgbTxid::from_str(txid).unwrap();
+    runtime
+        .stock
+        .as_store()
+        .witness_spv_proof(txid)
+        .unwrap()
+        .is_some()
+}
+
+/// Stop refusing transaction lookups when a test ends.
+struct AllowTxLookups;
+
+impl Drop for AllowTxLookups {
+    fn drop(&mut self) {
+        refuse_tx_lookups(&[]);
+    }
+}
+
+// a consignment carries the SPV proof of each mined history witness, and the receiver checks it
+// without fetching the witness
+#[wasm_bindgen_test]
+async fn spv_proofs() {
+    let _allow = AllowTxLookups;
+    let (mut a, a_on) = nia_wallet(2).await;
+    let (mut b, b_on) = nia_wallet(2).await;
+    let (mut c, c_on) = nia_wallet(2).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+
+    let txid_1 = send(
+        &mut a,
+        &a_on,
+        &mut b,
+        &b_on,
+        &asset_id,
+        Assignment::Fungible(100),
+    )
+    .await;
+    settle_both(&mut a, &a_on, &mut b, &b_on).await;
+
+    // own send: A spends its change from txid_1
+    let txid_2 = send(
+        &mut a,
+        &a_on,
+        &mut c,
+        &c_on,
+        &asset_id,
+        Assignment::Fungible(50),
+    )
+    .await;
+    let ac = consignment(&a, &asset_id, &txid_2);
+    let proofs = proven(&ac);
+    assert!(proofs[&txid_1]);
+    assert!(!proofs[&txid_2]);
+    assert!(stored_proof(&a, &txid_1));
+
+    // C settles the transfer with the lookups of txid_1 refused
+    for _ in 0..3 {
+        refuse_tx_lookups(&[&txid_1]);
+        c.sync(c_on.clone()).await.unwrap();
+        for (idx, refreshed) in c.refresh(c_on.clone(), None, vec![], false).await.unwrap() {
+            assert!(
+                refreshed.failure.is_none(),
+                "transfer {idx}: {:?}",
+                refreshed.failure
+            );
+        }
+        assert_eq!(refused_tx_lookups(), 0);
+        refuse_tx_lookups(&[]);
+        a.sync(a_on.clone()).await.unwrap();
+        a.refresh(a_on.clone(), None, vec![], false).await.unwrap();
+        mine_blocks(1).await;
+        wait_for_esplora_sync().await;
+    }
+    let received: Vec<Transfer> = c
+        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == TransferKind::ReceiveBlind)
+        .collect();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].status, TransferStatus::Settled);
+    assert_eq!(balance(&c, &asset_id).settled, 50);
+    assert!(stored_proof(&c, &txid_1));
+
+    // a carried proof replaces the lookup of its witness
+    let witness_1 = RgbTxid::from_str(&txid_1).unwrap();
+    let height = ac
+        .bundles
+        .iter()
+        .find(|bw| bw.witness_id() == witness_1)
+        .and_then(|bw| bw.spv_proof.as_ref())
+        .unwrap()
+        .block_height;
+    refuse_tx_lookups(&[&txid_1]);
+    let resolver = c.prefetch_consignment_witnesses(&ac).await.unwrap();
+    refuse_tx_lookups(&[]);
+    assert!(resolver.resolve_witness(witness_1).is_err());
+    assert!(resolver.get_block_header(height).is_ok());
+
+    // a proof that does not verify makes the receiver fetch the witness
+    let mut broken = ac.clone();
+    for bw in broken.bundles.iter_mut() {
+        if bw.witness_id() == witness_1 {
+            let proof = bw.spv_proof.as_mut().unwrap();
+            let mut nodes: Vec<TxMerkleNode> = proof.merkle.iter().copied().collect();
+            assert!(!nodes.is_empty());
+            nodes[0] = TxMerkleNode::from_byte_array([0xab; 32]);
+            proof.merkle = Confined::try_from(nodes).unwrap();
+        }
+    }
+    let resolver = c.prefetch_consignment_witnesses(&broken).await.unwrap();
+    assert!(matches!(
+        resolver.resolve_witness(witness_1),
+        Ok(WitnessStatus::Resolved(_, WitnessOrd::Mined(_)))
+    ));
+
+    // a proof above the chain tip has no header, so the receiver fetches the witness
+    let mut above_tip = ac.clone();
+    for bw in above_tip.bundles.iter_mut() {
+        if bw.witness_id() == witness_1 {
+            bw.spv_proof.as_mut().unwrap().block_height = NonZeroU32::MAX;
+        }
+    }
+    let resolver = c.prefetch_consignment_witnesses(&above_tip).await.unwrap();
+    assert!(resolver.get_block_header(NonZeroU32::MAX).is_err());
+    assert!(matches!(
+        resolver.resolve_witness(witness_1),
+        Ok(WitnessStatus::Resolved(_, WitnessOrd::Mined(_)))
+    ));
 }

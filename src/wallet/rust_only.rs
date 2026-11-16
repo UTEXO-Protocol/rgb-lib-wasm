@@ -247,12 +247,17 @@ impl Wallet {
                     }
                 };
             }
-            transfers.push(runtime.transfer(
+            #[cfg_attr(not(feature = "esplora"), allow(unused_mut))]
+            let mut transfer = runtime.transfer(
                 contract_id,
                 beneficiaries_witness,
                 beneficiaries_blinded,
                 Some(witness_txid),
-            )?);
+            )?;
+            #[cfg(feature = "esplora")]
+            self.attach_spv_proofs(&mut runtime, &mut transfer, witness_txid)
+                .await?;
+            transfers.push(transfer);
         }
         drop(runtime);
         self.flush().await?;
