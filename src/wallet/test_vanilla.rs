@@ -5,6 +5,7 @@ use super::test_bfa::{funded_wallet, wallet_data};
 use crate::database::DbWalletTransaction;
 use crate::wallet::{Online, Outpoint, PendingVanillaTx, TransactionType, Wallet};
 use crate::{AssetSchema, Error, TransferStatus, WalletTransactionType};
+use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::OutPoint;
 use bdk_wallet::bitcoin::psbt::Psbt;
 use std::str::FromStr;
@@ -62,6 +63,13 @@ fn row(w: &Wallet, txid: &str) -> DbWalletTransaction {
     rows.remove(0)
 }
 
+fn no_row(w: &Wallet, txid: &str) -> bool {
+    w.database
+        .get_wallet_transaction_by_txid(txid)
+        .unwrap()
+        .is_none()
+}
+
 fn pending(w: &Wallet) -> Vec<PendingVanillaTx> {
     w.list_pending_vanilla_txs().unwrap()
 }
@@ -80,23 +88,23 @@ fn spendable(w: &mut Wallet) -> u64 {
 
 async fn send_begin(w: &mut Wallet, online: &Online) -> Result<String, Error> {
     let address = rcv_address();
-    w.send_btc_begin(online.clone(), address, AMOUNT, 1, true)
+    w.send_btc_begin(online.clone(), address, AMOUNT, 1, true, false)
         .await
 }
 
 async fn create_begin(w: &mut Wallet, online: &Online) -> Result<String, Error> {
-    w.create_utxos_begin(online.clone(), false, Some(1), None, 1, true)
+    w.create_utxos_begin(online.clone(), false, Some(1), None, 1, true, false)
         .await
 }
 
 async fn drain_begin(w: &mut Wallet, online: &Online) -> Result<String, Error> {
-    w.drain_to_begin(online.clone(), rcv_address(), false, 1)
+    w.drain_to_begin(online.clone(), rcv_address(), 1, false)
         .await
 }
 
 async fn send_end(w: &mut Wallet, online: &Online, psbt: String) -> Result<String, Error> {
     let signed = w.sign_psbt(psbt, None).unwrap();
-    w.send_btc_end(online.clone(), signed, true).await
+    w.send_btc_end(online.clone(), signed).await
 }
 
 async fn drain_end(w: &mut Wallet, online: &Online, psbt: String) -> Result<String, Error> {
@@ -148,7 +156,7 @@ async fn abort_pending_vanilla_tx_success() {
 
     assert!(pending(&w).is_empty());
     assert!(reserved(&w).is_empty());
-    assert_eq!(row(&w, &txid).status, TransferStatus::Failed);
+    assert!(no_row(&w, &txid));
     let again = send_begin(&mut w, &online).await.unwrap();
     assert_eq!(inputs_of(&again), inputs_of(&psbt));
 }
@@ -215,7 +223,7 @@ async fn send_btc_two_concurrent_begins_pick_disjoint_inputs() {
 async fn create_utxos_begin_reservation_interactions() {
     let (mut w, online) = vanilla_wallet(2).await;
     let psbt = w
-        .create_utxos_begin(online.clone(), true, None, None, 1, false)
+        .create_utxos_begin(online.clone(), true, None, None, 1, false, false)
         .await
         .unwrap();
     let txid = txid_of(&psbt);
@@ -226,6 +234,15 @@ async fn create_utxos_begin_reservation_interactions() {
 
     let send_inputs = inputs_of(&send_begin(&mut w, &online).await.unwrap());
     assert_eq!(send_inputs.len(), 1);
+    let before = reserved(&w);
+    let dry = w
+        .create_utxos_begin(online.clone(), false, Some(1), None, 1, true, true)
+        .await
+        .unwrap();
+    let dry_inputs = inputs_of(&dry);
+    assert_eq!(dry_inputs.len(), 1);
+    assert!(!send_inputs.contains(&dry_inputs[0]));
+    assert_eq!(reserved(&w), before);
     let create_inputs = inputs_of(&create_begin(&mut w, &online).await.unwrap());
     assert_eq!(create_inputs.len(), 1);
     assert!(!send_inputs.contains(&create_inputs[0]));
@@ -255,11 +272,11 @@ async fn drain_to_repeated_begin_keeps_one_row() {
     let (mut w, online) = vanilla_wallet(1).await;
     let address = rcv_address();
     let first = w
-        .drain_to_begin(online.clone(), address.clone(), false, 1)
+        .drain_to_begin(online.clone(), address.clone(), 1, false)
         .await
         .unwrap();
     let second = w
-        .drain_to_begin(online.clone(), address, false, 1)
+        .drain_to_begin(online.clone(), address, 1, false)
         .await
         .unwrap();
     let txid = txid_of(&first);
@@ -329,14 +346,12 @@ async fn pending_vanilla_survives_reload() {
 async fn refresh_settles_ended() {
     let (mut w, online) = vanilla_wallet(3).await;
     let create = w
-        .create_utxos_begin(online.clone(), false, Some(1), None, 1, false)
+        .create_utxos_begin(online.clone(), false, Some(1), None, 1, false, false)
         .await
         .unwrap();
     let create_txid = txid_of(&create);
     let signed = w.sign_psbt(create, None).unwrap();
-    w.create_utxos_end(online.clone(), signed, false)
-        .await
-        .unwrap();
+    w.create_utxos_end(online.clone(), signed).await.unwrap();
     let send = send_begin(&mut w, &online).await.unwrap();
     let send_txid = send_end(&mut w, &online, send).await.unwrap();
 
@@ -361,4 +376,52 @@ async fn refresh_settles_ended() {
     );
     mine_and_refresh(&mut w, &online).await;
     assert_eq!(row(&w, &drain_txid).status, TransferStatus::Settled);
+}
+
+#[wasm_bindgen_test]
+async fn dry_begin_survives_reload() {
+    let (mut w, online) = vanilla_wallet(2).await;
+    for (r#type, keychain) in [
+        (WalletTransactionType::CreateUtxos, KeychainKind::External),
+        (WalletTransactionType::SendBtc, KeychainKind::Internal),
+    ] {
+        let psbt = match r#type {
+            WalletTransactionType::CreateUtxos => {
+                w.create_utxos_begin(online.clone(), false, Some(1), None, 1, true, true)
+                    .await
+            }
+            _ => {
+                w.send_btc_begin(online.clone(), rcv_address(), AMOUNT, 1, true, true)
+                    .await
+            }
+        }
+        .unwrap();
+        let outputs: Vec<_> = Psbt::from_str(&psbt)
+            .unwrap()
+            .unsigned_tx
+            .output
+            .into_iter()
+            .map(|o| o.script_pubkey)
+            .collect();
+
+        let (mut restored, _) = saved_wallet(&w).await;
+        let next = restored._get_new_address(keychain).unwrap().script_pubkey();
+        assert!(!outputs.contains(&next));
+    }
+}
+
+#[wasm_bindgen_test]
+async fn drain_begin_backup_info() {
+    let (mut w, online) = vanilla_wallet(1).await;
+    for dry_run in [true, false] {
+        w.backup("pw").unwrap();
+        sleep_ms(1100).await;
+        let psbt = w
+            .drain_to_begin(online.clone(), rcv_address(), 1, dry_run)
+            .await
+            .unwrap();
+        assert_eq!(w.backup_info().unwrap(), !dry_run);
+        assert_eq!(no_row(&w, &txid_of(&psbt)), dry_run);
+        assert_eq!(reserved(&w).is_empty(), dry_run);
+    }
 }

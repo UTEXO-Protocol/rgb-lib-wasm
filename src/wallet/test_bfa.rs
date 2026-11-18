@@ -74,12 +74,12 @@ pub(super) async fn funded_wallet_with(
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(utxos), None, 1, true)
+        .create_utxos_begin(online.clone(), true, Some(utxos), None, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     mine_blocks(1).await;
