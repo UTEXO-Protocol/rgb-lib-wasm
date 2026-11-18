@@ -150,9 +150,9 @@ await wallet.sync(online);
 RGB allocations live on UTXOs. Before issuing or receiving assets you need colored UTXOs:
 
 ```javascript
-const unsignedPsbt = await wallet.createUtxosBegin(online, true, 5, 1000, 1n, false);
+const unsignedPsbt = await wallet.createUtxosBegin(online, true, 5, 1000, 1n, false, false);
 const signedPsbt = wallet.signPsbt(unsignedPsbt);
-const count = await wallet.createUtxosEnd(online, signedPsbt, false);
+const count = await wallet.createUtxosEnd(online, signedPsbt);
 ```
 
 ### Issuing assets
@@ -194,9 +194,9 @@ const result = await wallet.sendEnd(online, signed, false);
 ### Sending BTC
 
 ```javascript
-const psbt = await wallet.sendBtcBegin(online, address, 50000n, 1n, false);
+const psbt = await wallet.sendBtcBegin(online, address, 50000n, 1n, false, false);
 const signed = wallet.signPsbt(psbt);
-const txid = await wallet.sendBtcEnd(online, signed, false);
+const txid = await wallet.sendBtcEnd(online, signed);
 ```
 
 ### Receiving assets
@@ -245,7 +245,7 @@ const feeRate = await wallet.getFeeEstimation(online, 6); // target 6 blocks
 ### Draining the wallet
 
 ```javascript
-const psbt = await wallet.drainToBegin(online, destinationAddress, true, 1n);
+const psbt = await wallet.drainToBegin(online, destinationAddress, 1n, false);
 const signed = wallet.signPsbt(psbt);
 const txid = await wallet.drainToEnd(online, signed);
 ```
@@ -383,11 +383,11 @@ To protect a wallet:
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
 | `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
-| `abortPendingVanillaTx(txid)` | no | Fail a begun vanilla operation and release its inputs |
+| `abortPendingVanillaTx(txid)` | no | Abort a begun vanilla operation: delete it and release its inputs |
 | `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. |
 | `sync(online)` | yes | Sync wallet with indexer |
-| `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
-| `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
+| `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
+| `createUtxosEnd(online, psbt)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
 | `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight` |
 | `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight` |
@@ -395,10 +395,10 @@ To protect a wallet:
 | `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
 | `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
 | `sendEnd(online, psbt, skipSync)` | yes | Broadcast RGB send PSBT |
-| `sendBtcBegin(...)` | yes | Prepare BTC send PSBT |
-| `sendBtcEnd(online, psbt, skipSync)` | yes | Broadcast BTC send PSBT |
+| `sendBtcBegin(...)` | yes | Prepare BTC send PSBT, reserve its inputs unless dryRun |
+| `sendBtcEnd(online, psbt)` | yes | Broadcast BTC send PSBT |
 | `getFeeEstimation(online, blocks)` | yes | Estimate fee rate for target blocks |
-| `drainToBegin(online, addr, destroyAssets, feeRate)` | yes | Prepare drain PSBT |
+| `drainToBegin(online, addr, feeRate, dryRun)` | yes | Prepare drain PSBT, reserve its inputs unless dryRun |
 | `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
 | `inflateBegin(...)` | yes | Prepare IFA inflation PSBT |
 | `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
