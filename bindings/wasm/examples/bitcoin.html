@@ -201,9 +201,6 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         <input id="drain-fee-rate" type="number" value="1" min="1" />
       </div>
     </div>
-    <label class="checkbox-label">
-      <input type="checkbox" id="drain-destroy-assets"> Destroy RGB assets (drain everything)
-    </label>
     <div class="btn-group">
       <button id="btn-drain-begin" disabled>1. Begin</button>
       <button id="btn-drain-sign" disabled>2. Sign</button>
@@ -414,7 +411,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('sendBtcBegin...', 'log-warn');
         const unsignedPsbt = await state.wallet.sendBtcBegin(
-          state.online, address, BigInt(amount), BigInt(feeRate), skipSync
+          state.online, address, BigInt(amount), BigInt(feeRate), skipSync, false
         );
         document.getElementById('send-btc-unsigned-psbt').value = unsignedPsbt;
         showResult('send-btc-output', 'send-btc-result', 'Unsigned PSBT created. Proceed to Sign.');
@@ -450,10 +447,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         showResult('send-btc-output', 'send-btc-result', 'No signed PSBT. Run Sign first.');
         return;
       }
-      const skipSync = document.getElementById('send-btc-skip-sync').checked;
       try {
         log('sendBtcEnd...', 'log-warn');
-        const txid = await state.wallet.sendBtcEnd(state.online, signed, skipSync);
+        const txid = await state.wallet.sendBtcEnd(state.online, signed);
         showResult('send-btc-output', 'send-btc-result', 'Transaction broadcast!\nTxid: ' + txid);
         log('sendBtcEnd OK: ' + txid, 'log-ok');
       } catch (e) {
@@ -475,7 +471,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('sendBtc (auto) begin...', 'log-warn');
         const unsignedPsbt = await state.wallet.sendBtcBegin(
-          state.online, address, BigInt(amount), BigInt(feeRate), skipSync
+          state.online, address, BigInt(amount), BigInt(feeRate), skipSync, true
         );
         document.getElementById('send-btc-unsigned-psbt').value = unsignedPsbt;
 
@@ -484,7 +480,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         document.getElementById('send-btc-signed-psbt').value = signed;
 
         log('sendBtc (auto) end...', 'log-warn');
-        const txid = await state.wallet.sendBtcEnd(state.online, signed, skipSync);
+        const txid = await state.wallet.sendBtcEnd(state.online, signed);
         showResult('send-btc-output', 'send-btc-result', 'Transaction broadcast (auto)!\nTxid: ' + txid);
         log('sendBtc (auto) complete: ' + txid, 'log-ok');
       } catch (e) {
@@ -504,12 +500,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         showResult('drain-output', 'drain-result', 'Enter a destination address');
         return;
       }
-      const destroyAssets = document.getElementById('drain-destroy-assets').checked;
       const feeRate = parseInt(document.getElementById('drain-fee-rate').value, 10) || 1;
       try {
         log('drainToBegin...', 'log-warn');
         const unsignedPsbt = await state.wallet.drainToBegin(
-          state.online, address, destroyAssets, BigInt(feeRate)
+          state.online, address, BigInt(feeRate), false
         );
         document.getElementById('drain-unsigned-psbt').value = unsignedPsbt;
         showResult('drain-output', 'drain-result', 'Unsigned PSBT created. Proceed to Sign.');
@@ -563,12 +558,11 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         showResult('drain-output', 'drain-result', 'Enter a destination address');
         return;
       }
-      const destroyAssets = document.getElementById('drain-destroy-assets').checked;
       const feeRate = parseInt(document.getElementById('drain-fee-rate').value, 10) || 1;
       try {
         log('drain (auto) begin...', 'log-warn');
         const unsignedPsbt = await state.wallet.drainToBegin(
-          state.online, address, destroyAssets, BigInt(feeRate)
+          state.online, address, BigInt(feeRate), true
         );
         document.getElementById('drain-unsigned-psbt').value = unsignedPsbt;
 

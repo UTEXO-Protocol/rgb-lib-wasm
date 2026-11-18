@@ -681,12 +681,12 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('createUtxos (auto) begin...', 'log-warn');
         const unsignedPsbt = await state.wallet.createUtxosBegin(
-          state.online, true, num, size, BigInt(feeRate), false
+          state.online, true, num, size, BigInt(feeRate), false, true
         );
         log('createUtxos (auto) sign...', 'log-warn');
         const signed = state.wallet.signPsbt(unsignedPsbt);
         log('createUtxos (auto) end...', 'log-warn');
-        const count = await state.wallet.createUtxosEnd(state.online, signed, false);
+        const count = await state.wallet.createUtxosEnd(state.online, signed);
         showResult('setup-output', 'setup-result', 'UTXOs created: ' + count);
         log('createUtxos complete: ' + count + ' UTXOs', 'log-ok');
       } catch (e) {
