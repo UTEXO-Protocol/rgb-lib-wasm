@@ -117,7 +117,7 @@ use bdk_wallet::{
         psbt::{ExtractTxError, Psbt},
         secp256k1::Secp256k1,
     },
-    chain::{CanonicalizationParams, ChainPosition},
+    chain::{CanonicalizationParams, ChainPosition, Merge},
     descriptor::{IntoWalletDescriptor, Segwitv0},
     keys::{
         DerivableKey, DescriptorKey,
@@ -248,7 +248,7 @@ use crate::{
     error::InternalError,
     utils::{
         DumbResolver, LOG_FILE, RgbRuntime, adjust_canonicalization, beneficiary_from_script_buf,
-        from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
+        fault_point, from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
         get_descriptors, get_descriptors_from_xpubs, load_rgb_runtime, now, parse_address_str,
         setup_logger, str_to_xpub,
     },

@@ -595,6 +595,25 @@ thread_local! {
     pub(crate) static CLOCK_OFFSET: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The fault point that fails next in this test thread.
+    pub(crate) static FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fail when a test injects a fault at `point`.
+pub(crate) fn fault_point(point: &'static str) -> Result<(), Error> {
+    #[cfg(test)]
+    if FAULT.with(|f| f.get() == Some(point)) {
+        FAULT.with(|f| f.set(None));
+        return Err(Error::Internal {
+            details: format!("fault injected in {point}"),
+        });
+    }
+    let _ = point;
+    Ok(())
+}
+
 pub(crate) struct DumbResolver;
 
 impl ResolveWitness for DumbResolver {

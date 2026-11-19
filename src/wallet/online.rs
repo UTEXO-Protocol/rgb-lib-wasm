@@ -2708,90 +2708,98 @@ impl Wallet {
         };
         self.online_data.as_mut().unwrap().evm_chains = evm_chains;
         if !online_options.skip_consistency_check {
-            // DB assets must be contracts in the RGB stock
-            let contract_ids: HashSet<String> = self
-                .rgb_contract_ids()?
-                .iter()
-                .map(|id| id.to_string())
-                .collect();
-            if !self
-                .database
-                .get_asset_ids()?
-                .iter()
-                .all(|id| contract_ids.contains(id))
-            {
-                return Err(Error::Inconsistency {
-                    details: s!("DB assets do not match with ones stored in RGB"),
-                });
-            }
-            // unspent DB TXOs must be in BDK's unspent list after a full scan
-            self.sync_and_save(true).await?;
-            let bdk_utxos: HashSet<String> = self
-                .bdk_wallet
-                .list_unspent()
-                .map(|u| u.outpoint.to_string())
-                .collect();
-            // this wallet marks its inputs spent at the next refresh: skip outputs its own
-            // transactions spend, and also check the wallet outputs of these transactions
-            let own_txids: HashSet<String> = self
-                .database
-                .iter_batch_transfers()?
-                .into_iter()
-                .filter_map(|bt| bt.txid)
-                .chain(
-                    self.database
-                        .iter_wallet_transactions()?
-                        .into_iter()
-                        .map(|wt| wt.txid),
-                )
-                .collect();
-            let own_spent: HashSet<String> = self
-                .bdk_wallet
-                .tx_graph()
-                .full_txs()
-                .filter(|t| own_txids.contains(&t.txid.to_string()))
-                .flat_map(|t| {
-                    t.tx.input
-                        .iter()
-                        .map(|i| i.previous_output.to_string())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let own_outputs: Vec<String> = self
-                .bdk_wallet
-                .transactions()
-                .filter(|t| own_txids.contains(&t.tx_node.txid.to_string()))
-                .flat_map(|t| {
-                    let txid = t.tx_node.txid;
-                    t.tx_node
-                        .tx
-                        .output
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, o)| self.bdk_wallet.is_mine(o.script_pubkey.clone()))
-                        .map(|(vout, _)| format!("{txid}:{vout}"))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let mut spent: Vec<String> = self
-                .database
-                .iter_txos()?
-                .into_iter()
-                .filter(|t| !t.spent && t.exists)
-                .map(|t| t.outpoint().to_string())
-                .chain(own_outputs)
-                .filter(|o| !bdk_utxos.contains(o) && !own_spent.contains(o))
-                .collect();
-            if !spent.is_empty() {
-                spent.sort();
-                spent.dedup();
-                return Err(Error::Inconsistency {
-                    details: format!("spent bitcoins with another wallet: {spent:?}"),
-                });
-            }
+            let cp = self.checkpoint("go_online");
+            let res = self._check_consistency().await;
+            self.commit(cp, res, |_| false).await?;
         }
         info!(self.logger, "Go online completed");
         Ok(online)
+    }
+
+    /// Check that the DB matches the RGB stock and BDK.
+    async fn _check_consistency(&mut self) -> Result<(), Error> {
+        // DB assets must be contracts in the RGB stock
+        let contract_ids: HashSet<String> = self
+            .rgb_contract_ids()?
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        if !self
+            .database
+            .get_asset_ids()?
+            .iter()
+            .all(|id| contract_ids.contains(id))
+        {
+            return Err(Error::Inconsistency {
+                details: s!("DB assets do not match with ones stored in RGB"),
+            });
+        }
+        // unspent DB TXOs must be in BDK's unspent list after a full scan
+        self.sync_db_txos(true).await?;
+        let bdk_utxos: HashSet<String> = self
+            .bdk_wallet
+            .list_unspent()
+            .map(|u| u.outpoint.to_string())
+            .collect();
+        // this wallet marks its inputs spent at the next refresh: skip outputs its own
+        // transactions spend, and also check the wallet outputs of these transactions
+        let own_txids: HashSet<String> = self
+            .database
+            .iter_batch_transfers()?
+            .into_iter()
+            .filter_map(|bt| bt.txid)
+            .chain(
+                self.database
+                    .iter_wallet_transactions()?
+                    .into_iter()
+                    .map(|wt| wt.txid),
+            )
+            .collect();
+        let own_spent: HashSet<String> = self
+            .bdk_wallet
+            .tx_graph()
+            .full_txs()
+            .filter(|t| own_txids.contains(&t.txid.to_string()))
+            .flat_map(|t| {
+                t.tx.input
+                    .iter()
+                    .map(|i| i.previous_output.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let own_outputs: Vec<String> = self
+            .bdk_wallet
+            .transactions()
+            .filter(|t| own_txids.contains(&t.tx_node.txid.to_string()))
+            .flat_map(|t| {
+                let txid = t.tx_node.txid;
+                t.tx_node
+                    .tx
+                    .output
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, o)| self.bdk_wallet.is_mine(o.script_pubkey.clone()))
+                    .map(|(vout, _)| format!("{txid}:{vout}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut spent: Vec<String> = self
+            .database
+            .iter_txos()?
+            .into_iter()
+            .filter(|t| !t.spent && t.exists)
+            .map(|t| t.outpoint().to_string())
+            .chain(own_outputs)
+            .filter(|o| !bdk_utxos.contains(o) && !own_spent.contains(o))
+            .collect();
+        if !spent.is_empty() {
+            spent.sort();
+            spent.dedup();
+            return Err(Error::Inconsistency {
+                details: format!("spent bitcoins with another wallet: {spent:?}"),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) async fn sync_db_txos(&mut self, full_scan: bool) -> Result<(), Error> {
@@ -2851,21 +2859,20 @@ impl Wallet {
         Ok(())
     }
 
-    /// Sync and save the state, also when the sync fails part way.
-    async fn sync_and_save(&mut self, full_scan: bool) -> Result<(), Error> {
-        let res = self.sync_db_txos(full_scan).await;
-        self.flush().await?;
-        res
-    }
-
     /// Incrementally sync the wallet and save new RGB UTXOs to the DB (wasm32 async).
     ///
     /// Re-queries only already-revealed SPKs. To rediscover UTXOs for unrevealed SPKs (e.g. a thin
     /// restored state) use [`Wallet::full_scan`].
     pub async fn sync(&mut self, online: Online) -> Result<(), Error> {
+        let cp = self.checkpoint("sync");
+        let res = self._sync(online).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _sync(&mut self, online: Online) -> Result<(), Error> {
         info!(self.logger, "Syncing...");
         self.check_online(online)?;
-        self.sync_and_save(false).await?;
+        self.sync_db_txos(false).await?;
         info!(self.logger, "Sync completed");
         Ok(())
     }
@@ -2875,9 +2882,15 @@ impl Wallet {
     /// Derives and queries SPKs up to the indexer stop-gap, rebuilding a thin BDK state (no
     /// revealed SPKs) from the indexer when an incremental [`Wallet::sync`] cannot.
     pub async fn full_scan(&mut self, online: Online) -> Result<(), Error> {
+        let cp = self.checkpoint("full_scan");
+        let res = self._full_scan(online).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _full_scan(&mut self, online: Online) -> Result<(), Error> {
         info!(self.logger, "Full scanning...");
         self.check_online(online)?;
-        self.sync_and_save(true).await?;
+        self.sync_db_txos(true).await?;
         info!(self.logger, "Full scan completed");
         Ok(())
     }
@@ -2918,9 +2931,14 @@ impl Wallet {
         let tx = self
             ._broadcast_tx(signed_psbt.extract_tx().map_err(InternalError::from)?)
             .await?;
+        self.broadcast_txs.push(tx.clone());
+        fault_point("after_broadcast")?;
 
+        // a retried end finds its inputs spent by its own TX
         let internal_unspents_outpoints: Vec<(String, u32)> = self
-            .internal_unspents()
+            .bdk_wallet
+            .list_output()
+            .filter(|o| o.keychain == KeychainKind::Internal)
             .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout))
             .collect();
 
@@ -2958,7 +2976,7 @@ impl Wallet {
         Ok(tx)
     }
 
-    async fn _record_vanilla_begin(
+    fn _record_vanilla_begin(
         &self,
         psbt: &Psbt,
         r#type: WalletTransactionType,
@@ -2995,8 +3013,7 @@ impl Wallet {
             self.database.set_wallet_transaction(row)?;
         }
         self.update_backup_info(false)?;
-        // the PSBT leaves the wallet only after its operation is saved
-        self.flush().await
+        Ok(())
     }
 
     fn _finalize_vanilla_transaction(&self, tx: &BdkTransaction) -> Result<(), Error> {
@@ -3026,11 +3043,14 @@ impl Wallet {
         {
             return Err(Error::WrongOperation { txid });
         }
+        let initiated = row
+            .as_ref()
+            .is_some_and(|t| t.status == TransferStatus::Initiated);
         if row.is_some_and(|t| t.status == TransferStatus::Failed) {
             return Err(Error::CannotEndTransfer { txid });
         }
-        // a broadcast always adds the TX to the graph, a TX listed by the wallet can be evicted
-        if self.bdk_wallet.tx_graph().get_tx(bdk_txid).is_some() {
+        // an ended TX is in the graph. A begun one is there only after a failed end or an outside broadcast.
+        if !initiated && self.bdk_wallet.tx_graph().get_tx(bdk_txid).is_some() {
             return Err(Error::CannotEndTransfer { txid });
         }
         Ok(())
@@ -3053,12 +3073,28 @@ impl Wallet {
         fee_rate: u64,
         skip_sync: bool,
     ) -> Result<String, Error> {
+        let cp = self.checkpoint("create_utxos_begin");
+        let res = self
+            ._create_utxos_begin(online, up_to, num, size, fee_rate, skip_sync)
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _create_utxos_begin(
+        &mut self,
+        online: Online,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<String, Error> {
         info!(self.logger, "Creating UTXOs (begin)...");
         self.check_online(online)?;
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
         if !skip_sync {
-            self.sync_and_save(false).await?;
+            self.sync_db_txos(false).await?;
         }
 
         let unspent_txos = self.database.get_unspent_txos(vec![])?;
@@ -3104,8 +3140,7 @@ impl Wallet {
         while !addresses.is_empty() {
             match self._create_split_tx(&inputs, &addresses, utxo_size, fee_rate_checked) {
                 Ok(psbt) => {
-                    self._record_vanilla_begin(&psbt, WalletTransactionType::CreateUtxos)
-                        .await?;
+                    self._record_vanilla_begin(&psbt, WalletTransactionType::CreateUtxos)?;
                     info!(self.logger, "Create UTXOs (begin) completed");
                     return Ok(psbt.to_string());
                 }
@@ -3148,6 +3183,17 @@ impl Wallet {
         signed_psbt: String,
         skip_sync: bool,
     ) -> Result<u8, Error> {
+        let cp = self.checkpoint("create_utxos_end");
+        let res = self._create_utxos_end(online, signed_psbt, skip_sync).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _create_utxos_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+        skip_sync: bool,
+    ) -> Result<u8, Error> {
         info!(self.logger, "Creating UTXOs (end)...");
         self.check_online(online)?;
 
@@ -3168,7 +3214,6 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Create UTXOs (end) completed");
         Ok(num_utxos_created)
@@ -6246,6 +6291,24 @@ impl Wallet {
         consignment_bytes: &[u8],
         txid: &str,
     ) -> Result<(), Error> {
+        let cp = self.shared_checkpoint("save_new_asset");
+        let res = self
+            ._save_new_asset(online, consignment_bytes, txid)
+            .await
+            .and_then(|()| fault_point("save_new_asset"));
+        if res.is_err() {
+            self.rollback_shared(cp);
+            return res;
+        }
+        self.flush().await
+    }
+
+    async fn _save_new_asset(
+        &self,
+        online: Online,
+        consignment_bytes: &[u8],
+        txid: &str,
+    ) -> Result<(), Error> {
         info!(self.logger, "Saving new asset...");
         self.check_online(online)?;
         let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
@@ -6371,7 +6434,6 @@ impl Wallet {
         )?;
         drop(runtime);
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Save new asset completed");
         Ok(())
@@ -6397,9 +6459,9 @@ impl Wallet {
             info!(self.logger, "Refreshing assets...");
         }
         self.check_online(online)?;
+        let cp = self.checkpoint("refresh");
         let res = self._refresh(asset_id, filter, skip_sync).await;
-        self.flush().await?;
-        res
+        self.commit(cp, res, |_| false).await
     }
 
     async fn _refresh(
@@ -6707,11 +6769,18 @@ impl Wallet {
             "Failing batch transfer with idx {:?}...", batch_transfer_idx
         );
         self.check_online(online)?;
+        let cp = self.checkpoint("fail_transfers");
         let res = self
             ._fail_transfers(batch_transfer_idx, no_asset_only, skip_sync)
             .await;
-        self.flush().await?;
-        res
+        // rgb-lib saves what it changed before these errors
+        self.commit(cp, res, |e| {
+            matches!(
+                e,
+                Error::CannotFailBatchTransfer | Error::MissingTransferArtifacts { .. }
+            )
+        })
+        .await
     }
 
     async fn _fail_transfers(
@@ -7018,6 +7087,35 @@ impl Wallet {
         lock_time: Option<u32>,
         dry_run: bool,
     ) -> Result<SendBeginResult, Error> {
+        let cp = self.checkpoint("send_begin");
+        let res = self
+            ._send_begin(
+                online,
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                expiration_timestamp,
+                sender_transport_endpoint,
+                lock_time,
+                dry_run,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _send_begin(
+        &mut self,
+        online: Online,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp: u64,
+        sender_transport_endpoint: Option<String>,
+        lock_time: Option<u32>,
+        dry_run: bool,
+    ) -> Result<SendBeginResult, Error> {
         info!(self.logger, "Sending (begin) to: {:?}...", recipient_map);
 
         if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
@@ -7256,8 +7354,6 @@ impl Wallet {
         } else {
             self.update_backup_info(false)?;
         }
-        // the PSBT leaves the wallet only after its operation is saved
-        self.flush().await?;
 
         info!(self.logger, "Send (begin) completed");
         Ok(SendBeginResult {
@@ -7437,6 +7533,17 @@ impl Wallet {
         signed_psbt: String,
         skip_sync: bool,
     ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("send_end");
+        let res = self._send_end(online, signed_psbt, skip_sync).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _send_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+        skip_sync: bool,
+    ) -> Result<OperationResult, Error> {
         info!(self.logger, "Sending (end)...");
         self.check_online(online)?;
 
@@ -7611,11 +7718,7 @@ impl Wallet {
             .get_mut(&txid)
             .expect("artifacts checked above");
         artifacts.asset_infos = asset_infos.clone();
-        if let Err(e) = post_result {
-            // keep the used flags after a failed post
-            self.flush().await?;
-            return Err(e);
-        }
+        post_result?;
         // keep the signed PSBT for the refresh
         artifacts.signed_psbt = Some(signed_psbt.clone());
         if artifacts.inputs.is_empty() {
@@ -7664,7 +7767,6 @@ impl Wallet {
         };
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Send (end) completed");
         Ok(OperationResult {
@@ -7685,12 +7787,27 @@ impl Wallet {
         fee_rate: u64,
         skip_sync: bool,
     ) -> Result<String, Error> {
+        let cp = self.checkpoint("send_btc_begin");
+        let res = self
+            ._send_btc_begin(online, address, amount, fee_rate, skip_sync)
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _send_btc_begin(
+        &mut self,
+        online: Online,
+        address: String,
+        amount: u64,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<String, Error> {
         info!(self.logger, "Sending BTC (begin)...");
         self.check_online(online)?;
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
         if !skip_sync {
-            self.sync_and_save(false).await?;
+            self.sync_db_txos(false).await?;
         }
 
         let script_pubkey = self.get_script_pubkey(&address)?;
@@ -7734,8 +7851,7 @@ impl Wallet {
         })?;
         self.add_non_witness_utxos(&mut psbt);
 
-        self._record_vanilla_begin(&psbt, WalletTransactionType::SendBtc)
-            .await?;
+        self._record_vanilla_begin(&psbt, WalletTransactionType::SendBtc)?;
 
         info!(self.logger, "Send BTC (begin) completed");
         Ok(psbt.to_string())
@@ -7750,6 +7866,17 @@ impl Wallet {
         signed_psbt: String,
         skip_sync: bool,
     ) -> Result<String, Error> {
+        let cp = self.checkpoint("send_btc_end");
+        let res = self._send_btc_end(online, signed_psbt, skip_sync).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _send_btc_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+        skip_sync: bool,
+    ) -> Result<String, Error> {
         info!(self.logger, "Sending BTC (end)...");
         self.check_online(online)?;
 
@@ -7759,7 +7886,6 @@ impl Wallet {
         self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Send BTC (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -7788,6 +7914,20 @@ impl Wallet {
         destroy_assets: bool,
         fee_rate: u64,
     ) -> Result<String, Error> {
+        let cp = self.checkpoint("drain_to_begin");
+        let res = self
+            ._drain_to_begin(online, address, destroy_assets, fee_rate)
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _drain_to_begin(
+        &mut self,
+        online: Online,
+        address: String,
+        destroy_assets: bool,
+        fee_rate: u64,
+    ) -> Result<String, Error> {
         info!(
             self.logger,
             "Draining (begin) to '{}' destroying assets '{}'...", address, destroy_assets
@@ -7795,7 +7935,7 @@ impl Wallet {
         self.check_online(online)?;
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
-        self.sync_and_save(false).await?;
+        self.sync_db_txos(false).await?;
 
         let script_pubkey = self.get_script_pubkey(&address)?;
 
@@ -7831,8 +7971,7 @@ impl Wallet {
         })?;
         self.add_non_witness_utxos(&mut psbt);
 
-        self._record_vanilla_begin(&psbt, WalletTransactionType::Drain)
-            .await?;
+        self._record_vanilla_begin(&psbt, WalletTransactionType::Drain)?;
 
         info!(self.logger, "Drain (begin) completed");
         Ok(psbt.to_string())
@@ -7840,6 +7979,16 @@ impl Wallet {
 
     /// Broadcast the PSBT to drain wallet funds.
     pub async fn drain_to_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<String, Error> {
+        let cp = self.checkpoint("drain_to_end");
+        let res = self._drain_to_end(online, signed_psbt).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _drain_to_end(
         &mut self,
         online: Online,
         signed_psbt: String,
@@ -7853,7 +8002,6 @@ impl Wallet {
         self._finalize_vanilla_transaction(&tx)?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Drain (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -7861,6 +8009,27 @@ impl Wallet {
 
     /// Prepare the PSBT to inflate an IFA asset.
     pub async fn inflate_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        inflation_amounts: Vec<u64>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<String, Error> {
+        let cp = self.checkpoint("inflate_begin");
+        let res = self
+            ._inflate_begin(
+                online,
+                asset_id,
+                inflation_amounts,
+                fee_rate,
+                min_confirmations,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _inflate_begin(
         &mut self,
         online: Online,
         asset_id: String,
@@ -7978,8 +8147,6 @@ impl Wallet {
 
         // release the RGB stock so the wallet state can be saved
         drop(runtime);
-        // the PSBT leaves the wallet only after its operation is saved
-        self.flush().await?;
 
         info!(self.logger, "Inflation (begin) completed");
         Ok(psbt_string)
@@ -7987,6 +8154,16 @@ impl Wallet {
 
     /// Complete the inflate operation and broadcast.
     pub async fn inflate_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("inflate_end");
+        let res = self._inflate_end(online, signed_psbt).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _inflate_end(
         &mut self,
         online: Online,
         signed_psbt: String,
@@ -8080,7 +8257,6 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Inflate (end) completed");
         Ok(OperationResult {
@@ -8105,10 +8281,33 @@ impl Wallet {
         fee_rate: u64,
         min_confirmations: u8,
     ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("burn");
+        let res = self
+            ._burn(
+                online,
+                asset_id,
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _burn(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
         info!(self.logger, "Burning amount: {}...", amount);
         self._check_xprv()?;
         let begin = self
-            .burn_begin(
+            ._burn_begin(
                 online.clone(),
                 asset_id,
                 amount,
@@ -8119,7 +8318,7 @@ impl Wallet {
             )
             .await?;
         let signed_psbt = self.sign_psbt(begin.psbt, None)?;
-        let res = self.burn_end(online, signed_psbt).await?;
+        let res = self._burn_end(online, signed_psbt).await?;
         info!(self.logger, "Burn completed");
         Ok(res)
     }
@@ -8137,6 +8336,31 @@ impl Wallet {
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn burn_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        amount: u64,
+        burn_reason: Option<String>,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<BurnBeginResult, Error> {
+        let cp = self.checkpoint("burn_begin");
+        let res = self
+            ._burn_begin(
+                online,
+                asset_id,
+                amount,
+                burn_reason,
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _burn_begin(
         &mut self,
         online: Online,
         asset_id: String,
@@ -8209,6 +8433,16 @@ impl Wallet {
         online: Online,
         signed_psbt: String,
     ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("burn_end");
+        let res = self._burn_end(online, signed_psbt).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _burn_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
         info!(self.logger, "Burning (end)...");
         self.check_online(online)?;
 
@@ -8217,7 +8451,6 @@ impl Wallet {
             .await?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Burn (end) completed");
         Ok(res)
@@ -8297,7 +8530,6 @@ impl Wallet {
         } else {
             self.update_backup_info(false)?;
         }
-        self.flush().await?;
 
         Ok(begin_data)
     }
@@ -8415,13 +8647,34 @@ impl Wallet {
         fee_rate: u64,
         min_confirmations: u8,
     ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("link");
+        let res = self
+            ._link(
+                online,
+                asset_id,
+                linked_to_contract,
+                fee_rate,
+                min_confirmations,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _link(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
         info!(
             self.logger,
             "Linking to contract: {}...", linked_to_contract
         );
         self._check_xprv()?;
         let begin = self
-            .link_begin(
+            ._link_begin(
                 online.clone(),
                 asset_id,
                 linked_to_contract,
@@ -8431,7 +8684,7 @@ impl Wallet {
             )
             .await?;
         let signed_psbt = self.sign_psbt(begin.psbt, None)?;
-        let res = self.link_end(online, signed_psbt).await?;
+        let res = self._link_end(online, signed_psbt).await?;
         info!(self.logger, "Link completed");
         Ok(res)
     }
@@ -8451,6 +8704,29 @@ impl Wallet {
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn link_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<LinkBeginResult, Error> {
+        let cp = self.checkpoint("link_begin");
+        let res = self
+            ._link_begin(
+                online,
+                asset_id,
+                linked_to_contract,
+                fee_rate,
+                min_confirmations,
+                dry_run,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _link_begin(
         &mut self,
         online: Online,
         asset_id: String,
@@ -8532,6 +8808,16 @@ impl Wallet {
         online: Online,
         signed_psbt: String,
     ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("link_end");
+        let res = self._link_end(online, signed_psbt).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _link_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
         info!(self.logger, "Linking (end)...");
         self.check_online(online)?;
 
@@ -8550,7 +8836,6 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Link (end) completed");
         Ok(res)
@@ -8758,6 +9043,32 @@ impl Wallet {
         min_confirmations: u8,
         sender_transport_endpoint: String,
     ) -> Result<MintBeginResult, Error> {
+        let cp = self.checkpoint("mint_begin");
+        let res = self
+            ._mint_begin(
+                online,
+                asset_id,
+                recipient,
+                before_block,
+                fee_rate,
+                min_confirmations,
+                sender_transport_endpoint,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn _mint_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        recipient: Recipient,
+        before_block: u64,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: String,
+    ) -> Result<MintBeginResult, Error> {
         info!(self.logger, "Minting (begin) to: {:?}...", recipient);
         self.check_online(online.clone())?;
 
@@ -8933,15 +9244,7 @@ impl Wallet {
                 false,
             )
             .await;
-        if let Err(e) = post_result {
-            let batch_transfer = self
-                ._get_outgoing_batch_transfer(&txid)?
-                .expect("saved by _prepare_transfer_psbt_wasm");
-            self._fail_batch_transfer(&batch_transfer)?;
-            self.update_backup_info(false)?;
-            self.flush().await?;
-            return Err(e);
-        }
+        post_result?;
         self.transfer_artifacts
             .get_mut(&txid)
             .expect("artifacts read above")
@@ -8954,7 +9257,6 @@ impl Wallet {
             &HashMap::from([(asset_id, consignment_hash)]),
         )?;
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         let opid = mint_opid(&fascia_from_bytes(begin_data.fascia.clone())?, contract_id).ok_or(
             Error::Internal {
@@ -8984,6 +9286,17 @@ impl Wallet {
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn mint_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("mint_end");
+        let res = self._mint_end(online, signed_psbt).await;
+        self.commit(cp, res, |e| matches!(e, Error::MintLockExpired { .. }))
+            .await
+    }
+
+    async fn _mint_end(
         &mut self,
         online: Online,
         signed_psbt: String,
@@ -9024,7 +9337,6 @@ impl Wallet {
             Err(e @ Error::MintLockExpired { .. }) => {
                 self._fail_batch_transfer(&batch_transfer)?;
                 self.update_backup_info(false)?;
-                self.flush().await?;
                 return Err(e);
             }
             Err(e) => return Err(e),
@@ -9050,7 +9362,6 @@ impl Wallet {
             .await?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Mint (end) completed");
         Ok(OperationResult {
@@ -9165,8 +9476,9 @@ impl Wallet {
         self.check_online(online)?;
 
         if !skip_sync {
-            self.sync_db_txos(false).await?;
-            self.flush().await?;
+            let cp = self.checkpoint("list_unspents_vanilla");
+            let res = self.sync_db_txos(false).await;
+            self.commit(cp, res, |_| false).await?;
         }
 
         let all_unspents: Vec<LocalOutput> = self.internal_unspents().collect();
@@ -9477,7 +9789,7 @@ mod separate_signer_tests {
 mod send_end_tests {
     use super::*;
     use crate::utils::recipient_id_from_script_buf;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, make_test_wallet};
     use strict_encoding::StrictDumb;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
@@ -10022,6 +10334,15 @@ mod send_end_tests {
     fn fail_transfers_fails_initiated_send() {
         let (mut wallet, online) = setup();
         let idx = seed_batch(&wallet, "t", TransferStatus::Initiated, false, None);
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "fail_transfers",
+            0,
+            async |w| {
+                w.fail_transfers(online.clone(), Some(idx), false, true)
+                    .await
+            },
+        ));
         let res = block_on(wallet.fail_transfers(online, Some(idx), false, true));
         assert_eq!(res, Ok(true));
         assert_eq!(status(&wallet, idx), TransferStatus::Failed);
@@ -10199,7 +10520,7 @@ mod send_end_tests {
         let txout = parsed.inputs[0].witness_utxo.clone().unwrap();
         wallet.bdk_wallet.insert_txout(input, txout);
         seed_txo(&wallet, &input.txid.to_string(), input.vout);
-        let res = block_on(wallet._record_vanilla_begin(&parsed, WalletTransactionType::SendBtc));
+        let res = wallet._record_vanilla_begin(&parsed, WalletTransactionType::SendBtc);
         assert_eq!(res, Ok(()));
 
         // two hours later
@@ -10224,6 +10545,99 @@ mod send_end_tests {
         let row = wallet.database.get_wallet_transaction_by_txid(&txid);
         let status = row.unwrap().unwrap().status;
         assert_eq!(status, TransferStatus::WaitingConfirmations);
+    }
+
+    #[test]
+    fn delete_transfers_is_atomic() {
+        let (mut wallet, _) = setup();
+        seed_batch(&wallet, "t", TransferStatus::Failed, false, None);
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "delete_transfers",
+            0,
+            async |w| w.delete_transfers(None, false),
+        ));
+    }
+
+    #[test]
+    fn abort_pending_vanilla_tx_is_atomic() {
+        let (_, txid) = dummy_psbt();
+        let (mut wallet, _) = setup();
+        seed_vanilla(
+            &wallet,
+            &txid,
+            WalletTransactionType::SendBtc,
+            TransferStatus::Initiated,
+            vec![],
+        );
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "abort_pending_vanilla_tx",
+            0,
+            async |w| w.abort_pending_vanilla_tx(txid.clone()),
+        ));
+    }
+
+    #[test]
+    fn vanilla_end_is_atomic_and_keeps_its_tx() {
+        async fn end(
+            w: &mut Wallet,
+            online: &Online,
+            psbt: &str,
+            r#type: WalletTransactionType,
+        ) -> Result<(), Error> {
+            let (online, psbt) = (online.clone(), psbt.to_string());
+            match r#type {
+                WalletTransactionType::CreateUtxos => {
+                    w.create_utxos_end(online, psbt, true).await.map(|_| ())
+                }
+                WalletTransactionType::SendBtc => {
+                    w.send_btc_end(online, psbt, true).await.map(|_| ())
+                }
+                WalletTransactionType::Drain => w.drain_to_end(online, psbt).await.map(|_| ()),
+            }
+        }
+        let (psbt, txid) = dummy_psbt();
+        let parsed = Psbt::from_str(&psbt).unwrap();
+        let input = parsed.unsigned_tx.input[0].previous_output;
+        for (r#type, op) in
+            VANILLA_TYPES
+                .into_iter()
+                .zip(["create_utxos_end", "send_btc_end", "drain_to_end"])
+        {
+            // a drain end always syncs, which the fake indexer cannot serve
+            let faults = if r#type == WalletTransactionType::Drain {
+                vec!["after_broadcast"]
+            } else {
+                vec!["after_broadcast", op]
+            };
+            for fault in faults {
+                let (mut wallet, online) =
+                    setup_at(&fake_esplora(esplora_route(Some(raw_tx(&psbt)))));
+                // the TX spends an output of the wallet, so BDK keeps it
+                let script_pubkey = wallet
+                    .bdk_wallet
+                    .reveal_next_address(KeychainKind::External)
+                    .script_pubkey();
+                let txout = TxOut {
+                    value: BdkAmount::from_sat(2000),
+                    script_pubkey,
+                };
+                wallet.bdk_wallet.insert_txout(input, txout);
+                seed_txo(&wallet, &input.txid.to_string(), input.vout);
+                wallet._record_vanilla_begin(&parsed, r#type).unwrap();
+                let res = block_on(assert_no_partial_change(&mut wallet, fault, 1, async |w| {
+                    end(w, &online, &psbt, r#type).await
+                }));
+                assert_eq!(res, vec![txid.clone()]);
+                if r#type != WalletTransactionType::Drain {
+                    assert_eq!(block_on(end(&mut wallet, &online, &psbt, r#type)), Ok(()));
+                    let row = wallet.database.get_wallet_transaction_by_txid(&txid);
+                    let status = row.unwrap().unwrap().status;
+                    assert_eq!(status, TransferStatus::WaitingConfirmations);
+                }
+            }
+        }
     }
 
     #[test]
@@ -10536,6 +10950,12 @@ mod send_end_tests {
         block_on(wallet.refresh(online.clone(), None, filter(false), true)).unwrap();
         assert_eq!(status(&wallet, idx), TransferStatus::WaitingBroadcast);
 
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "refresh",
+            0,
+            async |w| w.refresh(online.clone(), None, filter(true), true).await,
+        ));
         let res = block_on(wallet.refresh(online.clone(), None, filter(true), true)).unwrap();
         assert_eq!(
             res[&idx].updated_status,
@@ -10543,6 +10963,7 @@ mod send_end_tests {
         );
         assert_eq!(status(&wallet, idx), TransferStatus::WaitingConfirmations);
 
+        // a fail it cannot do keeps what its refresh changed
         let now = now().unix_timestamp();
         let idx2 = seed_batch(
             &wallet,
@@ -11762,14 +12183,33 @@ mod send_end_tests {
             .received_consignment_meta
             .remove("recipient")
             .unwrap();
-        wallet.received_consignment_meta.insert(rid, meta);
+        wallet.received_consignment_meta.insert(rid.clone(), meta);
+        wallet
+            .received_signed_txs
+            .insert(rid.clone(), raw_tx(&dummy_psbt().0));
         let txid = apply_tx_paying(&mut wallet, script);
         let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
         let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
+        let kept = |w: &Wallet| {
+            [
+                w.received_consignments.contains_key(&rid),
+                w.received_consignment_meta.contains_key(&rid),
+                w.received_signed_txs.contains_key(&rid),
+            ]
+        };
 
+        // a failed refresh restores the data it cleared
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "refresh",
+            0,
+            async |w| w.refresh(online.clone(), None, vec![], true).await,
+        ));
+        assert_eq!(kept(&wallet), [true; 3]);
         let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
 
         assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+        assert_eq!(kept(&wallet), [false; 3]);
         assert!(!pending_witness(&wallet, paid_txo));
         assert!(pending_witness(&wallet, unrelated_txo));
     }

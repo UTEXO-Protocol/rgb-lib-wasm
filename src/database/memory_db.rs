@@ -558,6 +558,73 @@ pub struct InMemoryDb {
 }
 
 impl InMemoryDb {
+    /// Replace every table with the one in `saved`.
+    pub(crate) fn restore(&self, saved: InMemoryDb) {
+        let InMemoryDb {
+            txos,
+            next_txo_idx,
+            media,
+            next_media_idx,
+            assets,
+            next_asset_idx,
+            batch_transfers,
+            next_batch_transfer_idx,
+            asset_transfers,
+            next_asset_transfer_idx,
+            colorings,
+            next_coloring_idx,
+            transfers,
+            next_transfer_idx,
+            transport_endpoints,
+            next_transport_endpoint_idx,
+            transfer_transport_endpoints,
+            next_transfer_transport_endpoint_idx,
+            wallet_transactions,
+            next_wallet_transaction_idx,
+            pending_witness_scripts,
+            next_pending_witness_script_idx,
+            backup_info,
+            next_backup_info_idx,
+        } = saved;
+        self.txos.replace(txos.into_inner());
+        self.next_txo_idx.replace(next_txo_idx.into_inner());
+        self.media.replace(media.into_inner());
+        self.next_media_idx.replace(next_media_idx.into_inner());
+        self.assets.replace(assets.into_inner());
+        self.next_asset_idx.replace(next_asset_idx.into_inner());
+        self.batch_transfers.replace(batch_transfers.into_inner());
+        self.next_batch_transfer_idx
+            .replace(next_batch_transfer_idx.into_inner());
+        self.asset_transfers.replace(asset_transfers.into_inner());
+        self.next_asset_transfer_idx
+            .replace(next_asset_transfer_idx.into_inner());
+        self.colorings.replace(colorings.into_inner());
+        self.next_coloring_idx
+            .replace(next_coloring_idx.into_inner());
+        self.transfers.replace(transfers.into_inner());
+        self.next_transfer_idx
+            .replace(next_transfer_idx.into_inner());
+        self.transport_endpoints
+            .replace(transport_endpoints.into_inner());
+        self.next_transport_endpoint_idx
+            .replace(next_transport_endpoint_idx.into_inner());
+        self.transfer_transport_endpoints
+            .replace(transfer_transport_endpoints.into_inner());
+        self.next_transfer_transport_endpoint_idx
+            .replace(next_transfer_transport_endpoint_idx.into_inner());
+        self.wallet_transactions
+            .replace(wallet_transactions.into_inner());
+        self.next_wallet_transaction_idx
+            .replace(next_wallet_transaction_idx.into_inner());
+        self.pending_witness_scripts
+            .replace(pending_witness_scripts.into_inner());
+        self.next_pending_witness_script_idx
+            .replace(next_pending_witness_script_idx.into_inner());
+        self.backup_info.replace(backup_info.into_inner());
+        self.next_backup_info_idx
+            .replace(next_backup_info_idx.into_inner());
+    }
+
     pub fn new() -> Self {
         Self {
             txos: RefCell::new(Vec::new()),
