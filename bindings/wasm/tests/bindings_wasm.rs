@@ -187,6 +187,14 @@ fn get_received_mint_is_null_when_unknown() {
 }
 
 #[wasm_bindgen_test]
+fn get_burn_consignment_fails_for_unknown_asset() {
+    let e = err(wallet()
+        .get_burn_consignment("rgb:unknown", &"00".repeat(32))
+        .unwrap_err());
+    assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+}
+
+#[wasm_bindgen_test]
 fn get_wallet_data_hides_mnemonic() {
     let mut wd: WalletData = serde_json::from_str(&wallet_json(vec![AssetSchema::Nia])).unwrap();
     wd.vanilla_keychain = Some(1);
