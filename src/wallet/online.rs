@@ -5291,6 +5291,8 @@ impl Wallet {
                                 .await;
                         }
                         self.received_mints.insert(recipient_id, mint.clone());
+                        // a backup made before the check does not have it: mark one as required
+                        self.update_backup_info(false)?;
                     }
                     info!(
                         self.logger,
@@ -5834,6 +5836,8 @@ impl Wallet {
         else {
             let txid = txid.clone();
             self._fail_batch_transfer(batch_transfer)?;
+            // the call keeps this fail: mark a backup as required
+            self.update_backup_info(false)?;
             return Err(Error::MissingTransferArtifacts { txid });
         };
         let signed_psbt = Psbt::from_str(signed_psbt)?;
@@ -6551,6 +6555,9 @@ impl Wallet {
             }
         }
 
+        if refresh_result.transfers_changed() {
+            self.update_backup_info(false)?;
+        }
         info!(self.logger, "Refresh completed");
         Ok(refresh_result)
     }
@@ -6828,6 +6835,7 @@ impl Wallet {
                     && !no_asset_only
                     && self._fail_expired_mint(batch_transfer).await?
                 {
+                    self.update_backup_info(false)?;
                     info!(self.logger, "Fail transfers completed");
                     return Ok(true);
                 }
@@ -6858,6 +6866,8 @@ impl Wallet {
                     .await?,
                 TryFailBatchTransferOutcome::Failed
             ) {
+                // rgb-lib marks a backup as required also when it cannot fail this transfer
+                self.update_backup_info(false)?;
                 return Err(Error::CannotFailBatchTransfer);
             }
         } else {
@@ -6922,6 +6932,9 @@ impl Wallet {
             }
         }
 
+        if transfers_changed {
+            self.update_backup_info(false)?;
+        }
         info!(self.logger, "Fail transfers completed");
         Ok(transfers_changed)
     }
@@ -10949,6 +10962,14 @@ mod send_end_tests {
         assert_eq!(wallet.is_batch_transfer_sent("t"), Ok(true));
     }
 
+    fn last_operation(wallet: &Wallet) -> Option<i128> {
+        wallet
+            .database
+            .get_backup_info()
+            .unwrap()
+            .map(|b| b.last_operation_timestamp.parse().unwrap())
+    }
+
     #[test]
     fn refresh_moves_waiting_broadcast_to_waiting_confirmations() {
         let (psbt, txid) = dummy_psbt();
@@ -10969,6 +10990,7 @@ mod send_end_tests {
         };
         block_on(wallet.refresh(online.clone(), None, filter(false), true)).unwrap();
         assert_eq!(status(&wallet, idx), TransferStatus::WaitingBroadcast);
+        assert_eq!(last_operation(&wallet), None);
 
         block_on(assert_no_partial_change(
             &mut wallet,
@@ -10982,6 +11004,7 @@ mod send_end_tests {
             Some(TransferStatus::WaitingConfirmations)
         );
         assert_eq!(status(&wallet, idx), TransferStatus::WaitingConfirmations);
+        assert!(last_operation(&wallet).is_some());
 
         // a fail it cannot do keeps what its refresh changed
         let now = now().unix_timestamp();
@@ -11093,17 +11116,20 @@ mod send_end_tests {
         let res = block_on(wallet.fail_transfers(online.clone(), None, false, true));
         assert_eq!(res, Ok(false));
         assert_eq!(status(&wallet, live), TransferStatus::WaitingBroadcast);
+        assert_eq!(last_operation(&wallet), None);
 
         let expired = seed(&wallet, now - 1);
         let res = block_on(wallet.fail_transfers(online.clone(), Some(expired), false, true));
         assert_eq!(res, Ok(true));
         assert_eq!(status(&wallet, expired), TransferStatus::Failed);
+        let failed = last_operation(&wallet).unwrap();
 
         let expired = seed(&wallet, now - 1);
         let res = block_on(wallet.fail_transfers(online, None, false, true));
         assert_eq!(res, Ok(true));
         assert_eq!(status(&wallet, expired), TransferStatus::Failed);
         assert_eq!(status(&wallet, live), TransferStatus::WaitingBroadcast);
+        assert!(last_operation(&wallet).unwrap() > failed);
     }
 
     #[test]
@@ -11750,8 +11776,10 @@ mod send_end_tests {
         let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
         assert!(matches!(res[&idx].failure, Some(Error::OperationNotFound)));
         assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+        assert_eq!(last_operation(&wallet), None);
         let res = block_on(wallet.fail_transfers(online.clone(), Some(idx), false, true));
         assert_eq!(res, Err(Error::CannotFailBatchTransfer));
+        assert!(last_operation(&wallet).is_some());
 
         // expired, but the broadcast deadline is not past
         set(&wallet, now - 400, Some(now + 1000));
@@ -12227,6 +12255,7 @@ mod send_end_tests {
 
         assert!(matches!(res, Err(Error::MissingTransferArtifacts { .. })));
         assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+        assert!(last_operation(&wallet).is_some());
 
         // a refresh keeps this fail too
         let idx = seed_outgoing(
