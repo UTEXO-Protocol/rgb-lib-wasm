@@ -55,6 +55,26 @@ impl AssetSchema {
         Self::from_schema_id_str(schema_id.to_string())
     }
 
+    pub(crate) fn schema(&self) -> Schema {
+        match self {
+            Self::Nia => NonInflatableAsset::schema(),
+            Self::Ifa => InflatableFungibleAsset::schema(),
+            Self::Bfa => BridgedFungibleAsset::schema(),
+        }
+    }
+
+    /// Whether the schema has state the given concrete `assignment` can refer to.
+    pub(crate) fn supports_assignment(&self, assignment: &Assignment) -> bool {
+        match assignment {
+            Assignment::Fungible(_) => true,
+            Assignment::NonFungible => false,
+            Assignment::InflationRight(_) => matches!(self, Self::Ifa),
+            Assignment::LinkRight => matches!(self, Self::Ifa | Self::Bfa),
+            Assignment::MintRight => matches!(self, Self::Bfa),
+            Assignment::Any => false,
+        }
+    }
+
     pub(crate) fn get_from_contract_id(
         contract_id: ContractId,
         runtime: &RgbRuntime,
@@ -324,7 +344,6 @@ impl Assignment {
 
     /// Get the assignment at the given index of the given typed assignments, returning `None` for
     /// assignment types unknown to the supported schemas.
-    #[cfg(feature = "esplora")]
     pub(crate) fn from_typed_assigns<Seal: ExposedSeal>(
         ty: AssignmentType,
         typed_assigns: &TypedAssigns<Seal>,
@@ -349,6 +368,33 @@ impl Assignment {
                 OS_MINT => assigns.get(no).map(|_| Self::MintRight),
                 _ => None,
             },
+        }
+    }
+}
+
+/// Type of RGB assignment
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TypeOfAssignment {
+    /// The asset itself, fungible or not
+    Asset,
+    /// An inflation right, allowing to issue new tokens
+    InflationRight,
+    /// A link right, allowing to link the asset to a contract on another chain
+    LinkRight,
+    /// A mint right, allowing to mint tokens backed by the ones locked on the external chain
+    MintRight,
+}
+
+impl TypeOfAssignment {
+    /// Get the type of the given RGB assignment type, returning `None` for the ones unknown to the
+    /// supported schemas.
+    pub(crate) fn from_assignment_type(ty: AssignmentType) -> Option<Self> {
+        match ty {
+            OS_ASSET => Some(Self::Asset),
+            OS_INFLATION => Some(Self::InflationRight),
+            OS_LINK => Some(Self::LinkRight),
+            OS_MINT => Some(Self::MintRight),
+            _ => None,
         }
     }
 }
@@ -386,6 +432,24 @@ impl TypeOfTransition {
             Self::TransferLink => "transferLink",
             Self::Propagate => "propagate",
         }
+    }
+}
+
+impl TryFrom<TransitionType> for TypeOfTransition {
+    type Error = ();
+
+    fn try_from(transition_type: TransitionType) -> Result<Self, Self::Error> {
+        Ok(match transition_type {
+            TS_TRANSFER => Self::Transfer,
+            TS_INFLATION => Self::Inflate,
+            TS_BURN => Self::Burn,
+            TS_LINK => Self::Link,
+            TS_MINT => Self::Mint,
+            TS_TRANSFER_INFLATION => Self::TransferInflation,
+            TS_TRANSFER_LINK => Self::TransferLink,
+            TS_PROPAGATE => Self::Propagate,
+            _ => return Err(()),
+        })
     }
 }
 

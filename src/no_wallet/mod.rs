@@ -2,6 +2,15 @@
 
 use super::*;
 
+pub(crate) mod inspection;
+
+pub use inspection::{
+    BundleFilter, ConsignmentInspection, Opout, RgbBridgeLocationInfo, RgbEvmContractInfo,
+    RgbGenesisInfo, RgbInputInfo, RgbInspection, RgbMediaInfo, RgbOperationInfo, RgbOutputInfo,
+    RgbRejectListInfo, RgbTransitionInfo, TransitionGlobal, TransitionMetadata,
+    inspect_consignment,
+};
+
 /// Bitcoin transaction outpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]

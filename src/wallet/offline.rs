@@ -53,14 +53,14 @@ const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
 pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
 pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
+pub(crate) const RGB_GLOBAL_BURNED_INFLATION: &str = "burnedInflation";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
 pub(crate) const RGB_GLOBAL_LINKED_FROM_CONTRACT: &str = "linkedFromContract";
-#[cfg(feature = "esplora")]
 pub(crate) const RGB_GLOBAL_LINKED_TO_CONTRACT: &str = "linkedToContract";
 pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
-#[cfg(feature = "esplora")]
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
+pub(crate) const RGB_METADATA_BEFORE_BLOCK: &str = "beforeBlock";
 
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";

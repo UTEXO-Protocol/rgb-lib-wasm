@@ -1334,6 +1334,22 @@ pub fn validate_consignment_offchain(
     to_js(&result)
 }
 
+/// Inspect an RGB consignment (raw bytes) without a wallet.
+///
+/// The bundle filter is `"All"`, `"Terminals"` or `{ Witness: "<txid>" }`.
+#[wasm_bindgen(js_name = "inspectConsignment")]
+pub fn inspect_consignment(
+    consignment_bytes: &[u8],
+    bundle_filter: JsValue,
+) -> Result<JsValue, JsValue> {
+    let bundle_filter: rgb_lib_wasm::no_wallet::BundleFilter =
+        serde_wasm_bindgen::from_value(bundle_filter)
+            .map_err(|e| JsValue::from_str(&format!("Invalid bundle filter: {e}")))?;
+    let inspection = rgb_lib_wasm::no_wallet::inspect_consignment(consignment_bytes, bundle_filter)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&inspection)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
