@@ -2821,6 +2821,28 @@ impl Wallet {
         Ok(self.received_mints.get(&recipient_id).cloned())
     }
 
+    /// Return the consignment of the burn of `asset_id` with TXID `txid`. It proves the burn with
+    /// the signed transaction and the full history. The wallet keeps it once the burn is ended.
+    ///
+    /// Fails with [`Error::UnknownTransfer`] if the wallet has no ended burn of the asset with
+    /// that TXID.
+    pub fn get_burn_consignment(&self, asset_id: String, txid: String) -> Result<Vec<u8>, Error> {
+        info!(self.logger, "Getting burn consignment...");
+        let transfers =
+            self.list_transfers(AssetFilter::Id(asset_id.clone()), Some(txid.clone()))?;
+        if !transfers.iter().any(|t| t.kind == TransferKind::Burn) {
+            return Err(Error::UnknownTransfer { txid });
+        }
+        let bytes = self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.consignment_bytes.get(&asset_id))
+            .cloned()
+            .ok_or(Error::UnknownTransfer { txid })?;
+        info!(self.logger, "Get burn consignment completed");
+        Ok(bytes)
+    }
+
     /// Return the [`Metadata`] of the RGB asset with the given ID.
     pub fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, Error> {
         info!(self.logger, "Getting metadata for asset '{}'...", asset_id);

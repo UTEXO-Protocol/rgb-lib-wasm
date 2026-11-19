@@ -3690,7 +3690,8 @@ impl Wallet {
             if keeps_fascia {
                 artifacts.fascia = Some(fascia_bytes.clone());
             }
-            if let Some(consignment) = consignment {
+            // an operation without recipient builds its consignment at the end
+            if let Some(consignment) = consignment.filter(|_| !op_without_recipient) {
                 // Store consignment bytes in memory instead of filesystem
                 let mut consignment_bytes = Vec::new();
                 consignment.save(&mut consignment_bytes)?;
@@ -8200,6 +8201,7 @@ impl Wallet {
     /// have already been signed.
     ///
     /// The wallet keeps a consignment that proves the burn, with its full history.
+    /// [`get_burn_consignment`](Wallet::get_burn_consignment) returns it.
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn burn_end(

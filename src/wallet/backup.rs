@@ -502,6 +502,121 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    // Rows and artifacts of one settled outgoing transfer without a recipient.
+    fn seed_ended_without_recipient(
+        wallet: &mut crate::wallet::Wallet,
+        txid: &str,
+        asset_id: &str,
+        transition: crate::database::enums::TypeOfTransition,
+        bytes: Vec<u8>,
+    ) {
+        use crate::database::enums::{AssetSchema, TransferStatus};
+        use crate::database::memory_db::{
+            ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
+            DbTransferActMod,
+        };
+        use crate::wallet::online::TransferArtifacts;
+
+        let batch_idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::Settled),
+                expiration: ActiveValue::Set(Some(i64::MAX)),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(asset_id.to_string()),
+                schema: ActiveValue::Set(AssetSchema::Ifa),
+                added_at: ActiveValue::Set(1000),
+                name: ActiveValue::Set(s!("Test Asset")),
+                precision: ActiveValue::Set(8),
+                initial_supply: ActiveValue::Set(s!("1000")),
+                timestamp: ActiveValue::Set(1000),
+                ..Default::default()
+            })
+            .unwrap();
+        let asset_transfer_idx = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                asset_id: ActiveValue::Set(Some(asset_id.to_string())),
+                transition_type: ActiveValue::Set(Some(transition)),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                incoming: ActiveValue::Set(false),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet.transfer_artifacts.insert(
+            txid.to_string(),
+            TransferArtifacts {
+                signed_psbt: Some(s!("psbt")),
+                consignment_bytes: crate::HashMap::from([(asset_id.to_string(), bytes)]),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Only a burn returns its consignment.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_burn_consignment_returns_only_burns() {
+        use crate::database::enums::TypeOfTransition;
+        use crate::keys::generate_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+
+        let burn = "4".repeat(64);
+        let link = "6".repeat(64);
+        let mut wallet =
+            make_test_wallet_with_keys(generate_keys(crate::BitcoinNetwork::Regtest), false);
+        seed_ended_without_recipient(
+            &mut wallet,
+            &burn,
+            "rgb:burn",
+            TypeOfTransition::Burn,
+            vec![1, 2, 3],
+        );
+        seed_ended_without_recipient(
+            &mut wallet,
+            &link,
+            "rgb:link",
+            TypeOfTransition::Link,
+            vec![7],
+        );
+
+        let get = |asset_id: &str, txid: &str| {
+            wallet.get_burn_consignment(asset_id.to_string(), txid.to_string())
+        };
+        let unknown = |txid: &str| {
+            Err(Error::UnknownTransfer {
+                txid: txid.to_string(),
+            })
+        };
+        assert_eq!(get("rgb:burn", &burn), Ok(vec![1, 2, 3]));
+        assert_eq!(get("rgb:link", &link), unknown(&link));
+        assert_eq!(get("rgb:link", &burn), unknown(&burn));
+        let missing = "f".repeat(64);
+        assert_eq!(get("rgb:burn", &missing), unknown(&missing));
+        assert_eq!(
+            get("rgb:unknown", &burn),
+            Err(Error::AssetNotFound {
+                asset_id: s!("rgb:unknown")
+            })
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
