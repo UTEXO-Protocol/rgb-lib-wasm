@@ -62,7 +62,7 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 ```javascript
 import init, {
   generateKeys, restoreKeys, checkProxyUrl, maxExpirationSecs,
-  validateConsignmentOffchain,
+  validateConsignmentOffchain, inspectConsignment,
   WasmWallet, WasmInvoice,
 } from './pkg/rgb_lib_wasm.js';
 
@@ -332,6 +332,10 @@ const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
 // result: { valid: true, warnings: [...] }
 // result: { valid: false, error: "invalid", details: "..." }
 
+// Inspect an RGB consignment without a wallet
+// the filter is 'All', 'Terminals' or { Witness: txid }
+const inspection = inspectConsignment(consignmentBytes, 'Terminals');
+
 // PSBT signing and finalization (standalone)
 const signed = wallet.signPsbt(unsignedPsbtBase64);
 const finalized = wallet.finalizePsbt(signedPsbtBase64);
@@ -358,6 +362,7 @@ To protect a wallet:
 | `restoreKeys(network, mnemonic)` | Restore xpubs from a mnemonic |
 | `checkProxyUrl(url)` | Validate an RGB proxy server URL |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
+| `inspectConsignment(bytes, bundleFilter)` | Inspect an RGB consignment without a wallet |
 
 ### `WasmInvoice`
 
@@ -441,7 +446,7 @@ To protect a wallet:
 ## Running tests
 
 ```bash
-# Native unit tests (94 tests)
+# Native unit tests (281 tests)
 cargo test --lib
 
 # WASM unit tests (headless Firefox)
