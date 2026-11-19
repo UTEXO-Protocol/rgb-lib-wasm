@@ -253,7 +253,13 @@ impl EvmClient {
     async fn post(&self, body: &impl Serialize) -> Result<reqwest::Response, Error> {
         let mut retries = 0;
         loop {
-            let res = self.client.post(&self.rpc_url).json(body).send().await;
+            let res = self
+                .client
+                .post(&self.rpc_url)
+                .timeout(CLIENT_TIMEOUT)
+                .json(body)
+                .send()
+                .await;
             let temporary = match &res {
                 Ok(resp) => matches!(
                     resp.status(),
@@ -268,26 +274,7 @@ impl EvmClient {
             }
             retries += 1;
             let pause = RPC_RETRY_PAUSE * retries;
-            #[cfg(target_arch = "wasm32")]
-            {
-                // setTimeout of the global scope, so that it also works in a worker
-                let promise = js_sys::Promise::new(&mut |resolve, _| {
-                    let set_timeout: js_sys::Function =
-                        js_sys::Reflect::get(&js_sys::global(), &"setTimeout".into())
-                            .expect("setTimeout")
-                            .into();
-                    set_timeout
-                        .call2(
-                            &wasm_bindgen::JsValue::NULL,
-                            &resolve,
-                            &(pause.as_millis() as f64).into(),
-                        )
-                        .expect("setTimeout call");
-                });
-                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            std::thread::sleep(pause);
+            <crate::utils::WasmSleeper as esplora_client::Sleeper>::sleep(pause).await;
         }
     }
 
@@ -1053,24 +1040,20 @@ pub(crate) mod tests {
         let slow = server
             .mock("POST", "/")
             .with_body_from_request(|_| {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(CLIENT_TIMEOUT + Duration::from_secs(1));
                 br#"{"jsonrpc":"2.0","id":1,"result":"0x7a69"}"#.to_vec()
             })
             .expect(1)
             .create();
-        let client = EvmClient {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(100))
-                .build()
-                .unwrap(),
-            rpc_url: server.url(),
-        };
         let start = std::time::Instant::now();
-        assert!(matches!(
-            block_on(client.chain_id()),
-            Err(Error::Network { .. })
-        ));
-        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        let result = block_on(EvmClient::new(&server.url()).chain_id());
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(Error::Network { .. })), "{result:?}");
+        assert!(elapsed >= CLIENT_TIMEOUT, "{elapsed:?}");
+        assert!(
+            elapsed < CLIENT_TIMEOUT + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
         slow.assert();
 
         // a request that cannot be sent is sent again, then reported

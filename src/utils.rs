@@ -33,9 +33,35 @@ pub(crate) struct WasmSleeper;
 
 #[cfg(feature = "esplora")]
 impl esplora_client::Sleeper for WasmSleeper {
+    // A Send future: bdk_esplora needs it.
+    #[cfg(target_arch = "wasm32")]
+    type Sleep = tokio::sync::futures::OwnedNotified;
+    #[cfg(not(target_arch = "wasm32"))]
     type Sleep = core::future::Ready<()>;
 
-    fn sleep(_duration: std::time::Duration) -> Self::Sleep {
+    #[cfg(target_arch = "wasm32")]
+    fn sleep(duration: std::time::Duration) -> Self::Sleep {
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fired = notify.clone();
+        let callback = wasm_bindgen::closure::Closure::once_into_js(move || fired.notify_one());
+        // setTimeout of the global scope, so that it also works in a worker
+        let set_timeout: js_sys::Function =
+            js_sys::Reflect::get(&js_sys::global(), &"setTimeout".into())
+                .expect("setTimeout")
+                .into();
+        set_timeout
+            .call2(
+                &wasm_bindgen::JsValue::NULL,
+                &callback,
+                &(duration.as_millis() as f64).into(),
+            )
+            .expect("setTimeout call");
+        notify.notified_owned()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sleep(duration: std::time::Duration) -> Self::Sleep {
+        std::thread::sleep(duration);
         core::future::ready(())
     }
 }
@@ -476,7 +502,9 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
     use crate::wallet::online::Indexer;
     #[cfg(target_arch = "wasm32")]
     no_store_fetch(indexer_url, u32::from(INDEXER_TIMEOUT) * 1000);
-    let opts = esplora_client::Builder::new(indexer_url).timeout(INDEXER_TIMEOUT.into());
+    let opts = esplora_client::Builder::new(indexer_url)
+        .timeout(INDEXER_TIMEOUT.into())
+        .max_retries(INDEXER_RETRIES.into());
     let client = opts.build_async_with_sleeper::<WasmSleeper>().ok()?;
     Some(Indexer::EsploraAsync(Box::new(client)))
 }

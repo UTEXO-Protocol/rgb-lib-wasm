@@ -11058,6 +11058,25 @@ mod send_end_tests {
     }
 
     #[test]
+    fn indexer_retries_after_pauses() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let url = fake_esplora(move |_: &str| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ("503 Service Unavailable", vec![])
+        });
+        let start = std::time::Instant::now();
+        let result = block_on(crate::utils::build_indexer(&url).unwrap().block_hash(0));
+        assert!(result.is_err());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            crate::utils::INDEXER_RETRIES as usize + 1
+        );
+        // esplora-client pauses 256 ms, then doubles the pause.
+        assert!(start.elapsed() >= Duration::from_millis(256 + 512 + 1024));
+    }
+
+    #[test]
     fn up_to_allocatable_above_u8_max() {
         let (mut wallet, online) = setup();
         for vout in 0..256 {
