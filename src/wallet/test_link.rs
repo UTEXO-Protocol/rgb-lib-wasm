@@ -5,6 +5,7 @@ use super::test_bfa::*;
 use super::test_burn::*;
 use crate::database::enums::RecipientTypeFull;
 use crate::wallet::offline::MOCK_IFA_LINK_RIGHT;
+use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{AssetFilter, Invoice, Online, Recipient, Wallet};
 use crate::{
     AssetSchema, Assignment, Error, FileContent, OS_LINK, RgbTransfer, TS_LINK, TransferKind,
@@ -658,4 +659,56 @@ async fn link_right_moves_with_spent_utxo() {
     assert!(unspent.rgb_allocations.iter().any(|a| {
         a.asset_id.as_deref() == Some(asset_id.as_str()) && a.assignment == Assignment::LinkRight
     }));
+}
+
+#[wasm_bindgen_test]
+async fn link_is_atomic() {
+    let (mut wallet, online) = funded_wallet(nia_ifa(), 8).await;
+    let asset_id = issue_ifa_link(&wallet, None);
+    let replacement = issue_ifa_link(&wallet, Some(asset_id.clone()));
+    let other = issue_ifa_link(&wallet, None);
+    let other_replacement = issue_ifa_link(&wallet, Some(other.clone()));
+
+    assert_no_partial_change(&mut wallet, "link_begin", 0, async |w| {
+        w.link_begin(
+            online.clone(),
+            asset_id.clone(),
+            replacement.clone(),
+            1,
+            1,
+            false,
+        )
+        .await
+    })
+    .await;
+    let begin = wallet
+        .link_begin(
+            online.clone(),
+            asset_id.clone(),
+            replacement.clone(),
+            1,
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+    assert_no_partial_change(&mut wallet, "link_end", 1, async |w| {
+        w.link_end(online.clone(), signed.clone()).await
+    })
+    .await;
+    wallet.link_end(online.clone(), signed).await.unwrap();
+    mine_and_refresh(&mut wallet, &online).await;
+
+    assert_no_partial_change(&mut wallet, "link", 1, async |w| {
+        w.link(
+            online.clone(),
+            other.clone(),
+            other_replacement.clone(),
+            1,
+            1,
+        )
+        .await
+    })
+    .await;
 }

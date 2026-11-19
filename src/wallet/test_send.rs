@@ -5,7 +5,8 @@ use super::online::{
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
-use crate::wallet::{AssetFilter, Balance, Online, RgbAllocation, Transfer, Wallet};
+use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::{AssetFilter, Balance, Online, Recipient, RgbAllocation, Transfer, Wallet};
 use crate::{AssetSchema, Assignment, Error, RgbTransfer, TransferKind, TransferStatus};
 use amplify::confinement::Confined;
 use bdk_wallet::bitcoin::psbt::Psbt;
@@ -554,4 +555,84 @@ async fn spv_proofs() {
         resolver.resolve_witness(witness_1),
         Ok(WitnessStatus::Resolved(_, WitnessOrd::Mined(_)))
     ));
+}
+
+#[wasm_bindgen_test]
+async fn send_and_refresh_are_atomic() {
+    let (mut a, a_on) = nia_wallet(3).await;
+    let (mut b, b_on) = nia_wallet(1).await;
+    assert_no_partial_change(&mut b, "go_online", 0, async |w| {
+        w.go_online(go_online_options(false)).await
+    })
+    .await;
+    assert_no_partial_change(&mut a, "issue_asset_nia", 0, async |w| {
+        w.issue_asset_nia(s("NIA"), s("Fixed"), 0, vec![1000, 1000])
+    })
+    .await;
+    let asset_id = a
+        .issue_asset_nia(s("NIA"), s("Fixed"), 0, vec![1000, 1000])
+        .unwrap()
+        .asset_id;
+    let endpoints = vec![transport_endpoint(PROXY_URL)];
+    assert_no_partial_change(&mut b, "blind_receive", 0, async |w| {
+        let exp = default_rcv_expiration();
+        blind_rcv(w, &b_on, None, Assignment::Any, exp, endpoints.clone()).await
+    })
+    .await;
+    assert_no_partial_change(&mut b, "witness_receive", 0, async |w| {
+        let exp = default_rcv_expiration();
+        witness_rcv(w, &b_on, None, Assignment::Any, exp, endpoints.clone()).await
+    })
+    .await;
+    let exp = default_rcv_expiration();
+    let blind = blind_rcv(&mut b, &b_on, None, Assignment::Any, exp, endpoints.clone())
+        .await
+        .unwrap()
+        .recipient_id;
+    let witness = witness_rcv(&mut b, &b_on, None, Assignment::Any, exp, endpoints)
+        .await
+        .unwrap()
+        .recipient_id;
+
+    let send_begin = async |w: &mut Wallet, recipient: Recipient| {
+        w.send_begin(
+            a_on.clone(),
+            HashMap::from([(asset_id.clone(), vec![recipient])]),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await
+    };
+    assert_no_partial_change(&mut a, "send_begin", 0, async |w| {
+        send_begin(w, recipient(&blind, 100, None, PROXY_URL)).await
+    })
+    .await;
+    let (signed, txid) = begin(&mut a, &a_on, &asset_id, &blind, 100, PROXY_URL, false).await;
+    end(&mut a, &a_on, signed).await;
+    b.refresh(b_on.clone(), None, vec![], false).await.unwrap();
+    let txids = assert_no_partial_change(&mut a, "refresh", 1, async |w| {
+        w.refresh(a_on.clone(), None, vec![], true).await
+    })
+    .await;
+    assert_eq!(txids, vec![txid]);
+    a.refresh(a_on.clone(), None, vec![], true).await.unwrap();
+    assert_eq!(
+        transfer_of(&a, &blind).status,
+        TransferStatus::WaitingConfirmations
+    );
+
+    let unsigned = send_begin(&mut a, recipient(&witness, 100, Some(1000), PROXY_URL))
+        .await
+        .unwrap()
+        .psbt;
+    let signed = a.sign_psbt(unsigned, None).unwrap();
+    assert_no_partial_change(&mut a, "send_end", 0, async |w| {
+        w.send_end(a_on.clone(), signed.clone(), false).await
+    })
+    .await;
 }

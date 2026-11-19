@@ -3,6 +3,7 @@ use wasm_bindgen_test::*;
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, wallet_data};
 use crate::database::DbWalletTransaction;
+use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{Online, Outpoint, PendingVanillaTx, TransactionType, Wallet};
 use crate::{AssetSchema, Error, TransferStatus, WalletTransactionType};
 use bdk_wallet::bitcoin::OutPoint;
@@ -361,4 +362,80 @@ async fn refresh_settles_ended() {
     );
     mine_and_refresh(&mut w, &online).await;
     assert_eq!(row(&w, &drain_txid).status, TransferStatus::Settled);
+}
+
+/// Create colored UTXOs that the DB does not know yet. Return the TXID that creates them.
+async fn unsynced_utxos(w: &mut Wallet, online: &Online) -> String {
+    let psbt = create_begin(w, online).await.unwrap();
+    let signed = w.sign_psbt(psbt.clone(), None).unwrap();
+    w.create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    txid_of(&psbt)
+}
+
+fn has_txo(w: &Wallet, txid: &str) -> bool {
+    w.database
+        .iter_txos()
+        .unwrap()
+        .iter()
+        .any(|t| t.txid == txid)
+}
+
+#[wasm_bindgen_test]
+async fn vanilla_operations_are_atomic() {
+    let (mut w, online) = vanilla_wallet(3).await;
+    // a failed sync drops the UTXOs it found, and a new sync finds them
+    let txid = unsynced_utxos(&mut w, &online).await;
+    assert_no_partial_change(&mut w, "sync", 0, async |w| w.sync(online.clone()).await).await;
+    assert!(!has_txo(&w, &txid));
+    w.sync(online.clone()).await.unwrap();
+    assert!(has_txo(&w, &txid));
+    let txid = unsynced_utxos(&mut w, &online).await;
+    assert_no_partial_change(&mut w, "full_scan", 0, async |w| {
+        w.full_scan(online.clone()).await
+    })
+    .await;
+    assert!(!has_txo(&w, &txid));
+    w.full_scan(online.clone()).await.unwrap();
+    assert!(has_txo(&w, &txid));
+    let txid = unsynced_utxos(&mut w, &online).await;
+    assert_no_partial_change(&mut w, "list_unspents_vanilla", 0, async |w| {
+        w.list_unspents_vanilla(online.clone(), 0, false).await
+    })
+    .await;
+    assert!(!has_txo(&w, &txid));
+    w.list_unspents_vanilla(online.clone(), 0, false)
+        .await
+        .unwrap();
+    assert!(has_txo(&w, &txid));
+
+    assert_no_partial_change(&mut w, "create_utxos_begin", 0, async |w| {
+        create_begin(w, &online).await
+    })
+    .await;
+    assert_no_partial_change(&mut w, "send_btc_begin", 0, async |w| {
+        send_begin(w, &online).await
+    })
+    .await;
+    assert_no_partial_change(&mut w, "drain_to_begin", 0, async |w| {
+        drain_begin(w, &online).await
+    })
+    .await;
+
+    // an end that fails after its broadcast keeps the TX and can run again
+    let psbt = drain_begin(&mut w, &online).await.unwrap();
+    let signed = w.sign_psbt(psbt.clone(), None).unwrap();
+    let txids = assert_no_partial_change(&mut w, "drain_to_end", 1, async |w| {
+        w.drain_to_end(online.clone(), signed.clone()).await
+    })
+    .await;
+    assert_eq!(txids, vec![txid_of(&psbt)]);
+    w.drain_to_end(online.clone(), signed).await.unwrap();
+    assert_eq!(
+        row(&w, &txid_of(&psbt)).status,
+        TransferStatus::WaitingConfirmations
+    );
 }

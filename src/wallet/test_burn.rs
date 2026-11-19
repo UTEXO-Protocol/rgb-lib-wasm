@@ -3,6 +3,7 @@ use wasm_bindgen_test::*;
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
 use super::test_send::{consignment as saved_consignment, proven, witness_ord, witness_ords};
+use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbOutExt, RgbTransfer,
@@ -717,4 +718,62 @@ async fn ifa_inflate_reject_list() {
         "{result:?}"
     );
     assert_eq!(witness_ords(&b), ords);
+}
+
+#[wasm_bindgen_test]
+async fn inflate_and_burn_are_atomic() {
+    let (mut wallet, online, asset_id, _) = ifa(6, None).await;
+    assert_no_partial_change(&mut wallet, "issue_asset_ifa", 0, async |w| {
+        w.issue_asset_ifa(
+            s("IFA"),
+            s("Inflatable"),
+            0,
+            vec![600, 400],
+            vec![100],
+            None,
+            false,
+            None,
+        )
+    })
+    .await;
+
+    assert_no_partial_change(&mut wallet, "inflate_begin", 0, async |w| {
+        w.inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1)
+            .await
+    })
+    .await;
+    let unsigned = wallet
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    assert_no_partial_change(&mut wallet, "inflate_end", 1, async |w| {
+        w.inflate_end(online.clone(), signed.clone()).await
+    })
+    .await;
+    wallet.inflate_end(online.clone(), signed).await.unwrap();
+    mine_and_refresh(&mut wallet, &online).await;
+
+    assert_no_partial_change(&mut wallet, "burn_begin", 0, async |w| {
+        w.burn_begin(online.clone(), asset_id.clone(), 10, None, 1, 1, false)
+            .await
+    })
+    .await;
+    let begin = wallet
+        .burn_begin(online.clone(), asset_id.clone(), 10, None, 1, 1, false)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+    assert_no_partial_change(&mut wallet, "burn_end", 1, async |w| {
+        w.burn_end(online.clone(), signed.clone()).await
+    })
+    .await;
+    wallet.burn_end(online.clone(), signed).await.unwrap();
+    mine_and_refresh(&mut wallet, &online).await;
+
+    assert_no_partial_change(&mut wallet, "burn", 1, async |w| {
+        w.burn(online.clone(), asset_id.clone(), 10, None, 1, 1)
+            .await
+    })
+    .await;
 }
