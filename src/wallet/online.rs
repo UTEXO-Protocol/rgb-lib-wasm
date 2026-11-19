@@ -6221,6 +6221,148 @@ impl Wallet {
         }
     }
 
+    /// Import the asset of a transfer consignment, so the wallet can make invoices for it.
+    ///
+    /// `txid` is the ID of the witness TX of the consignment, which can be not broadcast yet. The
+    /// checks are the ones applied to a received consignment. The asset gets zero balance. Its
+    /// media file is not downloaded. When the asset is already known, nothing changes.
+    pub async fn save_new_asset(
+        &self,
+        online: Online,
+        consignment_bytes: &[u8],
+        txid: &str,
+    ) -> Result<(), Error> {
+        info!(self.logger, "Saving new asset...");
+        self.check_online(online)?;
+        let witness_id = RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+        let consignment =
+            RgbTransfer::load(consignment_bytes).map_err(|_| Error::InvalidConsignment)?;
+        let contract_id = consignment.contract_id();
+        let asset_id = contract_id.to_string();
+        let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+        self.check_schema_support(&asset_schema)?;
+        if self.database.check_asset_exists(asset_id.clone()).is_ok() {
+            info!(self.logger, "Asset {asset_id} is already known");
+            return Ok(());
+        }
+
+        let chain_resolver = self.prefetch_consignment_witnesses(&consignment).await?;
+        let resolver = OffchainResolverWasm {
+            witness_id,
+            consignment: &consignment,
+            fallback: &chain_resolver,
+        };
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            build_ops_dag: true,
+            ..Default::default()
+        };
+        let mut pending = consignment
+            .clone()
+            .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
+            .and_then(|mut p| p.pending().resolve_all(&resolver).map(|_| p))
+            .map_err(|e| match e {
+                ValidationError::InvalidConsignment(e) => Error::ConsignmentValidationFailed {
+                    details: e.to_string(),
+                },
+                ValidationError::ResolverError(e) => Error::Network {
+                    details: e.to_string(),
+                },
+                e => Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
+                },
+            })?;
+        match self._resolve_claims(&mut pending).await? {
+            ClaimsResolution::NoClaims => {}
+            ClaimsResolution::Resolved { unconfirmed, .. } => {
+                if let Some(opid) = unconfirmed.first() {
+                    return Err(Error::MintLockNotFound {
+                        opid: opid.to_string(),
+                    });
+                }
+            }
+            ClaimsResolution::Retry => {
+                let BridgeLocation::Evm(EvmContract { chain_id, .. }) =
+                    BridgedFungibleAsset::bridge_location(&consignment.genesis).map_err(|e| {
+                        Error::Internal {
+                            details: format!("unexpected bridge location error: {e:?}"),
+                        }
+                    })?;
+                if self._evm_client(chain_id).is_none() {
+                    return Err(Error::NoEvmRpcUrl { chain_id });
+                }
+                return Err(Error::Network {
+                    details: format!(
+                        "the EVM RPC endpoint configured for chain ID {chain_id} is on another \
+                         chain"
+                    ),
+                });
+            }
+        }
+
+        let valid_consignment = pending.finalize();
+        let mut runtime = self.rgb_runtime()?;
+        let reject_list_source = match asset_schema {
+            AssetSchema::Ifa => IfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
+                .reject_list_url()
+                .map(|u| RejectListSource::Url(u.to_string())),
+            AssetSchema::Bfa => BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
+                .reject_list()
+                .map(RejectListSource::from),
+            AssetSchema::Nia => None,
+        };
+        if let Some(source) = &reject_list_source {
+            let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
+            // check from the inputs and outputs of the terminal operations
+            let terminal_ops = consignment.terminal_ops();
+            let mut origins = HashSet::new();
+            for KnownTransition { opid, transition } in consignment
+                .bundles
+                .iter()
+                .flat_map(|wb| wb.bundle.known_transitions.iter())
+                .filter(|kt| terminal_ops.contains(&kt.opid))
+            {
+                origins.extend(transition.inputs.iter().copied());
+                for (ass_type, typed) in transition.assignments.iter() {
+                    for no in 0..typed.len_u16() {
+                        origins.insert(Opout::new(*opid, *ass_type, no));
+                    }
+                }
+            }
+            let rejected = self._check_dag(
+                valid_consignment
+                    .validation_status()
+                    .ops_dag
+                    .as_ref()
+                    .expect("build_ops_dag is true"),
+                &reject_opouts,
+                &allow_opouts,
+                &origins,
+            )?;
+            if !rejected.is_empty() {
+                let mut opouts: Vec<String> = rejected.iter().map(|o| o.to_string()).collect();
+                opouts.sort();
+                return Err(Error::ConsignmentRejected { opouts });
+            }
+        }
+
+        let valid_contract = valid_consignment.clone().into_valid_contract();
+        runtime.import_contract(valid_contract.clone(), &chain_resolver)?;
+        self.save_new_asset_internal(
+            &runtime,
+            contract_id,
+            asset_schema,
+            valid_contract,
+            valid_consignment,
+        )?;
+        drop(runtime);
+        self.update_backup_info(false)?;
+        self.flush().await?;
+
+        info!(self.logger, "Save new asset completed");
+        Ok(())
+    }
+
     /// Update pending RGB transfers (wasm32 async).
     ///
     /// With no `asset_id`, it also settles the ended vanilla operations whose TX has a
@@ -12374,5 +12516,42 @@ mod bfa_tests {
         );
         assert!(options("").unwrap().evm_chains.is_empty());
         assert!(options(&format!(r#","evm_chains":{{"mainnet":{chain}}}"#)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod save_new_asset_tests {
+    use super::*;
+    use crate::block_on;
+    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn save_new_asset_refuses_bad_input() {
+        let url = "http://127.0.0.1:1";
+        let mut wallet = make_test_wallet(false);
+        let online = Online {
+            id: 1,
+            indexer_url: url.to_string(),
+        };
+        let txid = "00".repeat(32);
+        let save = |w: &Wallet, bytes: &[u8], txid: &str| {
+            block_on(w.save_new_asset(online.clone(), bytes, txid))
+        };
+
+        assert!(matches!(
+            save(&wallet, &[0u8; 4], &txid),
+            Err(Error::Offline)
+        ));
+        wallet.online_data = Some(OnlineData::for_test(url));
+        assert!(matches!(
+            save(&wallet, &[0u8; 4], "zz"),
+            Err(Error::InvalidTxid)
+        ));
+        assert!(matches!(
+            save(&wallet, &[0u8; 4], &txid),
+            Err(Error::InvalidConsignment)
+        ));
+        assert!(wallet.rgb_contract_ids().unwrap().is_empty());
     }
 }

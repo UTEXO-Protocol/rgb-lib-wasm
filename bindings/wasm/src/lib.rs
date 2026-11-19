@@ -711,6 +711,24 @@ impl WasmWallet {
         to_js(&result)
     }
 
+    /// Import the asset of a transfer consignment (raw bytes) with its witness TXID, with zero
+    /// balance, so the wallet can make invoices for it.
+    #[wasm_bindgen(js_name = "saveNewAsset")]
+    pub async fn save_new_asset(
+        &self,
+        online_js: JsValue,
+        consignment_bytes: &[u8],
+        txid: &str,
+    ) -> Result<(), JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let wallet = self.inner.borrow();
+        wallet
+            .save_new_asset(online, consignment_bytes, txid)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Fail pending transfers. Returns true if any transfers were failed.
     #[wasm_bindgen(js_name = "failTransfers")]
     pub async fn fail_transfers(
