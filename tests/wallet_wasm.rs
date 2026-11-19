@@ -14,8 +14,7 @@ use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, IndexerConfig, Invoice, OnlineOptions, Wallet, WalletData,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
-use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, transport_endpoint};
-use wasm_bindgen::JsValue;
+use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, run_js, transport_endpoint, within};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -408,12 +407,6 @@ fn test_validate_consignment_result_serializes() {
     assert!(json.contains("test warning"));
 }
 
-fn run_js(body: &str) -> JsValue {
-    js_sys::Function::new_no_args(body)
-        .call0(&JsValue::NULL)
-        .unwrap()
-}
-
 #[wasm_bindgen_test]
 async fn test_save_uses_strict_durability() {
     run_js(
@@ -804,19 +797,6 @@ async fn test_vss_restore_refuses_wrong_total_size() {
     assert!(matches!(err, Error::InvalidBackup), "{err:?}");
 }
 
-/// Return `None` when `fut` is not ready within `ms`.
-async fn within<F: std::future::Future>(ms: u32, fut: F) -> Option<F::Output> {
-    let mut timer = std::pin::pin!(utils::sleep_ms(ms));
-    let mut fut = std::pin::pin!(fut);
-    std::future::poll_fn(|cx| {
-        if let std::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
-            return std::task::Poll::Ready(Some(out));
-        }
-        timer.as_mut().poll(cx).map(|()| None)
-    })
-    .await
-}
-
 /// A stalled indexer or VSS server fails the call after the configured timeout.
 #[wasm_bindgen_test]
 async fn test_stalled_indexer_and_vss_time_out() {
@@ -879,4 +859,53 @@ async fn test_stalled_indexer_and_vss_time_out() {
     assert!(online_ms >= 9_000.0, "go_online after {online_ms} ms");
     assert!(backup_ms >= 9_000.0, "vss_backup after {backup_ms} ms");
     assert_eq!(aborts, 2.0);
+}
+
+/// A busy indexer is asked again 3 times, after real pauses.
+#[wasm_bindgen_test]
+async fn test_busy_indexer_retried_after_pauses() {
+    run_js(
+        "const g = globalThis;
+        g.__busySaved = [g.fetch, g.__rgbLibNoStoreUrls];
+        delete g.__rgbLibNoStoreUrls;
+        g.__busyHits = 0;
+        const fetch = g.fetch;
+        g.fetch = function (input, init) {
+            const url = input instanceof Request ? input.url : String(input);
+            if (!url.startsWith('http://busy.invalid/')) {
+                return fetch.call(this, input, init);
+            }
+            g.__busyHits += 1;
+            const resp = new Response('', { status: 503 });
+            Object.defineProperty(resp, 'url', { value: url });
+            return Promise.resolve(resp);
+        };",
+    );
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let options = OnlineOptions {
+        indexer_config: IndexerConfig::Esplora {
+            url: "http://busy.invalid/indexer".to_string(),
+        },
+        ..go_online_options(true)
+    };
+    let start = js_sys::Date::now();
+    let online = within(15_000, wallet.go_online(options)).await;
+    let online_ms = js_sys::Date::now() - start;
+    let hits = run_js(
+        "const g = globalThis;
+        const [fetch, urls] = g.__busySaved;
+        g.fetch = fetch;
+        if (urls === undefined) delete g.__rgbLibNoStoreUrls; else g.__rgbLibNoStoreUrls = urls;
+        delete g.__busySaved;
+        return g.__busyHits;",
+    )
+    .as_f64()
+    .unwrap();
+    assert!(
+        matches!(online, Some(Err(Error::InvalidIndexer { .. }))),
+        "go_online after {online_ms} ms: {online:?}"
+    );
+    assert_eq!(hits, 4.0);
+    // the pauses are 256, 512 and 1024 ms
+    assert!(online_ms >= 1_700.0, "go_online after {online_ms} ms");
 }
