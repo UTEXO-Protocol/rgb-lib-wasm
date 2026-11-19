@@ -947,9 +947,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
       try {
         log('inflateBegin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.inflateBegin(
-          state.online, assetId, amounts, BigInt(feeRate), minConf
-        );
+        const unsignedPsbt = (await state.wallet.inflateBegin(
+          state.online, assetId, amounts, BigInt(feeRate), minConf, false
+        )).psbt;
         document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
         showResult('inflate-output', 'inflate-result', 'Unsigned PSBT created. Proceed to Sign.');
         log('inflateBegin OK', 'log-ok');
@@ -1007,9 +1007,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
       try {
         log('inflate (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.inflateBegin(
-          state.online, assetId, amounts, BigInt(feeRate), minConf
-        );
+        const unsignedPsbt = (await state.wallet.inflateBegin(
+          state.online, assetId, amounts, BigInt(feeRate), minConf, false
+        )).psbt;
         document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
 
         log('inflate (auto) sign...', 'log-warn');

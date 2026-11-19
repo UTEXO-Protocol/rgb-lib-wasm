@@ -16,7 +16,8 @@ pub(crate) const UTXO_NUM: u8 = 5;
 
 pub(crate) const MIN_FEE_RATE: u64 = 1;
 
-// how long an operation with no expiration of its own (an inflation) keeps its inputs reserved
+// how long a begun operation with no saved transfer and no expiration of its own keeps its inputs
+// reserved
 pub(crate) const DURATION_SEND_TRANSFER: i64 = 3600;
 
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
@@ -295,6 +296,30 @@ pub struct LinkBeginResult {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct LinkDetails {
+    /// Strict-encoded fascia, for inspection
+    pub fascia: Vec<u8>,
+    /// Minimum confirmations for the operation
+    pub min_confirmations: u8,
+    /// Entropy used for the merkle tree construction operation
+    pub entropy: u64,
+}
+
+/// The result of an inflate begin operation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct InflateBeginResult {
+    /// PSBT to inspect and sign
+    pub psbt: String,
+    /// Batch transfer idx, None when `dry_run` is true
+    pub batch_transfer_idx: Option<i32>,
+    /// Operation details
+    pub details: InflateDetails,
+}
+
+/// Details for inflate operations.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct InflateDetails {
     /// Strict-encoded fascia, for inspection
     pub fascia: Vec<u8>,
     /// Minimum confirmations for the operation
@@ -2387,21 +2412,32 @@ impl Wallet {
                         transfer_info.main_transition,
                         TypeOfTransition::Transfer | TypeOfTransition::Mint
                     ) {
-                    let vout = if let LocalRecipientData::Witness(local_witness_data) =
-                        recipient.local_recipient_data
-                    {
-                        local_witness_data.vout
-                    } else {
+                    let LocalRecipientData::Witness(local_witness_data) =
+                        &recipient.local_recipient_data
+                    else {
                         unreachable!("inflation uses witness recipients")
                     };
-                    let txo_idx = self
-                        .database
-                        .get_txo(&Outpoint {
-                            txid: txid.clone(),
-                            vout,
-                        })?
-                        .expect("outpoint should be in the DB")
-                        .idx;
+                    let vout = local_witness_data.vout;
+                    let txo_idx = match self.database.get_txo(&Outpoint {
+                        txid: txid.clone(),
+                        vout,
+                    })? {
+                        Some(txo) => txo.idx,
+                        None => {
+                            let db_utxo = DbTxoActMod {
+                                txid: ActiveValue::Set(txid.clone()),
+                                vout: ActiveValue::Set(vout),
+                                btc_amount: ActiveValue::Set(
+                                    local_witness_data.amount_sat.to_string(),
+                                ),
+                                spent: ActiveValue::Set(false),
+                                exists: ActiveValue::Set(false),
+                                pending_witness: ActiveValue::Set(false),
+                                ..Default::default()
+                            };
+                            self.database.set_txo(db_utxo)?
+                        }
+                    };
                     let db_coloring = DbColoringActMod {
                         txo_idx: ActiveValue::Set(txo_idx),
                         asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
@@ -8047,7 +8083,11 @@ impl Wallet {
         Ok(tx.compute_txid().to_string())
     }
 
-    /// Prepare the PSBT to inflate an IFA asset.
+    /// Prepare the PSBT to inflate an IFA asset, one new UTXO per amount in `inflation_amounts`.
+    ///
+    /// If `dry_run` is false, the wallet saves the transfer as [`TransferStatus::Initiated`] and
+    /// returns its batch transfer idx. If true, it saves and reserves nothing.
+    /// Sign the PSBT and give it to [`inflate_end`](Wallet::inflate_end).
     pub async fn inflate_begin(
         &mut self,
         online: Online,
@@ -8055,7 +8095,8 @@ impl Wallet {
         inflation_amounts: Vec<u64>,
         fee_rate: u64,
         min_confirmations: u8,
-    ) -> Result<String, Error> {
+        dry_run: bool,
+    ) -> Result<InflateBeginResult, Error> {
         let cp = self.checkpoint("inflate_begin");
         let res = self
             ._inflate_begin(
@@ -8064,6 +8105,7 @@ impl Wallet {
                 inflation_amounts,
                 fee_rate,
                 min_confirmations,
+                dry_run,
             )
             .await;
         self.commit(cp, res, |_| false).await
@@ -8076,7 +8118,8 @@ impl Wallet {
         inflation_amounts: Vec<u64>,
         fee_rate: u64,
         min_confirmations: u8,
-    ) -> Result<String, Error> {
+        dry_run: bool,
+    ) -> Result<InflateBeginResult, Error> {
         info!(
             self.logger,
             "Inflating (begin) amounts: {:?}...", inflation_amounts
@@ -8169,7 +8212,7 @@ impl Wallet {
             beneficiaries_witness: vec![],
             beneficiaries_blinded: vec![],
         };
-        let psbt_string = self
+        let begin_data = self
             ._prepare_single_asset_psbt(
                 transfer_info,
                 unspents,
@@ -8180,19 +8223,40 @@ impl Wallet {
                 None,
                 None,
                 &mut runtime,
-                true,
+                dry_run,
             )
-            .await?
-            .psbt;
+            .await?;
 
         // release the RGB stock so the wallet state can be saved
         drop(runtime);
 
+        if dry_run {
+            // a dry run reserves nothing: the end saves the transfer
+            let txid = Psbt::from_str(&begin_data.psbt)?
+                .unsigned_tx
+                .compute_txid()
+                .to_string();
+            if let Some(artifacts) = self.transfer_artifacts.get_mut(&txid) {
+                artifacts.inputs.clear();
+            }
+        } else {
+            self.update_backup_info(false)?;
+        }
+
         info!(self.logger, "Inflation (begin) completed");
-        Ok(psbt_string)
+        Ok(InflateBeginResult {
+            psbt: begin_data.psbt,
+            batch_transfer_idx: begin_data.batch_transfer_idx,
+            details: InflateDetails {
+                fascia: begin_data.fascia,
+                min_confirmations,
+                entropy: begin_data.entropy,
+            },
+        })
     }
 
-    /// Complete the inflate operation and broadcast.
+    /// Complete the inflate operation: broadcast the PSBT and save the transfer. An inflation that
+    /// begin saved is ended only while it is Initiated.
     pub async fn inflate_end(
         &mut self,
         online: Online,
@@ -8219,12 +8283,7 @@ impl Wallet {
             .compute_txid()
             .to_string();
 
-        // a failed or progressed operation must not end again
-        if let Some(bt) = self._get_outgoing_batch_transfer(&txid)?
-            && bt.status != TransferStatus::Initiated
-        {
-            return Err(Error::CannotEndTransfer { txid });
-        }
+        self._check_end_initiated(&txid)?;
 
         let artifacts = self
             .transfer_artifacts
@@ -8237,10 +8296,6 @@ impl Wallet {
             _ => false,
         }) {
             return Err(Error::WrongOperation { txid });
-        }
-        // an expired inflation no longer reserves its inputs, so it cannot be ended
-        if now().unix_timestamp() >= artifacts.expiration {
-            return Err(Error::CannotEndTransfer { txid });
         }
         let fascia = artifacts.fascia()?;
         let info_contents = artifacts.batch_info.clone().ok_or(Error::Internal {
@@ -8264,17 +8319,11 @@ impl Wallet {
             },
         );
 
-        let batch_transfer_idx = self._save_transfers(
+        let batch_transfer_idx = self._update_or_save_transfers(
             txid.clone(),
             &transfer_info_map,
-            info_contents.extra_allocations,
-            info_contents.change_utxo_idx,
-            info_contents.btc_change,
+            &info_contents,
             TransferStatus::WaitingConfirmations,
-            info_contents.min_confirmations,
-            info_contents.expiration_timestamp,
-            None,
-            None,
             &HashMap::new(),
         )?;
 
