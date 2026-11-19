@@ -249,7 +249,8 @@ impl WasmWallet {
     ///
     /// `amounts_js` is a JS array of u64 values.
     /// `inflation_amounts_js` is a JS array of u64 values for inflation allowances.
-    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from.
+    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from,
+    /// `skip_contract_checks` skips the checks on that contract.
     #[wasm_bindgen(js_name = "issueAssetIfa")]
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
@@ -262,6 +263,7 @@ impl WasmWallet {
         reject_list_url: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<JsValue, JsValue> {
         let amounts: Vec<u64> = serde_wasm_bindgen::from_value(amounts_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid amounts array: {e}")))?;
@@ -279,6 +281,7 @@ impl WasmWallet {
                 reject_list_url,
                 link_right,
                 linked_from_contract,
+                skip_contract_checks,
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&asset)
@@ -288,7 +291,8 @@ impl WasmWallet {
     ///
     /// `contract_address` is the bridge contract on the EVM chain `chain_id`.
     /// `reject_list_address` is an optional reject list contract on the same chain.
-    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from.
+    /// `link_right` issues the link right, `linked_from_contract` is the contract linked from,
+    /// `skip_contract_checks` skips the checks on that contract.
     #[wasm_bindgen(js_name = "issueAssetBfa")]
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_bfa(
@@ -302,6 +306,7 @@ impl WasmWallet {
         reject_list_address: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<JsValue, JsValue> {
         let asset = self
             .inner
@@ -316,6 +321,7 @@ impl WasmWallet {
                 reject_list_address,
                 link_right,
                 linked_from_contract,
+                skip_contract_checks,
             )
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&asset)
@@ -1018,6 +1024,7 @@ impl WasmWallet {
         linked_to_contract: &str,
         fee_rate: u64,
         min_confirmations: u8,
+        skip_contract_checks: bool,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
@@ -1029,6 +1036,7 @@ impl WasmWallet {
                 linked_to_contract.to_string(),
                 fee_rate,
                 min_confirmations,
+                skip_contract_checks,
             )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -1038,6 +1046,7 @@ impl WasmWallet {
     /// Link an IFA or BFA asset to another contract (begin): prepare a PSBT. Returns a
     /// LinkBeginResult JS object.
     #[wasm_bindgen(js_name = "linkBegin")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn link_begin(
         &self,
         online_js: JsValue,
@@ -1045,6 +1054,7 @@ impl WasmWallet {
         linked_to_contract: &str,
         fee_rate: u64,
         min_confirmations: u8,
+        skip_contract_checks: bool,
         dry_run: bool,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
@@ -1057,6 +1067,7 @@ impl WasmWallet {
                 linked_to_contract.to_string(),
                 fee_rate,
                 min_confirmations,
+                skip_contract_checks,
                 dry_run,
             )
             .await

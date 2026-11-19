@@ -8724,6 +8724,9 @@ impl Wallet {
     /// This calls [`link_begin`](Wallet::link_begin), signs the resulting PSBT and finally
     /// calls [`link_end`](Wallet::link_end).
     ///
+    /// The contract to link to is checked as in [`link_begin`](Wallet::link_begin), unless
+    /// `skip_contract_checks` is true.
+    ///
     /// A wallet with private keys is required.
     pub async fn link(
         &mut self,
@@ -8732,6 +8735,7 @@ impl Wallet {
         linked_to_contract: String,
         fee_rate: u64,
         min_confirmations: u8,
+        skip_contract_checks: bool,
     ) -> Result<OperationResult, Error> {
         let cp = self.checkpoint("link");
         let res = self
@@ -8741,6 +8745,7 @@ impl Wallet {
                 linked_to_contract,
                 fee_rate,
                 min_confirmations,
+                skip_contract_checks,
             )
             .await;
         self.commit(cp, res, |_| false).await
@@ -8753,6 +8758,7 @@ impl Wallet {
         linked_to_contract: String,
         fee_rate: u64,
         min_confirmations: u8,
+        skip_contract_checks: bool,
     ) -> Result<OperationResult, Error> {
         info!(
             self.logger,
@@ -8766,6 +8772,7 @@ impl Wallet {
                 linked_to_contract,
                 fee_rate,
                 min_confirmations,
+                skip_contract_checks,
                 true,
             )
             .await?;
@@ -8780,8 +8787,10 @@ impl Wallet {
     ///
     /// The link spends the link right of the asset, which the wallet needs to hold, and commits the
     /// contract it links to (`linkedToContract`), which can't be the asset's own one. As the asset
-    /// has at most one link right, an asset can be linked only once. The wallet needs to know the
-    /// contract `linked_to_contract`, and it needs to have been issued linked from the asset.
+    /// has at most one link right, an asset can be linked only once. The contract to link to needs
+    /// to be known to the wallet, which checks it has been issued linked from the linking one
+    /// (`linkedFromContract`). Set `skip_contract_checks` to skip these checks and link to a
+    /// contract the wallet cannot check, e.g. one it doesn't know.
     ///
     /// If `dry_run` is false, the wallet saves the transfer in [`TransferStatus::Initiated`] and
     /// returns its batch transfer idx.
@@ -8796,6 +8805,7 @@ impl Wallet {
         linked_to_contract: String,
         fee_rate: u64,
         min_confirmations: u8,
+        skip_contract_checks: bool,
         dry_run: bool,
     ) -> Result<LinkBeginResult, Error> {
         let cp = self.checkpoint("link_begin");
@@ -8806,6 +8816,7 @@ impl Wallet {
                 linked_to_contract,
                 fee_rate,
                 min_confirmations,
+                skip_contract_checks,
                 dry_run,
             )
             .await;
@@ -8819,6 +8830,7 @@ impl Wallet {
         linked_to_contract: String,
         fee_rate: u64,
         min_confirmations: u8,
+        skip_contract_checks: bool,
         dry_run: bool,
     ) -> Result<LinkBeginResult, Error> {
         info!(
@@ -8843,12 +8855,14 @@ impl Wallet {
         if linked_to_contract.to_string() == asset.id {
             return Err(Error::CannotLinkToItself);
         }
-        let linked_to = self.check_linked_contract_known(&linked_to_contract)?;
-        if linked_to.linked_from_contract.as_deref() != Some(asset.id.as_str()) {
-            return Err(Error::InvalidLinkedContract {
-                contract_id: linked_to.id,
-                details: format!("it has not been issued linked from contract {}", asset.id),
-            });
+        if !skip_contract_checks {
+            let linked_to = self.check_linked_contract_known(&linked_to_contract)?;
+            if linked_to.linked_from_contract.as_deref() != Some(asset.id.as_str()) {
+                return Err(Error::InvalidLinkedContract {
+                    contract_id: linked_to.id,
+                    details: format!("it has not been issued linked from contract {}", asset.id),
+                });
+            }
         }
 
         let assignments_needed = AssignmentsCollection {
@@ -12814,29 +12828,41 @@ mod bfa_tests {
         let invalid = Error::InvalidContractId {
             contract_id: s!("invalid"),
         };
-        let res = wallet.issue_asset_ifa(
-            s!("IFA"),
-            s!("Name"),
-            0,
-            vec![10],
-            vec![],
-            None,
-            true,
-            Some(s!("invalid")),
-        );
-        assert_eq!(res.unwrap_err(), invalid);
-        let res = wallet.issue_asset_bfa(
-            s!("BFA"),
-            s!("Name"),
-            0,
-            1,
-            31337,
-            s!("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
-            None,
-            true,
-            Some(s!("invalid")),
-        );
-        assert_eq!(res.unwrap_err(), invalid);
+        let issue_ifa = |linked_from: &str, skip: bool| {
+            wallet
+                .issue_asset_ifa(
+                    s!("IFA"),
+                    s!("Name"),
+                    0,
+                    vec![10],
+                    vec![],
+                    None,
+                    true,
+                    Some(linked_from.to_string()),
+                    skip,
+                )
+                .unwrap_err()
+        };
+        let issue_bfa = |linked_from: &str, skip: bool| {
+            wallet
+                .issue_asset_bfa(
+                    s!("BFA"),
+                    s!("Name"),
+                    0,
+                    1,
+                    31337,
+                    s!("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
+                    None,
+                    true,
+                    Some(linked_from.to_string()),
+                    skip,
+                )
+                .unwrap_err()
+        };
+        for skip in [false, true] {
+            assert_eq!(issue_ifa("invalid", skip), invalid);
+            assert_eq!(issue_bfa("invalid", skip), invalid);
+        }
 
         use crate::database::memory_db::{ActiveValue, DbAssetActMod};
         let nia = ContractId::copy_from_slice([1; 32]).unwrap().to_string();
@@ -12871,19 +12897,26 @@ mod bfa_tests {
                     details: format!("it's already linked to contract {unknown}"),
                 },
             ),
+            (
+                &unknown,
+                Error::UnknownLinkedContract {
+                    contract_id: unknown.clone(),
+                },
+            ),
         ];
         for (linked_from, expected) in cases {
-            let res = wallet.issue_asset_ifa(
-                s!("IFA"),
-                s!("Name"),
-                0,
-                vec![10],
-                vec![],
-                None,
-                true,
-                Some(linked_from.clone()),
-            );
-            assert_eq!(res.unwrap_err(), expected);
+            assert_eq!(issue_ifa(linked_from, false), expected);
+            assert_eq!(issue_bfa(linked_from, false), expected);
+            // the wallet has no UTXOs, so issuance fails later
+            for err in [issue_ifa(linked_from, true), issue_bfa(linked_from, true)] {
+                assert!(
+                    !matches!(
+                        err,
+                        Error::UnknownLinkedContract { .. } | Error::InvalidLinkedContract { .. }
+                    ),
+                    "{err:?}"
+                );
+            }
         }
     }
 
@@ -12968,17 +13001,48 @@ mod bfa_tests {
                 },
             ),
         ];
-        for (id, linked_to, expected) in cases {
-            let err = block_on(wallet.link_begin(
+        let mut link_begin = |id: &str, linked_to: &str, skip: bool| {
+            block_on(wallet.link_begin(
                 online.clone(),
                 id.to_string(),
                 linked_to.to_string(),
                 1,
                 1,
+                skip,
                 true,
             ))
-            .unwrap_err();
-            assert_eq!(err, expected);
+            .unwrap_err()
+        };
+        for (id, linked_to, expected) in cases {
+            assert_eq!(link_begin(id, linked_to, false), expected);
+        }
+        // the skip keeps the other checks
+        assert_eq!(
+            link_begin(ifa.as_str(), ifa.as_str(), true),
+            Error::CannotLinkToItself
+        );
+        assert_eq!(
+            link_begin(ifa.as_str(), "invalid", true),
+            Error::InvalidContractId {
+                contract_id: s!("invalid"),
+            }
+        );
+        assert_eq!(
+            link_begin("rgb:nia", other.as_str(), true),
+            Error::UnsupportedLink {
+                asset_schema: AssetSchema::Nia,
+            }
+        );
+        // the skip removes the contract checks, so input selection fails later
+        for linked_to in [&other, &unrelated, &mislinked] {
+            let err = link_begin(ifa.as_str(), linked_to, true);
+            assert!(
+                !matches!(
+                    err,
+                    Error::UnknownLinkedContract { .. } | Error::InvalidLinkedContract { .. }
+                ),
+                "{err:?}"
+            );
         }
     }
 
@@ -12999,6 +13063,7 @@ mod bfa_tests {
                 None,
                 false,
                 None,
+                false,
             )
         };
         assert!(matches!(
