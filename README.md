@@ -253,7 +253,7 @@ const txid = await wallet.drainToEnd(online, signed);
 ### Inflating an IFA asset
 
 ```javascript
-const psbt = await wallet.inflateBegin(online, assetId, [200], 1n, 1);
+const { psbt } = await wallet.inflateBegin(online, assetId, [200], 1n, 1, false);
 const signed = wallet.signPsbt(psbt);
 const result = await wallet.inflateEnd(online, signed);
 ```
@@ -267,6 +267,8 @@ const result = await wallet.burn(online, assetId, 50n, reason, 1n, 1);
 
 `sendEnd`, `inflateEnd`, `burn`, `burnEnd` and `mintEnd` return `{ txid, batchTransferIdx, entropy }`,
 where `entropy` is the MPC entropy of the commitment.
+`inflateBegin` returns `{ psbt, batchTransferIdx, details: { fascia, minConfirmations, entropy } }`;
+`batchTransferIdx` is null when `dryRun` is true.
 
 ### Local encrypted backup
 
@@ -406,7 +408,7 @@ To protect a wallet:
 | `getFeeEstimation(online, blocks)` | yes | Estimate fee rate for target blocks |
 | `drainToBegin(online, addr, destroyAssets, feeRate)` | yes | Prepare drain PSBT |
 | `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
-| `inflateBegin(...)` | yes | Prepare IFA inflation PSBT |
+| `inflateBegin(online, assetId, amounts, feeRate, minConf, dryRun)` | yes | Prepare IFA inflation PSBT, save it as Initiated unless dryRun |
 | `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
