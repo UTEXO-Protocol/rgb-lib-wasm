@@ -205,6 +205,10 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
+      - name: Run import tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_import::'
       - name: Run link tests
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
