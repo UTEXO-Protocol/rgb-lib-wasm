@@ -167,6 +167,7 @@ async fn bfa_mint_settles_and_is_spendable() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     let asset_id = asset.asset_id.clone();
@@ -493,6 +494,7 @@ async fn bfa_mint_begin_refusals() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     let result = mint_begin(
@@ -516,6 +518,7 @@ async fn bfa_mint_begin_refusals() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     let id = &bfa.asset_id;
@@ -541,6 +544,7 @@ async fn bfa_mint_begin_refusals() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     for blocks in [1, 5, 101] {
@@ -589,6 +593,7 @@ async fn bfa_mint_history_refused_by_reject_list() {
             Some(reject_list.clone()),
             false,
             None,
+            false,
         )
         .unwrap();
     let asset_id = asset.asset_id.clone();
@@ -688,6 +693,7 @@ async fn bfa_mint_multi_right_utxo() {
             Some(reject_list.clone()),
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -787,6 +793,7 @@ async fn bfa_mint_receiver_checks() {
             None,
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -911,6 +918,7 @@ async fn bfa_mint_begin_reserves_inputs() {
             None,
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -995,6 +1003,7 @@ async fn bfa_mint_begin_reserves_inputs() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     let burn = a
@@ -1046,6 +1055,7 @@ async fn minter_and_receiver(
             reject_list,
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -1317,6 +1327,7 @@ async fn bfa_mint_reject_list_not_repeated() {
             Some(reject_list.clone()),
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -1371,6 +1382,7 @@ async fn bfa_mint_reject_list_not_repeated() {
             Some(reject_list.clone()),
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -1588,6 +1600,7 @@ async fn bfa_mint_is_atomic() {
             None,
             false,
             None,
+            false,
         )
     })
     .await;

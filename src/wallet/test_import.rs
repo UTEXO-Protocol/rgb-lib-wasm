@@ -217,6 +217,7 @@ async fn import_contract_reject_list() {
             Some(url.clone()),
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
