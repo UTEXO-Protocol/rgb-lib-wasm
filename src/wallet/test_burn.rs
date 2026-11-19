@@ -2,7 +2,7 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
-use super::test_send::{consignment as saved_consignment, proven};
+use super::test_send::{consignment as saved_consignment, proven, witness_ord, witness_ords};
 use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbOutExt, RgbTransfer,
@@ -642,12 +642,22 @@ fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
 }
 
 async fn inflate_and_settle(b: &mut Wallet, b_online: &Online, asset_id: &str, amount: u64) {
+    let ords = witness_ords(b);
     let unsigned = b
         .inflate_begin(b_online.clone(), asset_id.to_string(), vec![amount], 1, 1)
         .await
         .unwrap();
+    // an inflation builds no consignment and enters the stock at its end
+    let txid = Psbt::from_str(&unsigned)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    assert_eq!(witness_ords(b), ords);
+    assert!(b.transfer_artifacts[&txid].consignment_bytes.is_empty());
     let signed = b.sign_psbt(unsigned, None).unwrap();
     let res = b.inflate_end(b_online.clone(), signed).await.unwrap();
+    assert!(witness_ord(b, &txid).is_some());
     mine_and_refresh(b, b_online).await;
     assert_eq!(
         transfer(b, asset_id, res.batch_transfer_idx).status,
@@ -689,13 +699,16 @@ async fn ifa_inflate_reject_list() {
     // an inflation that selects a rejected right retries with the other one and gets the list once
     serve_reject_list(&url, &r40[0].to_string());
     let fetches = reject_list_fetches(&url);
+    let ords = witness_ords(&b);
     inflate_and_settle(&mut b, &b_online, &asset_id, 5).await;
+    assert_eq!(witness_ords(&b).len(), ords.len() + 1);
     assert_eq!(reject_list_fetches(&url) - fetches, 1);
     assert_eq!(inflation_rights(&mut b, &asset_id), vec![10, 55]);
     assert!(assignments(&mut b, &asset_id).contains(&Assignment::Fungible(5)));
 
     // a right with a rejected allocation in its history is refused
     serve_reject_list(&url, &format!("{}\n{}", r60[0], r40[0]));
+    let ords = witness_ords(&b);
     let result = b
         .inflate_begin(b_online.clone(), asset_id.clone(), vec![5], 1, 1)
         .await;
@@ -703,4 +716,5 @@ async fn ifa_inflate_reject_list() {
         matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
         "{result:?}"
     );
+    assert_eq!(witness_ords(&b), ords);
 }

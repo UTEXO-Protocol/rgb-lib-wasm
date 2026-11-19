@@ -3,6 +3,7 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
+use super::test_send::witness_ord;
 use crate::wallet::rust_only::validate_consignment_offchain;
 use crate::wallet::{
     AssetFilter, Balance, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData,
@@ -287,6 +288,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     record_lock(&bridge, &LockId::from([0u8; 32]), 0, MINT_AMOUNT - 1).await;
     finalize_evm().await;
     let minted = mint_end(&mut a, &a_online, &res).await.unwrap();
+    assert!(witness_ord(&a, &txid).is_some());
     assert_eq!(minted.batch_transfer_idx, res.batch_transfer_idx);
     assert_eq!(minted.entropy, res.details.entropy);
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
@@ -877,6 +879,8 @@ async fn bfa_mint_begin_reserves_inputs() {
     );
     let reserved = a.get_reserved_outpoints().unwrap();
     let psbt = Psbt::from_str(&res.psbt).unwrap();
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    assert_eq!(witness_ord(&a, &txid), None);
     assert!(
         psbt.unsigned_tx
             .input
@@ -920,6 +924,7 @@ async fn bfa_mint_begin_reserves_inputs() {
         TransferStatus::Failed
     );
     assert!(a.get_reserved_outpoints().unwrap().is_empty());
+    assert_eq!(witness_ord(&a, &txid), None);
     let result = a.mint_end(a_online.clone(), signed).await;
     assert!(
         matches!(result, Err(Error::CannotEndTransfer { .. })),

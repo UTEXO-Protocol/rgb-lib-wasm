@@ -867,10 +867,10 @@ fn txid_of(signed: &str) -> String {
 async fn settled_send(encryption: Encryption) {
     let (mut wallet, online, mut rcv, rcv_online, asset_id, rid, signed, _) =
         pending_send(Some(encryption)).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
     let plaintext = wallet
         .send_consignment_bytes(&txid_of(&signed), &asset_id)
         .unwrap();
-    end(&mut wallet, &online, &signed).await.unwrap();
     rpc_hook(
         PROXY_URL,
         "consignment.get",
