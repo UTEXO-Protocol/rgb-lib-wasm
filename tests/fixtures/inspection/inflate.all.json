@@ -1,0 +1,175 @@
+{
+  "consignment_id": "rgb:csg:YPjo1LFm-k~U~cMc-sVCfjHv-mJv0Ut6-tmuGID7-SZGL51c#critic-micro-symbol",
+  "version": 1,
+  "is_transfer": true,
+  "asset_id": "rgb:gl3u_jnj-m7KujbW-tU59uBA-~s4jdzd-ScrrneH-mS~owiw",
+  "asset_schema": "Ifa",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795089192,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": 666,
+    "max_supply": 1166,
+    "linked_from_contract": null,
+    "bridge_location": null,
+    "reject_list": null,
+    "media": [],
+    "outputs": [
+      {
+        "txid": "3107769923084855e800134d40c38b9ffc9a842d6335bb98e6e6e93e9404a390",
+        "vout": 3,
+        "blinding": 16563453084888166371,
+        "assignment": {
+          "Fungible": 666
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      },
+      {
+        "txid": "3107769923084855e800134d40c38b9ffc9a842d6335bb98e6e6e93e9404a390",
+        "vout": 1,
+        "blinding": 6837070557788139925,
+        "assignment": {
+          "InflationRight": 500
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": [
+    {
+      "txid": "aeb154c788a0f47d67052f8385d2e46f9c291b783228bf00224ea273ec7b3619",
+      "close_method": "opretFirst",
+      "commitment_hex": "368dcdeef70ca0ebdd4c908dfb50e1316ea66f7c654dc2182ef64bf45fd1df9a",
+      "operations": [
+        {
+          "asset_id": "rgb:gl3u_jnj-m7KujbW-tU59uBA-~s4jdzd-ScrrneH-mS~owiw",
+          "committed_transition_count": 1,
+          "committed_input_count": 1,
+          "transitions": [
+            {
+              "type": "Inflate",
+              "opid": "e7faa695cccbc4e0294474bf7f3a0ff497b8a97dd1a9871f0ab22da9a84e35ed",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "825deefa39e39bb2ae8db5ad539f6e040fece2377375272bae7787992fe8c22c",
+                    "assignment_type": "InflationRight",
+                    "index": 0
+                  },
+                  "vin": 1,
+                  "assignment": {
+                    "InflationRight": 500
+                  }
+                }
+              ],
+              "outputs": [
+                {
+                  "txid": "aeb154c788a0f47d67052f8385d2e46f9c291b783228bf00224ea273ec7b3619",
+                  "vout": 1,
+                  "blinding": 4026523985947682840,
+                  "assignment": {
+                    "Fungible": 199
+                  },
+                  "is_concealed": false,
+                  "recipient_id": null,
+                  "is_ours": null,
+                  "is_terminal": false
+                },
+                {
+                  "txid": "aeb154c788a0f47d67052f8385d2e46f9c291b783228bf00224ea273ec7b3619",
+                  "vout": 2,
+                  "blinding": 8976051545638809180,
+                  "assignment": {
+                    "InflationRight": 301
+                  },
+                  "is_concealed": false,
+                  "recipient_id": null,
+                  "is_ours": null,
+                  "is_terminal": false
+                }
+              ],
+              "globals": [
+                {
+                  "IssuedSupply": 199
+                }
+              ],
+              "metadata": [
+                {
+                  "AllowedInflation": 301
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "txid": "b71b0b1e3daebcdfdc780b3d5c7af85cc726a68a7f2535f62d7192c1a3626992",
+      "close_method": "opretFirst",
+      "commitment_hex": "2374d2b90ca7112ca522dff4446f9df35034599e992d8f94ae030a8ef4d9b260",
+      "operations": [
+        {
+          "asset_id": "rgb:gl3u_jnj-m7KujbW-tU59uBA-~s4jdzd-ScrrneH-mS~owiw",
+          "committed_transition_count": 1,
+          "committed_input_count": 2,
+          "transitions": [
+            {
+              "type": "Transfer",
+              "opid": "3bfa68560b9cd2393ab61504222aefc544234117b3276770dc0b169a394c3721",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "825deefa39e39bb2ae8db5ad539f6e040fece2377375272bae7787992fe8c22c",
+                    "assignment_type": "Asset",
+                    "index": 0
+                  },
+                  "vin": 0,
+                  "assignment": {
+                    "Fungible": 666
+                  }
+                },
+                {
+                  "opout": {
+                    "opid": "e7faa695cccbc4e0294474bf7f3a0ff497b8a97dd1a9871f0ab22da9a84e35ed",
+                    "assignment_type": "Asset",
+                    "index": 0
+                  },
+                  "vin": 1,
+                  "assignment": {
+                    "Fungible": 199
+                  }
+                }
+              ],
+              "outputs": [
+                {
+                  "txid": null,
+                  "vout": null,
+                  "blinding": null,
+                  "assignment": {
+                    "Fungible": 865
+                  },
+                  "is_concealed": true,
+                  "recipient_id": "bcrt:utxob:2dcrbCeY-nKs~y54-pbe4BNp-e~17HCz-P0JDkke-T3gl_Lk-Y8~MU",
+                  "is_ours": null,
+                  "is_terminal": true
+                }
+              ],
+              "globals": [],
+              "metadata": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

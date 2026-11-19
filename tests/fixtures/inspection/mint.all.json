@@ -1,0 +1,114 @@
+{
+  "consignment_id": "rgb:csg:kC6XYPa0-rYsIeoA-MzBRaX_-~iMBDlK-3KF5KVt-WO5Cbxs#janet-concept-arena",
+  "version": 1,
+  "is_transfer": true,
+  "asset_id": "rgb:ev2anaCK-j4pVp~W-WXcNVyA-~Y1h2QG-UZslJ2_-cIQQ9BQ",
+  "asset_schema": "Bfa",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795085559,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": null,
+    "max_supply": null,
+    "linked_from_contract": null,
+    "bridge_location": {
+      "Evm": {
+        "chain_id": 31337,
+        "address": "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0"
+      }
+    },
+    "reject_list": null,
+    "media": [],
+    "outputs": [
+      {
+        "txid": "b40c2f0319b763ec833f05e7671aba24ccfc3c752f5f9d452ea9c6c24a463254",
+        "vout": 7,
+        "blinding": 14281025154185868161,
+        "assignment": "MintRight",
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      },
+      {
+        "txid": "b40c2f0319b763ec833f05e7671aba24ccfc3c752f5f9d452ea9c6c24a463254",
+        "vout": 12,
+        "blinding": 9577321911312750723,
+        "assignment": "MintRight",
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      },
+      {
+        "txid": "b40c2f0319b763ec833f05e7671aba24ccfc3c752f5f9d452ea9c6c24a463254",
+        "vout": 13,
+        "blinding": 17940380307790333182,
+        "assignment": "MintRight",
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": [
+    {
+      "txid": "abbf8a49d741eb98a2396e6319dce2edea095eb0b90992f7662343ac85d82655",
+      "close_method": "opretFirst",
+      "commitment_hex": "b72de59480e61b2e5bb8885be02d8ad51ff0f4cbc622d514e4476bd80f94403d",
+      "operations": [
+        {
+          "asset_id": "rgb:ev2anaCK-j4pVp~W-WXcNVyA-~Y1h2QG-UZslJ2_-cIQQ9BQ",
+          "committed_transition_count": 1,
+          "committed_input_count": 1,
+          "transitions": [
+            {
+              "type": "Mint",
+              "opid": "0925fad14a64e1881db906a9267b8dd8ecdffdaaa8f88b5385ec4b7a784f439e",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "7afd9a9da08a8f8a55a7f5965dc355c80fd8d61d9019466c949dbe708410f414",
+                    "assignment_type": "MintRight",
+                    "index": 0
+                  },
+                  "vin": 0,
+                  "assignment": "MintRight"
+                }
+              ],
+              "outputs": [
+                {
+                  "txid": null,
+                  "vout": null,
+                  "blinding": null,
+                  "assignment": {
+                    "Fungible": 666
+                  },
+                  "is_concealed": true,
+                  "recipient_id": "bcrt:utxob:J74sXLwu-suGSOH5-s5JdHNI-uZWk4Mo-RWYAnyu-YycoE8V-Ha2sk",
+                  "is_ours": null,
+                  "is_terminal": true
+                }
+              ],
+              "globals": [
+                {
+                  "IssuedSupply": 666
+                }
+              ],
+              "metadata": [
+                {
+                  "BeforeBlock": 100003
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

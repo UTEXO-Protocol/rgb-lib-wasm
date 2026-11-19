@@ -4,6 +4,10 @@ use wasm_bindgen_test::*;
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
 use super::test_send::witness_ord;
+use crate::no_wallet::{
+    BundleFilter, RgbBridgeLocationInfo, RgbEvmContractInfo, TransitionGlobal, TransitionMetadata,
+    inspect_consignment,
+};
 use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, state};
 use crate::wallet::rust_only::validate_consignment_offchain;
 use crate::wallet::{
@@ -12,7 +16,7 @@ use crate::wallet::{
 };
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, OS_MINT, RgbOutExt, TransferKind,
-    TransferStatus, script_buf_from_recipient_id,
+    TransferStatus, TypeOfTransition, script_buf_from_recipient_id,
 };
 use amplify::ByteArray;
 use bdk_wallet::bitcoin::Psbt;
@@ -194,6 +198,46 @@ async fn bfa_mint_settles_and_is_spendable() {
     // an import of the mint needs an EVM RPC URL and a confirmed lock
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     let bytes = a.send_consignment_bytes(&txid, &asset_id).unwrap();
+
+    // the mint consignment shows what is minted before the lock
+    let inspection = inspect_consignment(&bytes, BundleFilter::Terminals).unwrap();
+    assert_eq!(inspection.asset_id, asset_id);
+    assert_eq!(inspection.asset_schema, AssetSchema::Bfa);
+    assert_eq!(
+        inspection.genesis.bridge_location,
+        Some(RgbBridgeLocationInfo::Evm(RgbEvmContractInfo {
+            chain_id: CHAIN_ID,
+            address: bridge.to_lowercase(),
+        }))
+    );
+    assert_eq!(inspection.witnesses.len(), 1);
+    let witness = &inspection.witnesses[0];
+    assert_eq!(witness.txid, txid);
+    assert!(!witness.has_concealed_transitions());
+    let mints: Vec<_> = witness
+        .operations
+        .iter()
+        .flat_map(|o| &o.transitions)
+        .filter(|t| t.r#type == TypeOfTransition::Mint)
+        .collect();
+    assert_eq!(mints.len(), 1);
+    let mint = mints[0];
+    assert_eq!(mint.opid, res.details.opid);
+    let inputs: Vec<_> = mint.inputs.iter().map(|i| &i.assignment).collect();
+    assert_eq!(inputs, [&Some(Assignment::MintRight)]);
+    assert_eq!(
+        mint.metadata,
+        [TransitionMetadata::BeforeBlock(before_block)]
+    );
+    assert_eq!(mint.globals, [TransitionGlobal::IssuedSupply(MINT_AMOUNT)]);
+    let outputs: Vec<_> = mint
+        .outputs
+        .iter()
+        .filter(|o| o.assignment == Assignment::Fungible(MINT_AMOUNT))
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].recipient_id, Some(receive.recipient_id.clone()));
+
     let mut d1 = Wallet::new(wallet_data(vec![AssetSchema::Bfa])).unwrap();
     let d1_online = d1.go_online(go_online_options(false)).await.unwrap();
     assert!(matches!(
