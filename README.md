@@ -405,6 +405,7 @@ To protect a wallet:
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
+| `getBurnConsignment(assetId, txid)` | no | Return the consignment of an ended burn (bytes), which proves it with its history |
 | `link(online, assetId, linkedToContract, feeRate, minConf)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
 | `linkBegin(online, assetId, linkedToContract, feeRate, minConf, dryRun)` | yes | Prepare link PSBT |
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
