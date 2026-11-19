@@ -321,21 +321,57 @@ impl Assignment {
             0
         }
     }
+
+    /// Get the assignment at the given index of the given typed assignments, returning `None` for
+    /// assignment types unknown to the supported schemas.
+    #[cfg(feature = "esplora")]
+    pub(crate) fn from_typed_assigns<Seal: ExposedSeal>(
+        ty: AssignmentType,
+        typed_assigns: &TypedAssigns<Seal>,
+        no: u16,
+    ) -> Option<Self> {
+        let no = no as usize;
+        match typed_assigns {
+            TypedAssigns::Fungible(assigns) => {
+                let amount = assigns.get(no)?.state.as_u64();
+                match ty {
+                    OS_ASSET => Some(Self::Fungible(amount)),
+                    OS_INFLATION => Some(Self::InflationRight(amount)),
+                    _ => None,
+                }
+            }
+            TypedAssigns::Structured(assigns) => match ty {
+                OS_ASSET => assigns.get(no).map(|_| Self::NonFungible),
+                _ => None,
+            },
+            TypedAssigns::Declarative(assigns) => match ty {
+                OS_LINK => assigns.get(no).map(|_| Self::LinkRight),
+                OS_MINT => assigns.get(no).map(|_| Self::MintRight),
+                _ => None,
+            },
+        }
+    }
 }
 
-/// The main transition of an outgoing operation.
+/// Type of RGB transition
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum TypeOfTransition {
     /// Inflation transition (issuing new tokens)
-    Inflate = 2,
+    Inflate = 1,
     /// Transfer transition (moving existing tokens)
-    Transfer = 1,
+    Transfer = 2,
     /// Burn transition (burning existing tokens)
     Burn = 3,
-    /// Mint transition (minting assets backed by tokens locked on the external chain)
-    Mint = 4,
     /// Link transition (spending the link right to link the asset to another contract)
-    Link = 5,
+    Link = 4,
+    /// Mint transition (minting assets backed by tokens locked on the external chain)
+    Mint = 7,
+    /// Transfer of inflation rights. The main transition of an operation cannot move them.
+    TransferInflation = 5,
+    /// Transfer of link rights. The main transition of an operation cannot move them.
+    TransferLink = 6,
+    /// Propagation of mint rights to other wallets, for later mint transitions.
+    Propagate = 8,
 }
 
 impl TypeOfTransition {
@@ -344,8 +380,11 @@ impl TypeOfTransition {
             Self::Inflate => "inflate",
             Self::Transfer => "transfer",
             Self::Burn => "burn",
-            Self::Mint => "mint",
             Self::Link => "link",
+            Self::Mint => "mint",
+            Self::TransferInflation => "transferInflation",
+            Self::TransferLink => "transferLink",
+            Self::Propagate => "propagate",
         }
     }
 }
@@ -420,5 +459,82 @@ mod tests {
             // the integer stored in the DB must not change across versions
             assert_eq!(encryption as u8, num_value);
         }
+    }
+
+    #[test]
+    fn type_of_transition_variants() {
+        for (variant, discriminant, name) in [
+            (TypeOfTransition::Inflate, 1, "inflate"),
+            (TypeOfTransition::Transfer, 2, "transfer"),
+            (TypeOfTransition::Burn, 3, "burn"),
+            (TypeOfTransition::Link, 4, "link"),
+            (TypeOfTransition::TransferInflation, 5, "transferInflation"),
+            (TypeOfTransition::TransferLink, 6, "transferLink"),
+            (TypeOfTransition::Mint, 7, "mint"),
+            (TypeOfTransition::Propagate, 8, "propagate"),
+        ] {
+            assert_eq!(variant as u8, discriminant);
+            assert_eq!(variant.type_name(), name);
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn assignment_from_typed_assigns() {
+        let seal = || BuilderSeal::Revealed(GraphSeal::new_random_vout(0));
+
+        let fungible: TypedAssigns<GraphSeal> = TypedAssigns::Fungible(AssignVec::with(
+            NonEmptyVec::with(Assign::with(seal(), RevealedValue::new(7))),
+        ));
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &fungible, 0),
+            Some(Assignment::Fungible(7))
+        );
+        assert_eq!(Assignment::from_typed_assigns(OS_ASSET, &fungible, 1), None);
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_INFLATION, &fungible, 0),
+            Some(Assignment::InflationRight(7))
+        );
+        assert_eq!(Assignment::from_typed_assigns(OS_LINK, &fungible, 0), None);
+
+        let structured: TypedAssigns<GraphSeal> = TypedAssigns::Structured(AssignVec::with(
+            NonEmptyVec::with(Assign::with(seal(), RevealedData::default())),
+        ));
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &structured, 0),
+            Some(Assignment::NonFungible)
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &structured, 1),
+            None
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_LINK, &structured, 0),
+            None
+        );
+
+        let declarative: TypedAssigns<GraphSeal> = TypedAssigns::Declarative(AssignVec::with(
+            NonEmptyVec::with(Assign::with(seal(), VoidState::default())),
+        ));
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_LINK, &declarative, 0),
+            Some(Assignment::LinkRight)
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_LINK, &declarative, 1),
+            None
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_MINT, &declarative, 0),
+            Some(Assignment::MintRight)
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_MINT, &declarative, 1),
+            None
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &declarative, 0),
+            None
+        );
     }
 }

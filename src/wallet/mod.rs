@@ -25,6 +25,9 @@ mod test_send;
 mod test_vanilla;
 pub mod vss;
 
+pub use crate::no_wallet::{
+    Invoice, InvoiceData, Outpoint, RecipientInfo, RecipientType, TransportEndpoint,
+};
 pub use offline::*;
 #[cfg(feature = "esplora")]
 pub use online::*;

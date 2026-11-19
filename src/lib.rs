@@ -24,6 +24,9 @@
 //! The library currently implements the API for a proxy server to support these data exchanges
 //! between sender and receiver.
 //!
+//! The [`no_wallet`] module provides the objects and helpers that need no wallet. The wallet APIs
+//! use and re-export them.
+//!
 //! ## Errors
 //! Errors are handled with the crate `thiserror`.
 
@@ -35,6 +38,7 @@ pub(crate) mod database;
 pub(crate) mod encryption;
 pub(crate) mod error;
 pub mod keys;
+pub mod no_wallet;
 pub mod utils;
 pub mod wallet;
 
@@ -42,8 +46,11 @@ pub use bdk_wallet;
 pub use bdk_wallet::bitcoin;
 pub use rgbinvoice::RgbTransport;
 pub use rgbstd::{
-    ChainNet, ContractId, Txid as RgbTxid,
-    containers::{ConsignmentExt, Fascia, FileContent, Transfer as RgbTransfer},
+    AssignmentType, ChainNet, ContractId, Genesis, GraphSeal, OpId, Txid as RgbTxid,
+    containers::{
+        BuilderSeal, ConsignmentExt, Fascia, FileContent, LoadError, SpvProof,
+        Transfer as RgbTransfer, WitnessBundle,
+    },
     indexers::AnyResolver,
     persistence::UpdateRes,
     schema::SchemaId,
@@ -59,7 +66,8 @@ pub use rgbstd::{
 
 pub use crate::{
     database::enums::{
-        AssetSchema, Assignment, Encryption, TransferStatus, TransportType, WalletTransactionType,
+        AssetSchema, Assignment, Encryption, TransferStatus, TransportType, TypeOfTransition,
+        WalletTransactionType,
     },
     error::Error,
     keys::{generate_keys, restore_keys},
@@ -99,6 +107,8 @@ use std::{
 };
 
 use crate::database::{memory_db::ActiveValue, rgb_store::MemRgbStore};
+#[cfg(all(test, feature = "esplora"))]
+use amplify::confinement::NonEmptyVec;
 use amplify::{Bytes32, Wrapper, bmap, confinement::Confined, s};
 #[cfg(feature = "esplora")]
 use base64::{Engine as _, engine::general_purpose};
@@ -151,9 +161,9 @@ use rand::{Rng, TryRng, distr::Alphanumeric, rngs::SysRng};
 use reqwest::{Client as RestClient, header::CONTENT_TYPE, multipart};
 use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
-    Allocation, Amount, Genesis, GraphSeal, Identity, Layer1, Operation, OutputSeal, OwnedFraction,
-    Precision, Schema, SecretSeal, Transition, TransitionType,
-    containers::{BuilderSeal, ValidConsignment, ValidContract, ValidTransfer},
+    Allocation, Amount, Identity, Layer1, Operation, OutputSeal, OwnedFraction, Precision, Schema,
+    SecretSeal, Transition, TransitionType,
+    containers::{ValidConsignment, ValidContract, ValidTransfer},
     contract::{
         AllocatedState, ContractBuilder, ContractData, FilteredContractState, IssuerWrapper,
         TransitionBuilder,
@@ -176,14 +186,14 @@ use rgbstd::{
 };
 #[cfg(feature = "esplora")]
 use rgbstd::{
-    Assign, AssignmentType, KnownTransition, OpId, TransitionBundle,
-    containers::{CheckedClaimResolver, Consignment, PendingConsignment, SpvProof, WitnessBundle},
+    Assign, ExposedSeal, KnownTransition, TransitionBundle, TypedAssigns,
+    containers::{CheckedClaimResolver, Consignment, PendingConsignment},
     contract::{LinkError, LinkableSchemaWrapper, SchemaWrapper},
     txout::TxPtr,
     validation::{OpsDag, Validity, Warning},
 };
 #[cfg(all(test, feature = "esplora"))]
-use rgbstd::{RevealedValue, TypedAssigns};
+use rgbstd::{RevealedData, RevealedValue, VoidState, assignments::AssignVec};
 #[cfg(feature = "esplora")]
 use schemata::{
     BfaWrapper, IfaWrapper, NiaWrapper, OS_ASSET, OS_INFLATION, OS_LINK, OS_MINT, TS_BURN, TS_LINK,
@@ -213,6 +223,10 @@ use crate::database::{
 };
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
+use crate::no_wallet::{
+    Outpoint, beneficiary_from_script_buf, recipient_id_from_script_buf,
+    script_buf_from_recipient_id,
+};
 #[cfg(feature = "esplora")]
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(feature = "esplora")]
@@ -237,23 +251,28 @@ use crate::{
         verifying_key_from_bytes,
     },
     error::IndexerError,
-    utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},
+    utils::INDEXER_STOP_GAP,
     wallet::{AssignmentsCollection, Indexer},
 };
 use crate::{
     database::{
         LocalRgbAllocation, LocalTransportEndpoint, LocalUnspent, TransferData,
-        enums::{ColoringType, RecipientTypeFull, TransportEndpointKind, TypeOfTransition},
+        enums::{ColoringType, RecipientTypeFull, TransportEndpointKind},
     },
     error::InternalError,
     utils::{
-        DumbResolver, LOG_FILE, RgbRuntime, adjust_canonicalization, beneficiary_from_script_buf,
-        fault_point, from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
+        DumbResolver, LOG_FILE, RgbRuntime, adjust_canonicalization, fault_point,
+        from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
         get_descriptors, get_descriptors_from_xpubs, load_rgb_runtime, now, parse_address_str,
         setup_logger, str_to_xpub,
     },
-    wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_BFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
+    wallet::{Balance, NUM_KNOWN_SCHEMAS, SCHEMA_ID_BFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
 };
 
 /// Text that replaces a secret in Debug output.
 const REDACTED: &str = "[redacted]";
+
+pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
+pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
+pub(crate) const RGB_STATE_LINK_RIGHT: &str = "linkRight";
+pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
