@@ -171,6 +171,17 @@ async fn go_online_reads_options_object() {
 }
 
 #[wasm_bindgen_test]
+async fn save_new_asset_reads_arguments() {
+    let wallet = wallet();
+    let txid = "00".repeat(32);
+    let e = err(wallet
+        .save_new_asset(JsValue::NULL, &[0u8; 4], &txid)
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("Invalid Online object:"), "{e}");
+}
+
+#[wasm_bindgen_test]
 fn get_received_mint_is_null_when_unknown() {
     assert!(wallet().get_received_mint("unknown").unwrap().is_null());
 }
