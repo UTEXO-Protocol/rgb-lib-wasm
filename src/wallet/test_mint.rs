@@ -259,6 +259,8 @@ async fn bfa_mint_settles_and_is_spendable() {
             .unwrap()
             .is_none()
     );
+    b.backup("pw").unwrap();
+    assert!(!b.backup_info().unwrap());
     b.refresh(b_online.clone(), None, vec![], false)
         .await
         .unwrap();
@@ -266,6 +268,12 @@ async fn bfa_mint_settles_and_is_spendable() {
         .get_received_mint(receive.recipient_id.clone())
         .unwrap()
         .unwrap();
+    // the check keeps the transfer waiting and marks a backup as required
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+    assert!(b.backup_info().unwrap());
     assert_eq!(
         ReceivedMint {
             bridge_contract: received.bridge_contract.to_lowercase(),
@@ -1125,6 +1133,7 @@ async fn bfa_mint_lock_before_block() {
         TransferStatus::Initiated
     );
     // a mint is of an asset, so no_asset_only keeps it
+    a.backup("pw").unwrap();
     let result = a
         .fail_transfers(a_online.clone(), Some(res.batch_transfer_idx), true, false)
         .await;
@@ -1136,6 +1145,7 @@ async fn bfa_mint_lock_before_block() {
         transfer_status(&mut a, &receive.recipient_id),
         TransferStatus::Initiated
     );
+    assert!(!a.backup_info().unwrap());
     assert!(
         a.fail_transfers(a_online.clone(), Some(res.batch_transfer_idx), false, false)
             .await
@@ -1145,6 +1155,7 @@ async fn bfa_mint_lock_before_block() {
         transfer_status(&mut a, &receive.recipient_id),
         TransferStatus::Failed
     );
+    assert!(a.backup_info().unwrap());
 
     // fail_transfers fails a sent mint only once its lock has expired
     let receive = mint_rcv(&mut b, &b_online).await;

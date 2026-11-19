@@ -823,8 +823,6 @@ async fn test_full_wallet_flow() {
     // 50_000 sats
     wallet.backup("pw").unwrap();
     assert!(!wallet.backup_info().unwrap());
-    // backup timestamps compare as text, which is only safe across seconds
-    sleep_ms(1100).await;
     let unsigned_btc = wallet
         .send_btc_begin(online.clone(), addr_b2, 50_000, 1, false)
         .await
@@ -851,7 +849,7 @@ async fn test_full_wallet_flow() {
     .await;
     wallet.backup("pw").unwrap();
     assert!(!wallet.backup_info().unwrap());
-    sleep_ms(1100).await;
+    wallet.flush().await.unwrap();
     // backup saves its time
     let (saved, _) = saved_wallet(&wallet).await;
     assert!(!saved.backup_info().unwrap());
