@@ -285,6 +285,34 @@ async fn test_receive_and_transfers() {
 /// The amount 100 as an invoice carries it
 const AMOUNT_100: &str = "BF";
 
+/// Tests the public paths of the shared types and the RGB re-exports
+#[wasm_bindgen_test]
+fn public_api_exports() {
+    let _: Option<(
+        rgb_lib_wasm::wallet::RecipientInfo,
+        rgb_lib_wasm::wallet::TransportEndpoint,
+        rgb_lib_wasm::wallet::Outpoint,
+        rgb_lib_wasm::TypeOfTransition,
+    )> = None::<(
+        rgb_lib_wasm::no_wallet::RecipientInfo,
+        rgb_lib_wasm::no_wallet::TransportEndpoint,
+        rgb_lib_wasm::no_wallet::Outpoint,
+        rgb_lib_wasm::TypeOfTransition,
+    )>;
+    let _: Option<(
+        rgb_lib_wasm::AssignmentType,
+        rgb_lib_wasm::OpId,
+        rgb_lib_wasm::GraphSeal,
+        rgb_lib_wasm::BuilderSeal<rgb_lib_wasm::GraphSeal>,
+    )> = None;
+    let _: Option<(
+        rgb_lib_wasm::Genesis,
+        rgb_lib_wasm::SpvProof,
+        rgb_lib_wasm::WitnessBundle,
+        rgb_lib_wasm::LoadError,
+    )> = None;
+}
+
 /// Tests error paths and backup: invalid PSBT, issue without UTXOs,
 /// nonexistent asset balance, backup/restore round-trip
 #[wasm_bindgen_test]

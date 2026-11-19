@@ -6,7 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::wallet::{DatabaseType, ReceiveData, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
-use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet};
+use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet, max_expiration_secs};
 
 fn wallet() -> WasmWallet {
     wallet_with_schemas(vec![AssetSchema::Nia])
@@ -283,4 +283,49 @@ async fn wallet_builds_after_trap() {
         "no wallet after a trap"
     );
     assert!(WasmWallet::create(&json).await.is_ok());
+}
+
+#[wasm_bindgen_test]
+fn sign_psbt_reads_sign_options() {
+    use rgb_lib_wasm::bitcoin::{
+        Amount, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid, absolute::LockTime,
+        psbt::Psbt, transaction::Version,
+    };
+    use std::str::FromStr;
+
+    let w = wallet();
+    let psbt = Psbt::from_unsigned_tx(Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_str(&"11".repeat(32)).unwrap(), 0),
+            ..Default::default()
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    })
+    .unwrap()
+    .to_string();
+
+    // BDK defaults refuse an input without its previous TX
+    let e = err(w.sign_psbt(&psbt, None).unwrap_err());
+    assert!(e.contains("Missing non-witness UTXO"), "{e}");
+
+    // the option reaches BDK
+    let opts = js_sys::JSON::parse(r#"{"trustWitnessUtxo":true}"#).unwrap();
+    assert!(w.sign_psbt(&psbt, Some(opts.unchecked_into())).is_ok());
+
+    let opts = js_sys::JSON::parse(r#"{"trustWitnessUtxo":"yes"}"#).unwrap();
+    let e = err(w.sign_psbt(&psbt, Some(opts.unchecked_into())).unwrap_err());
+    assert!(e.starts_with("Invalid SignOptions object"), "{e}");
+}
+
+#[wasm_bindgen_test]
+fn max_expiration_secs_is_exposed() {
+    assert_eq!(
+        max_expiration_secs(),
+        rgb_lib_wasm::wallet::MAX_EXPIRATION_SECS
+    );
 }
