@@ -927,7 +927,15 @@ impl Indexer {
                     .map_err(IndexerError::from)?;
                 if let Some(tx_height) = tx_status.block_height {
                     let height = client.get_height().await.map_err(IndexerError::from)?;
-                    Some((height - tx_height + 1) as u64)
+                    // a TX height above the tip means an inconsistent indexer
+                    let blocks_since = height.checked_sub(tx_height).ok_or_else(|| {
+                        Error::Indexer {
+                            details: s!(
+                                "indexer reported a transaction height greater than the chain tip"
+                            ),
+                        }
+                    })?;
+                    Some(u64::from(blocks_since) + 1)
                 } else if client
                     .get_tx(&txid)
                     .await
@@ -1886,7 +1894,7 @@ impl Wallet {
         }
 
         let mut assignments_collected = AssignmentsCollection::default();
-        let mut input_btc_amt = 0;
+        let mut input_btc_amt: u64 = 0;
         for unspent in mut_unspents {
             // get spendable allocations for the required asset
             let asset_allocations: Vec<LocalRgbAllocation> = unspent
@@ -1948,7 +1956,14 @@ impl Wallet {
                 .for_each(|a| a.assignment.add_to_assignments(&mut assignments_collected));
             txo_map.insert(unspent.utxo.idx, unspent.utxo.outpoint());
 
-            input_btc_amt += unspent.utxo.btc_amount.parse::<u64>().unwrap();
+            let utxo_btc_amt = unspent
+                .utxo
+                .btc_amount
+                .parse::<u64>()
+                .expect("DB should contain a valid BTC amount");
+            input_btc_amt = input_btc_amt
+                .checked_add(utxo_btc_amt)
+                .expect("total input BTC value cannot exceed u64::MAX");
 
             // stop as soon as we have the needed assignments
             if assignments_collected.enough(assignments_needed) {
@@ -3102,11 +3117,13 @@ impl Wallet {
 
         let mut utxos_to_create = num.unwrap_or(UTXO_NUM);
         if up_to {
-            let allocatable = self.get_available_allocations(unspents, &[], None)?.len() as u8;
-            if allocatable >= utxos_to_create {
+            // the count of allocatable UTXOs can exceed u8::MAX
+            let allocatable = self.get_available_allocations(unspents, &[], None)?.len();
+            if allocatable >= utxos_to_create as usize {
                 return Err(Error::AllocationsAlreadyAvailable);
             }
-            utxos_to_create -= allocatable
+            utxos_to_create -=
+                u8::try_from(allocatable).expect("allocatable count cannot exceed u8::MAX");
         }
         debug!(self.logger, "Will try to create {} UTXOs", utxos_to_create);
 
@@ -8241,13 +8258,10 @@ impl Wallet {
         if transfer_info.main_transition == TypeOfTransition::Inflate {
             let inflation = transfer_info.original_assignments_needed.inflation;
             let db_asset = self.database.get_asset(asset_id).unwrap().unwrap();
-            let updated_known_circulating_supply = db_asset
-                .known_circulating_supply
-                .as_ref()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-                + inflation;
+            let updated_known_circulating_supply = add_inflation(
+                db_asset.known_circulating_supply.as_ref().unwrap(),
+                inflation,
+            );
             let mut updated_asset: DbAssetActMod = db_asset.into();
             updated_asset.known_circulating_supply =
                 ActiveValue::Set(Some(updated_known_circulating_supply.to_string()));
@@ -9502,6 +9516,14 @@ impl Wallet {
         info!(self.logger, "List unspents vanilla completed");
         Ok(res)
     }
+}
+
+fn add_inflation(known_circulating_supply: &str, inflation: u64) -> u64 {
+    known_circulating_supply
+        .parse::<u64>()
+        .expect("DB should contain a valid known circulating supply")
+        .checked_add(inflation)
+        .expect("known circulating supply plus inflation cannot exceed u64::MAX")
 }
 
 // Serve an esplora: `route` maps a request path to a status line and a body.
@@ -10973,6 +10995,81 @@ mod send_end_tests {
         let res = block_on(wallet.fail_transfers(online, Some(idx2), false, true));
         assert_eq!(res, Err(Error::CannotFailBatchTransfer));
         assert_eq!(status(&wallet, idx2), TransferStatus::WaitingConfirmations);
+    }
+
+    #[test]
+    fn get_tx_confirmations_inconsistent_height() {
+        let txid = "22".repeat(32);
+        let url = fake_esplora(|p: &str| {
+            match p {
+            p if p.ends_with("/status") => (
+                "200 OK",
+                br#"{"confirmed":true,"block_height":101,"block_hash":"0000000000000000000000000000000000000000000000000000000000000000","block_time":1600000000}"#.to_vec(),
+            ),
+            "/blocks/tip/height" => ("200 OK", b"100".to_vec()),
+            _ => ("404 Not Found", vec![]),
+        }
+        });
+        assert_eq!(
+            block_on(
+                crate::utils::build_indexer(&url)
+                    .unwrap()
+                    .get_tx_confirmations(&txid)
+            ),
+            Err(Error::Indexer {
+                details: s!("indexer reported a transaction height greater than the chain tip")
+            })
+        );
+    }
+
+    #[test]
+    fn up_to_allocatable_above_u8_max() {
+        let (mut wallet, online) = setup();
+        for vout in 0..256 {
+            seed_txo(&wallet, &"11".repeat(32), vout);
+        }
+        assert_eq!(
+            block_on(wallet.create_utxos_begin(online, true, Some(1), None, 1, true)),
+            Err(Error::AllocationsAlreadyAvailable)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "known circulating supply plus inflation cannot exceed u64::MAX")]
+    fn add_inflation_past_u64_max() {
+        add_inflation(&u64::MAX.to_string(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "total input BTC value cannot exceed u64::MAX")]
+    fn select_rgb_inputs_input_btc_past_u64_max() {
+        let (wallet, _) = setup();
+        let unspents = (0..2)
+            .map(|vout| LocalUnspent {
+                utxo: DbTxo {
+                    idx: vout as i32 + 1,
+                    txid: "33".repeat(32),
+                    vout,
+                    btc_amount: u64::MAX.to_string(),
+                    spent: false,
+                    exists: true,
+                    pending_witness: false,
+                },
+                rgb_allocations: vec![LocalRgbAllocation {
+                    asset_id: Some(s!("asset")),
+                    assignment: Assignment::Fungible(1),
+                    status: TransferStatus::Settled,
+                    incoming: true,
+                    txo_spent: false,
+                }],
+                pending_blinded: 0,
+            })
+            .collect();
+        let needed = AssignmentsCollection {
+            fungible: 2,
+            ..Default::default()
+        };
+        let _ = wallet._select_rgb_inputs(s!("asset"), &needed, unspents);
     }
 
     #[test]
