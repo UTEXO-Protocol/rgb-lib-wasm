@@ -373,7 +373,7 @@ async fn test_no_receive_on_pending_send_input() {
 }
 
 #[wasm_bindgen_test]
-async fn test_no_inflate_end_after_expiration() {
+async fn test_no_inflate_end_after_fail() {
     let transport = transport_endpoint();
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
@@ -394,8 +394,8 @@ async fn test_no_inflate_end_after_expiration() {
     wallet.sync(online.clone()).await.unwrap();
     let asset = wallet
         .issue_asset_ifa(
-            "EXP".to_string(),
-            "Expired inflation".to_string(),
+            "FIN".to_string(),
+            "Failed inflation".to_string(),
             0,
             vec![],
             vec![1000],
@@ -429,10 +429,19 @@ async fn test_no_inflate_end_after_expiration() {
     assert_eq!(colored.len(), 2);
 
     // begin an inflation, without ending it
-    let unsigned = wallet
-        .inflate_begin(online.clone(), asset.asset_id.clone(), vec![500], 1, 1)
+    let res = wallet
+        .inflate_begin(
+            online.clone(),
+            asset.asset_id.clone(),
+            vec![500],
+            1,
+            1,
+            false,
+        )
         .await
         .unwrap();
+    let idx = res.batch_transfer_idx.unwrap();
+    let unsigned = res.psbt;
     let psbt = unsigned.parse::<Psbt>().unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let (mut saved, saved_online) = saved_wallet(&wallet).await;
@@ -453,6 +462,9 @@ async fn test_no_inflate_end_after_expiration() {
         .map(|i| Outpoint::from(i.previous_output))
         .collect();
     assert_eq!(inputs, colored);
+    // an initiated inflation does not expire
+    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
+        .unwrap();
     let result = blind_rcv(
         &mut wallet,
         &online,
@@ -462,15 +474,20 @@ async fn test_no_inflate_end_after_expiration() {
         vec![transport.clone()],
     )
     .await;
+    js_sys::eval("Date.now = realDateNow").unwrap();
     assert!(
         matches!(result, Err(Error::InsufficientAllocationSlots)),
-        "a receive must not use an input of a begun inflation, got: {:?}",
+        "a receive must not use an input of an initiated inflation, got: {:?}",
         result.map(|r| r.recipient_id)
     );
 
-    // move the clock past the expiration and receive on an input of the inflation
-    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
-        .unwrap();
+    // fail the inflation and receive on one of its inputs
+    assert!(
+        wallet
+            .fail_transfers(online.clone(), Some(idx), false, false)
+            .await
+            .unwrap()
+    );
     let receive_data = blind_rcv(
         &mut wallet,
         &online,
@@ -481,13 +498,21 @@ async fn test_no_inflate_end_after_expiration() {
     )
     .await
     .unwrap();
+    let txid = psbt_txid(&signed);
     let result = wallet.inflate_end(online.clone(), signed).await;
-    js_sys::eval("Date.now = realDateNow").unwrap();
     assert!(
-        matches!(result, Err(Error::CannotEndTransfer { .. })),
-        "an expired inflation must not be ended, got: {:?}",
+        matches!(result, Err(Error::CannotEndTransfer { txid: ref t }) if t == &txid),
+        "a failed inflation must not be ended, got: {:?}",
         result.map(|r| r.txid)
     );
+    let status = wallet
+        .list_transfers(AssetFilter::Any, None)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.batch_transfer_idx == idx)
+        .unwrap()
+        .status;
+    assert_eq!(status, TransferStatus::Failed);
 
     // the received allocation is intact
     let receive = wallet
@@ -505,7 +530,8 @@ async fn test_no_inflate_end_after_expiration() {
         .list_unspents(None, false, true)
         .unwrap()
         .into_iter()
-        .filter(|u| u.utxo.colorable)
+        // the outputs of the failed inflation never exist
+        .filter(|u| u.utxo.colorable && u.utxo.exists)
         .map(|u| u.utxo.outpoint)
         .collect();
     assert_eq!(unspents, colored);
@@ -902,9 +928,10 @@ async fn test_full_wallet_flow() {
     // IFA inflation: inflate the IFA asset by 500
     let ifa_balance_before = ifa.balance.settled;
     let unsigned_inflate = wallet
-        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
+        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1, false)
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let inflate_entropy = Psbt::from_str(&unsigned_inflate)
         .unwrap()
         .outputs
@@ -1243,9 +1270,17 @@ async fn test_full_wallet_flow() {
     let online_r = restored.go_online(go_online_options(false)).await.unwrap();
     restored.sync(online_r.clone()).await.unwrap();
     let unsigned_inflate = restored
-        .inflate_begin(online_r.clone(), ifa.asset_id.clone(), vec![200], 1, 1)
+        .inflate_begin(
+            online_r.clone(),
+            ifa.asset_id.clone(),
+            vec![200],
+            1,
+            1,
+            false,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed_inflate = restored.sign_psbt(unsigned_inflate, None).unwrap();
     restored
         .inflate_end(online_r.clone(), signed_inflate)
@@ -1510,9 +1545,10 @@ async fn test_restored_wallet_inflates_after_inflation() {
         .unwrap();
 
     let unsigned = wallet
-        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
+        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1, false)
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let inflate_txid = wallet
         .inflate_end(online.clone(), signed)
@@ -1554,14 +1590,21 @@ async fn test_restored_wallet_inflates_after_inflation() {
     let online_r = restored.go_online(go_online_options(false)).await.unwrap();
     restored.sync(online_r.clone()).await.unwrap();
     let r = restored
-        .inflate_begin(online_r.clone(), ifa.asset_id.clone(), vec![200], 1, 1)
+        .inflate_begin(
+            online_r.clone(),
+            ifa.asset_id.clone(),
+            vec![200],
+            1,
+            1,
+            false,
+        )
         .await;
     assert!(
         r.is_ok(),
         "restored inflate_begin: {:?}; inflation tx height: {height:?}; transfers: {original:?}",
         r.as_ref().err()
     );
-    let signed_r = restored.sign_psbt(r.unwrap(), None).unwrap();
+    let signed_r = restored.sign_psbt(r.unwrap().psbt, None).unwrap();
     restored
         .inflate_end(online_r.clone(), signed_r)
         .await
@@ -1588,9 +1631,10 @@ async fn test_inflate_end_retries_after_failed_sync() {
         )
         .unwrap();
     let unsigned = wallet
-        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
+        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1, false)
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
 
     // esplora fails every call after the broadcast, so the sync after it fails

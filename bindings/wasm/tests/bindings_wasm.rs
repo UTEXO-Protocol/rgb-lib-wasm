@@ -356,3 +356,94 @@ fn inspect_consignment_js() {
     assert!(error(JsValue::from_str("All"), &[0]).contains("Invalid consignment"));
     assert!(error(JsValue::from_str("Bogus"), bytes).starts_with("Invalid bundle filter"));
 }
+
+async fn await_js(code: &str) -> JsValue {
+    let promise: js_sys::Promise = js_sys::eval(code).unwrap().dyn_into().unwrap();
+    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap()
+}
+
+async fn helper_post(path: &str, body: &str) {
+    await_js(&format!(
+        "fetch('http://127.0.0.1:8080/{path}', {{method: 'POST', \
+         headers: {{'Content-Type': 'application/json'}}, body: '{body}'}}).then(r => r.json())"
+    ))
+    .await;
+}
+
+async fn esplora_synced() {
+    await_js(
+        "(async () => {
+            const height = (await (await fetch('http://127.0.0.1:8080/height')).json()).height;
+            for (let i = 0; i < 120; i++) {
+                const r = await fetch('http://127.0.0.1:8094/regtest/api/blocks/tip/height',
+                    {cache: 'no-store'});
+                if (r.ok && parseInt(await r.text(), 10) >= height) return;
+                await new Promise(res => setTimeout(res, 500));
+            }
+            throw new Error('esplora did not sync');
+        })()",
+    )
+    .await;
+}
+
+fn prop(v: &JsValue, key: &str) -> JsValue {
+    js_sys::Reflect::get(v, &key.into()).unwrap()
+}
+
+#[wasm_bindgen_test]
+async fn inflate_begin_returns_result_object() {
+    let wallet = wallet_with_schemas(vec![AssetSchema::Nia, AssetSchema::Ifa]);
+    let online = online(&wallet).await;
+    let address = wallet.get_address().unwrap();
+    helper_post(
+        "fund",
+        &format!(r#"{{"address":"{address}","amount":"1.0"}}"#),
+    )
+    .await;
+    esplora_synced().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), true, Some(5), None, 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(&unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), &signed, true)
+        .await
+        .unwrap();
+    helper_post("mine", r#"{"blocks":1}"#).await;
+    esplora_synced().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let asset = wallet
+        .issue_asset_ifa(
+            "IFA",
+            "Inflatable",
+            0,
+            serde_wasm_bindgen::to_value(&vec![600u64, 400]).unwrap(),
+            serde_wasm_bindgen::to_value(&vec![100u64]).unwrap(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+    let asset_id = prop(&asset, "assetId").as_string().unwrap();
+    let amounts = || serde_wasm_bindgen::to_value(&vec![50u64]).unwrap();
+
+    let res = wallet
+        .inflate_begin(online.clone(), &asset_id, amounts(), 1, 1, true)
+        .await
+        .unwrap();
+    assert!(prop(&res, "psbt").is_string());
+    assert!(prop(&res, "batchTransferIdx").loose_eq(&JsValue::NULL));
+    let details = prop(&res, "details");
+    assert_eq!(prop(&details, "minConfirmations").as_f64(), Some(1.0));
+    let fascia: js_sys::Array = prop(&details, "fascia").dyn_into().unwrap();
+    assert!(fascia.length() > 0);
+    assert!(prop(&details, "entropy").is_bigint());
+
+    let res = wallet
+        .inflate_begin(online.clone(), &asset_id, amounts(), 1, 1, false)
+        .await
+        .unwrap();
+    assert!(prop(&res, "batchTransferIdx").as_f64().is_some());
+}
