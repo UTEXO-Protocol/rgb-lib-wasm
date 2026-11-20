@@ -4,7 +4,7 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-use rgb_lib_wasm::wallet::{DatabaseType, ReceiveData, WalletData};
+use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, ReceiveData, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
 use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet, inspect_consignment, max_expiration_secs};
 
@@ -455,4 +455,19 @@ async fn inflate_begin_returns_result_object() {
         .await
         .unwrap();
     assert!(prop(&res, "batchTransferIdx").as_f64().is_some());
+
+    // the change of the inflation right is listed in an array
+    let filter = serde_wasm_bindgen::to_value(&AssetFilter::Id(asset_id.clone())).unwrap();
+    let transfers: js_sys::Array = wallet
+        .list_transfers(filter, None)
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    let inflation = transfers
+        .iter()
+        .find(|t| prop(t, "kind").as_string().as_deref() == Some("Inflation"))
+        .unwrap();
+    let change_utxos: js_sys::Array = prop(&inflation, "changeUtxos").dyn_into().unwrap();
+    assert_eq!(change_utxos.length(), 1);
+    assert!(prop(&inflation, "changeUtxo").is_undefined());
 }

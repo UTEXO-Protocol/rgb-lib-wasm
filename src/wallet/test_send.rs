@@ -10,6 +10,7 @@ use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
     AssetFilter, Balance, Online, Outpoint, Recipient, RgbAllocation, Transfer, Unspent, Wallet,
+    WalletData,
 };
 use crate::{AssetSchema, Assignment, Error, RgbTransfer, TransferKind, TransferStatus};
 use amplify::confinement::Confined;
@@ -73,6 +74,29 @@ async fn invoice(
     .recipient_id
 }
 
+/// Begin the send of `map` and return its PSBT.
+async fn begin_map(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    donation: bool,
+) -> Result<String, Error> {
+    wallet
+        .send_begin(
+            online.clone(),
+            map,
+            donation,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await
+        .map(|r| r.psbt)
+}
+
 /// Begin a send of `amount` to `rid` through `url` and sign it. Return the PSBT and its txid.
 async fn begin(
     wallet: &mut Wallet,
@@ -87,21 +111,7 @@ async fn begin(
         asset_id.to_string(),
         vec![recipient(rid, amount, None, url)],
     )]);
-    let unsigned = wallet
-        .send_begin(
-            online.clone(),
-            map,
-            donation,
-            1,
-            1,
-            default_send_expiration(),
-            Some(transport_endpoint(PROXY_URL)),
-            None,
-            false,
-        )
-        .await
-        .unwrap()
-        .psbt;
+    let unsigned = begin_map(wallet, online, map, donation).await.unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let txid = Psbt::from_str(&signed)
         .unwrap()
@@ -751,6 +761,278 @@ async fn utxo_allocations_limit_across_assets_x_first() {
 #[wasm_bindgen_test]
 async fn utxo_allocations_limit_across_assets_y_first() {
     utxo_allocations_limit_across_assets(false).await;
+}
+
+/// A funded wallet with no UTXOs.
+async fn noutxo_wallet(wd: WalletData) -> (Wallet, Online) {
+    let mut wallet = Wallet::new(wd).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    (wallet, online)
+}
+
+async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8, size: Option<u32>) {
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(num), size, 1, true, false)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+}
+
+fn utxo_num_allocations(wallet: &mut Wallet, outpoint: &Outpoint) -> Option<usize> {
+    wallet
+        .list_unspents(None, true, true)
+        .unwrap()
+        .into_iter()
+        .find(|u| &u.utxo.outpoint == outpoint)
+        .map(|u| u.rgb_allocations.len())
+}
+
+/// Begin a send of `amount` to `rid` and return the result.
+async fn begin_result(
+    wallet: &mut Wallet,
+    online: &Online,
+    asset_id: &str,
+    rid: &str,
+    amount: u64,
+) -> Result<(), Error> {
+    let map = HashMap::from([(
+        asset_id.to_string(),
+        vec![recipient(rid, amount, None, PROXY_URL)],
+    )]);
+    begin_map(wallet, online, map, false).await.map(|_| ())
+}
+
+// the RGB change does not take a UTXO past the limit with the slots of its unpaid invoices
+#[wasm_bindgen_test]
+async fn change_respects_invoice_slots() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(5).await;
+    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    wd.max_allocations_per_utxo = 3;
+    let (mut r, r_on) = noutxo_wallet(wd).await;
+    let (mut r2, r2_on) = nia_wallet(1).await;
+    // tiny UTXOs, so that a send at 1 sat/vB has no BTC change
+    create_utxos(&mut r, &r_on, 2, Some(400)).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    for _ in 0..3 {
+        send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
+    }
+
+    // the invoice goes on the UTXO with 1 allocation (U), the send spends the other one
+    let rid = invoice(&mut r, &r_on, Assignment::Any, &[PROXY_URL]).await;
+    let utxo_u = transfer_of(&r, &rid).receive_utxo.unwrap();
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_u), Some(1));
+    let rid2 = invoice(&mut r2, &r2_on, Assignment::Any, &[PROXY_URL]).await;
+    let res = begin_result(&mut r, &r_on, &asset_id, &rid2, 1).await;
+    assert!(
+        matches!(res, Err(Error::InsufficientAllocationSlots)),
+        "{res:?}"
+    );
+
+    // with another UTXO the RGB change goes there
+    create_utxos(&mut r, &r_on, 1, None).await;
+    let txid = send_to(&mut r, &r_on, &asset_id, &rid2, 1, PROXY_URL, false).await;
+    let change_utxos = sent(&r, &txid).change_utxos;
+    assert_eq!(change_utxos.len(), 1);
+    assert_ne!(change_utxos[0], utxo_u);
+    settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
+    assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
+
+    // the invoice can still be paid
+    send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(transfer_of(&r, &rid).status, TransferStatus::Settled);
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_u), Some(2));
+}
+
+// the RGB change does not take a UTXO past the allocations a bundle can spend
+#[wasm_bindgen_test]
+async fn change_utxo_allocations_limit() {
+    let _reset = ResetMocks;
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(10));
+    let (mut a, a_on) = nia_wallet(5).await;
+    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    wd.max_allocations_per_utxo = u32::MAX;
+    let (mut r, r_on) = noutxo_wallet(wd).await;
+    let (mut r2, r2_on) = nia_wallet(1).await;
+    // tiny UTXOs, so that a send at 1 sat/vB has no BTC change
+    create_utxos(&mut r, &r_on, 2, Some(400)).await;
+    let asset_id = issue(&a, vec![1_000_000 + 118]);
+
+    // D gets 1 allocation, S gets 10
+    let rid_d = invoice(&mut r, &r_on, Assignment::Any, &[PROXY_URL]).await;
+    send_to(
+        &mut a, &a_on, &asset_id, &rid_d, 1_000_000, PROXY_URL, false,
+    )
+    .await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    let rid_s = invoice(&mut r, &r_on, Assignment::Any, &[PROXY_URL]).await;
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(Some((9, 2)));
+    send_to(&mut a, &a_on, &asset_id, &rid_s, 118, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.with_borrow(|m| m.is_none()));
+    let utxo_d = transfer_of(&r, &rid_d).receive_utxo.unwrap();
+    let utxo_s = transfer_of(&r, &rid_s).receive_utxo.unwrap();
+    assert_ne!(utxo_d, utxo_s);
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_d), Some(1));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_s), Some(10));
+
+    // the send spends S and its 10 allocations go to the change, which D cannot take
+    let rid2 = invoice(&mut r2, &r2_on, Assignment::Any, &[PROXY_URL]).await;
+    let res = begin_result(&mut r, &r_on, &asset_id, &rid2, 1).await;
+    assert!(
+        matches!(res, Err(Error::InsufficientAllocationSlots)),
+        "{res:?}"
+    );
+
+    // with another UTXO the RGB change goes there
+    create_utxos(&mut r, &r_on, 1, None).await;
+    let txid = send_to(&mut r, &r_on, &asset_id, &rid2, 1, PROXY_URL, false).await;
+    let change_utxos = sent(&r, &txid).change_utxos;
+    assert_eq!(change_utxos.len(), 1);
+    let utxo_change = change_utxos[0].clone();
+    assert_ne!(utxo_change, utxo_d);
+    assert_ne!(utxo_change, utxo_s);
+    settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
+    assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_d), Some(1));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_change), Some(10));
+}
+
+// the RGB change goes to the BTC change output and to other UTXOs, as many as needed
+#[wasm_bindgen_test]
+async fn change_spread_over_utxos() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(5).await;
+    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    wd.max_allocations_per_utxo = 4;
+    let (mut r, r_on) = noutxo_wallet(wd).await;
+    let (mut r2, r2_on) = nia_wallet(1).await;
+    let ids: Vec<String> = (0..5).map(|_| issue(&a, vec![AMOUNT])).collect();
+
+    // S gets 1 allocation of A, B, C and D
+    create_utxos(&mut r, &r_on, 1, None).await;
+    for asset_id in &ids[..4] {
+        send_and_settle(&mut a, &a_on, &mut r, &r_on, asset_id, 100).await;
+    }
+    let utxo_s = r
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .find(|u| !u.rgb_allocations.is_empty())
+        .unwrap()
+        .utxo
+        .outpoint;
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_s), Some(4));
+
+    // the 4 change allocations do not fit on the BTC change output alone
+    r.wallet_data.max_allocations_per_utxo = 2;
+    let rid2 = invoice(&mut r2, &r2_on, Assignment::Any, &[PROXY_URL]).await;
+    let res = begin_result(&mut r, &r_on, &ids[0], &rid2, 10).await;
+    assert!(
+        matches!(res, Err(Error::InsufficientAllocationSlots)),
+        "{res:?}"
+    );
+    r.wallet_data.max_allocations_per_utxo = 4;
+
+    // U1 and U2 get 1 allocation of E each
+    create_utxos(&mut r, &r_on, 2, None).await;
+    let mut utxos_u = vec![];
+    for _ in 0..2 {
+        let rid = invoice(&mut r, &r_on, Assignment::Any, &[PROXY_URL]).await;
+        utxos_u.push(transfer_of(&r, &rid).receive_utxo.unwrap());
+        send_to(&mut a, &a_on, &ids[4], &rid, 100, PROXY_URL, false).await;
+        settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    }
+    assert_ne!(utxos_u[0], utxos_u[1]);
+    assert!(!utxos_u.contains(&utxo_s));
+
+    // the BTC change output gets 2 of the 4 change allocations, U1 and U2 get 1 each
+    r.wallet_data.max_allocations_per_utxo = 2;
+    let txid = send_to(&mut r, &r_on, &ids[0], &rid2, 10, PROXY_URL, false).await;
+    let change_utxos = sent(&r, &txid).change_utxos;
+    assert_eq!(change_utxos.len(), 1);
+    assert_eq!(change_utxos[0].txid, txid);
+    settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
+    assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_s), None);
+    for utxo in [&change_utxos[0], &utxos_u[0], &utxos_u[1]] {
+        assert_eq!(utxo_num_allocations(&mut r, utxo), Some(2));
+    }
+    assert_eq!(balance(&r, &ids[0]).spendable, 90);
+    for asset_id in &ids[1..4] {
+        assert_eq!(balance(&r, asset_id).spendable, 100);
+    }
+}
+
+// each change allocation takes its own slot
+#[wasm_bindgen_test]
+async fn change_allocations_placed_separately() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) =
+        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 5).await;
+    let (mut r, r_on) =
+        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 1).await;
+    let asset_id = a
+        .issue_asset_ifa(
+            s("IFA"),
+            s("Inflatable"),
+            0,
+            vec![AMOUNT],
+            vec![AMOUNT],
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap()
+        .asset_id;
+
+    a.wallet_data.max_allocations_per_utxo = 1;
+    let rid_f = invoice(&mut r, &r_on, Assignment::Any, &[PROXY_URL]).await;
+    let rid_i = invoice(&mut r, &r_on, Assignment::Any, &[PROXY_URL]).await;
+    let rec_f = recipient(&rid_f, 66, None, PROXY_URL);
+    let rec_i = Recipient {
+        assignment: Assignment::InflationRight(42),
+        ..recipient(&rid_i, 42, None, PROXY_URL)
+    };
+    let map = HashMap::from([(asset_id.clone(), vec![rec_f, rec_i])]);
+    let unsigned = begin_map(&mut a, &a_on, map, false).await.unwrap();
+    let signed = a.sign_psbt(unsigned, None).unwrap();
+    let txid = a.send_end(a_on.clone(), signed, false).await.unwrap().txid;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    let t = sent(&a, &txid);
+    assert_eq!(t.status, TransferStatus::Settled);
+
+    // the BTC change output and a pre-existing UTXO get 1 allocation each
+    assert_eq!(t.change_utxos.len(), 2);
+    assert_eq!(t.change_utxos.iter().filter(|o| o.txid == txid).count(), 1);
+    let unspents = a.list_unspents(None, false, true).unwrap();
+    let mut change: Vec<Assignment> = t
+        .change_utxos
+        .iter()
+        .flat_map(|o| {
+            let unspent = unspents.iter().find(|u| &u.utxo.outpoint == o).unwrap();
+            assert_eq!(unspent.rgb_allocations.len(), 1);
+            unspent.rgb_allocations.iter().map(|a| a.assignment.clone())
+        })
+        .collect();
+    change.sort();
+    let mut expected = vec![
+        Assignment::Fungible(AMOUNT - 66),
+        Assignment::InflationRight(AMOUNT - 42),
+    ];
+    expected.sort();
+    assert_eq!(change, expected);
 }
 
 pub(super) fn consignment(wallet: &Wallet, asset_id: &str, txid: &str) -> RgbTransfer {

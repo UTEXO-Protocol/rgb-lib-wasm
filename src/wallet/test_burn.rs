@@ -163,7 +163,7 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(burned.requested_assignment, Some(Assignment::Fungible(150)));
     assert_eq!(burned.assignments, vec![Assignment::Fungible(250)]);
     assert_eq!(burned.recipient_id, None);
-    assert!(burned.change_utxo.is_some());
+    assert_eq!(burned.change_utxos.len(), 1);
     let held = assignments(&mut wallet, &asset_id);
     assert!(held.contains(&Assignment::Fungible(600)) && held.contains(&Assignment::Fungible(250)));
     serve_reject_list(&url, "");
