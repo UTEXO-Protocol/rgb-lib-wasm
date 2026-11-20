@@ -2,7 +2,7 @@
 #![allow(clippy::derivable_impls)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -1620,8 +1620,11 @@ impl InMemoryDb {
         let colorings = colorings.unwrap_or_else(|| self.iter_colorings().unwrap_or_default());
         let transfers = transfers.unwrap_or_else(|| self.iter_transfers().unwrap_or_default());
 
+        // an invoice with saved colorings counts through them, not as a pending blind receive
+        let colored: HashSet<i32> = colorings.iter().map(|c| c.asset_transfer_idx).collect();
         let pending_blinded_utxos = transfers
             .iter()
+            .filter(|t| !colored.contains(&t.asset_transfer_idx))
             .filter_map(|t| match (&t.recipient_type, t.incoming) {
                 (Some(RecipientTypeFull::Blind { unblinded_utxo }), true) => t
                     .related_transfers(&asset_transfers, &batch_transfers)
@@ -2784,6 +2787,39 @@ mod tests {
     }
 
     // ── Fix #18: orphaned FK handling ─────────────────────────────
+
+    #[test]
+    fn test_pending_blinded_skips_colored_invoices() {
+        let db = make_db();
+        let txo_idx = db.set_txo(make_txo_mod("tx1", 0, "1000")).unwrap();
+        let txo = db.iter_txos().unwrap()[0].clone();
+        let bt = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::WaitingCounterparty))
+            .unwrap();
+        let blind = |bt| {
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            db.set_transfer(DbTransferActMod {
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Blind {
+                    unblinded_utxo: txo.outpoint(),
+                })),
+                ..make_transfer_mod(at, true)
+            })
+            .unwrap();
+            at
+        };
+        let at1 = blind(bt);
+        blind(bt);
+        db.set_coloring(make_coloring_mod(txo_idx, at1, ColoringType::Receive, 1))
+            .unwrap();
+
+        // the colored invoice counts through its coloring only
+        let unspents = db
+            .get_rgb_allocations(vec![txo], None, None, None, None)
+            .unwrap();
+        assert_eq!(unspents[0].pending_blinded, 1);
+    }
 
     #[test]
     fn test_utxo_allocations_skips_orphaned_colorings() {

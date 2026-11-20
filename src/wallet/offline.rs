@@ -28,6 +28,31 @@ pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARG
 /// [`Error::InvalidExpiration`].
 pub const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
 
+/// The maximum length of a confined collection, given an accessor returning it from a bundle.
+const fn bundle_confinement_max<
+    C: amplify::confinement::Collection,
+    const MIN: usize,
+    const MAX: usize,
+>(
+    _: fn(&TransitionBundle) -> &Confined<C, MIN, MAX>,
+) -> usize {
+    MAX
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold and still be spent. A bundle spends
+/// at most as many opouts as its input map holds.
+pub(crate) const MAX_UTXO_ASSET_ALLOCATIONS: usize =
+    bundle_confinement_max(|b: &TransitionBundle| &b.input_map);
+
+/// Maximum number of allocations of an asset a UTXO can hold (see [`MAX_UTXO_ASSET_ALLOCATIONS`]).
+pub(crate) fn max_utxo_asset_allocations() -> usize {
+    #[cfg(test)]
+    if let Some(max_allocations) = MOCK_MAX_UTXO_ASSET_ALLOCATIONS.with_borrow(|m| *m) {
+        return max_allocations;
+    }
+    MAX_UTXO_ASSET_ALLOCATIONS
+}
+
 /// Minimum `retention_grace_secs` a recipient requires from the sender proxy to ACK a transfer.
 /// A transfer whose sender proxy grants less is NACKed.
 #[cfg(feature = "esplora")]
@@ -88,6 +113,8 @@ pub(crate) struct LocalAssetData {
 thread_local! {
     /// Seal the genesis of the next IFA asset issued assigns a link right to, if set.
     pub(crate) static MOCK_IFA_LINK_RIGHT: std::cell::RefCell<Option<BuilderSeal<BlindSeal<RgbTxid>>>> =
+        const { std::cell::RefCell::new(None) };
+    pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: std::cell::RefCell<Option<usize>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1375,7 +1402,16 @@ impl Wallet {
         mut_unspents
             .iter_mut()
             .for_each(|u| u.rgb_allocations.retain(|a| !a.status.failed()));
-        let max_allocs = max_allocations.unwrap_or(self.max_allocations_per_utxo() - 1);
+        let max_allocs = max_allocations.unwrap_or_else(|| {
+            // a UTXO cannot get more allocations than it can hold and still be spent
+            let max_per_utxo = Ord::min(
+                self.max_allocations_per_utxo(),
+                u32::try_from(max_utxo_asset_allocations()).unwrap_or(u32::MAX),
+            );
+            max_per_utxo
+                .checked_sub(1)
+                .expect("max allocations per UTXO must be greater than 0")
+        });
         let reserved = self.get_reserved_outpoints()?;
         Ok(mut_unspents
             .iter()
@@ -4650,5 +4686,63 @@ mod receive_expiration_tests {
                 ("baz".to_string(), "qux".to_string()),
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod available_allocations_tests {
+    use super::address_reuse_tests::make_test_wallet;
+    use super::*;
+
+    fn unspent(vout: u32, allocations: usize, pending_blinded: u32) -> LocalUnspent {
+        LocalUnspent {
+            utxo: DbTxo {
+                idx: vout as i32 + 1,
+                txid: "33".repeat(32),
+                vout,
+                btc_amount: s!("1000"),
+                spent: false,
+                exists: true,
+                pending_witness: false,
+            },
+            rgb_allocations: vec![
+                LocalRgbAllocation {
+                    asset_id: Some(s!("asset")),
+                    assignment: Assignment::Fungible(1),
+                    status: TransferStatus::Settled,
+                    incoming: true,
+                    txo_spent: false,
+                };
+                allocations
+            ],
+            pending_blinded,
+        }
+    }
+
+    #[test]
+    fn available_allocations_capped_by_the_bundle_limit() {
+        let mut wallet = make_test_wallet(false);
+        wallet.wallet_data.max_allocations_per_utxo = u32::MAX;
+        let max = MAX_UTXO_ASSET_ALLOCATIONS;
+        let mut unspents = vec![
+            unspent(0, max - 1, 0),
+            unspent(1, max, 0),
+            unspent(2, max - 1, 1),
+        ];
+        let available = |wallet: &Wallet, unspents: &[LocalUnspent], max_allocations| {
+            wallet
+                .get_available_allocations(unspents.to_vec(), &[], max_allocations)
+                .unwrap()
+                .iter()
+                .map(|u| u.utxo.vout)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(available(&wallet, &unspents, None), vec![0]);
+        // an explicit maximum is not capped
+        assert_eq!(available(&wallet, &unspents, Some(u32::MAX)), vec![0, 1, 2]);
+        // the lower limit wins
+        wallet.wallet_data.max_allocations_per_utxo = 5;
+        unspents.push(unspent(3, 4, 0));
+        assert_eq!(available(&wallet, &unspents, None), vec![3]);
     }
 }

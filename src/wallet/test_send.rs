@@ -1,13 +1,16 @@
 use wasm_bindgen_test::*;
 
+use super::offline::MOCK_MAX_UTXO_ASSET_ALLOCATIONS;
 use super::online::{
-    MOCK_MAX_UTXO_ASSET_ALLOCATIONS, MOCK_SPAM_HIDDEN_SPENDS, MOCK_SPAM_RECIPIENT_ASSIGNMENTS,
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS, MOCK_SPAM_HIDDEN_SPENDS, MOCK_SPAM_RECIPIENT_ASSIGNMENTS,
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
-use crate::wallet::{AssetFilter, Balance, Online, Recipient, RgbAllocation, Transfer, Wallet};
+use crate::wallet::{
+    AssetFilter, Balance, Online, Outpoint, Recipient, RgbAllocation, Transfer, Unspent, Wallet,
+};
 use crate::{AssetSchema, Assignment, Error, RgbTransfer, TransferKind, TransferStatus};
 use amplify::confinement::Confined;
 use bdk_wallet::bitcoin::psbt::Psbt;
@@ -22,20 +25,21 @@ use rgbstd::containers::FileContent;
 use rgbstd::persistence::RgbStore;
 use rgbstd::validation::{ResolveWitness, WitnessStatus};
 use rgbstd::vm::WitnessOrd;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::str::FromStr;
 
 const AMOUNT: u64 = 1000;
 
 /// Reset the mocks when a test ends, as all lib tests share one thread.
-struct ResetMocks;
+pub(super) struct ResetMocks;
 
 impl Drop for ResetMocks {
     fn drop(&mut self) {
         MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(None);
         MOCK_SPAM_HIDDEN_SPENDS.set(None);
         MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(None);
+        MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(false);
     }
 }
 
@@ -460,7 +464,22 @@ async fn utxo_freeze_limit() {
     send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
     assert_eq!(colored_allocations(&mut r).len(), 2);
 
+    // the UTXO is full, so the wallet does not pick it for an invoice
+    assert!(matches!(
+        blind_rcv(
+            &mut r,
+            &r_on,
+            None,
+            Assignment::Fungible(100),
+            default_rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+        )
+        .await,
+        Err(Error::InsufficientAllocationSlots)
+    ));
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(3));
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(2));
     send_refused(&mut a, &a_on, &mut r, &r_on, &asset_id, &rid, 100).await;
     assert_eq!(colored_allocations(&mut r).len(), 2);
 
@@ -473,7 +492,7 @@ async fn utxo_freeze_limit() {
 #[wasm_bindgen_test]
 async fn utxo_freeze_concurrent_receives() {
     let _reset = ResetMocks;
-    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(1));
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(2));
     let (mut a, a_on) = nia_wallet(5).await;
     let (mut r, r_on) = nia_wallet(1).await;
     let asset_id = issue(&a, vec![AMOUNT, AMOUNT]);
@@ -488,6 +507,7 @@ async fn utxo_freeze_concurrent_receives() {
     let tx2 = send_to(&mut a, &a_on, &asset_id, &rid2, 50, PROXY_URL, false).await;
     assert_ne!(tx1, tx2);
 
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(1));
     refresh(&mut r, &r_on).await;
     let statuses = [transfer_of(&r, &rid1).status, transfer_of(&r, &rid2).status];
     assert!(statuses.contains(&TransferStatus::WaitingConfirmations));
@@ -503,6 +523,170 @@ async fn utxo_freeze_concurrent_receives() {
     assert_eq!(sent(&a, &refused).status, TransferStatus::Failed);
     assert_eq!(colored_allocations(&mut r).len(), 1);
     assert_eq!(balance(&r, &asset_id).settled, 50);
+}
+
+/// The RGB unspent of `wallet` at `outpoint`.
+fn unspent_at(wallet: &mut Wallet, outpoint: &Outpoint) -> Unspent {
+    wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .find(|u| &u.utxo.outpoint == outpoint)
+        .unwrap()
+}
+
+// a send skips a UTXO that takes its inputs past the allocations a bundle can spend
+#[wasm_bindgen_test]
+async fn utxo_allocations_limit_across_inputs() {
+    let _reset = ResetMocks;
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(10));
+    let (mut a, a_on) = nia_wallet(5).await;
+    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    wd.max_allocations_per_utxo = u32::MAX;
+    let (mut r, r_on) = funded_wallet(wd, 3).await;
+    let (mut r2, r2_on) = nia_wallet(1).await;
+    let asset_id = issue(&a, vec![33_000 + 34_000 + 50_000 + AMOUNT]);
+
+    // A and B get 6 allocations each, C gets 1, each on its own UTXO
+    let mut receive_utxos = vec![];
+    for (amount, spam) in [
+        (33_000, Some((5, 1))),
+        (34_000, Some((5, 1))),
+        (50_000, None),
+    ] {
+        let rid = invoice(&mut r, &r_on, Assignment::Fungible(amount), &[PROXY_URL]).await;
+        receive_utxos.push(transfer_of(&r, &rid).receive_utxo.unwrap());
+        MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(spam);
+        send_to(&mut a, &a_on, &asset_id, &rid, amount, PROXY_URL, false).await;
+        settle_both(&mut a, &a_on, &mut r, &r_on).await;
+        assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.with_borrow(|m| m.is_none()));
+    }
+    assert_eq!(receive_utxos.iter().collect::<HashSet<_>>().len(), 3);
+    let mut allocations: Vec<(u64, usize)> = r
+        .list_unspents(None, false, true)
+        .unwrap()
+        .iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .map(|u| {
+            let sum = u
+                .rgb_allocations
+                .iter()
+                .map(|a| a.assignment.main_amount())
+                .sum();
+            (sum, u.rgb_allocations.len())
+        })
+        .collect();
+    allocations.sort();
+    assert_eq!(allocations, vec![(33_000, 6), (34_000, 6), (50_000, 1)]);
+
+    // A comes first, B is skipped and C is selected
+    send_and_settle(&mut r, &r_on, &mut r2, &r2_on, &asset_id, 40_000).await;
+    assert_eq!(balance(&r2, &asset_id).settled, 40_000);
+    assert_eq!(
+        unspent_at(&mut r, &receive_utxos[1]).rgb_allocations.len(),
+        6
+    );
+}
+
+/// Send assets X and Y together from a wallet with two UTXOs. UTXO 1 holds X and 6 allocations
+/// of Y. UTXO 2 holds 6 allocations of Y. Only UTXO 1 can be spent.
+async fn utxo_allocations_limit_across_assets(x_first: bool) {
+    let _reset = ResetMocks;
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(10));
+    let (mut a, a_on) = nia_wallet(5).await;
+    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    wd.max_allocations_per_utxo = u32::MAX;
+    let (mut r, r_on) = funded_wallet(wd, 1).await;
+    let (mut r2, r2_on) = nia_wallet(2).await;
+
+    // the send selects inputs in asset ID order
+    let mut ids = [issue(&a, vec![AMOUNT]), issue(&a, vec![AMOUNT + 1])];
+    ids.sort();
+    let [first, second] = ids;
+    let (x, y) = if x_first {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    send_to(&mut a, &a_on, &x, &rid, 100, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(60), &[PROXY_URL]).await;
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(Some((5, 10)));
+    send_to(&mut a, &a_on, &y, &rid, 60, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(colored_allocations(&mut r).len(), 7);
+
+    let unsigned = r
+        .create_utxos_begin(r_on.clone(), false, Some(1), None, 1, true)
+        .await
+        .unwrap();
+    let signed = r.sign_psbt(unsigned, None).unwrap();
+    r.create_utxos_end(r_on.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    r.sync(r_on.clone()).await.unwrap();
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(30), &[PROXY_URL]).await;
+    let utxo_2 = transfer_of(&r, &rid).receive_utxo.unwrap();
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(Some((5, 5)));
+    send_to(&mut a, &a_on, &y, &rid, 30, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.with_borrow(|m| m.is_none()));
+
+    let rid_x = invoice(&mut r2, &r2_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    // with X first, UTXO 2 alone covers Y but takes Y past the limit
+    let y_amount = if x_first { 20 } else { 50 };
+    let rid_y = invoice(
+        &mut r2,
+        &r2_on,
+        Assignment::Fungible(y_amount),
+        &[PROXY_URL],
+    )
+    .await;
+    let map = HashMap::from([
+        (x.clone(), vec![recipient(&rid_x, 100, None, PROXY_URL)]),
+        (
+            y.clone(),
+            vec![recipient(&rid_y, y_amount, None, PROXY_URL)],
+        ),
+    ]);
+    let unsigned = r
+        .send_begin(
+            r_on.clone(),
+            map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .psbt;
+    let signed = r.sign_psbt(unsigned, None).unwrap();
+    let txid = r.send_end(r_on.clone(), signed, false).await.unwrap().txid;
+    settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
+    assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
+    assert_eq!(balance(&r2, &x).settled, 100);
+    assert_eq!(balance(&r2, &y).settled, y_amount);
+    assert_eq!(unspent_at(&mut r, &utxo_2).rgb_allocations.len(), 6);
+}
+
+#[wasm_bindgen_test]
+async fn utxo_allocations_limit_across_assets_x_first() {
+    utxo_allocations_limit_across_assets(true).await;
+}
+
+#[wasm_bindgen_test]
+async fn utxo_allocations_limit_across_assets_y_first() {
+    utxo_allocations_limit_across_assets(false).await;
 }
 
 pub(super) fn consignment(wallet: &Wallet, asset_id: &str, txid: &str) -> RgbTransfer {
