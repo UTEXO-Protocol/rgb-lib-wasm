@@ -27,6 +27,12 @@ pub(crate) const INDEXER_RETRIES: u8 = 3;
 #[cfg(feature = "esplora")]
 pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 
+// test probe: count the transition builders loaded from the stock
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TRANSITION_BUILDERS_LOADED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(feature = "esplora")]
 #[derive(Clone)]
 pub(crate) struct WasmSleeper;
@@ -853,6 +859,8 @@ impl RgbRuntime {
         contract_id: ContractId,
         transition_type: TransitionType,
     ) -> Result<TransitionBuilder, Error> {
+        #[cfg(test)]
+        TRANSITION_BUILDERS_LOADED.set(TRANSITION_BUILDERS_LOADED.get() + 1);
         self.stock
             .transition_builder_raw(contract_id, transition_type)
             .map_err(Error::from)

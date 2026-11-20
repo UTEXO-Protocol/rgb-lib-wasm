@@ -3938,11 +3938,20 @@ impl Wallet {
         }
 
         let mut extra_allocations = ExtraAllocations::new();
+        // Push all extra transitions at once. One push per transition rewrites the contract consumers each time.
+        let mut extra_transitions = vec![];
         for (cid, opout_state_map) in extra_state {
             let schema = runtime.contract_schema(cid)?;
+            // Load one builder per transition type and clone it for each allocation. Each load reads the contract schema rules.
+            let mut builders: HashMap<TransitionType, TransitionBuilder> = HashMap::new();
             for (txo_idx, opout, state) in opout_state_map {
                 let transition_type = schema.default_transition_for_assignment(&opout.ty);
-                let mut extra_builder = runtime.transition_builder_raw(cid, transition_type)?;
+                let mut extra_builder = match builders.entry(transition_type) {
+                    Entry::Occupied(entry) => entry.get().clone(),
+                    Entry::Vacant(entry) => entry
+                        .insert(runtime.transition_builder_raw(cid, transition_type)?)
+                        .clone(),
+                };
                 let assignment = Assignment::from_opout_and_state(opout, &state);
                 let (destination, seal) = self.take_change_seal(
                     &mut change_slots,
@@ -3960,10 +3969,11 @@ impl Wallet {
                     .entry(txo_idx)
                     .or_default()
                     .push((assignment, destination));
-                psbt.push_rgb_transition(extra_transition)
-                    .map_err(InternalError::from)?;
+                extra_transitions.push(extra_transition);
             }
         }
+        psbt.push_rgb_transitions(extra_transitions)
+            .map_err(InternalError::from)?;
 
         psbt.set_opret_host();
         let entropy = SysRng
