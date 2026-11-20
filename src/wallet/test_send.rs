@@ -687,13 +687,11 @@ async fn utxo_allocations_limit_across_assets(x_first: bool) {
     assert_eq!(colored_allocations(&mut r).len(), 7);
 
     let unsigned = r
-        .create_utxos_begin(r_on.clone(), false, Some(1), None, 1, true)
+        .create_utxos_begin(r_on.clone(), false, Some(1), None, 1, true, false)
         .await
         .unwrap();
     let signed = r.sign_psbt(unsigned, None).unwrap();
-    r.create_utxos_end(r_on.clone(), signed, true)
-        .await
-        .unwrap();
+    r.create_utxos_end(r_on.clone(), signed).await.unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
     r.sync(r_on.clone()).await.unwrap();

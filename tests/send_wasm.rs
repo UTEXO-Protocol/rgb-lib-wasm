@@ -48,13 +48,13 @@ async fn create_utxos(
     size: Option<u32>,
 ) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), up_to, num, size, 1, true)
+        .create_utxos_begin(online.clone(), up_to, num, size, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let txid = txid_of(&signed);
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     // A block can miss the TX before it reaches the mining node: mine until it confirms.
@@ -233,7 +233,7 @@ async fn begin_end() {
     assert!(!wallet.backup_info().unwrap());
     let (mut saved, saved_online) = saved_wallet(&wallet).await;
     assert_eq!(
-        saved.send_btc_end(saved_online, dry_signed, true).await,
+        saved.send_btc_end(saved_online, dry_signed).await,
         Err(Error::WrongOperation { txid: txid.clone() })
     );
 
@@ -391,11 +391,15 @@ async fn send_end_retry_after_post_failure() {
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, false).await;
     let idx = res.batch_transfer_idx.unwrap();
+    assert!(wallet.send_consignment_bytes(&txid, &asset_id).is_none());
     fail_posts(":3010", true);
     assert!(matches!(
         end(&mut wallet, &online, &signed).await,
         Err(Error::Proxy { .. })
     ));
+    // the failed end keeps the consignment it built
+    let built = wallet.send_consignment_bytes(&txid, &asset_id);
+    assert!(built.is_some());
     let saved = sends(&wallet, &txid);
     assert_eq!(saved.len(), 2);
     assert!(
@@ -403,10 +407,12 @@ async fn send_end_retry_after_post_failure() {
             .iter()
             .all(|t| t.status == TransferStatus::Initiated && t.batch_transfer_idx == idx)
     );
-    // a reload keeps the used flag of the post that succeeded, so the retry skips its proxy
+    // a reload keeps the built consignment and the used flag of the post that succeeded,
+    // so the retry skips its proxy
     let (reloaded, online) = saved_wallet(&wallet).await;
     drop(wallet);
     let mut wallet = reloaded;
+    assert_eq!(wallet.send_consignment_bytes(&txid, &asset_id), built);
     fail_posts(":3000", true);
     assert_eq!(
         end(&mut wallet, &online, &signed).await,

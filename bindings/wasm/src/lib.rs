@@ -426,7 +426,7 @@ impl WasmWallet {
         to_js(&txs)
     }
 
-    /// Fail a begun vanilla operation and release its inputs.
+    /// Abort a begun vanilla operation: delete it and release its inputs.
     #[wasm_bindgen(js_name = "abortPendingVanillaTx")]
     pub fn abort_pending_vanilla_tx(&self, txid: &str) -> Result<(), JsValue> {
         self.inner
@@ -628,8 +628,10 @@ impl WasmWallet {
     }
 
     /// Create UTXOs (begin): prepare a PSBT to create new UTXOs for RGB allocations.
+    /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation.
     /// Returns the unsigned PSBT string.
     #[wasm_bindgen(js_name = "createUtxosBegin")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_utxos_begin(
         &self,
         online_js: JsValue,
@@ -638,12 +640,13 @@ impl WasmWallet {
         size: Option<u32>,
         fee_rate: u64,
         skip_sync: bool,
+        dry_run: bool,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .create_utxos_begin(online, up_to, num, size, fee_rate, skip_sync)
+            .create_utxos_begin(online, up_to, num, size, fee_rate, skip_sync, dry_run)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -655,13 +658,12 @@ impl WasmWallet {
         &self,
         online_js: JsValue,
         signed_psbt: &str,
-        skip_sync: bool,
     ) -> Result<u8, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .create_utxos_end(online, signed_psbt.to_string(), skip_sync)
+            .create_utxos_end(online, signed_psbt.to_string())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -731,6 +733,7 @@ impl WasmWallet {
     }
 
     /// Send BTC (begin): prepare a PSBT. Returns the unsigned PSBT string.
+    /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation.
     #[wasm_bindgen(js_name = "sendBtcBegin")]
     pub async fn send_btc_begin(
         &self,
@@ -739,12 +742,20 @@ impl WasmWallet {
         amount: u64,
         fee_rate: u64,
         skip_sync: bool,
+        dry_run: bool,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .send_btc_begin(online, address.to_string(), amount, fee_rate, skip_sync)
+            .send_btc_begin(
+                online,
+                address.to_string(),
+                amount,
+                fee_rate,
+                skip_sync,
+                dry_run,
+            )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -755,13 +766,12 @@ impl WasmWallet {
         &self,
         online_js: JsValue,
         signed_psbt: &str,
-        skip_sync: bool,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .send_btc_end(online, signed_psbt.to_string(), skip_sync)
+            .send_btc_end(online, signed_psbt.to_string())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -841,19 +851,21 @@ impl WasmWallet {
     }
 
     /// Drain all wallet funds (begin): prepare a PSBT. Returns the unsigned PSBT string.
+    /// It spends the colored UTXOs too and destroys their assets.
+    /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation.
     #[wasm_bindgen(js_name = "drainToBegin")]
     pub async fn drain_to_begin(
         &self,
         online_js: JsValue,
         address: &str,
-        destroy_assets: bool,
         fee_rate: u64,
+        dry_run: bool,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .drain_to_begin(online, address.to_string(), destroy_assets, fee_rate)
+            .drain_to_begin(online, address.to_string(), fee_rate, dry_run)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
