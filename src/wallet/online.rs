@@ -269,6 +269,20 @@ impl SelectedInputs {
     }
 }
 
+/// The allocation slots taken on a UTXO that receives a consignment, besides the ones of the
+/// transfer it pays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TakenSlots {
+    /// allocations of the received asset, held or due
+    asset: usize,
+    /// amount of the received asset, held or due
+    asset_amount: u128,
+    /// allocations of any asset, held or due, including the received asset
+    all: usize,
+    /// other unpaid invoices, each due to receive an allocation of any asset
+    invoices: usize,
+}
+
 /// The result of a send operation
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -1836,22 +1850,33 @@ impl Wallet {
         })
     }
 
-    /// The number of allocations of the asset with ID `asset_id` the TXO at `outpoint`, if known
-    /// and unspent, holds or will receive from transfers that did not fail.
-    fn count_utxo_asset_allocations(
+    /// Count occupied slots on an unspent TXO, excluding the transfer being processed.
+    fn count_utxo_taken_slots(
         &self,
         outpoint: &Outpoint,
         asset_id: &str,
-    ) -> Result<usize, Error> {
+        transfer_idx: i32,
+        asset_transfer_idx: i32,
+    ) -> Result<TakenSlots, Error> {
         let Some(txo) = self.database.get_txo(outpoint)? else {
-            return Ok(0);
+            return Ok(TakenSlots::default());
         };
         if txo.spent {
-            return Ok(0);
+            return Ok(TakenSlots::default());
         }
-        Ok(self
-            .database
-            .count_txo_incoming_asset_colorings(txo.idx, asset_id)?)
+        let db = &self.database;
+        let asset = db.txo_incoming_colorings(txo.idx, Some(asset_id), asset_transfer_idx)?;
+        Ok(TakenSlots {
+            asset: asset.len(),
+            asset_amount: asset
+                .iter()
+                .map(|c| u128::from(c.assignment.main_amount()))
+                .sum(),
+            all: db
+                .txo_incoming_colorings(txo.idx, None, asset_transfer_idx)?
+                .len(),
+            invoices: db.count_utxo_unpaid_invoices(outpoint, transfer_idx)?,
+        })
     }
 
     fn assignments_for_bundle(
@@ -5217,8 +5242,7 @@ impl Wallet {
                 .await;
         }
 
-        // a UTXO with more allocations of an asset than one bundle can spend cannot be spent.
-        // Allocations of pending transfers count too.
+        // Pending allocations and unpaid invoices count because they may still settle.
         let receive_outpoint = match &transfer.recipient_type {
             Some(RecipientTypeFull::Blind { unblinded_utxo }) => unblinded_utxo.clone(),
             Some(RecipientTypeFull::Witness { .. }) => Outpoint {
@@ -5227,14 +5251,62 @@ impl Wallet {
             },
             _ => return Err(InternalError::Unexpected.into()),
         };
-        let held = self.count_utxo_asset_allocations(&receive_outpoint, &asset_id)?;
-        if held + receiving.len() > max_utxo_asset_allocations() {
+        let taken = self.count_utxo_taken_slots(
+            &receive_outpoint,
+            &asset_id,
+            transfer.idx,
+            asset_transfer.idx,
+        )?;
+        let max_per_utxo = self.max_allocations_per_utxo() as usize;
+        if taken.all + taken.invoices + receiving.len() > max_per_utxo {
             error!(
                 self.logger,
-                "Consignment pays {} allocation(s) of the asset to a UTXO already holding {held}, \
-                 exceeding the {} a UTXO can hold and still be spent",
+                "Consignment pays {} allocation(s) to a UTXO already holding {} and with {} other \
+                 unpaid invoice(s), exceeding the {max_per_utxo} allowed per UTXO",
                 receiving.len(),
+                taken.all,
+                taken.invoices
+            );
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
+                .await;
+        }
+        if taken.asset + taken.invoices + receiving.len() > max_utxo_asset_allocations() {
+            error!(
+                self.logger,
+                "Consignment pays {} allocation(s) of the asset to a UTXO already holding {} and \
+                 with {} other unpaid invoice(s), exceeding the {} a UTXO can hold and still be \
+                 spent",
+                receiving.len(),
+                taken.asset,
+                taken.invoices,
                 max_utxo_asset_allocations()
+            );
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                )
+                .await;
+        }
+        let received_amount: u128 = receiving
+            .values()
+            .map(|a| u128::from(a.main_amount()))
+            .sum();
+        if taken.asset_amount + received_amount > u128::from(u64::MAX) {
+            error!(
+                self.logger,
+                "Consignment pays {received_amount} of the asset to a UTXO already holding {}, \
+                 exceeding the {} a UTXO can hold and still be spent",
+                taken.asset_amount,
+                u64::MAX
             );
             return self
                 ._refuse_consignment_async(
@@ -13310,6 +13382,98 @@ mod send_end_tests {
         assert!(!pending_witness(&wallet, txos[2]));
         assert!(!pending_witness(&wallet, txos[3]));
         assert!(!pending_witness(&wallet, failed_paid_txo));
+    }
+    #[test]
+    fn count_utxo_taken_slots_leaves_out_the_transfer() {
+        let (wallet, _) = setup();
+        let db = &wallet.database;
+        let txo = |txid: &str| {
+            db.set_txo(DbTxoActMod {
+                txid: ActiveValue::Set(txid.to_string()),
+                vout: ActiveValue::Set(0),
+                btc_amount: ActiveValue::Set(s!("1000")),
+                spent: ActiveValue::Set(false),
+                exists: ActiveValue::Set(true),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let u_idx = txo("u");
+        let u = Outpoint {
+            txid: s!("u"),
+            vout: 0,
+        };
+        let batch = |status| {
+            db.set_batch_transfer(DbBatchTransferActMod {
+                status: ActiveValue::Set(status),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let asset_transfer = |bt, asset_id: Option<&str>| {
+            db.set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(bt),
+                asset_id: ActiveValue::Set(asset_id.map(|a| a.to_string())),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let invoice = |at| {
+            db.set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(at),
+                incoming: ActiveValue::Set(true),
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Blind {
+                    unblinded_utxo: u.clone(),
+                })),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let coloring = |txo_idx, at, r#type, amount| {
+            db.set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(txo_idx),
+                asset_transfer_idx: ActiveValue::Set(at),
+                r#type: ActiveValue::Set(r#type),
+                assignment: ActiveValue::Set(Assignment::Fungible(amount)),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // the transfer being processed, with its colorings saved
+        let at1 = asset_transfer(batch(TransferStatus::WaitingCounterparty), Some("a"));
+        let t1 = invoice(at1);
+        coloring(u_idx, at1, ColoringType::Receive, u64::MAX);
+        let settled = batch(TransferStatus::Settled);
+        let at2 = asset_transfer(settled, Some("a"));
+        coloring(u_idx, at2, ColoringType::Receive, 5);
+        let at3 = asset_transfer(settled, Some("b"));
+        coloring(u_idx, at3, ColoringType::Issue, 7);
+        // an unpaid invoice
+        let at4 = asset_transfer(batch(TransferStatus::WaitingCounterparty), None);
+        let t4 = invoice(at4);
+        let at5 = asset_transfer(batch(TransferStatus::Failed), Some("a"));
+        coloring(u_idx, at5, ColoringType::Receive, 100);
+
+        assert_eq!(
+            wallet.count_utxo_taken_slots(&u, "a", t1, at1).unwrap(),
+            TakenSlots {
+                asset: 1,
+                asset_amount: 5,
+                all: 2,
+                invoices: 1,
+            }
+        );
+        assert_eq!(
+            wallet.count_utxo_taken_slots(&u, "a", t4, at4).unwrap(),
+            TakenSlots {
+                asset: 2,
+                asset_amount: u128::from(u64::MAX) + 5,
+                all: 3,
+                invoices: 0,
+            }
+        );
     }
 }
 

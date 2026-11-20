@@ -16,6 +16,29 @@ use crate::error::InternalError;
 use crate::utils::now;
 use crate::wallet::{Balance, Outpoint};
 
+/// The unpaid blind invoices with their UTXO: incoming transfers that wait for the counterparty
+/// and have no colorings yet. Each one reserves the slot of the single allocation that pays it.
+fn unpaid_invoices<'a>(
+    transfers: &'a [DbTransfer],
+    asset_transfers: &[DbAssetTransfer],
+    batch_transfers: &[DbBatchTransfer],
+    colorings: &[DbColoring],
+) -> Vec<(&'a DbTransfer, &'a Outpoint)> {
+    let colored: HashSet<i32> = colorings.iter().map(|c| c.asset_transfer_idx).collect();
+    transfers
+        .iter()
+        .filter(|t| !colored.contains(&t.asset_transfer_idx))
+        .filter_map(|t| match (&t.recipient_type, t.incoming) {
+            (Some(RecipientTypeFull::Blind { unblinded_utxo }), true) => t
+                .related_transfers(asset_transfers, batch_transfers)
+                .ok()
+                .filter(|(_, bt)| bt.status.waiting_counterparty())
+                .map(|_| (t, unblinded_utxo)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Lightweight ActiveValue (mirrors sea_orm::ActiveValue without the dependency).
 #[derive(Clone, Debug)]
 pub enum ActiveValue<T> {
@@ -1143,30 +1166,55 @@ impl InMemoryDb {
         Ok(())
     }
 
-    /// Count the incoming colorings of the asset with ID `asset_id` on the TXO with index
-    /// `txo_idx`, from transfers that did not fail.
-    pub(crate) fn count_txo_incoming_asset_colorings(
+    /// The incoming colorings (receives, changes, issuances) of a TXO, for one asset or all if
+    /// `None`. Failed transfers and the asset transfer `exclude_asset_transfer_idx` do not count.
+    pub(crate) fn txo_incoming_colorings(
         &self,
         txo_idx: i32,
-        asset_id: &str,
-    ) -> Result<usize, InternalError> {
+        asset_id: Option<&str>,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<Vec<DbColoring>, InternalError> {
         let asset_transfers = self.asset_transfers.borrow();
         let batch_transfers = self.batch_transfers.borrow();
         Ok(self
             .colorings
             .borrow()
             .iter()
-            .filter(|c| c.txo_idx == txo_idx && ColoringType::INCOMING.contains(&c.r#type))
+            .filter(|c| {
+                c.txo_idx == txo_idx
+                    && c.asset_transfer_idx != exclude_asset_transfer_idx
+                    && ColoringType::INCOMING.contains(&c.r#type)
+            })
             .filter(|c| {
                 asset_transfers.iter().any(|at| {
                     at.idx == c.asset_transfer_idx
-                        && at.asset_id.as_deref() == Some(asset_id)
+                        && asset_id.is_none_or(|id| at.asset_id.as_deref() == Some(id))
                         && batch_transfers.iter().any(|bt| {
                             bt.idx == at.batch_transfer_idx && bt.status != TransferStatus::Failed
                         })
                 })
             })
-            .count())
+            .cloned()
+            .collect())
+    }
+
+    /// The number of unpaid blind invoices on the UTXO at `outpoint`, other than the one of the
+    /// transfer with index `exclude_transfer_idx` (see `unpaid_invoices`).
+    pub(crate) fn count_utxo_unpaid_invoices(
+        &self,
+        outpoint: &Outpoint,
+        exclude_transfer_idx: i32,
+    ) -> Result<usize, InternalError> {
+        let transfers = self.transfers.borrow();
+        let asset_transfers = self.asset_transfers.borrow();
+        let batch_transfers = self.batch_transfers.borrow();
+        let colorings = self.colorings.borrow();
+        Ok(
+            unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+                .into_iter()
+                .filter(|(t, utxo)| t.idx != exclude_transfer_idx && *utxo == outpoint)
+                .count(),
+        )
     }
 
     pub(crate) fn del_coloring(&self, asset_transfer_idx: i32) -> Result<(), InternalError> {
@@ -1620,23 +1668,13 @@ impl InMemoryDb {
         let colorings = colorings.unwrap_or_else(|| self.iter_colorings().unwrap_or_default());
         let transfers = transfers.unwrap_or_else(|| self.iter_transfers().unwrap_or_default());
 
-        // an invoice with saved colorings counts through them, not as a pending blind receive
-        let colored: HashSet<i32> = colorings.iter().map(|c| c.asset_transfer_idx).collect();
-        let pending_blinded_utxos = transfers
-            .iter()
-            .filter(|t| !colored.contains(&t.asset_transfer_idx))
-            .filter_map(|t| match (&t.recipient_type, t.incoming) {
-                (Some(RecipientTypeFull::Blind { unblinded_utxo }), true) => t
-                    .related_transfers(&asset_transfers, &batch_transfers)
-                    .ok()
-                    .filter(|(_, bt)| bt.status.waiting_counterparty())
-                    .map(|_| unblinded_utxo),
-                _ => None,
-            })
-            .fold(HashMap::new(), |mut acc, utxo| {
-                *acc.entry(utxo).or_insert(0) += 1;
-                acc
-            });
+        let pending_blinded_utxos =
+            unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+                .into_iter()
+                .fold(HashMap::new(), |mut acc, (_, utxo)| {
+                    *acc.entry(utxo).or_insert(0) += 1;
+                    acc
+                });
 
         utxos
             .iter()
@@ -2145,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_txo_incoming_asset_colorings() {
+    fn test_count_txo_incoming_colorings() {
         let db = make_db();
         let bt_ok = db
             .set_batch_transfer(make_batch_transfer_mod(
@@ -2179,10 +2217,54 @@ mod tests {
         }
 
         // inputs, failed transfers and other assets do not count
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "a").unwrap(), 3);
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo2, "a").unwrap(), 1);
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "b").unwrap(), 1);
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "c").unwrap(), 0);
+        let count = |txo, asset_id| db.txo_incoming_colorings(txo, asset_id, -1).unwrap().len();
+        assert_eq!(count(txo1, Some("a")), 3);
+        assert_eq!(count(txo2, Some("a")), 1);
+        assert_eq!(count(txo1, Some("b")), 1);
+        assert_eq!(count(txo1, Some("c")), 0);
+        assert_eq!(count(txo1, None), 5);
+    }
+
+    #[test]
+    fn test_count_utxo_unpaid_invoices() {
+        let db = make_db();
+        let u_idx = db.set_txo(make_txo_mod("u", 0, "1000")).unwrap();
+        db.set_txo(make_txo_mod("v", 0, "1000")).unwrap();
+        let txos = db.iter_txos().unwrap();
+        let (u, v) = (txos[0].outpoint(), txos[1].outpoint());
+        let waiting = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::WaitingCounterparty))
+            .unwrap();
+        let failed = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Failed))
+            .unwrap();
+        let blind = |outpoint: &Outpoint, bt, incoming| {
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            let t = db
+                .set_transfer(DbTransferActMod {
+                    recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Blind {
+                        unblinded_utxo: outpoint.clone(),
+                    })),
+                    ..make_transfer_mod(at, incoming)
+                })
+                .unwrap();
+            (at, t)
+        };
+        let (_, t1) = blind(&u, waiting, true);
+        blind(&u, waiting, true);
+        let (at3, _) = blind(&u, waiting, true);
+        db.set_coloring(make_coloring_mod(u_idx, at3, ColoringType::Receive, 1))
+            .unwrap();
+        blind(&u, failed, true);
+        blind(&v, waiting, true);
+        blind(&u, waiting, false);
+
+        // paid, failed and outgoing invoices do not count
+        assert_eq!(db.count_utxo_unpaid_invoices(&u, -1).unwrap(), 2);
+        assert_eq!(db.count_utxo_unpaid_invoices(&u, t1).unwrap(), 1);
+        assert_eq!(db.count_utxo_unpaid_invoices(&v, -1).unwrap(), 1);
     }
 
     // ── Media ──────────────────────────────────────────────────────
