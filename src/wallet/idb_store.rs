@@ -322,7 +322,7 @@ mod tests {
         transfer_artifact
             .consignment_bytes
             .insert("asset-id".to_owned(), vec![1, 2, 3, 4]);
-        transfer_artifact.signed_psbt = Some("signed-psbt".to_owned());
+        transfer_artifact.signed_tx = Some(vec![9]);
         transfer_artifact.fascia = Some(vec![7, 8]);
         let snapshot = WalletSnapshot {
             writer: 1,
@@ -370,10 +370,7 @@ mod tests {
             restored_artifact.consignment_bytes.get("asset-id"),
             Some(&vec![1, 2, 3, 4])
         );
-        assert_eq!(
-            restored_artifact.signed_psbt.as_deref(),
-            Some("signed-psbt")
-        );
+        assert_eq!(restored_artifact.signed_tx, Some(vec![9]));
         assert_eq!(restored_artifact.fascia, Some(vec![7, 8]));
 
         assert_eq!(

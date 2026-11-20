@@ -9,7 +9,6 @@ const SCHEMAS_SUPPORTING_BURN: [database::enums::AssetSchema; 2] =
     [AssetSchema::Ifa, AssetSchema::Bfa];
 
 const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
-const SIGNED_PSBT_FILE: &str = "signed.psbt";
 
 pub(crate) const UTXO_SIZE: u32 = 1000;
 pub(crate) const UTXO_NUM: u8 = 5;
@@ -515,7 +514,8 @@ pub(crate) struct TransferArtifacts {
     pub(crate) batch_info: Option<InfoBatchTransfer>,
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
-    pub(crate) signed_psbt: Option<String>,
+    /// Signed TX of an outgoing transfer (consensus-encoded), saved to broadcast it once the transfer is accepted
+    pub(crate) signed_tx: Option<Vec<u8>>,
     pub(crate) inputs: Vec<Outpoint>,
     pub(crate) expiration: i64,
     pub(crate) fascia: Option<Vec<u8>>,
@@ -561,6 +561,12 @@ fn fascia_from_bytes(fascia_bytes: Vec<u8>) -> Result<Fascia, Error> {
     )?)
     .map_err(|e| Error::Internal {
         details: e.to_string(),
+    })
+}
+
+fn decode_signed_tx(tx_bytes: &[u8]) -> Result<BdkTransaction, Error> {
+    bdk_wallet::bitcoin::consensus::encode::deserialize(tx_bytes).map_err(|e| Error::Internal {
+        details: format!("invalid signed TX: {e}"),
     })
 }
 
@@ -2985,9 +2991,16 @@ impl Wallet {
         signed_psbt: Psbt,
         skip_sync: bool,
     ) -> Result<BdkTransaction, Error> {
-        let tx = self
-            ._broadcast_tx(signed_psbt.extract_tx().map_err(InternalError::from)?)
-            .await?;
+        let tx = signed_psbt.extract_tx().map_err(InternalError::from)?;
+        self._broadcast_signed_tx(tx, skip_sync).await
+    }
+
+    async fn _broadcast_signed_tx(
+        &mut self,
+        tx: BdkTransaction,
+        skip_sync: bool,
+    ) -> Result<BdkTransaction, Error> {
+        let tx = self._broadcast_tx(tx).await?;
         self.broadcast_txs.push(tx.clone());
         fault_point("after_broadcast")?;
 
@@ -3667,6 +3680,8 @@ impl Wallet {
             .iter()
             .find_map(|o| o.mpc_entropy())
             .expect("commit sets the entropy");
+        strip_rgb_data(psbt);
+        check_psbt_parsable(psbt)?;
 
         let witness_txid = psbt.get_txid();
 
@@ -5836,22 +5851,17 @@ impl Wallet {
         let Some(txid) = &batch_transfer.txid else {
             return false;
         };
-        let Some(signed_psbt) = self
+        let Some(signed_tx) = self
             .transfer_artifacts
             .get(txid)
-            .and_then(|a| a.signed_psbt.as_ref())
+            .and_then(|a| a.signed_tx.as_ref())
         else {
             return false;
         };
-        let Ok(psbt) = Psbt::from_str(signed_psbt) else {
+        let Ok(tx) = decode_signed_tx(signed_tx) else {
             return false;
         };
-        let inputs: HashSet<BdkOutPoint> = psbt
-            .unsigned_tx
-            .input
-            .iter()
-            .map(|i| i.previous_output)
-            .collect();
+        let inputs: HashSet<BdkOutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
         self.bdk_wallet.transactions().any(|wallet_tx| {
             wallet_tx.chain_position.is_confirmed()
                 && wallet_tx.tx_node.txid.to_string() != *txid
@@ -5875,11 +5885,10 @@ impl Wallet {
             .txid
             .as_ref()
             .expect("batch transfer should have a TXID");
-        // read signed PSBT from in-memory transfer artifacts
-        let Some(signed_psbt) = self
+        let Some(signed_tx) = self
             .transfer_artifacts
             .get(txid)
-            .and_then(|a| a.signed_psbt.as_ref())
+            .and_then(|a| a.signed_tx.as_ref())
         else {
             let txid = txid.clone();
             self._fail_batch_transfer(batch_transfer)?;
@@ -5887,13 +5896,12 @@ impl Wallet {
             self.update_backup_info(false)?;
             return Err(Error::MissingTransferArtifacts { txid });
         };
-        let signed_psbt = Psbt::from_str(signed_psbt)?;
+        let signed_tx = decode_signed_tx(signed_tx)?;
         let fascia = self.transfer_artifacts[txid].fascia()?;
         let mut runtime = self.rgb_runtime()?;
-        self._broadcast_psbt(signed_psbt, skip_sync).await?;
+        self._broadcast_signed_tx(signed_tx, skip_sync).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
-        // Clean up: signed PSBT no longer needed after broadcast
         self.transfer_artifacts.remove(txid);
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
@@ -7816,8 +7824,7 @@ impl Wallet {
             .expect("artifacts checked above");
         artifacts.asset_infos = asset_infos.clone();
         post_result?;
-        // keep the signed PSBT for the refresh
-        artifacts.signed_psbt = Some(signed_psbt.clone());
+        artifacts.signed_tx = Some(tx_bytes.clone());
         if artifacts.inputs.is_empty() {
             artifacts.inputs = psbt
                 .unsigned_tx
@@ -8326,16 +8333,15 @@ impl Wallet {
 
         // the artifacts stay until the stock has the fascia, so a failed sync can be retried
         let mut runtime = self.rgb_runtime()?;
-        let _ = self._broadcast_psbt(psbt, false).await?;
+        let tx = self._broadcast_psbt(psbt, false).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         // Drop runtime so Stock returns to RefCell before auto-save
         drop(runtime);
 
-        // Store signed PSBT for refresh() persistence
         self.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
-                signed_psbt: Some(signed_psbt.clone()),
+                signed_tx: Some(bdk_wallet::bitcoin::consensus::encode::serialize(&tx)),
                 ..Default::default()
             },
         );
@@ -8694,7 +8700,7 @@ impl Wallet {
             consignment_bytes.insert(asset_id.clone(), bytes);
         }
 
-        self._broadcast_psbt(psbt, false).await?;
+        let tx = self._broadcast_psbt(psbt, false).await?;
         runtime.consume_fascia(fascia, None)?;
         runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
         // Drop runtime so Stock returns to RefCell before auto-save
@@ -8723,7 +8729,7 @@ impl Wallet {
         self.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
-                signed_psbt: Some(signed_psbt),
+                signed_tx: Some(bdk_wallet::bitcoin::consensus::encode::serialize(&tx)),
                 consignment_bytes,
                 ..Default::default()
             },
@@ -9463,7 +9469,7 @@ impl Wallet {
         };
 
         let mut runtime = self.rgb_runtime()?;
-        self._broadcast_psbt(psbt, false).await?;
+        let tx = self._broadcast_psbt(psbt, false).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
 
@@ -9473,7 +9479,7 @@ impl Wallet {
         self.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
-                signed_psbt: Some(signed_psbt),
+                signed_tx: Some(bdk_wallet::bitcoin::consensus::encode::serialize(&tx)),
                 consignment_bytes,
                 ..Default::default()
             },
@@ -9575,13 +9581,9 @@ impl Wallet {
         else {
             unreachable!("a mint has no retry")
         };
+        let opid = mint_opid(&fascia_from_bytes(begin_data.fascia.clone())?, contract_id)
+            .expect("a mint has a mint transition");
         let psbt_string = begin_data.psbt;
-        let opid = Psbt::from_str(&psbt_string)?
-            .rgb_contract_consumers(contract_id)
-            .unwrap()
-            .into_iter()
-            .find_map(|(opout, opid)| (opout.ty == OS_MINT).then_some(opid))
-            .unwrap();
         Ok((psbt_string, opid))
     }
 
@@ -10213,7 +10215,7 @@ mod send_end_tests {
             fascia: Some(dumb_fascia()),
             consignment_bytes: asset_infos.keys().map(|k| (k.clone(), vec![1])).collect(),
             asset_infos,
-            signed_psbt: None,
+            signed_tx: None,
             ..Default::default()
         }
     }
@@ -10901,7 +10903,7 @@ mod send_end_tests {
         let kept = &wallet.transfer_artifacts[&txid];
         assert!(kept.batch_info.is_some());
         assert!(kept.asset_infos["asset"].recipients[0].transport_endpoints[0].used);
-        assert!(kept.signed_psbt.is_none());
+        assert!(kept.signed_tx.is_none());
     }
 
     #[test]
@@ -11265,7 +11267,7 @@ mod send_end_tests {
         wallet.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
-                signed_psbt: Some(psbt),
+                signed_tx: Some(raw_tx(&psbt)),
                 ..artifacts(BTreeMap::new())
             },
         );
@@ -11708,7 +11710,9 @@ mod send_end_tests {
         artifact.asset_infos.get_mut("asset").unwrap().recipients[0].transport_endpoints[0]
             .endpoint = endpoint;
 
+        let signed_tx = raw_tx(&psbt);
         block_on(wallet.send_end(online, psbt, true)).unwrap();
+        assert_eq!(wallet.transfer_artifacts[&txid].signed_tx, Some(signed_tx));
         let batch = wallet
             .database
             .iter_batch_transfers()
@@ -11741,7 +11745,7 @@ mod send_end_tests {
         wallet.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
-                signed_psbt: Some(psbt),
+                signed_tx: Some(raw_tx(&psbt)),
                 ..artifacts(BTreeMap::new())
             },
         );
@@ -11843,7 +11847,7 @@ mod send_end_tests {
         wallet.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
-                signed_psbt: Some(psbt),
+                signed_tx: Some(raw_tx(&psbt)),
                 ..artifacts(BTreeMap::new())
             },
         );
@@ -11886,15 +11890,51 @@ mod send_end_tests {
         wallet.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
-                signed_psbt: Some(psbt),
+                signed_tx: Some(raw_tx(&psbt)),
                 ..artifacts(BTreeMap::new())
             },
         );
-        let res = block_on(wallet.fail_transfers(online, None, false, true));
+        let res = block_on(wallet.fail_transfers(online.clone(), None, false, true));
         // the ACK is signed, so the TX was released: nothing is failed, even though the TX is not
         // on-chain and the transfer has expired
         assert_eq!(res, Ok(false));
         assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+
+        use bdk_wallet::bitcoin::{Transaction, TxIn, TxOut};
+        use bdk_wallet::chain::{ConfirmationBlockTime, TxUpdate};
+        let conflict = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: Psbt::from_str(&psbt).unwrap().unsigned_tx.input[0]
+                    .previous_output,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(1000),
+                script_pubkey: wallet
+                    .bdk_wallet
+                    .reveal_next_address(KeychainKind::External)
+                    .script_pubkey(),
+            }],
+        };
+        let anchor = ConfirmationBlockTime {
+            block_id: wallet.bdk_wallet.local_chain().tip().block_id(),
+            confirmation_time: 1,
+        };
+        let mut tx_update = TxUpdate::default();
+        tx_update.anchors.insert((anchor, conflict.compute_txid()));
+        tx_update.txs.push(Arc::new(conflict));
+        wallet
+            .bdk_wallet
+            .apply_update(bdk_wallet::Update {
+                tx_update,
+                ..Default::default()
+            })
+            .unwrap();
+        let res = block_on(wallet.fail_transfers(online, None, false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, idx), TransferStatus::Failed);
     }
 
     // the sender proxy lost the operation
@@ -11918,7 +11958,7 @@ mod send_end_tests {
         wallet.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
-                signed_psbt: Some(psbt),
+                signed_tx: Some(raw_tx(&psbt)),
                 ..artifacts(BTreeMap::new())
             },
         );
@@ -12318,7 +12358,7 @@ mod send_end_tests {
         wallet.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
-                signed_psbt: Some(psbt),
+                signed_tx: Some(raw_tx(&psbt)),
                 ..artifacts(BTreeMap::new())
             },
         );
@@ -12366,7 +12406,7 @@ mod send_end_tests {
         wallet.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
-                signed_psbt: Some(psbt),
+                signed_tx: Some(raw_tx(&psbt)),
                 ..artifacts(BTreeMap::new())
             },
         );
@@ -12504,7 +12544,7 @@ mod send_end_tests {
             wallet.transfer_artifacts.insert(
                 txid,
                 TransferArtifacts {
-                    signed_psbt: Some(psbt),
+                    signed_tx: Some(raw_tx(&psbt)),
                     ..artifacts(BTreeMap::new())
                 },
             );

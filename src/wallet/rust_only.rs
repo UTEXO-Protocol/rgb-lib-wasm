@@ -210,6 +210,8 @@ impl Wallet {
         let fascia = psbt.rgb_commit().map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
+        strip_rgb_data(psbt);
+        check_psbt_parsable(psbt)?;
 
         info!(self.logger, "Color PSBT completed");
         Ok((fascia, asset_beneficiaries))

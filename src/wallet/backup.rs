@@ -594,7 +594,7 @@ mod tests {
         wallet.transfer_artifacts.insert(
             txid.to_string(),
             TransferArtifacts {
-                signed_psbt: Some(s!("psbt")),
+                signed_tx: Some(vec![1]),
                 consignment_bytes: crate::HashMap::from([(asset_id.to_string(), bytes)]),
                 ..Default::default()
             },
@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
+    fn refresh_after_restore_backup_reads_signed_tx_impl(asset_id: Option<&str>) {
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::Online;
@@ -666,11 +666,11 @@ mod tests {
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
         let (proxy, _mock) = ack_proxy();
         let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id, &proxy.url());
-        // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
+        // The stored TX is a sentinel: refresh rejects it only after it reads it back.
         sender.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
-                signed_psbt: Some(s!("not a psbt")),
+                signed_tx: Some(vec![0xff]),
                 ..Default::default()
             },
         );
@@ -698,26 +698,26 @@ mod tests {
 
         let refreshed = &result[&batch_idx];
         assert!(
-            matches!(refreshed.failure, Some(Error::InvalidPsbt { .. })),
-            "rebuilt wallet lost the signed PSBT: {:?}",
+            matches!(&refreshed.failure, Some(Error::Internal { details }) if details.starts_with("invalid signed TX")),
+            "rebuilt wallet lost the signed TX: {:?}",
             refreshed.failure
         );
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_after_restore_backup_reads_signed_psbt() {
-        refresh_after_restore_backup_reads_signed_psbt_impl(None);
+    fn refresh_after_restore_backup_reads_signed_tx() {
+        refresh_after_restore_backup_reads_signed_tx_impl(None);
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_after_restore_backup_reads_signed_psbt_for_rgb_asset() {
-        refresh_after_restore_backup_reads_signed_psbt_impl(Some("rgb:test-asset"));
+    fn refresh_after_restore_backup_reads_signed_tx_for_rgb_asset() {
+        refresh_after_restore_backup_reads_signed_tx_impl(Some("rgb:test-asset"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_fails_transfer_without_signed_psbt_impl(asset_id: Option<&str>) {
+    fn refresh_fails_transfer_without_signed_tx_impl(asset_id: Option<&str>) {
         use crate::database::enums::TransferStatus;
         use crate::wallet::Online;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet;
@@ -780,14 +780,14 @@ mod tests {
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_fails_transfer_without_signed_psbt() {
-        refresh_fails_transfer_without_signed_psbt_impl(None);
+    fn refresh_fails_transfer_without_signed_tx() {
+        refresh_fails_transfer_without_signed_tx_impl(None);
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_fails_transfer_without_signed_psbt_for_rgb_asset() {
-        refresh_fails_transfer_without_signed_psbt_impl(Some("rgb:test-asset"));
+    fn refresh_fails_transfer_without_signed_tx_for_rgb_asset() {
+        refresh_fails_transfer_without_signed_tx_impl(Some("rgb:test-asset"));
     }
 
     #[test]
@@ -897,7 +897,7 @@ mod tests {
         sender.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
-                signed_psbt: Some(s!("psbt")),
+                signed_tx: Some(vec![1]),
                 ..Default::default()
             },
         );
@@ -931,8 +931,8 @@ mod tests {
             restored
                 .transfer_artifacts
                 .get(&txid)
-                .and_then(|a| a.signed_psbt.clone()),
-            Some(s!("psbt"))
+                .and_then(|a| a.signed_tx.clone()),
+            Some(vec![1])
         );
         for restored in [&restored, &from_snapshot] {
             assert_eq!(
@@ -968,7 +968,7 @@ mod tests {
         wallet.transfer_artifacts.insert(
             "3".repeat(64),
             TransferArtifacts {
-                signed_psbt: Some(s!("psbt")),
+                signed_tx: Some(vec![1]),
                 ..Default::default()
             },
         );
