@@ -1,8 +1,11 @@
 use wasm_bindgen_test::*;
 
+use super::offline::MOCK_MAX_UTXO_ASSET_ALLOCATIONS;
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
-use super::test_send::{consignment as saved_consignment, proven, witness_ord, witness_ords};
+use super::test_send::{
+    ResetMocks, consignment as saved_consignment, proven, witness_ord, witness_ords,
+};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
 use crate::{
@@ -882,4 +885,69 @@ async fn inflate_dry_run_end_saves_transfer() {
     let saved = transfer(&wallet, &asset_id, res.batch_transfer_idx);
     assert_eq!(saved.status, TransferStatus::WaitingConfirmations);
     assert_eq!(saved.kind, TransferKind::Inflation);
+}
+
+// the inputs of a burn hold one allocation less than a bundle can spend
+#[wasm_bindgen_test]
+async fn burn_inputs_leave_one_bundle_slot() {
+    let _reset = ResetMocks;
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let colored: Vec<usize> = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .iter()
+        .map(|u| {
+            u.rgb_allocations
+                .iter()
+                .filter(|a| a.asset_id.as_deref() == Some(asset_id.as_str()))
+                .count()
+        })
+        .filter(|n| *n > 0)
+        .collect();
+    assert_eq!(colored, vec![1, 1, 1]);
+    let (mut rcv, rcv_online) =
+        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 1).await;
+    let rid = blind_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(1));
+    assert!(matches!(
+        wallet
+            .burn_begin(online.clone(), asset_id.clone(), 100, None, 1, 1, true)
+            .await,
+        Err(Error::InsufficientAssignments { .. })
+    ));
+    // a transfer keeps the whole limit
+    wallet
+        .send_begin(
+            online.clone(),
+            HashMap::from([(
+                asset_id.clone(),
+                vec![recipient(&rid, 100, None, PROXY_URL)],
+            )]),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(2));
+    wallet
+        .burn_begin(online.clone(), asset_id.clone(), 100, None, 1, 1, true)
+        .await
+        .unwrap();
 }
