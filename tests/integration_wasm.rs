@@ -64,11 +64,8 @@ async fn assert_refused(
         let (online, signed) = (online.clone(), signed.to_string());
         let res = match end {
             End::Send => wallet.send_end(online, signed, true).await.map(|_| ()),
-            End::SendBtc => wallet.send_btc_end(online, signed, true).await.map(|_| ()),
-            End::CreateUtxos => wallet
-                .create_utxos_end(online, signed, true)
-                .await
-                .map(|_| ()),
+            End::SendBtc => wallet.send_btc_end(online, signed).await.map(|_| ()),
+            End::CreateUtxos => wallet.create_utxos_end(online, signed).await.map(|_| ()),
             End::Drain => wallet.drain_to_end(online, signed).await.map(|_| ()),
             End::Inflate => wallet.inflate_end(online, signed).await.map(|_| ()),
         };
@@ -89,12 +86,12 @@ async fn fund_and_sync(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Onlin
 
 async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, num: u8) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true)
+        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     mine_blocks(1).await;
@@ -116,12 +113,12 @@ async fn test_no_receive_on_pending_send_input() {
 
     // issue an NIA asset on a UTXO with not enough bitcoins for a send
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
+        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     mine_blocks(1).await;
@@ -138,7 +135,7 @@ async fn test_no_receive_on_pending_send_input() {
 
     // create 1 UTXO with no allocations, to be used as additional bitcoin input
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -152,7 +149,7 @@ async fn test_no_receive_on_pending_send_input() {
     )
     .await;
     wallet
-        .create_utxos_end(online.clone(), signed.clone(), true)
+        .create_utxos_end(online.clone(), signed.clone())
         .await
         .unwrap();
     assert_refused(
@@ -326,12 +323,12 @@ async fn test_no_receive_on_pending_send_input() {
 
     // an expired send fails with no index
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     mine_blocks(1).await;
@@ -380,12 +377,12 @@ async fn test_no_inflate_end_after_fail() {
 
     // issue IFA inflation rights on a UTXO with not enough bitcoins for an inflation
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true)
+        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     mine_blocks(1).await;
@@ -407,12 +404,12 @@ async fn test_no_inflate_end_after_fail() {
 
     // create 1 UTXO with no allocations, to be used as additional bitcoin input
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true)
+        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     mine_blocks(1).await;
@@ -851,7 +848,7 @@ async fn test_full_wallet_flow() {
     wallet.backup("pw").unwrap();
     assert!(!wallet.backup_info().unwrap());
     let unsigned_btc = wallet
-        .send_btc_begin(online.clone(), addr_b2, 50_000, 1, false)
+        .send_btc_begin(online.clone(), addr_b2, 50_000, 1, false, false)
         .await
         .unwrap();
     assert!(wallet.backup_info().unwrap());
@@ -882,7 +879,7 @@ async fn test_full_wallet_flow() {
     assert!(!saved.backup_info().unwrap());
     drop(saved);
     let btc_txid = wallet
-        .send_btc_end(online.clone(), signed_btc.clone(), false)
+        .send_btc_end(online.clone(), signed_btc.clone())
         .await
         .unwrap();
     // send_btc_end saves the end before it returns
@@ -1121,11 +1118,33 @@ async fn test_full_wallet_flow() {
     assert!(!unspents.is_empty(), "Should have vanilla unspents");
 
     // Drain: wallet B drains to wallet A
+    let ifa_units = |w: &Wallet| {
+        let b = w.get_asset_balance(ifa.asset_id.clone()).unwrap();
+        b.settled + b.future
+    };
+    assert_eq!(ifa_units(&wallet_b), 5);
     let drain_addr = wallet.get_address().unwrap();
     let unsigned_drain = wallet_b
-        .drain_to_begin(online_b.clone(), drain_addr, false, 1)
+        .drain_to_begin(online_b.clone(), drain_addr, 1, false)
         .await
         .unwrap();
+    let colorable: Vec<Outpoint> = wallet_b
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.utxo.colorable)
+        .map(|u| u.utxo.outpoint)
+        .collect();
+    assert!(!colorable.is_empty());
+    let drain_inputs: Vec<Outpoint> = unsigned_drain
+        .parse::<Psbt>()
+        .unwrap()
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| i.previous_output.into())
+        .collect();
+    assert!(colorable.iter().all(|o| drain_inputs.contains(o)));
     let signer_b = Wallet::new(wd_b).unwrap();
     let signed_drain = signer_b.sign_psbt(unsigned_drain, None).unwrap();
     let txid = psbt_txid(&signed_drain);
@@ -1155,9 +1174,15 @@ async fn test_full_wallet_flow() {
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
     wallet_b.sync(online_b.clone()).await.unwrap();
+    assert!(
+        wallet_b
+            .list_unspents(None, false, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(ifa_units(&wallet_b), 0);
 
     // Drain verification: wallet_b vanilla balance should be ~0
-    // (colored UTXOs with RGB allocations are preserved when destroy_assets=false)
     let b_balance_after_drain = wallet_b.get_btc_balance(None, true).unwrap();
     let b_vanilla_after =
         b_balance_after_drain.vanilla.settled + b_balance_after_drain.vanilla.future;
@@ -1695,7 +1720,7 @@ async fn test_go_online_checks_outputs_spent_after_backup() {
         .get_address()
         .unwrap();
     let unsigned = wallet
-        .drain_to_begin(online.clone(), addr, true, 1)
+        .drain_to_begin(online.clone(), addr, 1, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -1804,7 +1829,7 @@ async fn test_go_online_checks_own_spends() {
     // a drain before the refresh spends the send's change
     let addr = rcv_wallet.get_address().unwrap();
     let unsigned = wallet
-        .drain_to_begin(online.clone(), addr, true, 1)
+        .drain_to_begin(online.clone(), addr, 1, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();

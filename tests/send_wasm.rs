@@ -48,13 +48,13 @@ async fn create_utxos(
     size: Option<u32>,
 ) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), up_to, num, size, 1, true)
+        .create_utxos_begin(online.clone(), up_to, num, size, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let txid = txid_of(&signed);
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     // A block can miss the TX before it reaches the mining node: mine until it confirms.
@@ -233,7 +233,7 @@ async fn begin_end() {
     assert!(!wallet.backup_info().unwrap());
     let (mut saved, saved_online) = saved_wallet(&wallet).await;
     assert_eq!(
-        saved.send_btc_end(saved_online, dry_signed, true).await,
+        saved.send_btc_end(saved_online, dry_signed).await,
         Err(Error::WrongOperation { txid: txid.clone() })
     );
 

@@ -416,7 +416,7 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
             .await
             .map(|_| ()),
         wallet
-            .create_utxos_end(online.clone(), signed.clone(), false)
+            .create_utxos_end(online.clone(), signed.clone())
             .await
             .map(|_| ()),
         wallet
@@ -424,7 +424,7 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
             .await
             .map(|_| ()),
         wallet
-            .send_btc_end(online.clone(), signed.clone(), false)
+            .send_btc_end(online.clone(), signed.clone())
             .await
             .map(|_| ()),
         wallet
@@ -453,7 +453,7 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
     ));
     assert!(wrong(
         &wallet
-            .create_utxos_end(online.clone(), signed.clone(), false)
+            .create_utxos_end(online.clone(), signed.clone())
             .await
             .map(|_| ())
     ));

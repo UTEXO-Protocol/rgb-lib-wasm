@@ -411,12 +411,12 @@ async fn inflate_begin_returns_result_object() {
     esplora_synced().await;
     wallet.sync(online.clone()).await.unwrap();
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(5), None, 1, true)
+        .create_utxos_begin(online.clone(), true, Some(5), None, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(&unsigned, None).unwrap();
     wallet
-        .create_utxos_end(online.clone(), &signed, true)
+        .create_utxos_end(online.clone(), &signed)
         .await
         .unwrap();
     helper_post("mine", r#"{"blocks":1}"#).await;
