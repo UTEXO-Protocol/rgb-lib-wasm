@@ -1217,6 +1217,51 @@ impl InMemoryDb {
         )
     }
 
+    fn unpaid_mint_right_invoices(&self, asset_id: &str) -> Vec<(i32, Outpoint)> {
+        let transfers = self.transfers.borrow();
+        let asset_transfers = self.asset_transfers.borrow();
+        let batch_transfers = self.batch_transfers.borrow();
+        let colorings = self.colorings.borrow();
+        unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+            .into_iter()
+            .filter(|(t, _)| {
+                asset_transfers
+                    .iter()
+                    .find(|at| at.idx == t.asset_transfer_idx)
+                    .is_some_and(|at| {
+                        t.requested_assignment == Some(Assignment::MintRight)
+                            && at.asset_id.as_deref() == Some(asset_id)
+                    })
+            })
+            .map(|(t, utxo)| (t.idx, utxo.clone()))
+            .collect()
+    }
+
+    /// The UTXOs of the unpaid invoices that request a mint right of asset `asset_id`.
+    pub(crate) fn get_mint_right_invoice_utxos(
+        &self,
+        asset_id: &str,
+    ) -> Result<HashSet<Outpoint>, InternalError> {
+        Ok(self
+            .unpaid_mint_right_invoices(asset_id)
+            .into_iter()
+            .map(|(_, utxo)| utxo)
+            .collect())
+    }
+
+    pub(crate) fn count_utxo_unpaid_mint_right_invoices(
+        &self,
+        outpoint: &Outpoint,
+        asset_id: &str,
+        exclude_transfer_idx: i32,
+    ) -> Result<usize, InternalError> {
+        Ok(self
+            .unpaid_mint_right_invoices(asset_id)
+            .into_iter()
+            .filter(|(idx, utxo)| *idx != exclude_transfer_idx && utxo == outpoint)
+            .count())
+    }
+
     pub(crate) fn del_coloring(&self, asset_transfer_idx: i32) -> Result<(), InternalError> {
         self.colorings
             .borrow_mut()

@@ -3365,6 +3365,20 @@ impl Wallet {
                             .iter()
                             .any(|a| !a.incoming && a.status.waiting_counterparty()))
                     });
+                    // A UTXO holds at most one mint right of an asset.
+                    if let (Assignment::MintRight, Some(aid)) = (&assignment, &asset_id) {
+                        let invoiced = self.database.get_mint_right_invoice_utxos(aid)?;
+                        unspents.retain(|u| {
+                            !invoiced.contains(&u.utxo.outpoint())
+                                && !u.rgb_allocations.iter().any(|a| {
+                                    a.incoming
+                                        && !a.txo_spent
+                                        && !a.status.failed()
+                                        && a.asset_id.as_deref() == Some(aid.as_str())
+                                        && a.assignment == Assignment::MintRight
+                                })
+                        });
+                    }
                     let utxo = self.get_utxo(&[], Some(&unspents), true, None)?;
                     let unblinded_utxo = utxo.outpoint();
                     debug!(
@@ -3455,6 +3469,11 @@ impl Wallet {
                 (Assignment::LinkRight, Some(AssetSchema::Ifa) | Some(AssetSchema::Bfa)) => {
                     invoice_builder = invoice_builder.set_void();
                     invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_LINK_RIGHT);
+                    assignment
+                }
+                (Assignment::MintRight, Some(AssetSchema::Bfa)) => {
+                    invoice_builder = invoice_builder.set_void();
+                    invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_MINT_RIGHT);
                     assignment
                 }
                 (Assignment::Any, _) => Assignment::Any,
@@ -3630,6 +3649,10 @@ impl Wallet {
     ///
     /// An optional amount can be specified, which will be embedded in the invoice. It will not be
     /// checked when accepting the transfer.
+    ///
+    /// A UTXO holds at most one mint right of an asset. An [`Assignment::MintRight`] invoice blinds
+    /// a UTXO that holds no mint right and is not due to receive one. The wallet refuses a transfer
+    /// that pays a mint right to a UTXO that holds one.
     ///
     /// An expiration UTC timestamp must be specified, which will set the expiration of the
     /// invoice and the transfer.

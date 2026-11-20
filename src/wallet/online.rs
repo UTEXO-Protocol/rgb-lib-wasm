@@ -283,6 +283,8 @@ struct TakenSlots {
     all: usize,
     /// other unpaid invoices, each due to receive an allocation of any asset
     invoices: usize,
+    /// mint rights of the asset, held or due, and other unpaid invoices that request one
+    mint_rights: usize,
 }
 
 /// The allocations of an asset a destination of the RGB change holds or is due to receive.
@@ -292,6 +294,8 @@ struct ChangeSlotAsset {
     num: usize,
     /// Total amount held. It cannot go over `u64::MAX`. A `u128` so the sum cannot overflow.
     amount: u128,
+    /// It holds a mint right, or an unpaid invoice on it requests one.
+    mint_right: bool,
 }
 
 /// A destination of the RGB change of an operation, with the slots left on it.
@@ -312,6 +316,8 @@ struct ChangeSlot {
 pub(crate) struct ChangeSlots {
     slots: Vec<ChangeSlot>,
     max_asset_allocations: usize,
+    /// Assets whose unpaid mint-right invoices are already counted.
+    mint_right_invoices: HashSet<String>,
 }
 
 impl ChangeSlots {
@@ -351,6 +357,7 @@ impl ChangeSlots {
                     .or_default();
                 asset.num += 1;
                 asset.amount += u128::from(allocation.assignment.main_amount());
+                asset.mint_right |= allocation.assignment == Assignment::MintRight;
             }
             slots.push(ChangeSlot {
                 destination: ChangeDestination::Utxo(utxo.utxo.outpoint()),
@@ -362,15 +369,33 @@ impl ChangeSlots {
         Self {
             slots,
             max_asset_allocations,
+            mint_right_invoices: HashSet::new(),
         }
     }
 
-    /// Take the first destination with room, or return `None`. Return its existing outpoint, or
-    /// `None` for the BTC change output.
+    /// Count the unpaid mint-right invoices of asset `asset_id` on `utxos`. These UTXOs cannot
+    /// receive another mint right.
+    pub(crate) fn add_mint_right_invoices(&mut self, asset_id: &str, utxos: &HashSet<Outpoint>) {
+        for slot in &mut self.slots {
+            if let ChangeDestination::Utxo(outpoint) = &slot.destination
+                && utxos.contains(outpoint)
+            {
+                slot.assets
+                    .entry(asset_id.to_string())
+                    .or_default()
+                    .mint_right = true;
+            }
+        }
+    }
+
+    /// Take the first destination with room for an allocation of `amount`, and whether it is a
+    /// mint right, or return `None`. Return its existing outpoint, or `None` for the BTC change
+    /// output.
     pub(crate) fn take(
         &mut self,
         asset_id: &str,
         amount: u128,
+        mint_right: bool,
     ) -> Option<(ChangeDestination, Option<OutPoint>)> {
         let max_asset_allocations = self.max_asset_allocations;
         let slot = self.slots.iter_mut().find(|s| {
@@ -378,11 +403,13 @@ impl ChangeSlots {
             s.free > 0
                 && asset.num < max_asset_allocations
                 && asset.amount + amount <= u128::from(u64::MAX)
+                && !(mint_right && asset.mint_right)
         })?;
         slot.free -= 1;
         let asset = slot.assets.entry(asset_id.to_string()).or_default();
         asset.num += 1;
         asset.amount += amount;
+        asset.mint_right |= mint_right;
         Some((slot.destination.clone(), slot.outpoint))
     }
 }
@@ -985,6 +1012,13 @@ fn state_amount(state: &AllocatedState) -> u64 {
         AllocatedState::Amount(amt) => amt.as_u64(),
         _ => 0,
     }
+}
+
+/// The number of transitions that take `inputs` inputs, at most `max_inputs` each. Each takes one
+/// output and the last takes the rest. Return `None` when there are too few of the `outputs`.
+fn side_transition_chunks(inputs: usize, outputs: usize, max_inputs: usize) -> Option<usize> {
+    let chunks = inputs.div_ceil(max_inputs).max(1);
+    (outputs >= chunks).then_some(chunks)
 }
 
 /// Assign `state` of type `ty` to `seal` through the main transition when it can assign the type
@@ -2018,6 +2052,11 @@ impl Wallet {
                 .txo_incoming_colorings(txo.idx, None, asset_transfer_idx)?
                 .len(),
             invoices: db.count_utxo_unpaid_invoices(outpoint, transfer_idx)?,
+            mint_rights: asset
+                .iter()
+                .filter(|c| c.assignment == Assignment::MintRight)
+                .count()
+                + db.count_utxo_unpaid_mint_right_invoices(outpoint, asset_id, transfer_idx)?,
         })
     }
 
@@ -2030,72 +2069,28 @@ impl Wallet {
         let mut received = HashMap::new();
         for KnownTransition { transition, opid } in bundle.bundle.known_transitions.iter() {
             for (ass_type, typed_assigns) in transition.assignments.iter() {
-                for (no, fungible_assignment) in typed_assigns.as_fungible().iter().enumerate() {
-                    let opout = Opout::new(*opid, *ass_type, no as u16);
-                    if let BuilderSeal::Concealed(seal) = fungible_assignment.seal {
-                        let state = &fungible_assignment.state;
-                        if Some(seal) == known_concealed {
-                            match *ass_type {
-                                OS_ASSET => {
-                                    received.insert(opout, Assignment::Fungible(state.as_u64()));
-                                }
-                                OS_INFLATION => {
-                                    received
-                                        .insert(opout, Assignment::InflationRight(state.as_u64()));
-                                }
-                                _ => {}
-                            }
+                // A TypedAssigns holds one kind, so only one of these is not empty.
+                let seals = typed_assigns
+                    .as_fungible()
+                    .iter()
+                    .map(|a| a.seal)
+                    .chain(typed_assigns.as_structured().iter().map(|a| a.seal))
+                    .chain(typed_assigns.as_declarative().iter().map(|a| a.seal));
+                for (no, seal) in seals.enumerate() {
+                    let matches = match seal {
+                        BuilderSeal::Concealed(s) => Some(s) == known_concealed,
+                        BuilderSeal::Revealed(s) => {
+                            s.txid == TxPtr::WitnessTx && Some(s.vout.into_u32()) == vout
                         }
                     };
-                    if let BuilderSeal::Revealed(seal) = fungible_assignment.seal {
-                        let state = &fungible_assignment.state;
-                        if seal.txid == TxPtr::WitnessTx && Some(seal.vout.into_u32()) == vout {
-                            match *ass_type {
-                                OS_ASSET => {
-                                    received.insert(opout, Assignment::Fungible(state.as_u64()));
-                                }
-                                OS_INFLATION => {
-                                    received
-                                        .insert(opout, Assignment::InflationRight(state.as_u64()));
-                                }
-                                _ => {}
-                            }
-                        }
-                    };
-                }
-                for (no, structured_assignment) in typed_assigns.as_structured().iter().enumerate()
-                {
-                    let opout = Opout::new(*opid, *ass_type, no as u16);
-                    if let BuilderSeal::Concealed(seal) = structured_assignment.seal
-                        && Some(seal) == known_concealed
-                    {
-                        received.insert(opout, Assignment::NonFungible);
+                    if !matches {
+                        continue;
                     }
-                    if let BuilderSeal::Revealed(seal) = structured_assignment.seal
-                        && seal.txid == TxPtr::WitnessTx
-                        && Some(seal.vout.into_u32()) == vout
+                    let no = no as u16;
+                    if let Some(assignment) =
+                        Assignment::from_typed_assigns(*ass_type, typed_assigns, no)
                     {
-                        received.insert(opout, Assignment::NonFungible);
-                    };
-                }
-                // the link right is the only declarative state handled here
-                if *ass_type != OS_LINK {
-                    continue;
-                }
-                for (no, declarative_assignment) in
-                    typed_assigns.as_declarative().iter().enumerate()
-                {
-                    let opout = Opout::new(*opid, *ass_type, no as u16);
-                    if let BuilderSeal::Concealed(seal) = declarative_assignment.seal
-                        && Some(seal) == known_concealed
-                    {
-                        received.insert(opout, Assignment::LinkRight);
-                    }
-                    if let BuilderSeal::Revealed(seal) = declarative_assignment.seal
-                        && seal.txid == TxPtr::WitnessTx
-                        && Some(seal.vout.into_u32()) == vout
-                    {
-                        received.insert(opout, Assignment::LinkRight);
+                        received.insert(Opout::new(*opid, *ass_type, no), assignment);
                     }
                 }
             }
@@ -2449,9 +2444,18 @@ impl Wallet {
         btc_change: &Option<BtcChange>,
         asset_id: &str,
         amount: u128,
+        mint_right: bool,
     ) -> Result<(ChangeDestination, BlindSeal<TxPtr>), Error> {
+        if mint_right
+            && change_slots
+                .mint_right_invoices
+                .insert(asset_id.to_string())
+        {
+            let utxos = self.database.get_mint_right_invoice_utxos(asset_id)?;
+            change_slots.add_mint_right_invoices(asset_id, &utxos);
+        }
         let (destination, outpoint) = change_slots
-            .take(asset_id, amount)
+            .take(asset_id, amount, mint_right)
             .ok_or(Error::InsufficientAllocationSlots)?;
         debug!(
             self.logger,
@@ -3721,6 +3725,7 @@ impl Wallet {
                     Assignment::Fungible(amt) => (OS_ASSET, Amount::from(*amt).into()),
                     Assignment::InflationRight(amt) => (OS_INFLATION, Amount::from(*amt).into()),
                     Assignment::LinkRight => (OS_LINK, AllocatedState::Void),
+                    Assignment::MintRight => (OS_MINT, AllocatedState::Void),
                     _ => unreachable!(),
                 };
                 asset_transition_builder = add_or_side_output(
@@ -3762,6 +3767,7 @@ impl Wallet {
                         &btc_change,
                         asset_id,
                         u128::from(assignment.main_amount()),
+                        ty == OS_MINT,
                     )?;
                     transfer_info
                         .change_destinations
@@ -3804,36 +3810,52 @@ impl Wallet {
             // the transitions moving the assignment types the main transition doesn't, before
             // the main one, which may spend the output of a split
             for (ty, side) in side_transfers {
-                if side.outputs.is_empty() {
-                    return Err(Error::Internal {
-                        details: format!("not enough outputs to move assignments of type {ty}"),
-                    });
-                }
-                let mut side_builder = runtime.transition_builder_raw(
+                let transition_type = schema.default_transition_for_assignment(&ty);
+                let max_inputs = schema
+                    .transitions
+                    .get(&transition_type)
+                    .expect("default transition missing from the schema")
+                    .transition_schema
+                    .inputs
+                    .get(&ty)
+                    .map(|o| o.max_value() as usize)
+                    .unwrap_or(usize::MAX);
+                let chunks =
+                    side_transition_chunks(side.inputs.len(), side.outputs.len(), max_inputs)
+                        .ok_or_else(|| Error::Internal {
+                            details: format!("not enough outputs to move assignments of type {ty}"),
+                        })?;
+                let builder = runtime.transition_builder_raw(
                     transfer_info.asset_info.contract_id,
-                    schema.default_transition_for_assignment(&ty),
+                    transition_type,
                 )?;
-                for (opout, state) in side.inputs {
-                    side_builder = side_builder.add_input(opout, state)?;
+                let mut inputs = side.inputs.into_iter();
+                let mut outputs = side.outputs.into_iter();
+                for chunk in 0..chunks {
+                    let mut side_builder = builder.clone();
+                    for (opout, state) in inputs.by_ref().take(max_inputs) {
+                        side_builder = side_builder.add_input(opout, state)?;
+                    }
+                    let n_out = if chunk + 1 == chunks { usize::MAX } else { 1 };
+                    for (seal, state) in outputs.by_ref().take(n_out) {
+                        side_builder = side_builder.add_owned_state_raw(ty, seal, state)?;
+                    }
+                    let side_transition = side_builder.complete_transition()?;
+                    if let Some((split_seal, needed)) = side.split
+                        && let Some(no) = side_transition.assignments.get(&ty).and_then(|a| {
+                            a.as_fungible()
+                                .iter()
+                                .position(|a| a.revealed_seal() == Some(split_seal))
+                        })
+                    {
+                        main_inputs.push((
+                            Opout::new(side_transition.id(), ty, no as u16),
+                            Amount::from(needed).into(),
+                        ));
+                    }
+                    psbt.push_rgb_transition(side_transition)
+                        .map_err(InternalError::from)?;
                 }
-                for (seal, state) in side.outputs {
-                    side_builder = side_builder.add_owned_state_raw(ty, seal, state)?;
-                }
-                let side_transition = side_builder.complete_transition()?;
-                if let Some((split_seal, needed)) = side.split
-                    && let Some(no) = side_transition.assignments.get(&ty).and_then(|a| {
-                        a.as_fungible()
-                            .iter()
-                            .position(|a| a.revealed_seal() == Some(split_seal))
-                    })
-                {
-                    main_inputs.push((
-                        Opout::new(side_transition.id(), ty, no as u16),
-                        Amount::from(needed).into(),
-                    ));
-                }
-                psbt.push_rgb_transition(side_transition)
-                    .map_err(InternalError::from)?;
             }
             for (opout, state) in main_inputs {
                 asset_transition_builder = asset_transition_builder.add_input(opout, state)?;
@@ -3958,6 +3980,7 @@ impl Wallet {
                     &btc_change,
                     &cid.to_string(),
                     u128::from(assignment.main_amount()),
+                    opout.ty == OS_MINT,
                 )?;
                 extra_builder = extra_builder
                     .add_input(opout, state.clone())?
@@ -5494,6 +5517,22 @@ impl Wallet {
                  exceeding the {} a UTXO can hold and still be spent",
                 taken.asset_amount,
                 u64::MAX
+            );
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                    mint_known,
+                )
+                .await;
+        }
+        // A UTXO holds at most one mint right of an asset.
+        if receiving.values().any(|a| *a == Assignment::MintRight) && taken.mint_rights > 0 {
+            error!(
+                self.logger,
+                "Consignment pays a mint right to a UTXO already holding or due to receive one"
             );
             return self
                 ._refuse_consignment_async(
@@ -7450,6 +7489,7 @@ impl Wallet {
                 }
             }
             (Assignment::LinkRight, AssetSchema::Ifa | AssetSchema::Bfa) => {}
+            (Assignment::MintRight, AssetSchema::Bfa) => {}
             _ => {
                 return Err(Error::InvalidAssignment);
             }
@@ -7596,6 +7636,11 @@ impl Wallet {
     ///
     /// See native [`send_begin`](Wallet::send_begin) for full documentation.
     ///
+    /// The wallet spends one mint right for any number of [`Assignment::MintRight`] recipients.
+    ///
+    /// Each mint right the spent UTXOs move goes to a UTXO that holds none. If no UTXO is free, the
+    /// call returns [`Error::InsufficientAllocationSlots`].
+    ///
     /// An expiration UTC timestamp must be specified, which will set the expiration of the
     /// transfer. This should be set to the same value specified by the recipient's invoice. After it
     /// passes, the recipient can fail the transfer and the sender does not broadcast it, even when
@@ -7722,6 +7767,8 @@ impl Wallet {
                     .assignment
                     .add_to_assignments(&mut original_assignments_needed);
             }
+            // One mint right can be duplicated to any number of recipients.
+            original_assignments_needed.mint = std::cmp::min(original_assignments_needed.mint, 1);
             let contract_id = ContractId::from_str(asset_id).expect("invalid contract ID");
             assets_data.insert(
                 asset_id.clone(),
@@ -11853,7 +11900,7 @@ mod send_end_tests {
     }
 
     fn take(slots: &mut ChangeSlots, asset_id: &str, amount: u128) -> Option<ChangeDestination> {
-        let taken = slots.take(asset_id, amount);
+        let taken = slots.take(asset_id, amount, false);
         // a pre-existing UTXO gives its outpoint, the BTC change output none
         if let Some((destination, outpoint)) = &taken {
             assert_eq!(
@@ -11888,6 +11935,40 @@ mod send_end_tests {
             assert_eq!(take(&mut slots, "a", 1), utxo_slot(3));
         }
         assert_eq!(take(&mut slots, "a", 1), None);
+    }
+
+    fn take_mint_right(slots: &mut ChangeSlots, asset_id: &str) -> Option<ChangeDestination> {
+        slots
+            .take(asset_id, 0, true)
+            .map(|(destination, _)| destination)
+    }
+
+    #[test]
+    fn change_slots_hold_one_mint_right() {
+        let mut u0 = unspent_with(0, &[("a", 0, TransferStatus::Settled)]);
+        u0.rgb_allocations[0].assignment = Assignment::MintRight;
+        let new_slots = || ChangeSlots::new(true, &[u0.clone(), unspent_with(1, &[])], 10, 10);
+        let mut slots = new_slots();
+        assert_eq!(
+            take_mint_right(&mut slots, "a"),
+            Some(ChangeDestination::BtcChange)
+        );
+        assert_eq!(take_mint_right(&mut slots, "a"), utxo_slot(1));
+        assert_eq!(take_mint_right(&mut slots, "a"), None);
+        assert_eq!(
+            take_mint_right(&mut slots, "b"),
+            Some(ChangeDestination::BtcChange)
+        );
+        assert_eq!(take(&mut slots, "a", 5), Some(ChangeDestination::BtcChange));
+
+        // an unpaid invoice for a mint right reserves its UTXO
+        let mut slots = new_slots();
+        slots.add_mint_right_invoices("a", &HashSet::from([unspent_with(1, &[]).utxo.outpoint()]));
+        assert_eq!(
+            take_mint_right(&mut slots, "a"),
+            Some(ChangeDestination::BtcChange)
+        );
+        assert_eq!(take_mint_right(&mut slots, "a"), None);
     }
 
     #[test]
@@ -13845,9 +13926,10 @@ mod send_end_tests {
             })
             .unwrap()
         };
-        let invoice = |at| {
+        let invoice = |at, requested| {
             db.set_transfer(DbTransferActMod {
                 asset_transfer_idx: ActiveValue::Set(at),
+                requested_assignment: ActiveValue::Set(Some(requested)),
                 incoming: ActiveValue::Set(true),
                 recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Blind {
                     unblinded_utxo: u.clone(),
@@ -13856,49 +13938,104 @@ mod send_end_tests {
             })
             .unwrap()
         };
-        let coloring = |txo_idx, at, r#type, amount| {
+        let coloring = |txo_idx, at, r#type, assignment| {
             db.set_coloring(DbColoringActMod {
                 txo_idx: ActiveValue::Set(txo_idx),
                 asset_transfer_idx: ActiveValue::Set(at),
                 r#type: ActiveValue::Set(r#type),
-                assignment: ActiveValue::Set(Assignment::Fungible(amount)),
+                assignment: ActiveValue::Set(assignment),
                 ..Default::default()
             })
             .unwrap()
         };
         // the transfer being processed, with its colorings saved
         let at1 = asset_transfer(batch(TransferStatus::WaitingCounterparty), Some("a"));
-        let t1 = invoice(at1);
-        coloring(u_idx, at1, ColoringType::Receive, u64::MAX);
+        let t1 = invoice(at1, Assignment::Any);
+        coloring(
+            u_idx,
+            at1,
+            ColoringType::Receive,
+            Assignment::Fungible(u64::MAX),
+        );
         let settled = batch(TransferStatus::Settled);
         let at2 = asset_transfer(settled, Some("a"));
-        coloring(u_idx, at2, ColoringType::Receive, 5);
+        coloring(u_idx, at2, ColoringType::Receive, Assignment::Fungible(5));
         let at3 = asset_transfer(settled, Some("b"));
-        coloring(u_idx, at3, ColoringType::Issue, 7);
+        coloring(u_idx, at3, ColoringType::Issue, Assignment::Fungible(7));
         // an unpaid invoice
         let at4 = asset_transfer(batch(TransferStatus::WaitingCounterparty), None);
-        let t4 = invoice(at4);
+        let t4 = invoice(at4, Assignment::Any);
         let at5 = asset_transfer(batch(TransferStatus::Failed), Some("a"));
-        coloring(u_idx, at5, ColoringType::Receive, 100);
+        coloring(u_idx, at5, ColoringType::Receive, Assignment::Fungible(100));
+        // a held mint right and unpaid invoices that request one
+        let at6 = asset_transfer(settled, Some("a"));
+        coloring(u_idx, at6, ColoringType::Receive, Assignment::MintRight);
+        let waiting = TransferStatus::WaitingCounterparty;
+        let t7 = invoice(
+            asset_transfer(batch(waiting), Some("a")),
+            Assignment::MintRight,
+        );
+        invoice(
+            asset_transfer(batch(waiting), Some("b")),
+            Assignment::MintRight,
+        );
+        invoice(asset_transfer(batch(waiting), Some("a")), Assignment::Any);
+        invoice(
+            asset_transfer(batch(TransferStatus::Failed), Some("a")),
+            Assignment::MintRight,
+        );
 
         assert_eq!(
             wallet.count_utxo_taken_slots(&u, "a", t1, at1).unwrap(),
             TakenSlots {
-                asset: 1,
+                asset: 2,
                 asset_amount: 5,
-                all: 2,
-                invoices: 1,
+                all: 3,
+                invoices: 4,
+                mint_rights: 2,
             }
         );
         assert_eq!(
             wallet.count_utxo_taken_slots(&u, "a", t4, at4).unwrap(),
             TakenSlots {
-                asset: 2,
+                asset: 3,
                 asset_amount: u128::from(u64::MAX) + 5,
-                all: 3,
-                invoices: 0,
+                all: 4,
+                invoices: 3,
+                mint_rights: 2,
             }
         );
+        assert_eq!(
+            db.get_mint_right_invoice_utxos("a").unwrap(),
+            HashSet::from([u.clone()])
+        );
+        assert!(db.get_mint_right_invoice_utxos("c").unwrap().is_empty());
+        assert_eq!(
+            db.count_utxo_unpaid_mint_right_invoices(&u, "a", -1)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.count_utxo_unpaid_mint_right_invoices(&u, "a", t7)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.count_utxo_unpaid_mint_right_invoices(&u, "b", -1)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn side_transition_chunks_split_per_input() {
+        assert_eq!(side_transition_chunks(1, 3, 1), Some(1));
+        assert_eq!(side_transition_chunks(2, 3, 1), Some(2));
+        assert_eq!(side_transition_chunks(3, 3, 1), Some(3));
+        assert_eq!(side_transition_chunks(3, 2, 1), None);
+        assert_eq!(side_transition_chunks(1, 0, 1), None);
+        assert_eq!(side_transition_chunks(0, 2, 1), Some(1));
+        assert_eq!(side_transition_chunks(3, 1, usize::MAX), Some(1));
     }
 }
 

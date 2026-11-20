@@ -462,7 +462,8 @@ impl WasmWallet {
     ///
     /// `online_js` is the Online object returned by `goOnline` (the wallet reserves the invoice on
     /// its proxies).
-    /// `assignment_js` is a JS object like `{ "Fungible": 100 }` or `"NonFungible"` or `"Any"`.
+    /// `assignment_js` is a JS object like `{ "Fungible": 100 }` or `"NonFungible"`, `"MintRight"`
+    /// or `"Any"`.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `transport_endpoints_js` is a JS array of endpoint strings.
     /// `encryption` is "Required" (default), "Unsupported" or "Optional".
@@ -505,6 +506,7 @@ impl WasmWallet {
     /// Create an address to receive RGB assets via witness TX. Returns ReceiveData as a JS object.
     ///
     /// `online_js` is the Online object returned by `goOnline`.
+    /// `assignment_js` is a JS object like `{ "Fungible": 100 }`, `"MintRight"` or `"Any"`.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `encryption` is "Required" (default), "Unsupported" or "Optional".
     #[wasm_bindgen(js_name = "witnessReceive")]
