@@ -868,7 +868,9 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Inflate an IFA asset (begin): prepare a PSBT. Returns the unsigned PSBT string.
+    /// Inflate an IFA asset (begin): prepare a PSBT. Returns an InflateBeginResult JS object
+    /// `{ psbt, batchTransferIdx, details }`. If `dry_run` is true, the wallet does not save the
+    /// transfer as Initiated.
     ///
     /// `inflation_amounts_js` is a JS array of u64 values.
     #[allow(clippy::too_many_arguments)]
@@ -880,22 +882,25 @@ impl WasmWallet {
         inflation_amounts_js: JsValue,
         fee_rate: u64,
         min_confirmations: u8,
-    ) -> Result<String, JsValue> {
+        dry_run: bool,
+    ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let inflation_amounts: Vec<u64> = serde_wasm_bindgen::from_value(inflation_amounts_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid inflation_amounts array: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
-        wallet
+        let result = wallet
             .inflate_begin(
                 online,
                 asset_id.to_string(),
                 inflation_amounts,
                 fee_rate,
                 min_confirmations,
+                dry_run,
             )
             .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
     }
 
     /// Inflate an IFA asset (end): broadcast a signed PSBT. Returns an OperationResult JS object.

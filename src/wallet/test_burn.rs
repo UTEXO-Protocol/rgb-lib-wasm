@@ -466,9 +466,10 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
 
     // an inflate PSBT in burn_end
     let unsigned = wallet
-        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1)
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let inflate = wallet.sign_psbt(unsigned, None).unwrap();
     assert!(wrong(
         &wallet
@@ -645,9 +646,17 @@ fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
 async fn inflate_and_settle(b: &mut Wallet, b_online: &Online, asset_id: &str, amount: u64) {
     let ords = witness_ords(b);
     let unsigned = b
-        .inflate_begin(b_online.clone(), asset_id.to_string(), vec![amount], 1, 1)
+        .inflate_begin(
+            b_online.clone(),
+            asset_id.to_string(),
+            vec![amount],
+            1,
+            1,
+            false,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     // an inflation builds no consignment and enters the stock at its end
     let txid = Psbt::from_str(&unsigned)
         .unwrap()
@@ -685,7 +694,7 @@ async fn ifa_inflate_reject_list() {
     // an inflation only the rejected right could cover fails
     serve_reject_list(&url, &r60[0].to_string());
     let result = b
-        .inflate_begin(b_online.clone(), asset_id.clone(), vec![41], 1, 1)
+        .inflate_begin(b_online.clone(), asset_id.clone(), vec![41], 1, 1, false)
         .await;
     assert!(
         matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
@@ -711,7 +720,7 @@ async fn ifa_inflate_reject_list() {
     serve_reject_list(&url, &format!("{}\n{}", r60[0], r40[0]));
     let ords = witness_ords(&b);
     let result = b
-        .inflate_begin(b_online.clone(), asset_id.clone(), vec![5], 1, 1)
+        .inflate_begin(b_online.clone(), asset_id.clone(), vec![5], 1, 1, false)
         .await;
     assert!(
         matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
@@ -738,14 +747,15 @@ async fn inflate_and_burn_are_atomic() {
     .await;
 
     assert_no_partial_change(&mut wallet, "inflate_begin", 0, async |w| {
-        w.inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1)
+        w.inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
             .await
     })
     .await;
     let unsigned = wallet
-        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1)
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     assert_no_partial_change(&mut wallet, "inflate_end", 1, async |w| {
         w.inflate_end(online.clone(), signed.clone()).await
@@ -776,4 +786,112 @@ async fn inflate_and_burn_are_atomic() {
             .await
     })
     .await;
+}
+
+#[wasm_bindgen_test]
+async fn inflate_begin_end() {
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let last_operation = |wallet: &Wallet| {
+        wallet
+            .database
+            .get_backup_info()
+            .unwrap()
+            .map(|b| b.last_operation_timestamp)
+    };
+    let transfers = |wallet: &Wallet| {
+        wallet
+            .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+            .unwrap()
+            .len()
+    };
+
+    // a dry run saves and reserves nothing
+    let before = last_operation(&wallet);
+    let count = transfers(&wallet);
+    let res = wallet
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, true)
+        .await
+        .unwrap();
+    assert_eq!(res.batch_transfer_idx, None);
+    assert_eq!(last_operation(&wallet), before);
+    assert_eq!(transfers(&wallet), count);
+    assert!(wallet.get_reserved_outpoints().unwrap().is_empty());
+
+    // begin saves the inflation as initiated
+    let before = last_operation(&wallet);
+    let begin = wallet
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
+        .await
+        .unwrap();
+    assert_ne!(last_operation(&wallet), before);
+    let idx = begin.batch_transfer_idx.unwrap();
+    let initiated = transfer(&wallet, &asset_id, idx);
+    assert_eq!(initiated.status, TransferStatus::Initiated);
+    assert_eq!(initiated.kind, TransferKind::Inflation);
+    let psbt = Psbt::from_str(&begin.psbt).unwrap();
+    let reserved = wallet.get_reserved_outpoints().unwrap();
+    assert!(
+        psbt.unsigned_tx
+            .input
+            .iter()
+            .all(|i| reserved.contains(&i.previous_output.into()))
+    );
+    assert_eq!(begin.details.min_confirmations, 1);
+    assert_eq!(
+        psbt.outputs.iter().find_map(|o| o.mpc_entropy()),
+        Some(begin.details.entropy)
+    );
+    let fascia = Fascia::from_strict_serialized::<U32>(
+        Confined::try_from(begin.details.fascia.clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fascia.bundles().len(), 1);
+
+    // end moves the saved inflation on
+    let before = last_operation(&wallet);
+    let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+    let res = wallet.inflate_end(online.clone(), signed).await.unwrap();
+    assert_ne!(last_operation(&wallet), before);
+    assert_eq!(res.batch_transfer_idx, idx);
+    assert_eq!(res.entropy, begin.details.entropy);
+    assert_eq!(
+        transfer(&wallet, &asset_id, idx).status,
+        TransferStatus::WaitingConfirmations
+    );
+    let inflations: Vec<Transfer> = wallet
+        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == TransferKind::Inflation)
+        .collect();
+    assert_eq!(inflations.len(), 1);
+    assert_eq!(inflations[0].txid.as_ref(), Some(&res.txid));
+    assert!(wallet.get_reserved_outpoints().unwrap().is_empty());
+
+    mine_and_refresh(&mut wallet, &online).await;
+    assert_eq!(
+        transfer(&wallet, &asset_id, idx).status,
+        TransferStatus::Settled
+    );
+    assert_eq!(balance(&wallet, &asset_id), (1050, 1050, 1050));
+}
+
+#[wasm_bindgen_test]
+async fn inflate_dry_run_end_saves_transfer() {
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let begin = wallet
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+
+    // a dry run has no expiration
+    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
+        .unwrap();
+    let res = wallet.inflate_end(online.clone(), signed).await;
+    js_sys::eval("Date.now = realDateNow").unwrap();
+    let res = res.unwrap();
+    let saved = transfer(&wallet, &asset_id, res.batch_transfer_idx);
+    assert_eq!(saved.status, TransferStatus::WaitingConfirmations);
+    assert_eq!(saved.kind, TransferKind::Inflation);
 }

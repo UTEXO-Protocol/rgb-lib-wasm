@@ -1387,7 +1387,8 @@ impl Wallet {
 
 impl Wallet {
     /// Return the inputs of the transfers that can still fail (Initiated, waiting for the
-    /// counterparty or for the broadcast), and of the inflations that are begun and not expired.
+    /// counterparty or for the broadcast), and of the begun operations with no saved transfer,
+    /// until they expire.
     pub(crate) fn get_reserved_outpoints(&self) -> Result<Vec<Outpoint>, Error> {
         let now = now().unix_timestamp();
         let waiting: HashMap<String, bool> = self
