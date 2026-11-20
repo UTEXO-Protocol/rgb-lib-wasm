@@ -5,7 +5,7 @@ use super::test_bfa::utils::*;
 use super::test_bfa::*;
 use crate::wallet::rust_only::validate_consignment_offchain;
 use crate::wallet::{
-    AssetFilter, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData,
+    AssetFilter, Balance, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData,
     ReceivedMint, Recipient, Wallet,
 };
 use crate::{
@@ -189,6 +189,24 @@ async fn bfa_mint_settles_and_is_spendable() {
         .unwrap();
     assert_eq!(psbt.outputs[opret].mpc_entropy(), Some(res.details.entropy));
 
+    // an import of the mint needs an EVM RPC URL and a confirmed lock
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let bytes = a.send_consignment_bytes(&txid, &asset_id).unwrap();
+    let mut d1 = Wallet::new(wallet_data(vec![AssetSchema::Bfa])).unwrap();
+    let d1_online = d1.go_online(go_online_options(false)).await.unwrap();
+    assert!(matches!(
+        d1.save_new_asset(d1_online, &bytes, &txid).await,
+        Err(Error::NoEvmRpcUrl { chain_id: CHAIN_ID })
+    ));
+    let mut d2 = Wallet::new(wallet_data(vec![AssetSchema::Bfa])).unwrap();
+    let d2_online = d2
+        .go_online(OnlineOptions {
+            evm_chains: evm_chains(2, 1_000_000),
+            ..go_online_options(false)
+        })
+        .await
+        .unwrap();
+
     // the receiver checks the mint before the lock and tells what to lock
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
@@ -253,7 +271,13 @@ async fn bfa_mint_settles_and_is_spendable() {
             matches!(result, Err(Error::MintLockNotFound { ref opid }) if *opid == res.details.opid),
             "{result:?}"
         );
+        let result = d2.save_new_asset(d2_online.clone(), &bytes, &txid).await;
+        assert!(
+            matches!(result, Err(Error::MintLockNotFound { ref opid }) if *opid == res.details.opid),
+            "{result:?}"
+        );
     }
+    assert!(d2.rgb_contract_ids().unwrap().is_empty());
     assert_eq!(
         transfer_status(&mut a, &receive.recipient_id),
         TransferStatus::Initiated
@@ -280,6 +304,32 @@ async fn bfa_mint_settles_and_is_spendable() {
     );
     clear_rpc_hooks();
     assert_eq!(calls, (1, 0, 0));
+
+    // an EVM node on another chain cannot confirm the lock, then the import succeeds
+    rpc_hook(
+        EVM_RPC_URL,
+        "eth_chainId",
+        &format!("return {{ ...res, result: '0x{:x}' }}", CHAIN_ID + 1),
+    );
+    let result = d2.save_new_asset(d2_online.clone(), &bytes, &txid).await;
+    clear_rpc_hooks();
+    assert!(
+        matches!(result, Err(Error::Network { ref details }) if details.contains("another chain")),
+        "{result:?}"
+    );
+    assert!(d2.rgb_contract_ids().unwrap().is_empty());
+    d2.save_new_asset(d2_online, &bytes, &txid).await.unwrap();
+    let listed = d2.list_assets(vec![AssetSchema::Bfa]).unwrap().bfa.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].asset_id, asset_id);
+    assert_eq!(
+        listed[0].balance,
+        Balance {
+            settled: 0,
+            future: 0,
+            spendable: 0
+        }
+    );
 
     // only an online check can accept a consignment that holds a mint
     let bytes = &a.transfer_artifacts[&minted.txid].consignment_bytes[&asset_id];

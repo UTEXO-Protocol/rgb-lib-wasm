@@ -660,7 +660,7 @@ async fn bfa_receive_refuses_rejected_allocation() {
     finalize_evm().await;
 
     // the list rejects the minted allocation after the send
-    send(
+    let txid = send(
         &mut a,
         &a_online,
         &mut b,
@@ -670,6 +670,14 @@ async fn bfa_receive_refuses_rejected_allocation() {
     )
     .await;
     deploy_reject_list(&reject_list, &[(opid, 0)]).await;
+    let bytes = a.send_consignment_bytes(&txid, &asset_id).unwrap();
+    let result = b.save_new_asset(b_online.clone(), &bytes, &txid).await;
+    assert!(
+        matches!(result, Err(Error::ConsignmentRejected { .. })),
+        "{result:?}"
+    );
+    assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
+    assert!(b.rgb_contract_ids().unwrap().is_empty());
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses, vec![TransferStatus::Failed]);
     assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());

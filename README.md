@@ -413,6 +413,7 @@ To protect a wallet:
 | `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers and settle ended vanilla operations |
+| `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
 | `deleteTransfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
 | `signPsbt(psbt)` | no | Sign a PSBT |

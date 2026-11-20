@@ -76,6 +76,20 @@ pub enum Error {
         schema: AssetSchema,
     },
 
+    /// The reject list refuses opouts of the consignment
+    #[error("Consignment rejected by the reject list, rejected opouts: {opouts:?}")]
+    ConsignmentRejected {
+        /// The rejected opouts
+        opouts: Vec<String>,
+    },
+
+    /// The consignment failed validation
+    #[error("Consignment validation failed: {details}")]
+    ConsignmentValidationFailed {
+        /// Error details
+        details: String,
+    },
+
     /// Two proxy authentication key entries resolve to the same proxy URL
     #[error("Duplicate proxy authentication key: {details}")]
     DuplicateProxyAuthKey {
