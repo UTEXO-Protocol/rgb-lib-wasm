@@ -45,6 +45,9 @@ impl RejectListClient {
         use wasm_bindgen::JsCast;
         let resp = gloo_net::http::Request::get(&self.base_url)
             .redirect(web_sys::RequestRedirect::Error)
+            .abort_signal(Some(&web_sys::AbortSignal::timeout_with_u32(
+                CLIENT_TIMEOUT.as_millis() as u32,
+            )))
             .send()
             .await
             .map_err(Self::req_err)?;
@@ -79,6 +82,7 @@ impl RejectListClient {
     pub(crate) async fn get_reject_list(&self) -> Result<String, Error> {
         let mut resp = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(CLIENT_TIMEOUT)
             .build()
             .map_err(Self::req_err)?
             .get(&self.base_url)
@@ -140,6 +144,33 @@ mod tests {
                 Some(Error::RejectListService { .. })
             ));
         }
+
+        // a server that does not answer in time is refused
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/")
+            .with_body_from_request(|_| {
+                std::thread::sleep(CLIENT_TIMEOUT + Duration::from_secs(1));
+                b"".to_vec()
+            })
+            .create();
+        let start = std::time::Instant::now();
+        let result = block_on(
+            RejectListClient::new(&server.url())
+                .unwrap()
+                .get_reject_list(),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(Error::RejectListService { .. })),
+            "{result:?}"
+        );
+        assert!(elapsed >= CLIENT_TIMEOUT, "{elapsed:?}");
+        assert!(
+            elapsed < CLIENT_TIMEOUT + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        mock.assert();
     }
 
     #[test]

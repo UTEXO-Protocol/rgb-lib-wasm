@@ -187,6 +187,27 @@ pub async fn sleep_ms(ms: u32) {
     wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
 }
 
+#[allow(dead_code)]
+pub fn run_js(body: &str) -> JsValue {
+    js_sys::Function::new_no_args(body)
+        .call0(&JsValue::NULL)
+        .unwrap()
+}
+
+/// Return `None` when `fut` is not ready within `ms`.
+#[allow(dead_code)]
+pub async fn within<F: std::future::Future>(ms: u32, fut: F) -> Option<F::Output> {
+    let mut timer = std::pin::pin!(sleep_ms(ms));
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(out));
+        }
+        timer.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
 thread_local! {
     // public key, expiration and encryption of the invoices created by the receive helpers
     static RECEIVES: RefCell<HashMap<String, (String, u64, Encryption)>> =

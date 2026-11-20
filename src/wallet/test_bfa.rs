@@ -758,6 +758,70 @@ async fn bfa_reject_list_url() {
     ));
 }
 
+/// A stalled EVM node or reject list server fails the call after the time limit.
+#[wasm_bindgen_test]
+async fn bfa_stalled_evm_and_reject_list_time_out() {
+    use crate::api::evm::EvmClient;
+    use crate::api::reject_list::RejectListClient;
+
+    run_js(
+        "const g = globalThis;
+        g.__stallFetch = g.fetch;
+        g.__stallAborts = 0;
+        const fetch = g.fetch;
+        g.fetch = function (input, init) {
+            const url = input instanceof Request ? input.url : String(input);
+            if (!url.startsWith('http://stall.invalid/')) {
+                return fetch.call(this, input, init);
+            }
+            const signal = (init && init.signal) || input.signal;
+            return new Promise((_, reject) => signal.addEventListener('abort', () => {
+                g.__stallAborts += 1;
+                reject(signal.reason);
+            }));
+        };",
+    );
+    let ms = crate::api::CLIENT_TIMEOUT.as_millis() as u32;
+    let start = js_sys::Date::now();
+    let evm = within(
+        2 * ms,
+        EvmClient::new("http://stall.invalid/evm").chain_id(),
+    )
+    .await;
+    let evm_ms = js_sys::Date::now() - start;
+    let start = js_sys::Date::now();
+    let list = within(
+        2 * ms,
+        RejectListClient::new("http://stall.invalid/list")
+            .unwrap()
+            .get_reject_list(),
+    )
+    .await;
+    let list_ms = js_sys::Date::now() - start;
+    let aborts = run_js(
+        "const g = globalThis;
+        g.fetch = g.__stallFetch;
+        delete g.__stallFetch;
+        return g.__stallAborts;",
+    )
+    .as_f64()
+    .unwrap();
+    assert!(
+        matches!(evm, Some(Err(Error::Network { .. }))),
+        "chain_id after {evm_ms} ms: {evm:?}"
+    );
+    assert!(
+        matches!(list, Some(Err(Error::RejectListService { .. }))),
+        "get_reject_list after {list_ms} ms: {list:?}"
+    );
+    assert!(evm_ms >= 0.9 * f64::from(ms), "chain_id after {evm_ms} ms");
+    assert!(
+        list_ms >= 0.9 * f64::from(ms),
+        "get_reject_list after {list_ms} ms"
+    );
+    assert_eq!(aborts, 2.0);
+}
+
 #[wasm_bindgen_test]
 async fn bfa_reject_list_rpc_config() {
     let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
