@@ -91,7 +91,7 @@ pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
 #[cfg(feature = "esplora")]
 use std::{
     cmp::{Ordering, max, min},
-    collections::hash_map::DefaultHasher,
+    collections::hash_map::{DefaultHasher, Entry},
     hash::Hasher,
     num::NonZeroU32,
 };
