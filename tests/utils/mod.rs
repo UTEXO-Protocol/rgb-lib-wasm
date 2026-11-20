@@ -33,6 +33,7 @@ pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
             url: ESPLORA_URL.to_string(),
         },
         skip_consistency_check,
+        failed_witness_receive_grace_secs: 604_800,
         proxy_auth_keys: HashMap::new(),
         evm_chains: HashMap::new(),
     }
