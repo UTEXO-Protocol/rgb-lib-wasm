@@ -677,12 +677,20 @@ async fn sender_proxy_retention_grace(proxy_url: &str) -> Result<u32, Error> {
     Ok(crate::utils::proxy_retention_grace(&info))
 }
 
-/// The broadcast deadline of an operation from the `expires_at` returned by `ack.post` and the
-/// sender proxy retention grace, `None` if the proxy didn't return a valid expiration.
-fn broadcast_deadline(expires_at: Option<&str>, retention_grace: u32) -> Option<i64> {
-    expires_at
-        .and_then(|exp| exp.parse::<i64>().ok())
-        .map(|exp| exp + i64::from(retention_grace))
+/// The broadcast deadline from the expires_at of ack.post and the sender proxy retention grace.
+/// It is None when the expiration is missing, unparsable, before now or after the invoice
+/// expiration, or when there is no invoice expiration.
+fn broadcast_deadline(
+    expires_at: Option<&str>,
+    retention_grace: u32,
+    invoice_expiration: Option<i64>,
+) -> Option<i64> {
+    let expiration = expires_at.and_then(|exp| exp.parse::<i64>().ok())?;
+    let invoice_expiration = invoice_expiration?;
+    if expiration < now().unix_timestamp() || expiration > invoice_expiration {
+        return None;
+    }
+    Some(expiration.saturating_add(i64::from(retention_grace)))
 }
 
 /// Interpret an error returned by the sender proxy to `ack.get`, requested while waiting for the
@@ -4434,8 +4442,11 @@ impl Wallet {
         // the shared deadline for broadcasting the TX, after which (plus a confirmation margin)
         // the transfer is failed if the TX is not confirmed
         if let Some(grace) = retention_grace {
-            updated_batch_transfer.broadcast_deadline =
-                ActiveValue::Set(broadcast_deadline(res.expires_at.as_deref(), grace));
+            updated_batch_transfer.broadcast_deadline = ActiveValue::Set(broadcast_deadline(
+                res.expires_at.as_deref(),
+                grace,
+                batch_transfer.expiration,
+            ));
         }
 
         match (res.signed_tx, res.signed_tx_hash, res.sender_pk) {
@@ -6200,6 +6211,7 @@ impl Wallet {
             && let Some(deadline) = broadcast_deadline(
                 res.expires_at.as_deref(),
                 sender_proxy_retention_grace(&sender_proxy).await?,
+                batch_transfer.expiration,
             )
         {
             updated_batch_transfer.broadcast_deadline = ActiveValue::Set(Some(deadline));
@@ -11509,10 +11521,59 @@ mod send_end_tests {
             &batch(Some(now + 1), None, waiting, None),
             now
         ));
+    }
 
-        assert_eq!(broadcast_deadline(Some("1000"), 50), Some(1050));
-        assert_eq!(broadcast_deadline(Some("soon"), 50), None);
-        assert_eq!(broadcast_deadline(None, 50), None);
+    // the expires_at of ack.post comes from the sender proxy, so the deadline must not trust it
+    #[test]
+    fn broadcast_deadline_refuses_untrusted_expirations() {
+        let grace = MIN_SENDER_RETENTION_GRACE_SECS;
+        let invoice_expiration = now().unix_timestamp() + 86400;
+        let deadline = |expires_at: Option<&str>| {
+            broadcast_deadline(expires_at, grace, Some(invoice_expiration))
+        };
+
+        // an expiration inside the invoice validity gives the deadline
+        let expiration = invoice_expiration - i64::from(INVOICE_EXPIRATION_MARGIN_SECS);
+        assert_eq!(
+            deadline(Some(&expiration.to_string())),
+            Some(expiration + i64::from(grace))
+        );
+        // the invoice expiration itself is accepted
+        assert_eq!(
+            deadline(Some(&invoice_expiration.to_string())),
+            Some(invoice_expiration + i64::from(grace))
+        );
+        // an expiration equal to now is accepted
+        let (at, res) = (0..5)
+            .find_map(|_| {
+                let before = now().unix_timestamp();
+                let res = deadline(Some(&before.to_string()));
+                (now().unix_timestamp() == before).then_some((before, res))
+            })
+            .expect("clock ticked on every try");
+        assert_eq!(res, Some(at + i64::from(grace)));
+
+        // an expiration after the invoice expiration gives none
+        for expiration in [i64::MAX, invoice_expiration + 1] {
+            let refused = deadline(Some(&expiration.to_string()));
+            assert_eq!(refused, None, "expiration {expiration} was not refused");
+        }
+
+        // a passed, missing or unparsable expiration gives none
+        for expires_at in [Some("-1"), Some("0"), Some("sooner or later"), None] {
+            assert_eq!(deadline(expires_at), None, "{expires_at:?} was not refused");
+        }
+
+        // no invoice expiration gives none
+        let expiration = (now().unix_timestamp() + 1).to_string();
+        assert_eq!(broadcast_deadline(Some(&expiration), grace, None), None);
+
+        // the deadline saturates
+        let expiration = (i64::MAX - 1).to_string();
+        assert_eq!(
+            broadcast_deadline(Some(&expiration), grace, Some(i64::MAX)),
+            Some(i64::MAX)
+        );
     }
 
     #[test]
@@ -11867,6 +11928,128 @@ mod send_end_tests {
             let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
             assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
             assert_eq!(status(&wallet, idx), TransferStatus::Failed);
+        }
+    }
+
+    // the ACK refresh takes no broadcast deadline from an expires_at outside the invoice validity
+    #[test]
+    fn wait_broadcast_refuses_untrusted_expires_at() {
+        let now = now().unix_timestamp();
+        let expiration = now + 3600;
+        for (expires_at, expected) in [
+            (
+                expiration - i64::from(INVOICE_EXPIRATION_MARGIN_SECS),
+                Some(expiration - i64::from(INVOICE_EXPIRATION_MARGIN_SECS) + 100),
+            ),
+            (expiration + 1, None),
+        ] {
+            let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
+            let mut server = mockito::Server::new();
+            let _info = rpc_mock(&mut server, "server.info", INFO_BODY);
+            let _ack = rpc_mock(
+                &mut server,
+                "ack.post",
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":null,"result":{{"result":true,"expires_at":"{expires_at}"}}}}"#
+                ),
+            );
+            let idx = seed_batch(
+                &wallet,
+                &"44".repeat(32),
+                TransferStatus::WaitingBroadcast,
+                true,
+                Some(expiration),
+            );
+            let mut batch = DbBatchTransferActMod {
+                idx: ActiveValue::Set(idx),
+                operation_secret_key: ActiveValue::Set(Some(RECIPIENT_SEED.to_vec())),
+                ..Default::default()
+            };
+            wallet.database.update_batch_transfer(&mut batch).unwrap();
+            let transfer = wallet.database.iter_transfers().unwrap().pop().unwrap();
+            let mut updated: DbTransferActMod = transfer.clone().into();
+            updated.proxy_transfer_id = ActiveValue::Set(Some(s!("transfer")));
+            updated.consignment_hash = ActiveValue::Set(Some("00".repeat(32)));
+            wallet.database.update_transfer(&mut updated).unwrap();
+            wallet
+                .save_sender_transport_endpoint(transfer.idx, &server.url())
+                .unwrap();
+            let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+            assert_eq!(res[&idx].updated_status, None);
+            assert_eq!(status(&wallet, idx), TransferStatus::WaitingBroadcast);
+            let saved = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .into_iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap()
+                .broadcast_deadline;
+            assert_eq!(saved, expected, "expires_at {expires_at}");
+        }
+    }
+
+    // the first ACK takes no broadcast deadline from an expires_at outside the invoice validity
+    #[test]
+    fn ack_consignment_refuses_untrusted_expires_at() {
+        let now = now().unix_timestamp();
+        let expiration = now + 3600;
+        let accepted = expiration - i64::from(INVOICE_EXPIRATION_MARGIN_SECS);
+        for (expires_at, invoice_expiration, expected) in [
+            (accepted, Some(expiration), Some(accepted + 100)),
+            (expiration + 1, Some(expiration), None),
+            (accepted, None, None),
+        ] {
+            let (mut wallet, _) = setup();
+            let mut server = mockito::Server::new();
+            let _ack = rpc_mock(
+                &mut server,
+                "ack.post",
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":null,"result":{{"result":true,"expires_at":"{expires_at}"}}}}"#
+                ),
+            );
+            let idx = seed_batch(
+                &wallet,
+                &"44".repeat(32),
+                TransferStatus::WaitingCounterparty,
+                true,
+                invoice_expiration,
+            );
+            let batch = wallet
+                .database
+                .iter_batch_transfers()
+                .unwrap()
+                .into_iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap();
+            let transfer = wallet.database.iter_transfers().unwrap().pop().unwrap();
+            let data = ProxyReceiveData {
+                proxy_url: server.url(),
+                transfer_id: s!("transfer"),
+                sender_proxy: server.url(),
+                sender_pubkey: s!(""),
+                consignment_hash: "00".repeat(32),
+                recipient_encryption: Encryption::Optional,
+                batch: true,
+            };
+            let mut updated: DbBatchTransferActMod = batch.clone().into();
+            let res = block_on(wallet.ack_consignment(
+                &batch,
+                &transfer,
+                &mut updated,
+                &data,
+                &RECIPIENT_SEED,
+                Some(100),
+                None,
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(res.status, TransferStatus::WaitingBroadcast);
+            assert_eq!(
+                res.broadcast_deadline, expected,
+                "expires_at {expires_at}, invoice expiration {invoice_expiration:?}"
+            );
         }
     }
 
