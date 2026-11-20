@@ -24,39 +24,15 @@ pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
 const FASCIA_MAX_LEN: usize = amplify::confinement::U32;
 
-/// The maximum length of a confined collection, given an accessor returning it from a bundle.
-const fn bundle_confinement_max<
-    C: amplify::confinement::Collection,
-    const MIN: usize,
-    const MAX: usize,
->(
-    _: fn(&TransitionBundle) -> &Confined<C, MIN, MAX>,
-) -> usize {
-    MAX
-}
-
-/// Maximum number of allocations of an asset a UTXO can hold and still be spent. A bundle spends
-/// at most as many opouts as its input map holds.
-pub(crate) const MAX_UTXO_ASSET_ALLOCATIONS: usize =
-    bundle_confinement_max(|b: &TransitionBundle| &b.input_map);
-
-/// Maximum number of allocations of an asset a UTXO can hold (see [`MAX_UTXO_ASSET_ALLOCATIONS`]).
-pub(crate) fn max_utxo_asset_allocations() -> usize {
-    #[cfg(test)]
-    if let Some(max_allocations) = MOCK_MAX_UTXO_ASSET_ALLOCATIONS.with_borrow(|m| *m) {
-        return max_allocations;
-    }
-    MAX_UTXO_ASSET_ALLOCATIONS
-}
-
 #[cfg(test)]
 thread_local! {
     pub(crate) static MOCK_SPAM_RECIPIENT_ASSIGNMENTS: std::cell::RefCell<Option<(u16, u64)>> =
         const { std::cell::RefCell::new(None) };
     pub(crate) static MOCK_SPAM_HIDDEN_SPENDS: std::cell::RefCell<Option<()>> =
         const { std::cell::RefCell::new(None) };
-    pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: std::cell::RefCell<Option<usize>> =
-        const { std::cell::RefCell::new(None) };
+    // test mock: accept a consignment that pays an invoice more than one allocation
+    pub(crate) static MOCK_ACCEPT_MULTIPLE_ALLOCATIONS: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
 }
 
 // test mock: move part of the recipient amount to `num` extra assignments of `amount` to the
@@ -239,6 +215,58 @@ struct AssetSpend {
     txo_map: HashMap<i32, Outpoint>,
     assignments_collected: AssignmentsCollection,
     input_btc_amt: u64,
+}
+
+/// The UTXOs selected as inputs of an operation, with the number and the total amount of the
+/// allocations of each asset they hold. Spending them moves all of these allocations into the
+/// bundle of the asset. A transition cannot spend more than `u64::MAX` of an asset.
+#[derive(Clone, Debug, Default)]
+struct SelectedInputs {
+    outpoints: HashSet<Outpoint>,
+    // asset ID -> (number of allocations, total amount)
+    allocations: HashMap<String, (usize, u128)>,
+}
+
+impl SelectedInputs {
+    /// Select the UTXO if the allocations it holds fit, and return whether it is selected. The
+    /// allocations of each asset, added to the selected ones, must stay within `max_allocations`
+    /// and an amount of `u64::MAX`. A UTXO that is already selected counts once.
+    fn select(&mut self, unspent: &LocalUnspent, max_allocations: usize) -> bool {
+        let outpoint = unspent.utxo.outpoint();
+        if self.outpoints.contains(&outpoint) {
+            return true;
+        }
+        // asset ID -> (number of allocations, total amount) that the UTXO holds or will receive
+        let mut held: HashMap<&str, (usize, u128)> = HashMap::new();
+        for allocation in unspent
+            .rgb_allocations
+            .iter()
+            .filter(|a| a.incoming && !a.txo_spent && !a.status.failed() && a.asset_id.is_some())
+        {
+            let (num, amount) = held
+                .entry(allocation.asset_id.as_deref().unwrap())
+                .or_default();
+            *num += 1;
+            *amount += u128::from(allocation.assignment.main_amount());
+        }
+        let fits = held.iter().all(|(asset_id, (num, amount))| {
+            let (selected_num, selected_amount) =
+                self.allocations.get(*asset_id).copied().unwrap_or_default();
+            selected_num + num <= max_allocations
+                && selected_amount + amount <= u128::from(u64::MAX)
+        });
+        if !fits {
+            return false;
+        }
+        for (asset_id, (num, amount)) in held {
+            let (selected_num, selected_amount) =
+                self.allocations.entry(asset_id.to_string()).or_default();
+            *selected_num += num;
+            *selected_amount += amount;
+        }
+        self.outpoints.insert(outpoint);
+        true
+    }
 }
 
 /// The result of a send operation
@@ -1909,62 +1937,104 @@ impl Wallet {
         received
     }
 
+    /// The number of allocations of an asset that the inputs of an operation can hold. A burn gets
+    /// one less, because a split transition in its bundle adds one entry to the input map.
+    fn max_input_allocations(main_transition: &TypeOfTransition) -> usize {
+        match main_transition {
+            TypeOfTransition::Burn => max_utxo_asset_allocations() - 1,
+            _ => max_utxo_asset_allocations(),
+        }
+    }
+
+    /// Select the UTXOs that hold the assignments of the asset, and add them to `selected`. Skip a
+    /// UTXO that takes an asset past `max_allocations`. When a skip leaves too few assignments,
+    /// retry from the largest UTXOs.
     fn _select_rgb_inputs(
         &self,
         asset_id: String,
         assignments_needed: &AssignmentsCollection,
         unspents: Vec<LocalUnspent>,
+        selected: &mut SelectedInputs,
+        max_allocations: usize,
     ) -> Result<AssetSpend, Error> {
-        // sort unspents by the sum of main amounts
-        fn cmp_localunspent_allocation_sum(a: &LocalUnspent, b: &LocalUnspent) -> Ordering {
-            let a_sum: u64 = a
+        // the sum of the settled amounts of the asset on the UTXO; other assets do not count
+        let asset_sum = |unspent: &LocalUnspent, amount: fn(&Assignment) -> u64| -> u64 {
+            unspent
                 .rgb_allocations
                 .iter()
-                .map(|a| a.assignment.main_amount())
-                .sum();
-            let b_sum: u64 = b
-                .rgb_allocations
-                .iter()
-                .map(|a| a.assignment.main_amount())
-                .sum();
-            a_sum.cmp(&b_sum)
-        }
-        // sort unspents by the sum of inflation right amounts
-        fn cmp_localunspent_inflation_sum(a: &LocalUnspent, b: &LocalUnspent) -> Ordering {
-            let a_sum: u64 = a
-                .rgb_allocations
-                .iter()
-                .map(|a| a.assignment.inflation_amount())
-                .sum();
-            let b_sum: u64 = b
-                .rgb_allocations
-                .iter()
-                .map(|a| a.assignment.inflation_amount())
-                .sum();
-            a_sum.cmp(&b_sum)
-        }
+                .filter(|a| a.asset_id.as_ref() == Some(&asset_id) && a.status.settled())
+                .map(|a| amount(&a.assignment))
+                .sum()
+        };
 
         debug!(self.logger, "Selecting inputs for asset '{}'...", asset_id);
-        let mut txo_map: HashMap<i32, Outpoint> = HashMap::new();
-
         let mut mut_unspents = unspents;
 
         // sort unspents first by inflation rights amount, then main amount
         if assignments_needed.inflation > 0 {
-            mut_unspents.sort_by(cmp_localunspent_inflation_sum);
+            mut_unspents.sort_by_cached_key(|u| asset_sum(u, Assignment::inflation_amount));
         }
         if assignments_needed.fungible > 0 {
-            mut_unspents.sort_by(cmp_localunspent_allocation_sum);
+            mut_unspents.sort_by_cached_key(|u| asset_sum(u, Assignment::main_amount));
         }
 
+        let selected_before = selected.clone();
+        let (mut asset_spend, skipped) = self._select_rgb_inputs_pass(
+            &asset_id,
+            assignments_needed,
+            &mut_unspents,
+            selected,
+            max_allocations,
+        );
+        if skipped && !asset_spend.assignments_collected.enough(assignments_needed) {
+            debug!(
+                self.logger,
+                "Retrying input selection for asset '{}' from the largest UTXOs", asset_id
+            );
+            *selected = selected_before;
+            mut_unspents.reverse();
+            (asset_spend, _) = self._select_rgb_inputs_pass(
+                &asset_id,
+                assignments_needed,
+                &mut_unspents,
+                selected,
+                max_allocations,
+            );
+        }
+        if !asset_spend.assignments_collected.enough(assignments_needed) {
+            return Err(Error::InsufficientAssignments {
+                asset_id,
+                available: asset_spend.assignments_collected,
+            });
+        }
+
+        debug!(
+            self.logger,
+            "Asset input assignments {:?}", asset_spend.assignments_collected
+        );
+        Ok(asset_spend)
+    }
+
+    /// One pass of `_select_rgb_inputs` over `unspents` in their order. Also return whether a UTXO
+    /// was skipped.
+    fn _select_rgb_inputs_pass(
+        &self,
+        asset_id: &str,
+        assignments_needed: &AssignmentsCollection,
+        unspents: &[LocalUnspent],
+        selected: &mut SelectedInputs,
+        max_allocations: usize,
+    ) -> (AssetSpend, bool) {
+        let mut txo_map: HashMap<i32, Outpoint> = HashMap::new();
         let mut assignments_collected = AssignmentsCollection::default();
         let mut input_btc_amt: u64 = 0;
-        for unspent in mut_unspents {
+        let mut skipped = false;
+        for unspent in unspents {
             // get spendable allocations for the required asset
-            let asset_allocations: Vec<LocalRgbAllocation> = unspent
+            let asset_allocations: Vec<&LocalRgbAllocation> = unspent
                 .rgb_allocations
-                .into_iter()
-                .filter(|a| a.asset_id == Some(asset_id.clone()) && a.status.settled())
+                .iter()
+                .filter(|a| a.asset_id.as_deref() == Some(asset_id) && a.status.settled())
                 .collect();
 
             // skip UTXOs with no allocations
@@ -2014,6 +2084,17 @@ impl Wallet {
                 continue;
             }
 
+            // skip a UTXO that takes the operation past what a bundle or a transition can spend
+            if !selected.select(unspent, max_allocations) {
+                debug!(
+                    self.logger,
+                    "Skipping UTXO {} as it adds too many allocations or too much of an asset",
+                    unspent.utxo.outpoint()
+                );
+                skipped = true;
+                continue;
+            }
+
             // add selected allocations to collected assignments
             asset_allocations
                 .iter()
@@ -2034,22 +2115,15 @@ impl Wallet {
                 break;
             }
         }
-        if !assignments_collected.enough(assignments_needed) {
-            return Err(Error::InsufficientAssignments {
-                asset_id,
-                available: assignments_collected,
-            });
-        }
 
-        debug!(
-            self.logger,
-            "Asset input assignments {:?}", assignments_collected
-        );
-        Ok(AssetSpend {
-            txo_map,
-            assignments_collected,
-            input_btc_amt,
-        })
+        (
+            AssetSpend {
+                txo_map,
+                assignments_collected,
+                input_btc_amt,
+            },
+            skipped,
+        )
     }
 
     fn _prepare_psbt(
@@ -4774,6 +4848,8 @@ impl Wallet {
                         asset_id.clone(),
                         &assignments_needed,
                         input_unspents.to_vec(),
+                        &mut SelectedInputs::default(),
+                        Self::max_input_allocations(&transfer_info_map[&asset_id].main_transition),
                     )?;
                     transfer_info_map = BTreeMap::from([(
                         asset_id.clone(),
@@ -5121,7 +5197,11 @@ impl Wallet {
         let witness_id = paying_bundle.witness_id();
         let txid = witness_id.to_string();
 
-        if receiving.len() != 1 {
+        let single_allocation = receiving.len() == 1;
+        #[cfg(test)]
+        let single_allocation =
+            single_allocation || MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.with_borrow(|a| *a);
+        if !single_allocation {
             error!(
                 self.logger,
                 "Consignment pays this recipient {} allocations, refusing it",
@@ -7374,7 +7454,9 @@ impl Wallet {
         let mut invoices_checked = false;
 
         let begin_data = loop {
-            for asset_id in recipient_map.keys() {
+            // the inputs of all assets are spent together: select them per asset in asset ID order
+            let mut selected = SelectedInputs::default();
+            for asset_id in assets_data.keys() {
                 let (asset_info, original_assignments_needed) =
                     assets_data.get(asset_id).unwrap().clone();
                 let assignments_needed =
@@ -7388,6 +7470,8 @@ impl Wallet {
                     asset_id.clone(),
                     &assignments_needed,
                     input_unspents.clone(),
+                    &mut selected,
+                    Self::max_input_allocations(&TypeOfTransition::Transfer),
                 )?;
 
                 let transfer_info = InfoAssetTransfer {
@@ -8220,6 +8304,8 @@ impl Wallet {
             asset_id.clone(),
             &assignments_needed,
             input_unspents.clone(),
+            &mut SelectedInputs::default(),
+            Self::max_input_allocations(&TypeOfTransition::Inflate),
         )?;
 
         let network: ChainNet = self.bitcoin_network().into();
@@ -8630,6 +8716,8 @@ impl Wallet {
             asset_id.clone(),
             &assignments_needed,
             input_unspents.clone(),
+            &mut SelectedInputs::default(),
+            Self::max_input_allocations(&main_transition),
         )?;
 
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
@@ -9276,6 +9364,8 @@ impl Wallet {
             asset_id.clone(),
             &assignments_needed,
             input_unspents.clone(),
+            &mut SelectedInputs::default(),
+            Self::max_input_allocations(&TypeOfTransition::Mint),
         )?;
 
         let now_ts = now().unix_timestamp();
@@ -9555,6 +9645,8 @@ impl Wallet {
             asset_id.clone(),
             &assignments_needed,
             input_unspents.clone(),
+            &mut SelectedInputs::default(),
+            Self::max_input_allocations(&TypeOfTransition::Mint),
         )?;
         let network: ChainNet = self.bitcoin_network().into();
         let script_pubkey = self
@@ -11274,7 +11366,260 @@ mod send_end_tests {
             fungible: 2,
             ..Default::default()
         };
-        let _ = wallet._select_rgb_inputs(s!("asset"), &needed, unspents);
+        let _ = wallet._select_rgb_inputs(
+            s!("asset"),
+            &needed,
+            unspents,
+            &mut SelectedInputs::default(),
+            MAX_UTXO_ASSET_ALLOCATIONS,
+        );
+    }
+
+    fn unspent_with(vout: u32, allocations: &[(&str, u64, TransferStatus)]) -> LocalUnspent {
+        LocalUnspent {
+            utxo: DbTxo {
+                idx: vout as i32 + 1,
+                txid: "33".repeat(32),
+                vout,
+                btc_amount: s!("1000"),
+                spent: false,
+                exists: true,
+                pending_witness: false,
+            },
+            rgb_allocations: allocations
+                .iter()
+                .map(|(asset_id, amount, status)| LocalRgbAllocation {
+                    asset_id: Some(asset_id.to_string()),
+                    assignment: Assignment::Fungible(*amount),
+                    status: *status,
+                    incoming: true,
+                    txo_spent: false,
+                })
+                .collect(),
+            pending_blinded: 0,
+        }
+    }
+
+    /// Six settled allocations of `asset_id` that sum to `sum`.
+    fn six_summing_to(asset_id: &str, sum: u64) -> Vec<(&str, u64, TransferStatus)> {
+        let mut allocations = vec![(asset_id, sum - 5, TransferStatus::Settled)];
+        allocations.extend([(asset_id, 1, TransferStatus::Settled); 5]);
+        allocations
+    }
+
+    fn fungible(amount: u64) -> AssignmentsCollection {
+        AssignmentsCollection {
+            fungible: amount,
+            ..Default::default()
+        }
+    }
+
+    fn vouts(spend: &AssetSpend) -> HashSet<u32> {
+        spend.txo_map.values().map(|o| o.vout).collect()
+    }
+
+    #[test]
+    fn select_rgb_inputs_skips_utxos_past_the_bundle_limit() {
+        let (wallet, _) = setup();
+        let unspents = vec![
+            unspent_with(0, &six_summing_to("asset", 33_000)),
+            unspent_with(1, &six_summing_to("asset", 34_000)),
+            unspent_with(2, &[("asset", 50_000, TransferStatus::Settled)]),
+        ];
+        let spend = wallet
+            ._select_rgb_inputs(
+                s!("asset"),
+                &fungible(40_000),
+                unspents,
+                &mut SelectedInputs::default(),
+                10,
+            )
+            .unwrap();
+        assert_eq!(vouts(&spend), HashSet::from([0, 2]));
+
+        // failed allocations do not count
+        let mut allocations = vec![("asset", 1, TransferStatus::Failed); 10];
+        allocations.push(("asset", 1, TransferStatus::Settled));
+        let spend = wallet
+            ._select_rgb_inputs(
+                s!("asset"),
+                &fungible(1),
+                vec![unspent_with(0, &allocations)],
+                &mut SelectedInputs::default(),
+                10,
+            )
+            .unwrap();
+        assert_eq!(vouts(&spend), HashSet::from([0]));
+    }
+
+    #[test]
+    fn select_rgb_inputs_counts_utxos_selected_for_other_assets() {
+        let (wallet, _) = setup();
+        let mut u1 = six_summing_to("y", 60);
+        u1.push(("x", 100, TransferStatus::Settled));
+        let unspents = vec![
+            unspent_with(0, &u1),
+            unspent_with(1, &six_summing_to("y", 30)),
+        ];
+        let u1_outpoint = unspents[0].utxo.outpoint();
+        let select = |asset_id: &str, amount, selected: &mut SelectedInputs| {
+            vouts(
+                &wallet
+                    ._select_rgb_inputs(
+                        asset_id.to_string(),
+                        &fungible(amount),
+                        unspents.clone(),
+                        selected,
+                        10,
+                    )
+                    .unwrap(),
+            )
+        };
+
+        let mut selected = SelectedInputs::default();
+        assert_eq!(select("x", 100, &mut selected), HashSet::from([0]));
+        assert_eq!(select("y", 50, &mut selected), HashSet::from([0]));
+
+        let mut selected = SelectedInputs::default();
+        assert_eq!(select("y", 50, &mut selected), HashSet::from([0]));
+        assert_eq!(selected.outpoints, HashSet::from([u1_outpoint]));
+        assert_eq!(select("x", 100, &mut selected), HashSet::from([0]));
+
+        // a retry keeps the UTXOs selected for other assets
+        let unspents = vec![
+            unspent_with(0, &six_summing_to("y", 60)),
+            unspent_with(1, &six_summing_to("y", 30)),
+            unspent_with(2, &[("x", 100, TransferStatus::Settled)]),
+        ];
+        let y_outpoint = unspents[0].utxo.outpoint();
+        let x_outpoint = unspents[2].utxo.outpoint();
+        let mut selected = SelectedInputs::default();
+        let mut select = |asset_id: &str, amount| {
+            vouts(
+                &wallet
+                    ._select_rgb_inputs(
+                        asset_id.to_string(),
+                        &fungible(amount),
+                        unspents.clone(),
+                        &mut selected,
+                        10,
+                    )
+                    .unwrap(),
+            )
+        };
+        assert_eq!(select("x", 100), HashSet::from([2]));
+        assert_eq!(select("y", 50), HashSet::from([0]));
+        assert_eq!(selected.outpoints, HashSet::from([x_outpoint, y_outpoint]));
+        assert_eq!(
+            selected.allocations,
+            HashMap::from([(s!("x"), (1, 100)), (s!("y"), (6, 60))])
+        );
+    }
+
+    #[test]
+    fn select_rgb_inputs_sorts_by_the_settled_amount_of_the_asset() {
+        let (wallet, _) = setup();
+        let select = |unspents, amount| {
+            vouts(
+                &wallet
+                    ._select_rgb_inputs(
+                        s!("a"),
+                        &fungible(amount),
+                        unspents,
+                        &mut SelectedInputs::default(),
+                        MAX_UTXO_ASSET_ALLOCATIONS,
+                    )
+                    .unwrap(),
+            )
+        };
+        // other assets do not count
+        let unspents = vec![
+            unspent_with(
+                0,
+                &[
+                    ("a", 10, TransferStatus::Settled),
+                    ("b", u64::MAX, TransferStatus::Settled),
+                ],
+            ),
+            unspent_with(1, &[("a", 20, TransferStatus::Settled)]),
+        ];
+        assert_eq!(select(unspents.clone(), 10), HashSet::from([0]));
+        // other assets do not count for inflation rights
+        let rights = unspents
+            .into_iter()
+            .map(|mut u| {
+                for a in &mut u.rgb_allocations {
+                    a.assignment = Assignment::InflationRight(a.assignment.main_amount());
+                }
+                u
+            })
+            .collect();
+        let needed = AssignmentsCollection {
+            inflation: 10,
+            ..Default::default()
+        };
+        let spend = wallet
+            ._select_rgb_inputs(
+                s!("a"),
+                &needed,
+                rights,
+                &mut SelectedInputs::default(),
+                MAX_UTXO_ASSET_ALLOCATIONS,
+            )
+            .unwrap();
+        assert_eq!(vouts(&spend), HashSet::from([0]));
+        // pending amounts do not count
+        let unspents = vec![
+            unspent_with(
+                0,
+                &[
+                    ("a", 5, TransferStatus::Settled),
+                    ("a", 1000, TransferStatus::WaitingConfirmations),
+                ],
+            ),
+            unspent_with(1, &[("a", 8, TransferStatus::Settled)]),
+        ];
+        assert_eq!(select(unspents, 5), HashSet::from([0]));
+    }
+
+    #[test]
+    fn select_rgb_inputs_skips_amounts_past_u64_max() {
+        let (wallet, _) = setup();
+        let unspents = vec![
+            unspent_with(0, &[("a", u64::MAX - 1, TransferStatus::Settled)]),
+            unspent_with(1, &[("a", 2, TransferStatus::Settled)]),
+        ];
+        let res = wallet._select_rgb_inputs(
+            s!("a"),
+            &fungible(u64::MAX),
+            unspents,
+            &mut SelectedInputs::default(),
+            MAX_UTXO_ASSET_ALLOCATIONS,
+        );
+        assert!(matches!(
+            res,
+            Err(Error::InsufficientAssignments { available, .. })
+                if available.fungible == u64::MAX - 1
+        ));
+    }
+
+    #[test]
+    fn max_input_allocations_leaves_one_slot_for_a_burn() {
+        assert_eq!(
+            Wallet::max_input_allocations(&TypeOfTransition::Burn),
+            MAX_UTXO_ASSET_ALLOCATIONS - 1
+        );
+        for transition in [
+            TypeOfTransition::Transfer,
+            TypeOfTransition::Inflate,
+            TypeOfTransition::Link,
+            TypeOfTransition::Mint,
+        ] {
+            assert_eq!(
+                Wallet::max_input_allocations(&transition),
+                MAX_UTXO_ASSET_ALLOCATIONS
+            );
+        }
     }
 
     #[test]
