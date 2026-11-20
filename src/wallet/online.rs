@@ -33,6 +33,8 @@ thread_local! {
     // test mock: accept a consignment that pays an invoice more than one allocation
     pub(crate) static MOCK_ACCEPT_MULTIPLE_ALLOCATIONS: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
+    pub(crate) static MOCK_MINT_KEPT_AMOUNT: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 // test mock: move part of the recipient amount to `num` extra assignments of `amount` to the
@@ -623,13 +625,38 @@ fn mint_opid(fascia: &Fascia, contract_id: ContractId) -> Option<OpId> {
         .map(|kt| kt.opid)
 }
 
-/// Whether a received mint pays the amount the invoice requests, if it requests one.
-fn mint_pays_requested(transfer: &DbTransfer, received: &HashMap<Opout, Assignment>) -> bool {
-    match transfer.requested_assignment {
-        Some(Assignment::Fungible(requested)) => {
-            received.values().map(|a| a.main_amount()).sum::<u64>() == requested
-        }
-        _ => true,
+/// The mint of `paying_bundle` that creates an allocation of `receiving_ops`, if any.
+pub(crate) fn paying_mint_opid(
+    asset_schema: AssetSchema,
+    paying_bundle: &WitnessBundle,
+    receiving_ops: impl IntoIterator<Item = OpId>,
+) -> Option<OpId> {
+    if !asset_schema.supports_mint() {
+        return None;
+    }
+    let receiving_ops: HashSet<OpId> = receiving_ops.into_iter().collect();
+    paying_bundle
+        .bundle
+        .known_transitions
+        .iter()
+        .find(|kt| kt.transition.transition_type == TS_MINT && receiving_ops.contains(&kt.opid))
+        .map(|kt| kt.opid)
+}
+
+/// Whether a consignment makes claims that its schema does not support.
+pub(crate) fn unsupported_claims(
+    asset_schema: AssetSchema,
+    pending: &mut PendingConsignment<true>,
+) -> bool {
+    !asset_schema.supports_mint() && pending.pending().unresolved_claims().next().is_some()
+}
+
+/// Whether a received mint pays what the invoice requests. A mint pays only a fungible amount.
+fn mint_pays_requested(requested: Option<&Assignment>, received: u64) -> bool {
+    match requested {
+        Some(Assignment::Fungible(requested)) if *requested > 0 => received == *requested,
+        Some(Assignment::Fungible(_) | Assignment::Any) | None => true,
+        Some(_) => false,
     }
 }
 
@@ -3712,11 +3739,22 @@ impl Wallet {
                 let before_block = transfer_info.before_block.ok_or(Error::Internal {
                     details: s!("mint transfer is missing the external chain block"),
                 })?;
-                let minted: u64 = transfer_info
+                #[allow(unused_mut)]
+                let mut minted: u64 = transfer_info
                     .recipients
                     .iter()
                     .map(|r| r.assignment.main_amount())
                     .sum();
+                // test mock: the minter keeps `kept` more of the mint
+                #[cfg(test)]
+                if let Some(kept) = MOCK_MINT_KEPT_AMOUNT.take() {
+                    asset_transition_builder = asset_transition_builder.add_owned_state_raw(
+                        OS_ASSET,
+                        BuilderSeal::Revealed(GraphSeal::new_random_vout(0)),
+                        Amount::from(kept).into(),
+                    )?;
+                    minted += kept;
+                }
                 main_used = true;
                 asset_transition_builder = asset_transition_builder
                     .add_global_state(RGB_GLOBAL_ISSUED_SUPPLY, Amount::from(minted))
@@ -4355,32 +4393,36 @@ impl Wallet {
         recipient_id: &str,
         recipient_seed: &[u8],
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        mint: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(
             self.logger,
             "Refusing invalid consignment for {recipient_id}"
         );
-        match self
-            .sign_and_post_ack(
-                &data.sender_proxy,
-                &data.transfer_id,
-                false,
-                &data.consignment_hash,
-                recipient_seed,
-            )
-            .await
-        {
-            Ok(r) => debug!(self.logger, "Consignment NACK response: {:?}", r),
-            Err(Error::ProxyCannotChange { .. }) => {
-                warn!(self.logger, "Found an ACK when trying NACK");
-            }
-            // the sender proxy may have no operation (e.g. donation): just fail locally
-            Err(Error::OperationNotFound) => {}
-            Err(e) => {
-                error!(self.logger, "Failed to post NACK: {e}");
-                return Err(e);
-            }
-        };
+        // a mint has no operation on the sender proxy: it gets no NACK
+        if !mint {
+            match self
+                .sign_and_post_ack(
+                    &data.sender_proxy,
+                    &data.transfer_id,
+                    false,
+                    &data.consignment_hash,
+                    recipient_seed,
+                )
+                .await
+            {
+                Ok(r) => debug!(self.logger, "Consignment NACK response: {:?}", r),
+                Err(Error::ProxyCannotChange { .. }) => {
+                    warn!(self.logger, "Found an ACK when trying NACK");
+                }
+                // the sender proxy may have no operation (e.g. donation): just fail locally
+                Err(Error::OperationNotFound) => {}
+                Err(e) => {
+                    error!(self.logger, "Failed to post NACK: {e}");
+                    return Err(e);
+                }
+            };
+        }
         // a sync may have flagged a TXO paying the script of the refused receive
         let scripts = script_buf_from_recipient_id(recipient_id.to_string())?
             .into_iter()
@@ -4751,9 +4793,7 @@ impl Wallet {
     }
 
     /// Validate what a consignment pays and its history. `None` means refuse the consignment.
-    /// `mint_transfer` is the transfer of a mint, which must pay what its invoice requests.
     /// The history is checked against the reject list only when `check_reject_list` is true.
-    #[allow(clippy::too_many_arguments)]
     async fn _check_received_consignment(
         &self,
         runtime: &RgbRuntime,
@@ -4761,7 +4801,6 @@ impl Wallet {
         receiving: &HashMap<Opout, Assignment>,
         asset_schema: AssetSchema,
         asset_id: &str,
-        mint_transfer: Option<&DbTransfer>,
         check_reject_list: bool,
     ) -> Result<Option<(ValidConsignment<true>, HashMap<Opout, Assignment>)>, Error> {
         let valid_consignment = pending.finalize();
@@ -4812,13 +4851,6 @@ impl Wallet {
                     "Didn't find any opout(s) that should be rejected"
                 );
             }
-        }
-
-        if let Some(transfer) = mint_transfer
-            && !mint_pays_requested(transfer, &received)
-        {
-            error!(self.logger, "Mint does not pay the invoice");
-            return Ok(None);
         }
 
         Ok(Some((valid_consignment, received)))
@@ -5052,6 +5084,7 @@ impl Wallet {
                             &recipient_id,
                             &recipient_seed,
                             &mut updated_batch_transfer,
+                            false,
                         )
                         .await;
                 }
@@ -5118,6 +5151,9 @@ impl Wallet {
             })?
             .clone();
 
+        // a mint already checked, or found below, gets no NACK when refused
+        let checked_mint = self.received_mints.contains_key(&recipient_id);
+        let mut mint_known = checked_mint;
         let mut runtime = self.rgb_runtime()?;
         let consignment = match RgbTransfer::load(&consignment_bytes[..]) {
             Ok(c) => c,
@@ -5129,6 +5165,7 @@ impl Wallet {
                         &recipient_id,
                         recipient_seed,
                         updated_batch_transfer,
+                        mint_known,
                     )
                     .await;
             }
@@ -5148,6 +5185,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         }
@@ -5166,6 +5204,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         }
@@ -5185,6 +5224,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         };
@@ -5211,6 +5251,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         }
@@ -5238,6 +5279,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         }
@@ -5273,6 +5315,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         }
@@ -5293,6 +5336,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         }
@@ -5314,6 +5358,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         }
@@ -5353,6 +5398,7 @@ impl Wallet {
                         &recipient_id,
                         recipient_seed,
                         updated_batch_transfer,
+                        mint_known,
                     )
                     .await;
             }
@@ -5368,18 +5414,66 @@ impl Wallet {
                 });
             }
         };
-        // the mint paying this recipient, as opposed to those in its history
-        let terminal_opids: HashSet<OpId> = consignment
-            .bundles
-            .iter()
-            .filter(|ab| ab.witness_id() == witness_id)
-            .flat_map(|ab| ab.bundle.known_transitions.iter().map(|kt| kt.opid))
-            .collect();
-        let paying_claim = pending
-            .pending()
-            .unresolved_claims()
-            .find(|Claim::Lock { opid, .. }| terminal_opids.contains(opid))
-            .cloned();
+        if unsupported_claims(asset_schema, &mut pending) {
+            error!(self.logger, "{asset_schema} schema does not support claims");
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                    mint_known,
+                )
+                .await;
+        }
+        // the mint paying this recipient, as opposed to those in its history. Its lock must match
+        // the whole amount received, all of it from this mint, and the invoice.
+        let mut paying_claim = None;
+        if let Some(paying_opid) = paying_mint_opid(
+            asset_schema,
+            paying_bundle,
+            receiving.keys().map(|opout| opout.op),
+        ) {
+            mint_known = true;
+            let claim = pending
+                .pending()
+                .unresolved_claims()
+                .find(|Claim::Lock { opid, .. }| *opid == paying_opid)
+                .cloned();
+            let minted = claim.as_ref().map(|Claim::Lock { amount, .. }| *amount);
+            let received = receiving.values().map(|a| a.main_amount()).sum::<u64>();
+            if minted != Some(received) || receiving.keys().any(|opout| opout.op != paying_opid) {
+                error!(
+                    self.logger,
+                    "Mint of {minted:?} pays this recipient {received} from it, refusing it"
+                );
+                return self
+                    ._refuse_consignment_async(
+                        data,
+                        &recipient_id,
+                        recipient_seed,
+                        updated_batch_transfer,
+                        mint_known,
+                    )
+                    .await;
+            }
+            if !mint_pays_requested(transfer.requested_assignment.as_ref(), received) {
+                error!(
+                    self.logger,
+                    "Mint pays this recipient {received}, not the amount its invoice requests"
+                );
+                return self
+                    ._refuse_consignment_async(
+                        data,
+                        &recipient_id,
+                        recipient_seed,
+                        updated_batch_transfer,
+                        mint_known,
+                    )
+                    .await;
+            }
+            paying_claim = claim;
+        }
         let received_mint = paying_claim
             .as_ref()
             .map(|claim| {
@@ -5407,7 +5501,6 @@ impl Wallet {
             .transpose()?;
         // a mint whose lock may be made completes whatever the wallet does: the reject list is
         // not checked again for a mint already checked, nor for one whose lock is recorded
-        let checked_mint = self.received_mints.contains_key(&recipient_id);
         let mut committed_mint = checked_mint;
         match self._resolve_claims(&mut pending).await {
             Err(e @ Error::MintLockExpired { .. }) => {
@@ -5418,6 +5511,7 @@ impl Wallet {
                         &recipient_id,
                         recipient_seed,
                         updated_batch_transfer,
+                        mint_known,
                     )
                     .await;
             }
@@ -5481,6 +5575,7 @@ impl Wallet {
                                         &recipient_id,
                                         recipient_seed,
                                         updated_batch_transfer,
+                                        mint_known,
                                     )
                                     .await;
                             }
@@ -5502,7 +5597,6 @@ impl Wallet {
                                 &receiving,
                                 asset_schema,
                                 &asset_id,
-                                Some(transfer),
                                 !committed_mint,
                             )
                             .await?;
@@ -5513,6 +5607,7 @@ impl Wallet {
                                     &recipient_id,
                                     recipient_seed,
                                     updated_batch_transfer,
+                                    mint_known,
                                 )
                                 .await;
                         };
@@ -5537,6 +5632,7 @@ impl Wallet {
                                     &recipient_id,
                                     recipient_seed,
                                     updated_batch_transfer,
+                                    mint_known,
                                 )
                                 .await;
                         }
@@ -5561,7 +5657,6 @@ impl Wallet {
                 &receiving,
                 asset_schema,
                 &asset_id,
-                received_mint.as_ref().map(|_| transfer),
                 !committed_mint,
             )
             .await?
@@ -5572,6 +5667,7 @@ impl Wallet {
                     &recipient_id,
                     recipient_seed,
                     updated_batch_transfer,
+                    mint_known,
                 )
                 .await;
         };
@@ -5608,6 +5704,7 @@ impl Wallet {
                             &recipient_id,
                             recipient_seed,
                             updated_batch_transfer,
+                            mint_known,
                         )
                         .await;
                 }
@@ -5653,6 +5750,7 @@ impl Wallet {
                         &recipient_id,
                         recipient_seed,
                         updated_batch_transfer,
+                        mint_known,
                     )
                     .await;
             }
@@ -13480,6 +13578,29 @@ mod send_end_tests {
 #[cfg(test)]
 mod bfa_tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mint_pays_requested_follows_the_invoice() {
+        let pays = |requested: Option<Assignment>| mint_pays_requested(requested.as_ref(), 100);
+        for requested in [
+            Some(Assignment::Fungible(100)),
+            Some(Assignment::Fungible(0)),
+            Some(Assignment::Any),
+            None,
+        ] {
+            assert!(pays(requested.clone()), "{requested:?}");
+        }
+        for requested in [
+            Assignment::Fungible(99),
+            Assignment::LinkRight,
+            Assignment::InflationRight(100),
+            Assignment::NonFungible,
+            Assignment::MintRight,
+        ] {
+            assert!(!pays(Some(requested.clone())), "{requested:?}");
+        }
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
