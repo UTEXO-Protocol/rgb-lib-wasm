@@ -80,6 +80,8 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release -- --test pow_wasm
+      - name: Run overflow check tests
+        run: wasm-pack test --headless --firefox --release -- --test overflow_checks_wasm
 
   integration-tests:
     name: Integration tests (Firefox + regtest)
