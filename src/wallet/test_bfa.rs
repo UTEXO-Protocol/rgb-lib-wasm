@@ -20,7 +20,7 @@ use std::str::FromStr;
 use utils::*;
 
 pub(super) const CHAIN_ID: u64 = 31337;
-const BRIDGE: &str = "0x00000000000000000000000000000000000000b1";
+pub(super) const BRIDGE: &str = "0x00000000000000000000000000000000000000b1";
 
 pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -52,13 +52,15 @@ pub(super) fn evm_chains(min: u64, max: u64) -> HashMap<u64, EvmChain> {
 }
 
 pub(super) async fn funded_wallet(wd: WalletData, utxos: u8) -> (Wallet, Online) {
-    funded_wallet_with(wd, utxos, 2, 1_000_000).await
+    funded_wallet_with(wd, utxos, None, 2, 1_000_000).await
 }
 
-/// A funded wallet whose mint lock blocks are between `min` and `max`.
+/// A funded wallet whose UTXOs hold `size` sats and whose mint lock blocks are between `min` and
+/// `max`.
 pub(super) async fn funded_wallet_with(
     wd: WalletData,
     utxos: u8,
+    size: Option<u32>,
     min: u64,
     max: u64,
 ) -> (Wallet, Online) {
@@ -74,7 +76,7 @@ pub(super) async fn funded_wallet_with(
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(utxos), None, 1, true, false)
+        .create_utxos_begin(online.clone(), true, Some(utxos), size, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -86,6 +88,22 @@ pub(super) async fn funded_wallet_with(
     wait_for_esplora_sync().await;
     wallet.sync(online.clone()).await.unwrap();
     (wallet, online)
+}
+
+/// Create `num` UTXOs of `size` sats in `wallet`.
+pub(super) async fn add_utxos(wallet: &mut Wallet, online: &Online, num: u8, size: Option<u32>) {
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(num), size, 1, true, false)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
 }
 
 pub(super) fn mint_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
@@ -128,7 +146,17 @@ pub(super) async fn send(
             PROXY_URL,
         )
     };
-    let recipient_map = HashMap::from([(asset_id.to_string(), vec![recipient])]);
+    send_recipients(sender, sender_online, asset_id, vec![recipient]).await
+}
+
+/// Send `asset_id` from `sender` to `recipients`. Return the TXID.
+pub(super) async fn send_recipients(
+    sender: &mut Wallet,
+    sender_online: &Online,
+    asset_id: &str,
+    recipients: Vec<Recipient>,
+) -> String {
+    let recipient_map = HashMap::from([(asset_id.to_string(), recipients)]);
     let begin = sender
         .send_begin(
             sender_online.clone(),

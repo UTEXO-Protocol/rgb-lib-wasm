@@ -5,8 +5,8 @@ use super::test_bfa::utils::*;
 use super::test_bfa::*;
 use super::test_send::witness_ord;
 use crate::no_wallet::{
-    BundleFilter, RgbBridgeLocationInfo, RgbEvmContractInfo, TransitionGlobal, TransitionMetadata,
-    inspect_consignment,
+    BundleFilter, Invoice, RgbBridgeLocationInfo, RgbEvmContractInfo, TransitionGlobal,
+    TransitionMetadata, inspect_consignment,
 };
 use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, state};
 use crate::wallet::online::{MOCK_MINT_KEPT_AMOUNT, paying_mint_opid, unsupported_claims};
@@ -565,7 +565,7 @@ async fn bfa_mint_begin_refusals() {
     // the block the lock has to be included before leaves a block for it, and is within the
     // configured bounds
     let (mut c, c_online) =
-        funded_wallet_with(wallet_data(vec![AssetSchema::Bfa]), 5, 10, 100).await;
+        funded_wallet_with(wallet_data(vec![AssetSchema::Bfa]), 5, None, 10, 100).await;
     let bfa_c = c
         .issue_asset_bfa(
             s("BFA"),
@@ -737,7 +737,7 @@ async fn bfa_mint_multi_right_utxo() {
     assert!(rights.iter().all(|opouts| opouts.len() == 1));
 
     // the list rejects the first 2 mint rights to be selected: the mint retries with the next one
-    // and moves the rejected rights to its change UTXO
+    // and moves the rejected rights, each to its own UTXO
     deploy_reject_list_opouts(&reject_list, &[rights[0][0], rights[1][0]]).await;
     finalize_evm().await;
     mint(
@@ -750,18 +750,14 @@ async fn bfa_mint_multi_right_utxo() {
         MINT_AMOUNT,
     )
     .await;
-
-    // the list allows the moved rights again: 2 clean mint rights share the change UTXO, which
-    // follows the UTXO of the untouched mint right
     deploy_reject_list(&reject_list, &[]).await;
     finalize_evm().await;
     let rights = mint_right_opouts(&mut a, &asset_id);
-    assert_eq!(rights.len(), 2);
-    assert_eq!(rights[0].len(), 1);
-    assert_eq!(rights[1].len(), 2);
+    assert_eq!(rights.len(), 3);
+    assert!(rights.iter().all(|opouts| opouts.len() == 1));
 
-    // the list rejects the untouched mint right: the retry selects the shared UTXO too, but the
-    // mint spends a single mint right and moves the other 2
+    // the list rejects another mint right: the mint moves the rejected right, and each UTXO still
+    // holds one mint right
     deploy_reject_list_opouts(&reject_list, &[rights[0][0]]).await;
     finalize_evm().await;
     mint(
@@ -775,8 +771,8 @@ async fn bfa_mint_multi_right_utxo() {
     )
     .await;
     let rights = mint_right_opouts(&mut a, &asset_id);
-    assert_eq!(rights.len(), 1);
-    assert_eq!(rights[0].len(), 2);
+    assert_eq!(rights.len(), 2);
+    assert!(rights.iter().all(|opouts| opouts.len() == 1));
     assert_eq!(
         b.get_asset_balance(asset_id).unwrap().settled,
         MINT_AMOUNT * 2
@@ -1323,7 +1319,8 @@ async fn bfa_mint_lock_before_block() {
 #[wasm_bindgen_test]
 async fn bfa_mint_before_block_too_far() {
     let (mut a, a_online, _, _, bridge, asset_id) = minter_and_receiver(4, 1, None).await;
-    let (mut b, b_online) = funded_wallet_with(wallet_data(vec![AssetSchema::Bfa]), 3, 2, 50).await;
+    let (mut b, b_online) =
+        funded_wallet_with(wallet_data(vec![AssetSchema::Bfa]), 3, None, 2, 50).await;
 
     // a mint committing to a block further than the receiver accepts is refused
     let receive = mint_rcv(&mut b, &b_online).await;
@@ -1845,4 +1842,448 @@ async fn bfa_mint_invoice_restrictions() {
             .amount,
         MINT_AMOUNT
     );
+}
+
+/// A recipient of a mint right.
+fn mint_right_recipient(receive: &ReceiveData, sat: Option<u64>) -> Recipient {
+    Recipient {
+        assignment: Assignment::MintRight,
+        ..recipient(&receive.recipient_id, 0, sat, PROXY_URL)
+    }
+}
+
+fn issue_bfa(wallet: &mut Wallet, rights: u8, bridge: &str) -> String {
+    wallet
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            rights,
+            CHAIN_ID,
+            s(bridge),
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap()
+        .asset_id
+}
+
+/// The number of mint rights of `asset_id` on each UTXO that holds one.
+fn rights_by_utxo(wallet: &mut Wallet, asset_id: &str) -> Vec<usize> {
+    wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .iter()
+        .map(|u| {
+            u.rgb_allocations
+                .iter()
+                .filter(|a| {
+                    a.asset_id.as_deref() == Some(asset_id) && a.assignment == Assignment::MintRight
+                })
+                .count()
+        })
+        .filter(|n| *n > 0)
+        .collect()
+}
+
+async fn any_rcv(wallet: &mut Wallet, online: &Online) -> ReceiveData {
+    blind_rcv(
+        wallet,
+        online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+}
+
+async fn mint_right_rcv(
+    wallet: &mut Wallet,
+    online: &Online,
+    asset_id: &str,
+) -> Result<ReceiveData, Error> {
+    blind_rcv(
+        wallet,
+        online,
+        Some(asset_id.to_string()),
+        Assignment::MintRight,
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+}
+
+// one mint right of the sender goes to several recipients
+#[wasm_bindgen_test]
+async fn bfa_send_mint_right() {
+    let bridge = new_evm_address();
+    deploy_bridge(&bridge).await;
+    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let asset_id = issue_bfa(&mut a, 2, &bridge);
+
+    let r1 = any_rcv(&mut b, &b_online).await;
+    let r2 = any_rcv(&mut b, &b_online).await;
+    let rw = witness_rcv(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    let txid = send_recipients(
+        &mut a,
+        &a_online,
+        &asset_id,
+        vec![
+            mint_right_recipient(&r1, None),
+            mint_right_recipient(&r2, None),
+            mint_right_recipient(&rw, Some(1000)),
+        ],
+    )
+    .await;
+    // only propagate transitions move the mint right
+    let inspection = inspect_consignment(
+        &a.send_consignment_bytes(&txid, &asset_id).unwrap(),
+        BundleFilter::All,
+    )
+    .unwrap();
+    assert_eq!(inspection.asset_schema, AssetSchema::Bfa);
+    assert_eq!(inspection.witnesses.len(), 1);
+    let transitions = &inspection.witnesses[0].operations[0].transitions;
+    assert!(!transitions.is_empty());
+    assert!(
+        transitions
+            .iter()
+            .all(|t| t.r#type == TypeOfTransition::Propagate)
+    );
+
+    refresh(&mut b, &b_online).await;
+    refresh(&mut a, &a_online).await;
+    refresh(&mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &r1.recipient_id),
+        TransferStatus::WaitingConfirmations
+    );
+    let send_transfers = |wallet: &Wallet| -> Vec<crate::wallet::Transfer> {
+        wallet
+            .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind == TransferKind::Send && t.txid.as_ref() == Some(&txid))
+            .collect()
+    };
+    let transfers = send_transfers(&a);
+    assert_eq!(transfers.len(), 3);
+    assert!(
+        transfers
+            .iter()
+            .all(|t| t.status == TransferStatus::WaitingConfirmations)
+    );
+    assert_eq!(b.list_assets(vec![]).unwrap().bfa.unwrap().len(), 1);
+    assert_eq!(
+        b.get_asset_balance(asset_id.clone()).unwrap(),
+        Balance {
+            settled: 0,
+            future: 0,
+            spendable: 0,
+        }
+    );
+
+    settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    let transfers = send_transfers(&a);
+    assert_eq!(transfers.len(), 3);
+    for t in &transfers {
+        assert_eq!(t.status, TransferStatus::Settled);
+        assert!(t.change_utxos.is_empty());
+        assert_eq!(t.requested_assignment, Some(Assignment::MintRight));
+        assert!(t.assignments.is_empty());
+    }
+    let received: Vec<crate::wallet::Transfer> = b
+        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == TransferKind::ReceiveBlind)
+        .collect();
+    assert_eq!(received.len(), 2);
+    assert!(
+        received
+            .iter()
+            .all(|t| t.assignments == vec![Assignment::MintRight])
+    );
+    assert_eq!(mint_rights(&mut b, &asset_id), 3);
+    assert_eq!(mint_rights(&mut a, &asset_id), 1);
+
+    // the sender keeps its last mint right
+    let rcv = mint_rcv(&mut b, &b_online).await;
+    assert!(matches!(
+        mint_begin(
+            &mut a,
+            &a_online,
+            &asset_id,
+            mint_recipient(&rcv, MINT_AMOUNT)
+        )
+        .await,
+        Err(Error::LastMintRight)
+    ));
+
+    // the receiver mints with a received mint right
+    add_utxos(&mut b, &b_online, 1, None).await;
+    mint(
+        &mut b,
+        &b_online,
+        &mut a,
+        &a_online,
+        &asset_id,
+        &bridge,
+        MINT_AMOUNT,
+    )
+    .await;
+    assert_eq!(
+        a.get_asset_balance(asset_id.clone()).unwrap().settled,
+        MINT_AMOUNT
+    );
+    assert_eq!(mint_rights(&mut b, &asset_id), 2);
+}
+
+// a UTXO receives at most one mint right of an asset
+#[wasm_bindgen_test]
+async fn bfa_receive_mint_right_on_utxo_with_one() {
+    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 5).await;
+    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
+    let asset_id = issue_bfa(&mut a, 4, BRIDGE);
+
+    // two invoices on the only UTXO of the receiver
+    let i1 = any_rcv(&mut b, &b_online).await;
+    let i2 = any_rcv(&mut b, &b_online).await;
+    send_recipients(
+        &mut a,
+        &a_online,
+        &asset_id,
+        vec![mint_right_recipient(&i1, None)],
+    )
+    .await;
+    refresh(&mut b, &b_online).await;
+    refresh(&mut a, &a_online).await;
+    refresh(&mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &i1.recipient_id),
+        TransferStatus::WaitingConfirmations
+    );
+
+    // the second mint right is refused
+    send_recipients(
+        &mut a,
+        &a_online,
+        &asset_id,
+        vec![mint_right_recipient(&i2, None)],
+    )
+    .await;
+    settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &i2.recipient_id),
+        TransferStatus::Failed
+    );
+    assert_eq!(
+        transfer_of(&a, &i2.recipient_id).status,
+        TransferStatus::Failed
+    );
+    assert_eq!(
+        transfer_status(&mut b, &i1.recipient_id),
+        TransferStatus::Settled
+    );
+    assert_eq!(
+        transfer_of(&a, &i1.recipient_id).status,
+        TransferStatus::Settled
+    );
+
+    // no UTXO is left for a mint-right invoice
+    assert!(matches!(
+        mint_right_rcv(&mut b, &b_online, &asset_id).await,
+        Err(Error::InsufficientAllocationSlots)
+    ));
+
+    // a mint right paid to an Any invoice on the UTXO is refused too
+    let i3 = any_rcv(&mut b, &b_online).await;
+    send_recipients(
+        &mut a,
+        &a_online,
+        &asset_id,
+        vec![mint_right_recipient(&i3, None)],
+    )
+    .await;
+    settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &i3.recipient_id),
+        TransferStatus::Failed
+    );
+    let held: Vec<_> = b
+        .list_unspents(None, true, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(
+        held[0]
+            .rgb_allocations
+            .iter()
+            .map(|a| a.assignment.clone())
+            .collect::<Vec<_>>(),
+        vec![Assignment::MintRight]
+    );
+
+    // a new UTXO takes one mint-right invoice
+    add_utxos(&mut b, &b_online, 1, None).await;
+    let i4 = mint_right_rcv(&mut b, &b_online, &asset_id).await.unwrap();
+    assert_eq!(
+        Invoice::new(i4.invoice.clone())
+            .unwrap()
+            .invoice_data()
+            .assignment,
+        Assignment::MintRight
+    );
+    assert!(matches!(
+        mint_right_rcv(&mut b, &b_online, &asset_id).await,
+        Err(Error::InsufficientAllocationSlots)
+    ));
+    send_recipients(
+        &mut a,
+        &a_online,
+        &asset_id,
+        vec![mint_right_recipient(&i4, None)],
+    )
+    .await;
+    settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &i4.recipient_id),
+        TransferStatus::Settled
+    );
+    assert_eq!(rights_by_utxo(&mut b, &asset_id), vec![1, 1]);
+}
+
+/// Wallet A with 2 UTXOs, each holding a mint right of a new BFA, and wallet N with 1000 of a new
+/// NIA. A's UTXOs hold `size` sats.
+async fn rights_and_nia(size: Option<u32>) -> (Wallet, Online, String, Wallet, Online, String) {
+    let (mut a, a_online) = funded_wallet_with(
+        wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa]),
+        2,
+        size,
+        2,
+        1_000_000,
+    )
+    .await;
+    let bfa = issue_bfa(&mut a, 2, BRIDGE);
+    let (n, n_online) = funded_wallet(wallet_data(vec![AssetSchema::Nia]), 3).await;
+    let nia = n
+        .issue_asset_nia(s("NIA"), s("Plain"), 0, vec![1000])
+        .unwrap()
+        .asset_id;
+    (a, a_online, bfa, n, n_online, nia)
+}
+
+// the mint rights a send moves go each to its own UTXO
+#[wasm_bindgen_test]
+async fn bfa_moved_mint_rights_on_separate_utxos() {
+    let (mut a, a_online, bfa, mut n, n_online, nia) = rights_and_nia(None).await;
+    assert_eq!(rights_by_utxo(&mut a, &bfa), vec![1, 1]);
+    send_and_settle(&mut n, &n_online, &mut a, &a_online, &nia, 100).await;
+    send_and_settle(&mut n, &n_online, &mut a, &a_online, &nia, 100).await;
+    let colored: Vec<_> = a
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .collect();
+    assert_eq!(colored.len(), 2);
+    assert!(colored.iter().all(|u| u.rgb_allocations.len() == 2));
+
+    add_utxos(&mut a, &a_online, 2, None).await;
+    send_and_settle(&mut a, &a_online, &mut n, &n_online, &nia, 150).await;
+    assert_eq!(rights_by_utxo(&mut a, &bfa), vec![1, 1]);
+    assert_eq!(a.get_asset_balance(nia).unwrap().settled, 50);
+}
+
+// a moved mint right needs a UTXO without one when the send has no BTC change
+#[wasm_bindgen_test]
+async fn bfa_moved_mint_right_no_btc_change() {
+    let (mut a, a_online, bfa, mut n, n_online, nia) = rights_and_nia(Some(400)).await;
+    let rs = any_rcv(&mut a, &a_online).await;
+    send_recipients(
+        &mut n,
+        &n_online,
+        &nia,
+        vec![recipient(&rs.recipient_id, 100, None, PROXY_URL)],
+    )
+    .await;
+    settle_both(&mut n, &n_online, &mut a, &a_online).await;
+    let s_utxo = transfer_of(&a, &rs.recipient_id).receive_utxo.unwrap();
+    let colored: Vec<_> = a
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .collect();
+    assert_eq!(colored.len(), 2);
+    for u in &colored {
+        let rights = u
+            .rgb_allocations
+            .iter()
+            .filter(|a| a.assignment == Assignment::MintRight)
+            .count();
+        assert_eq!(rights, 1);
+        let expected = if u.utxo.outpoint == s_utxo { 2 } else { 1 };
+        assert_eq!(u.rgb_allocations.len(), expected);
+    }
+
+    // the other UTXO holds a mint right, so the moved one has no destination
+    let rr = any_rcv(&mut n, &n_online).await;
+    let recipient_map = HashMap::from([(
+        nia.clone(),
+        vec![recipient(&rr.recipient_id, 50, None, PROXY_URL)],
+    )]);
+    let res = a
+        .send_begin(
+            a_online.clone(),
+            recipient_map,
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(res, Err(Error::InsufficientAllocationSlots)),
+        "{res:?}"
+    );
+
+    add_utxos(&mut a, &a_online, 1, Some(400)).await;
+    send_recipients(
+        &mut a,
+        &a_online,
+        &nia,
+        vec![recipient(&rr.recipient_id, 50, None, PROXY_URL)],
+    )
+    .await;
+    settle_both(&mut a, &a_online, &mut n, &n_online).await;
+    let rights = rights_by_utxo(&mut a, &bfa);
+    assert!(rights.iter().all(|r| *r == 1));
+    assert_eq!(rights.iter().sum::<usize>(), 2);
+    assert!(
+        a.list_unspents(None, false, true)
+            .unwrap()
+            .iter()
+            .all(|u| u.utxo.outpoint != s_utxo)
+    );
+    assert_eq!(a.get_asset_balance(nia).unwrap().settled, 50);
 }
