@@ -23,8 +23,9 @@ pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 #[cfg(feature = "esplora")]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
-/// Maximum time in the future, in seconds, the expiration of an outgoing operation can be set to:
-/// about 10 years. `send_begin` refuses a later one with [`Error::InvalidExpiration`].
+/// Maximum time in the future, in seconds, that the expiration of an outgoing operation, or of an
+/// invoice it pays, can have: about 10 years. `send_begin` refuses a later one with
+/// [`Error::InvalidExpiration`].
 pub const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
 
 /// Minimum `retention_grace_secs` a recipient requires from the sender proxy to ACK a transfer.

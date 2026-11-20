@@ -6987,9 +6987,10 @@ impl Wallet {
         Ok(transfers_changed)
     }
 
-    /// Check a recipient and turn it into a local one.
+    /// Check a recipient and turn it into a local one. The caller checks if the transport
+    /// endpoints are usable, as that contacts them (see check_recipients_transport_endpoints).
     #[allow(clippy::too_many_arguments)]
-    async fn _parse_recipient(
+    fn _parse_recipient(
         &self,
         recipient: &Recipient,
         schema: AssetSchema,
@@ -7000,7 +7001,6 @@ impl Wallet {
         recipient_vout: &mut u32,
         mint: bool,
     ) -> Result<LocalRecipient, Error> {
-        self.check_transport_endpoints(&recipient.transport_endpoints)?;
         match (&recipient.assignment, schema) {
             (Assignment::Fungible(amt), AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa) => {
                 if *amt == 0 {
@@ -7017,37 +7017,23 @@ impl Wallet {
                 return Err(Error::InvalidAssignment);
             }
         }
-        let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
-        let mut found_valid = false;
-        for endpoint_str in &recipient.transport_endpoints {
-            let transport_endpoint = TransportEndpoint::new(endpoint_str.clone())?;
-            let mut local_transport_endpoint = LocalTransportEndpoint {
-                transport_type: transport_endpoint.transport_type,
-                endpoint: transport_endpoint.endpoint.clone(),
-                used: false,
-                usable: false,
-            };
-            if crate::utils::check_proxy(&transport_endpoint.endpoint)
-                .await
-                .is_ok()
-            {
-                local_transport_endpoint.usable = true;
-                found_valid = true;
-            }
-            transport_endpoints.push(local_transport_endpoint);
-        }
-
-        if !found_valid {
-            return Err(Error::InvalidTransportEndpoints {
-                details: s!("no valid transport endpoints"),
-            });
-        }
-
         let xchainnet_beneficiary = XChainNet::<Beneficiary>::from_str(&recipient.recipient_id)
             .map_err(|_| Error::InvalidRecipientID)?;
 
         if xchainnet_beneficiary.chain_network() != chainnet {
             return Err(Error::InvalidRecipientNetwork);
+        }
+
+        self.check_transport_endpoints(&recipient.transport_endpoints)?;
+        let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
+        for endpoint_str in &recipient.transport_endpoints {
+            let transport_endpoint = TransportEndpoint::new(endpoint_str.clone())?;
+            transport_endpoints.push(LocalTransportEndpoint {
+                transport_type: transport_endpoint.transport_type,
+                endpoint: transport_endpoint.endpoint,
+                used: false,
+                usable: false,
+            });
         }
 
         // decode and validate the recipient's Ed25519 public key, needed to encrypt data for and
@@ -7083,6 +7069,10 @@ impl Wallet {
                     })? as i64;
             if invoice_expiration <= now_ts {
                 return Err(Error::InvoiceExpired);
+            }
+            // the counterparty sets the invoice expiration, so it has the same bound
+            if invoice_expiration > now_ts + i64::from(MAX_EXPIRATION_SECS) {
+                return Err(Error::InvalidExpiration);
             }
             Some(invoice_expiration)
         };
@@ -7136,6 +7126,35 @@ impl Wallet {
         })
     }
 
+    /// Mark which transport endpoints of the recipients are usable. Contact each distinct
+    /// endpoint once. Refuse a recipient with no usable endpoint.
+    async fn check_recipients_transport_endpoints<'a>(
+        recipients: impl IntoIterator<Item = &'a mut LocalRecipient>,
+    ) -> Result<(), Error> {
+        let mut usable_endpoints: HashMap<String, bool> = HashMap::new();
+        for local_recipient in recipients {
+            for transport_endpoint in &mut local_recipient.transport_endpoints {
+                let usable = match usable_endpoints.get(&transport_endpoint.endpoint) {
+                    Some(usable) => *usable,
+                    None => {
+                        let usable = crate::utils::check_proxy(&transport_endpoint.endpoint)
+                            .await
+                            .is_ok();
+                        usable_endpoints.insert(transport_endpoint.endpoint.clone(), usable);
+                        usable
+                    }
+                };
+                transport_endpoint.usable = usable;
+            }
+            if !local_recipient.transport_endpoints.iter().any(|t| t.usable) {
+                return Err(Error::InvalidTransportEndpoints {
+                    details: s!("no valid transport endpoints"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare the PSBT to send RGB assets (wasm32 async).
     ///
     /// See native [`send_begin`](Wallet::send_begin) for full documentation.
@@ -7146,7 +7165,8 @@ impl Wallet {
     /// a late ACK arrives. In case of a batch transfer, set it to the minimum (earliest) expiration
     /// across the recipients' invoices. The expiration must be at least 5 minutes (the proxy
     /// clock-skew margin) and at most about 10 years in the future, else
-    /// [`Error::InvalidExpiration`] is returned.
+    /// [`Error::InvalidExpiration`] is returned. A recipient whose invoice expiration is more than
+    /// [`MAX_EXPIRATION_SECS`] in the future gets the same error.
     ///
     /// If `dry_run` is true, the wallet does not save the transfer in
     /// [`TransferStatus::Initiated`]. The returned `batch_transfer_idx` is then None.
@@ -7233,18 +7253,16 @@ impl Wallet {
 
             let mut original_assignments_needed = AssignmentsCollection::default();
             for recipient in recipients.clone() {
-                let local_recipient = self
-                    ._parse_recipient(
-                        &recipient,
-                        schema,
-                        chainnet,
-                        &operation_sk,
-                        now_ts,
-                        &mut witness_recipients,
-                        &mut recipient_vout,
-                        false,
-                    )
-                    .await?;
+                let local_recipient = self._parse_recipient(
+                    &recipient,
+                    schema,
+                    chainnet,
+                    &operation_sk,
+                    now_ts,
+                    &mut witness_recipients,
+                    &mut recipient_vout,
+                    false,
+                )?;
                 let invoice_expiration = local_recipient
                     .invoice_expiration
                     .expect("set by _parse_recipient");
@@ -7289,6 +7307,9 @@ impl Wallet {
         {
             return Err(Error::InvalidExpiration);
         }
+
+        // contact the endpoints only after the offline checks pass
+        Self::check_recipients_transport_endpoints(local_recipients.values_mut().flatten()).await?;
 
         // Check for duplicate recipient IDs
         let receive_ids: Vec<String> = recipient_map
@@ -9217,18 +9238,17 @@ impl Wallet {
 
         let now_ts = now().unix_timestamp();
         let mut witness_recipients: Vec<(ScriptBuf, u64)> = vec![];
-        let local_recipient = self
-            ._parse_recipient(
-                &recipient,
-                schema,
-                self.bitcoin_network().into(),
-                &operation_sk,
-                now_ts,
-                &mut witness_recipients,
-                &mut 1,
-                true,
-            )
-            .await?;
+        let mut local_recipient = self._parse_recipient(
+            &recipient,
+            schema,
+            self.bitcoin_network().into(),
+            &operation_sk,
+            now_ts,
+            &mut witness_recipients,
+            &mut 1,
+            true,
+        )?;
+        Self::check_recipients_transport_endpoints(std::iter::once(&mut local_recipient)).await?;
 
         // the lock can only be included after the latest block: refuse a block that leaves no
         // block for it, or one closer or further than configured. This block is the only
@@ -13462,5 +13482,110 @@ mod save_new_asset_tests {
             Err(Error::InvalidConsignment)
         ));
         assert!(wallet.rgb_contract_ids().unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod recipient_checks_tests {
+    use super::*;
+    use crate::no_wallet::recipient_id_from_script_buf;
+    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+    fn valid_recipient(wallet: &mut Wallet, endpoint: String, now_ts: i64) -> Recipient {
+        let script = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address
+            .script_pubkey();
+        Recipient {
+            recipient_id: recipient_id_from_script_buf(script, BitcoinNetwork::Regtest),
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            assignment: Assignment::Fungible(10),
+            transport_endpoints: vec![endpoint],
+            public_key: Some(hex::encode(
+                crate::encryption::ed25519_from_seed(&[8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            )),
+            encryption: Encryption::Required,
+            expiration_timestamp: Some((now_ts + 3600) as u64),
+        }
+    }
+
+    fn parse(wallet: &Wallet, r: &Recipient, now_ts: i64) -> Result<LocalRecipient, Error> {
+        wallet._parse_recipient(
+            r,
+            AssetSchema::Nia,
+            wallet.bitcoin_network().into(),
+            &crate::encryption::gen_ed25519(),
+            now_ts,
+            &mut vec![],
+            &mut 1,
+            false,
+        )
+    }
+
+    #[test]
+    fn parse_recipient_bounds_invoice_expiration() {
+        let now_ts = now().unix_timestamp();
+        let mut wallet = make_test_wallet(false);
+        let mut r = valid_recipient(&mut wallet, s!("rpc://127.0.0.1:1/json-rpc"), now_ts);
+
+        r.expiration_timestamp = Some((now_ts + i64::from(MAX_EXPIRATION_SECS)) as u64);
+        assert!(parse(&wallet, &r, now_ts).is_ok());
+        r.expiration_timestamp = Some((now_ts + i64::from(MAX_EXPIRATION_SECS) + 1) as u64);
+        assert!(matches!(
+            parse(&wallet, &r, now_ts),
+            Err(Error::InvalidExpiration)
+        ));
+    }
+
+    #[test]
+    fn parse_recipient_checks_in_order() {
+        let now_ts = now().unix_timestamp();
+        let mut wallet = make_test_wallet(false);
+        let valid = valid_recipient(&mut wallet, s!("rpc://127.0.0.1:1/json-rpc"), now_ts);
+        let too_many = vec![valid.transport_endpoints[0].clone(); MAX_TRANSPORT_ENDPOINTS + 1];
+        let script = XChainNet::<Beneficiary>::from_str(&valid.recipient_id)
+            .unwrap()
+            .into_inner();
+        let Beneficiary::WitnessVout(pay_2_vout, _) = script else {
+            panic!("witness recipient expected");
+        };
+        let mainnet_id =
+            recipient_id_from_script_buf(pay_2_vout.to_script(), BitcoinNetwork::Mainnet);
+        let with = |f: &dyn Fn(&mut Recipient)| {
+            let mut r = valid.clone();
+            f(&mut r);
+            parse(&wallet, &r, now_ts)
+        };
+
+        let result = with(&|r| {
+            r.assignment = Assignment::NonFungible;
+            r.transport_endpoints = too_many.clone();
+        });
+        assert!(
+            matches!(result, Err(Error::InvalidAssignment)),
+            "{result:?}"
+        );
+        let result = with(&|r| {
+            r.recipient_id = s!("invalid");
+            r.transport_endpoints = vec![s!("not an endpoint")];
+        });
+        assert!(
+            matches!(result, Err(Error::InvalidRecipientID)),
+            "{result:?}"
+        );
+        let result = with(&|r| {
+            r.recipient_id = mainnet_id.clone();
+            r.transport_endpoints = too_many.clone();
+        });
+        assert!(
+            matches!(result, Err(Error::InvalidRecipientNetwork)),
+            "{result:?}"
+        );
     }
 }
