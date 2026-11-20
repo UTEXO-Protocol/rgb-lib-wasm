@@ -765,8 +765,8 @@ pub struct Transfer {
     pub recipient_id: Option<String>,
     /// UTXO of an incoming transfer
     pub receive_utxo: Option<Outpoint>,
-    /// Change UTXO of an outgoing transfer
-    pub change_utxo: Option<Outpoint>,
+    /// UTXOs receiving the RGB change of an outgoing transfer, as it can be spread over several
+    pub change_utxos: Vec<Outpoint>,
     /// Expiration of the transfer
     pub expiration_timestamp: Option<u64>,
     /// Transport endpoints for the transfer
@@ -800,7 +800,7 @@ impl Transfer {
             txid: td.txid,
             recipient_id: x.recipient_id.clone(),
             receive_utxo: td.receive_utxo,
-            change_utxo: td.change_utxo,
+            change_utxos: td.change_utxos,
             expiration_timestamp: td.expiration.map(|t| t as u64),
             transport_endpoints,
             sender_transport_endpoint,
@@ -3103,8 +3103,8 @@ impl Wallet {
             }
             _ => None,
         };
-        let change_utxo = match kind {
-            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => None,
+        let change_utxos = match kind {
+            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => vec![],
             TransferKind::Send
             | TransferKind::Inflation
             | TransferKind::Burn
@@ -3114,15 +3114,14 @@ impl Wallet {
                     .filter(|c| c.r#type == ColoringType::Change)
                     .map(|c| c.txo_idx)
                     .collect();
-                transfer_txos
+                let mut change_txos: Vec<DbTxo> = transfer_txos
                     .into_iter()
                     .filter(|t| change_txo_idx.contains(&t.idx))
-                    .map(|t| t.outpoint())
-                    .collect::<Vec<Outpoint>>()
-                    .first()
-                    .cloned()
+                    .collect();
+                change_txos.sort_by_key(|t| t.idx);
+                change_txos.into_iter().map(|t| t.outpoint()).collect()
             }
-            TransferKind::Issuance => None,
+            TransferKind::Issuance => vec![],
         };
 
         let consignment_path = match (&kind, batch_transfer.status) {
@@ -3157,7 +3156,7 @@ impl Wallet {
             assignments,
             txid: batch_transfer.txid.clone(),
             receive_utxo,
-            change_utxo,
+            change_utxos,
             created_at: batch_transfer.created_at,
             updated_at: batch_transfer.updated_at,
             expiration: batch_transfer.expiration,

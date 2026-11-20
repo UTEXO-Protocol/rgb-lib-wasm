@@ -285,6 +285,108 @@ struct TakenSlots {
     invoices: usize,
 }
 
+/// The allocations of an asset a destination of the RGB change holds or is due to receive.
+#[derive(Clone, Debug, Default)]
+struct ChangeSlotAsset {
+    /// Number of allocations, rights included.
+    num: usize,
+    /// Total amount held. It cannot go over `u64::MAX`. A `u128` so the sum cannot overflow.
+    amount: u128,
+}
+
+/// A destination of the RGB change of an operation, with the slots left on it.
+#[derive(Clone, Debug)]
+struct ChangeSlot {
+    destination: ChangeDestination,
+    /// Outpoint of a pre-existing UTXO, parsed once.
+    outpoint: Option<OutPoint>,
+    /// Allocations it can still receive.
+    free: usize,
+    /// Allocations of each asset it holds or is due to receive.
+    assets: HashMap<String, ChangeSlotAsset>,
+}
+
+/// Place change allocations on the BTC change output first, then on existing UTXOs. Respect invoice
+/// reservations, the allocation limits and the per-asset amount cap.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChangeSlots {
+    slots: Vec<ChangeSlot>,
+    max_asset_allocations: usize,
+}
+
+impl ChangeSlots {
+    /// Build the destinations: the BTC change output if `btc_change`, then `utxos` in order.
+    /// Each holds at most `max_allocations` allocations and `max_asset_allocations` of each asset.
+    pub(crate) fn new(
+        btc_change: bool,
+        utxos: &[LocalUnspent],
+        max_allocations: usize,
+        max_asset_allocations: usize,
+    ) -> Self {
+        let mut slots = vec![];
+        if btc_change {
+            slots.push(ChangeSlot {
+                destination: ChangeDestination::BtcChange,
+                outpoint: None,
+                free: max_allocations,
+                assets: HashMap::new(),
+            });
+        }
+        for utxo in utxos {
+            let held: Vec<&LocalRgbAllocation> = utxo
+                .rgb_allocations
+                .iter()
+                .filter(|a| a.incoming && !a.txo_spent && !a.status.failed())
+                .collect();
+            let taken = held.len() + utxo.pending_blinded as usize;
+            let free = max_allocations.saturating_sub(taken);
+            if free == 0 {
+                continue;
+            }
+            let mut assets: HashMap<String, ChangeSlotAsset> = HashMap::new();
+            // allocations of a receive whose asset isn't known yet only count towards the total
+            for allocation in held.iter().filter(|a| a.asset_id.is_some()) {
+                let asset = assets
+                    .entry(allocation.asset_id.clone().unwrap())
+                    .or_default();
+                asset.num += 1;
+                asset.amount += u128::from(allocation.assignment.main_amount());
+            }
+            slots.push(ChangeSlot {
+                destination: ChangeDestination::Utxo(utxo.utxo.outpoint()),
+                outpoint: Some(utxo.utxo.clone().into()),
+                free,
+                assets,
+            });
+        }
+        Self {
+            slots,
+            max_asset_allocations,
+        }
+    }
+
+    /// Take the first destination with room, or return `None`. Return its existing outpoint, or
+    /// `None` for the BTC change output.
+    pub(crate) fn take(
+        &mut self,
+        asset_id: &str,
+        amount: u128,
+    ) -> Option<(ChangeDestination, Option<OutPoint>)> {
+        let max_asset_allocations = self.max_asset_allocations;
+        let slot = self.slots.iter_mut().find(|s| {
+            let asset = s.assets.get(asset_id).cloned().unwrap_or_default();
+            s.free > 0
+                && asset.num < max_asset_allocations
+                && asset.amount + amount <= u128::from(u64::MAX)
+        })?;
+        slot.free -= 1;
+        let asset = slot.assets.entry(asset_id.to_string()).or_default();
+        asset.num += 1;
+        asset.amount += amount;
+        Some((slot.destination.clone(), slot.outpoint))
+    }
+}
+
 /// The result of a send operation
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -435,8 +537,9 @@ type TxoAssignments = HashMap<i32, Vec<Assignment>>;
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct InfoBatchTransfer {
     btc_change: Option<BtcChange>,
-    change_utxo_idx: Option<i32>,
-    extra_allocations: HashMap<String, TxoAssignments>,
+    /// Allocations moved along by spending their UTXO, by asset ID and spent TXO idx, each with
+    /// where it goes
+    extra_allocations: ExtraAllocations,
     donation: bool,
     min_confirmations: u8,
     expiration_timestamp: Option<i64>,
@@ -451,7 +554,6 @@ impl std::fmt::Debug for InfoBatchTransfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InfoBatchTransfer")
             .field("btc_change", &self.btc_change)
-            .field("change_utxo_idx", &self.change_utxo_idx)
             .field("extra_allocations", &self.extra_allocations)
             .field("donation", &self.donation)
             .field("min_confirmations", &self.min_confirmations)
@@ -498,7 +600,6 @@ pub(crate) struct InfoAssetTransfer {
     asset_info: AssetInfo,
     recipients: Vec<LocalRecipient>,
     asset_spend: AssetSpend,
-    change: AssignmentsCollection,
     original_assignments_needed: AssignmentsCollection,
     assignments_needed: AssignmentsCollection,
     assignments_spent: TxoAssignments,
@@ -510,7 +611,21 @@ pub(crate) struct InfoAssetTransfer {
     linked_to_contract: Option<ContractId>,
     beneficiaries_witness: Vec<ExplicitSeal<RgbTxid>>,
     beneficiaries_blinded: Vec<SecretSeal>,
+    /// Where each allocation of the change of the asset goes
+    change_destinations: Vec<(Assignment, ChangeDestination)>,
 }
+
+/// Where an allocation moved to the RGB change of an operation goes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub(crate) enum ChangeDestination {
+    /// The new Bitcoin output created by the operation to hold RGB change
+    BtcChange,
+    /// A pre-existing UTXO
+    Utxo(Outpoint),
+}
+
+// asset ID -> spent TXO idx -> moved allocations, each with where it goes
+type ExtraAllocations = HashMap<String, HashMap<i32, Vec<(Assignment, ChangeDestination)>>>;
 
 impl InfoAssetTransfer {
     /// OpIds of the transitions to explicitly request when consigning from `fascia`: a burn or a
@@ -2326,32 +2441,29 @@ impl Wallet {
         Ok(())
     }
 
-    fn _get_change_seal(
+    /// Take the slot for an allocation of the asset with ID `asset_id` moved to the RGB change, of
+    /// the given amount, on a destination that can receive it, and return it with the seal for it.
+    fn take_change_seal(
         &self,
+        change_slots: &mut ChangeSlots,
         btc_change: &Option<BtcChange>,
-        change_utxo_option: &mut Option<DbTxo>,
-        change_utxo_idx: &mut Option<i32>,
-        input_outpoints: &[Outpoint],
-        unspents: &[LocalUnspent],
-    ) -> Result<BlindSeal<TxPtr>, Error> {
-        let graph_seal = if let Some(btc_change) = btc_change {
-            GraphSeal::new_random_vout(btc_change.vout)
-        } else {
-            if change_utxo_option.is_none() {
-                let change_utxo = self.get_utxo(input_outpoints, Some(unspents), true, None)?;
-                debug!(
-                    self.logger,
-                    "Change outpoint '{}'",
-                    change_utxo.outpoint().to_string()
-                );
-                *change_utxo_idx = Some(change_utxo.idx);
-                *change_utxo_option = Some(change_utxo);
-            }
-            let change_utxo = change_utxo_option.clone().unwrap();
-            let blind_seal = self.get_blind_seal(change_utxo).transmutate();
-            GraphSeal::from(blind_seal)
+        asset_id: &str,
+        amount: u128,
+    ) -> Result<(ChangeDestination, BlindSeal<TxPtr>), Error> {
+        let (destination, outpoint) = change_slots
+            .take(asset_id, amount)
+            .ok_or(Error::InsufficientAllocationSlots)?;
+        debug!(
+            self.logger,
+            "Change destination for an allocation of asset '{asset_id}': {destination:?}"
+        );
+        let seal = match outpoint {
+            Some(outpoint) => GraphSeal::from(self.get_blind_seal(outpoint).transmutate()),
+            None => GraphSeal::new_random_vout(
+                btc_change.as_ref().ok_or(InternalError::Unexpected)?.vout,
+            ),
         };
-        Ok(graph_seal)
+        Ok((destination, seal))
     }
 
     fn _check_dag(
@@ -2405,8 +2517,7 @@ impl Wallet {
         &self,
         txid: String,
         transfer_info_map: &BTreeMap<String, InfoAssetTransfer>,
-        extra_allocations: HashMap<String, TxoAssignments>,
-        change_utxo_idx: Option<i32>,
+        extra_allocations: ExtraAllocations,
         btc_change: Option<BtcChange>,
         status: TransferStatus,
         min_confirmations: u8,
@@ -2439,7 +2550,7 @@ impl Wallet {
             None => None,
         };
 
-        let change_utxo_idx = if let Some(btc_change) = btc_change {
+        let btc_change_idx = if let Some(btc_change) = btc_change {
             Some(
                 match self.database.get_txo(&Outpoint {
                     txid: txid.clone(),
@@ -2461,7 +2572,18 @@ impl Wallet {
                 },
             )
         } else {
-            change_utxo_idx
+            None
+        };
+        let change_idx = |destination: &ChangeDestination| -> Result<i32, Error> {
+            Ok(match destination {
+                ChangeDestination::BtcChange => btc_change_idx.ok_or(InternalError::Unexpected)?,
+                ChangeDestination::Utxo(outpoint) => {
+                    self.database
+                        .get_txo(outpoint)?
+                        .ok_or(InternalError::Unexpected)?
+                        .idx
+                }
+            })
         };
 
         for (asset_id, transfer_info) in transfer_info_map {
@@ -2489,36 +2611,12 @@ impl Wallet {
                     self.database.set_coloring(db_coloring)?;
                 }
             }
-            if transfer_info.change.fungible > 0 {
+            for (assignment, destination) in &transfer_info.change_destinations {
                 let db_coloring = DbColoringActMod {
-                    txo_idx: ActiveValue::Set(change_utxo_idx.unwrap()),
+                    txo_idx: ActiveValue::Set(change_idx(destination)?),
                     asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
                     r#type: ActiveValue::Set(ColoringType::Change),
-                    assignment: ActiveValue::Set(Assignment::Fungible(
-                        transfer_info.change.fungible,
-                    )),
-                    ..Default::default()
-                };
-                self.database.set_coloring(db_coloring)?;
-            }
-            if transfer_info.change.inflation > 0 {
-                let db_coloring = DbColoringActMod {
-                    txo_idx: ActiveValue::Set(change_utxo_idx.unwrap()),
-                    asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                    r#type: ActiveValue::Set(ColoringType::Change),
-                    assignment: ActiveValue::Set(Assignment::InflationRight(
-                        transfer_info.change.inflation,
-                    )),
-                    ..Default::default()
-                };
-                self.database.set_coloring(db_coloring)?;
-            }
-            for _ in 0..transfer_info.change.mint {
-                let db_coloring = DbColoringActMod {
-                    txo_idx: ActiveValue::Set(change_utxo_idx.unwrap()),
-                    asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                    r#type: ActiveValue::Set(ColoringType::Change),
-                    assignment: ActiveValue::Set(Assignment::MintRight),
+                    assignment: ActiveValue::Set(assignment.clone()),
                     ..Default::default()
                 };
                 self.database.set_coloring(db_coloring)?;
@@ -2645,7 +2743,7 @@ impl Wallet {
             };
             let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
             for (input_idx, assignments) in txo_assignments {
-                for assignment in assignments {
+                for (assignment, destination) in assignments {
                     let db_coloring = DbColoringActMod {
                         txo_idx: ActiveValue::Set(input_idx),
                         asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
@@ -2655,7 +2753,7 @@ impl Wallet {
                     };
                     self.database.set_coloring(db_coloring)?;
                     let db_coloring = DbColoringActMod {
-                        txo_idx: ActiveValue::Set(change_utxo_idx.unwrap()),
+                        txo_idx: ActiveValue::Set(change_idx(&destination)?),
                         asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
                         r#type: ActiveValue::Set(ColoringType::Change),
                         assignment: ActiveValue::Set(assignment),
@@ -2695,7 +2793,6 @@ impl Wallet {
                 txid,
                 transfer_info_map,
                 info.extra_allocations.clone(),
-                info.change_utxo_idx,
                 info.btc_change.clone(),
                 status,
                 info.min_confirmations,
@@ -3484,9 +3581,6 @@ impl Wallet {
         rejected: &mut HashSet<Opout>,
         reject_lists: &mut RejectLists,
     ) -> Result<Option<Vec<u8>>, Error> {
-        let mut change_utxo_option = None;
-        let mut change_utxo_idx = None;
-
         let prev_outputs = psbt
             .unsigned_tx
             .input
@@ -3496,6 +3590,26 @@ impl Wallet {
 
         let input_outpoints: Vec<Outpoint> =
             prev_outputs.iter().map(|o| Outpoint::from(*o)).collect();
+
+        // prefer empty UTXOs, then those due to receive allocations, each by fewest slots taken
+        let mut change_utxos =
+            self.get_available_allocations(&*unspents, &input_outpoints, Some(u32::MAX))?;
+        change_utxos.sort_by_key(|u| {
+            let rank = if u.rgb_allocations.is_empty() {
+                0
+            } else if u.rgb_allocations.iter().any(|a| a.future()) {
+                1
+            } else {
+                2
+            };
+            (rank, u.rgb_allocations.len() + u.pending_blinded as usize)
+        });
+        let mut change_slots = ChangeSlots::new(
+            btc_change.is_some(),
+            &change_utxos,
+            self.max_allocations_per_utxo() as usize,
+            max_utxo_asset_allocations(),
+        );
 
         let mut asset_beneficiaries = bmap![];
         let mut extra_state = HashMap::<ContractId, Vec<(i32, Opout, AllocatedState)>>::new();
@@ -3623,25 +3737,35 @@ impl Wallet {
             let change = inputs_added.change(&transfer_info.original_assignments_needed);
 
             if change != AssignmentsCollection::default() {
-                transfer_info.change = change.clone();
-                let seal = self._get_change_seal(
-                    &btc_change,
-                    &mut change_utxo_option,
-                    &mut change_utxo_idx,
-                    &input_outpoints,
-                    unspents.as_slice(),
-                )?;
-                let mut change_outputs: Vec<(AssignmentType, AllocatedState)> = vec![];
+                let mut change_outputs: Vec<(AssignmentType, AllocatedState, Assignment)> = vec![];
                 if change.fungible > 0 {
-                    change_outputs.push((OS_ASSET, Amount::from(change.fungible).into()));
+                    change_outputs.push((
+                        OS_ASSET,
+                        Amount::from(change.fungible).into(),
+                        Assignment::Fungible(change.fungible),
+                    ));
                 }
                 if change.inflation > 0 {
-                    change_outputs.push((OS_INFLATION, Amount::from(change.inflation).into()));
+                    change_outputs.push((
+                        OS_INFLATION,
+                        Amount::from(change.inflation).into(),
+                        Assignment::InflationRight(change.inflation),
+                    ));
                 }
                 for _ in 0..change.mint {
-                    change_outputs.push((OS_MINT, AllocatedState::Void));
+                    change_outputs.push((OS_MINT, AllocatedState::Void, Assignment::MintRight));
                 }
-                for (ty, state) in change_outputs {
+                for (ty, state, assignment) in change_outputs {
+                    // each allocation of the change takes its own slot
+                    let (destination, seal) = self.take_change_seal(
+                        &mut change_slots,
+                        &btc_change,
+                        asset_id,
+                        u128::from(assignment.main_amount()),
+                    )?;
+                    transfer_info
+                        .change_destinations
+                        .push((assignment, destination));
                     // split the inputs into change and the burn amount, sealed to an outpoint
                     // this TX spends; the main transition spends that split output
                     if !main_assignment_types.contains(&ty) && main_input_types.contains(&ty) {
@@ -3813,19 +3937,18 @@ impl Wallet {
             }
         }
 
-        let mut extra_allocations: HashMap<String, TxoAssignments> = HashMap::new();
+        let mut extra_allocations = ExtraAllocations::new();
         for (cid, opout_state_map) in extra_state {
             let schema = runtime.contract_schema(cid)?;
             for (txo_idx, opout, state) in opout_state_map {
                 let transition_type = schema.default_transition_for_assignment(&opout.ty);
                 let mut extra_builder = runtime.transition_builder_raw(cid, transition_type)?;
                 let assignment = Assignment::from_opout_and_state(opout, &state);
-                let seal = self._get_change_seal(
+                let (destination, seal) = self.take_change_seal(
+                    &mut change_slots,
                     &btc_change,
-                    &mut change_utxo_option,
-                    &mut change_utxo_idx,
-                    &input_outpoints,
-                    unspents.as_slice(),
+                    &cid.to_string(),
+                    u128::from(assignment.main_amount()),
                 )?;
                 extra_builder = extra_builder
                     .add_input(opout, state.clone())?
@@ -3836,7 +3959,7 @@ impl Wallet {
                     .or_default()
                     .entry(txo_idx)
                     .or_default()
-                    .push(assignment);
+                    .push((assignment, destination));
                 psbt.push_rgb_transition(extra_transition)
                     .map_err(InternalError::from)?;
             }
@@ -3969,7 +4092,6 @@ impl Wallet {
         // Store batch transfer info in memory instead of filesystem
         let info_contents = InfoBatchTransfer {
             btc_change,
-            change_utxo_idx,
             extra_allocations,
             donation,
             min_confirmations,
@@ -4093,7 +4215,6 @@ impl Wallet {
                 final_txid,
                 transfer_info_map,
                 info.extra_allocations,
-                info.change_utxo_idx,
                 info.btc_change,
                 TransferStatus::Initiated,
                 min_confirmations,
@@ -7660,7 +7781,6 @@ impl Wallet {
                     asset_info,
                     recipients: local_recipients[asset_id].clone(),
                     asset_spend,
-                    change: AssignmentsCollection::default(),
                     original_assignments_needed,
                     assignments_needed,
                     assignments_spent: HashMap::new(),
@@ -7670,6 +7790,7 @@ impl Wallet {
                     linked_to_contract: None,
                     beneficiaries_witness: vec![],
                     beneficiaries_blinded: vec![],
+                    change_destinations: vec![],
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -8552,7 +8673,6 @@ impl Wallet {
             asset_info,
             recipients: local_recipients,
             asset_spend,
-            change: AssignmentsCollection::default(),
             original_assignments_needed: assignments_needed.clone(),
             assignments_needed,
             assignments_spent: HashMap::new(),
@@ -8562,6 +8682,7 @@ impl Wallet {
             linked_to_contract: None,
             beneficiaries_witness: vec![],
             beneficiaries_blinded: vec![],
+            change_destinations: vec![],
         };
         let begin_data = self
             ._prepare_single_asset_psbt(
@@ -8929,7 +9050,6 @@ impl Wallet {
             },
             recipients: vec![],
             asset_spend,
-            change: AssignmentsCollection::default(),
             original_assignments_needed: assignments_needed.clone(),
             assignments_needed,
             assignments_spent: HashMap::new(),
@@ -8939,6 +9059,7 @@ impl Wallet {
             linked_to_contract,
             beneficiaries_witness: vec![],
             beneficiaries_blinded: vec![],
+            change_destinations: vec![],
         };
         let begin_data = self
             ._prepare_single_asset_psbt(
@@ -9041,7 +9162,6 @@ impl Wallet {
                 txid.clone(),
                 &transfer_info_map,
                 info_contents.extra_allocations,
-                info_contents.change_utxo_idx,
                 info_contents.btc_change,
                 TransferStatus::WaitingConfirmations,
                 info_contents.min_confirmations,
@@ -9632,7 +9752,6 @@ impl Wallet {
             },
             recipients: vec![local_recipient],
             asset_spend,
-            change: AssignmentsCollection::default(),
             original_assignments_needed: assignments_needed.clone(),
             assignments_needed,
             assignments_spent: HashMap::new(),
@@ -9642,6 +9761,7 @@ impl Wallet {
             linked_to_contract: None,
             beneficiaries_witness: vec![],
             beneficiaries_blinded: vec![],
+            change_destinations: vec![],
         };
         let begin_data = self
             ._prepare_single_asset_psbt(
@@ -9876,7 +9996,6 @@ impl Wallet {
             },
             recipients: local_recipients,
             asset_spend,
-            change: AssignmentsCollection::default(),
             original_assignments_needed: assignments_needed.clone(),
             assignments_needed,
             assignments_spent: HashMap::new(),
@@ -9886,6 +10005,7 @@ impl Wallet {
             linked_to_contract: None,
             beneficiaries_witness: vec![],
             beneficiaries_blinded: vec![],
+            change_destinations: vec![],
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id, transfer_info)]);
         let PrepareTransferPsbtResult::Success(begin_data) = self
@@ -10439,7 +10559,6 @@ mod send_end_tests {
         let key = format!("{:?}", OPERATION_SEED.to_vec());
         let info = InfoBatchTransfer {
             btc_change: None,
-            change_utxo_idx: None,
             extra_allocations: HashMap::new(),
             donation: false,
             min_confirmations: 1,
@@ -10528,7 +10647,6 @@ mod send_end_tests {
                 assignments_collected: AssignmentsCollection::default(),
                 input_btc_amt: 0,
             },
-            change: AssignmentsCollection::default(),
             original_assignments_needed: AssignmentsCollection::default(),
             assignments_needed: AssignmentsCollection::default(),
             assignments_spent,
@@ -10538,16 +10656,13 @@ mod send_end_tests {
             linked_to_contract: None,
             beneficiaries_witness: vec![],
             beneficiaries_blinded: vec![],
+            change_destinations: vec![],
         }
     }
 
-    fn batch_info(
-        change_utxo_idx: Option<i32>,
-        extra_allocations: HashMap<String, TxoAssignments>,
-    ) -> InfoBatchTransfer {
+    fn batch_info(extra_allocations: ExtraAllocations) -> InfoBatchTransfer {
         InfoBatchTransfer {
             btc_change: None,
-            change_utxo_idx,
             extra_allocations,
             donation: false,
             min_confirmations: 1,
@@ -10567,7 +10682,7 @@ mod send_end_tests {
 
     fn artifacts(asset_infos: BTreeMap<String, InfoAssetTransfer>) -> TransferArtifacts {
         TransferArtifacts {
-            batch_info: Some(batch_info(None, HashMap::new())),
+            batch_info: Some(batch_info(HashMap::new())),
             fascia: Some(dumb_fascia()),
             consignment_bytes: asset_infos.keys().map(|k| (k.clone(), vec![1])).collect(),
             asset_infos,
@@ -11355,7 +11470,7 @@ mod send_end_tests {
         let (wallet, _) = setup();
         let txid = s!("t");
         let input_idx = seed_txo(&wallet, "i", 0);
-        let change_idx = seed_txo(&wallet, &txid, 2);
+        seed_txo(&wallet, &txid, 2);
         let incoming = seed_batch(&wallet, &txid, TransferStatus::Settled, true, None);
         let mut map = BTreeMap::from([(
             s!("asset"),
@@ -11367,15 +11482,23 @@ mod send_end_tests {
         )]);
         let extra = HashMap::from([(
             s!("other"),
-            HashMap::from([(input_idx, vec![Assignment::Fungible(5)])]),
+            HashMap::from([(
+                input_idx,
+                vec![(
+                    Assignment::Fungible(5),
+                    ChangeDestination::Utxo(Outpoint {
+                        txid: txid.clone(),
+                        vout: 2,
+                    }),
+                )],
+            )]),
         )]);
-        let info = batch_info(Some(change_idx), extra);
+        let info = batch_info(extra);
         let outgoing = wallet
             ._save_transfers(
                 txid.clone(),
                 &map,
                 info.extra_allocations.clone(),
-                info.change_utxo_idx,
                 None,
                 TransferStatus::Initiated,
                 1,
@@ -11441,7 +11564,7 @@ mod send_end_tests {
         let (wallet, _) = setup();
         let txid = s!("t");
         let input_idx = seed_txo(&wallet, "i", 0);
-        let change_idx = seed_txo(&wallet, &txid, 2);
+        seed_txo(&wallet, &txid, 2);
         let incoming = seed_batch(&wallet, &txid, TransferStatus::Settled, true, None);
         let map = BTreeMap::from([(
             s!("asset"),
@@ -11453,9 +11576,18 @@ mod send_end_tests {
         )]);
         let extra = HashMap::from([(
             s!("other"),
-            HashMap::from([(input_idx, vec![Assignment::Fungible(5)])]),
+            HashMap::from([(
+                input_idx,
+                vec![(
+                    Assignment::Fungible(5),
+                    ChangeDestination::Utxo(Outpoint {
+                        txid: txid.clone(),
+                        vout: 2,
+                    }),
+                )],
+            )]),
         )]);
-        let info = batch_info(Some(change_idx), extra);
+        let info = batch_info(extra);
         let idx = wallet
             ._update_or_save_transfers(
                 txid.clone(),
@@ -11702,6 +11834,75 @@ mod send_end_tests {
 
     fn vouts(spend: &AssetSpend) -> HashSet<u32> {
         spend.txo_map.values().map(|o| o.vout).collect()
+    }
+
+    fn utxo_slot(vout: u32) -> Option<ChangeDestination> {
+        Some(ChangeDestination::Utxo(
+            unspent_with(vout, &[]).utxo.outpoint(),
+        ))
+    }
+
+    fn take(slots: &mut ChangeSlots, asset_id: &str, amount: u128) -> Option<ChangeDestination> {
+        let taken = slots.take(asset_id, amount);
+        // a pre-existing UTXO gives its outpoint, the BTC change output none
+        if let Some((destination, outpoint)) = &taken {
+            assert_eq!(
+                outpoint.is_some(),
+                *destination != ChangeDestination::BtcChange
+            );
+        }
+        taken.map(|(destination, _)| destination)
+    }
+
+    #[test]
+    fn change_slots_count_held_allocations_and_invoices() {
+        let mut u0 = unspent_with(
+            0,
+            &[
+                ("b", 1, TransferStatus::Settled),
+                ("b", 1, TransferStatus::Failed),
+            ],
+        );
+        u0.pending_blinded = 1;
+        let mut slots = ChangeSlots::new(false, &[u0, unspent_with(1, &[])], 3, 10);
+        assert_eq!(take(&mut slots, "a", 1), utxo_slot(0));
+        for _ in 0..3 {
+            assert_eq!(take(&mut slots, "a", 1), utxo_slot(1));
+        }
+        assert_eq!(take(&mut slots, "a", 1), None);
+
+        // a full UTXO gets no slot
+        let u2 = unspent_with(2, &[("c", 1, TransferStatus::Settled); 4]);
+        let mut slots = ChangeSlots::new(false, &[u2, unspent_with(3, &[])], 3, 10);
+        for _ in 0..3 {
+            assert_eq!(take(&mut slots, "a", 1), utxo_slot(3));
+        }
+        assert_eq!(take(&mut slots, "a", 1), None);
+    }
+
+    #[test]
+    fn change_slots_respect_the_bundle_limit() {
+        let u0 = unspent_with(
+            0,
+            &[
+                ("a", 1, TransferStatus::Settled),
+                ("a", 1, TransferStatus::Settled),
+            ],
+        );
+        let mut slots = ChangeSlots::new(false, &[u0, unspent_with(1, &[])], 10, 2);
+        assert_eq!(take(&mut slots, "a", 1), utxo_slot(1));
+        assert_eq!(take(&mut slots, "b", 1), utxo_slot(0));
+    }
+
+    #[test]
+    fn change_slots_respect_the_u64_amount() {
+        let u0 = unspent_with(0, &[("a", u64::MAX - 1, TransferStatus::Settled)]);
+        let mut slots = ChangeSlots::new(false, &[u0, unspent_with(1, &[])], 10, 10);
+        assert_eq!(take(&mut slots, "a", 2), utxo_slot(1));
+        assert_eq!(take(&mut slots, "a", 1), utxo_slot(0));
+        // a right holds no amount, so it still fits
+        assert_eq!(take(&mut slots, "a", 0), utxo_slot(0));
+        assert_eq!(take(&mut slots, "a", 1), utxo_slot(1));
     }
 
     #[test]
