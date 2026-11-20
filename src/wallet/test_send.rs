@@ -525,6 +525,72 @@ async fn utxo_freeze_concurrent_receives() {
     assert_eq!(balance(&r, &asset_id).settled, 50);
 }
 
+// a receive that puts more allocations of any asset on the UTXO than the wallet setting allows
+// is refused
+#[wasm_bindgen_test]
+async fn receive_max_allocations_per_utxo() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(5).await;
+    let (mut r, r_on) = nia_wallet(1).await;
+    r.wallet_data.max_allocations_per_utxo = 3;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    let other = issue(&a, vec![AMOUNT + 1]);
+    send_and_settle(&mut a, &a_on, &mut r, &r_on, &other, 100).await;
+    send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
+
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    r.wallet_data.max_allocations_per_utxo = 2;
+    send_refused(&mut a, &a_on, &mut r, &r_on, &asset_id, &rid, 100).await;
+    assert_eq!(colored_allocations(&mut r).len(), 2);
+
+    r.wallet_data.max_allocations_per_utxo = 3;
+    send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
+    assert_eq!(colored_allocations(&mut r).len(), 3);
+    assert_eq!(balance(&r, &asset_id).settled, 200);
+    assert_eq!(balance(&r, &other).settled, 100);
+}
+
+// each other unpaid invoice on the UTXO counts for one allocation
+#[wasm_bindgen_test]
+async fn receive_counts_unpaid_invoices() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(5).await;
+    let (mut r, r_on) = nia_wallet(1).await;
+    r.wallet_data.max_allocations_per_utxo = 3;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
+
+    let rid1 = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    let rid2 = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    assert_eq!(
+        transfer_of(&r, &rid1).receive_utxo,
+        transfer_of(&r, &rid2).receive_utxo
+    );
+    r.wallet_data.max_allocations_per_utxo = 2;
+    send_refused(&mut a, &a_on, &mut r, &r_on, &asset_id, &rid2, 100).await;
+
+    send_to(&mut a, &a_on, &asset_id, &rid1, 100, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(transfer_of(&r, &rid1).status, TransferStatus::Settled);
+    assert_eq!(colored_allocations(&mut r).len(), 2);
+
+    // the invoice also counts toward the allocations a bundle can spend
+    r.wallet_data.max_allocations_per_utxo = 10;
+    let rid3 = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    let rid4 = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    assert_eq!(
+        transfer_of(&r, &rid3).receive_utxo,
+        transfer_of(&r, &rid4).receive_utxo
+    );
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(3));
+    send_refused(&mut a, &a_on, &mut r, &r_on, &asset_id, &rid4, 100).await;
+
+    send_to(&mut a, &a_on, &asset_id, &rid3, 100, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(transfer_of(&r, &rid3).status, TransferStatus::Settled);
+    assert_eq!(colored_allocations(&mut r).len(), 3);
+}
+
 /// The RGB unspent of `wallet` at `outpoint`.
 fn unspent_at(wallet: &mut Wallet, outpoint: &Outpoint) -> Unspent {
     wallet

@@ -871,6 +871,56 @@ async fn bfa_mint_receiver_checks() {
     );
 }
 
+// a mint that puts more than u64::MAX of the asset on the UTXO is refused before the lock
+#[wasm_bindgen_test]
+async fn bfa_mint_past_u64_on_utxo_refused() {
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(3, 1, None).await;
+    let (first, _) = mint(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        &bridge,
+        MINT_AMOUNT,
+    )
+    .await;
+    let rcv = blind_rcv(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Fungible(u64::MAX),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        transfer_of(&b, &first).receive_utxo,
+        transfer_of(&b, &rcv.recipient_id).receive_utxo
+    );
+    mint_begin(&mut a, &a_online, &asset_id, mint_recipient(&rcv, u64::MAX))
+        .await
+        .unwrap();
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::Failed
+    );
+    assert!(
+        b.get_received_mint(rcv.recipient_id.clone())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        b.get_asset_balance(asset_id.clone()).unwrap().settled,
+        MINT_AMOUNT
+    );
+}
+
 /// Begin a mint to a blinded UTXO of `receiver` and let the receiver check it.
 async fn begin_checked_mint(
     minter: &mut Wallet,
