@@ -1231,6 +1231,13 @@ impl InMemoryDb {
         Ok(())
     }
 
+    pub(crate) fn del_wallet_transaction(&self, idx: i32) -> Result<(), InternalError> {
+        self.wallet_transactions
+            .borrow_mut()
+            .retain(|w| w.idx != idx);
+        Ok(())
+    }
+
     pub(crate) fn del_txo(&self, idx: i32) -> Result<(), InternalError> {
         {
             let mut colorings = self.colorings.borrow_mut();
@@ -2483,6 +2490,9 @@ mod tests {
             ..Default::default()
         };
         assert!(db.update_wallet_transaction(missing).is_err());
+        db.del_wallet_transaction(idx).unwrap();
+        assert!(db.get_wallet_transaction_by_txid("wtx2").unwrap().is_none());
+        assert!(db.get_wallet_transaction_by_txid("wtx1").unwrap().is_some());
     }
 
     // ── BackupInfo ─────────────────────────────────────────────────

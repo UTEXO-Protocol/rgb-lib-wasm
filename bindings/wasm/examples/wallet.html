@@ -552,7 +552,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('createUtxosBegin...', 'log-warn');
         const unsignedPsbt = await state.wallet.createUtxosBegin(
-          state.online, upTo, num, size, BigInt(feeRate), skipSync
+          state.online, upTo, num, size, BigInt(feeRate), skipSync, false
         );
         document.getElementById('utxo-unsigned-psbt').value = unsignedPsbt;
         showResult('utxo-output', 'utxo-result', 'Unsigned PSBT created. Proceed to Sign.');
@@ -588,10 +588,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         showResult('utxo-output', 'utxo-result', 'Error: No signed PSBT. Run Sign first.');
         return;
       }
-      const skipSync = document.getElementById('utxo-skip-sync').checked;
       try {
         log('createUtxosEnd...', 'log-warn');
-        const count = await state.wallet.createUtxosEnd(state.online, signed, skipSync);
+        const count = await state.wallet.createUtxosEnd(state.online, signed);
         showResult('utxo-output', 'utxo-result', 'UTXOs created: ' + count);
         log('createUtxosEnd OK: ' + count + ' UTXOs', 'log-ok');
       } catch (e) {
@@ -610,7 +609,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('createUtxos (auto) begin...', 'log-warn');
         const unsignedPsbt = await state.wallet.createUtxosBegin(
-          state.online, upTo, num, size, BigInt(feeRate), skipSync
+          state.online, upTo, num, size, BigInt(feeRate), skipSync, true
         );
         document.getElementById('utxo-unsigned-psbt').value = unsignedPsbt;
 
@@ -619,7 +618,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         document.getElementById('utxo-signed-psbt').value = signed;
 
         log('createUtxos (auto) end...', 'log-warn');
-        const count = await state.wallet.createUtxosEnd(state.online, signed, skipSync);
+        const count = await state.wallet.createUtxosEnd(state.online, signed);
         showResult('utxo-output', 'utxo-result', 'UTXOs created (auto): ' + count);
         log('createUtxos (auto) complete: ' + count + ' UTXOs', 'log-ok');
       } catch (e) {

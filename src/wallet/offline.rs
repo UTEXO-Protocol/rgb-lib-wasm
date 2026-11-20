@@ -2997,7 +2997,7 @@ impl Wallet {
         Ok(pending)
     }
 
-    /// Fail the begun vanilla operation with the given TXID and release its inputs.
+    /// Abort the begun vanilla operation with the given TXID: delete it and release its inputs.
     pub fn abort_pending_vanilla_tx(&self, txid: String) -> Result<(), Error> {
         let cp = self.shared_checkpoint("abort_pending_vanilla_tx");
         let res = self._abort_pending_vanilla_tx(txid);
@@ -3011,12 +3011,7 @@ impl Wallet {
             .get_wallet_transaction_by_txid(&txid)?
             .filter(|w| w.status == TransferStatus::Initiated)
             .ok_or(Error::CannotAbortPendingVanillaTx)?;
-        self.database
-            .update_wallet_transaction(DbWalletTransactionActMod {
-                idx: ActiveValue::Set(row.idx),
-                status: ActiveValue::Set(TransferStatus::Failed),
-                ..Default::default()
-            })?;
+        self.database.del_wallet_transaction(row.idx)?;
         self.update_backup_info(false)?;
         info!(self.logger, "Abort pending vanilla TX completed");
         Ok(())
