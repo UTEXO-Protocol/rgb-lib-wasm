@@ -15,7 +15,7 @@ use rgbstd::containers::FileContent;
 use rgbstd::persistence::RgbStore;
 use rgbstd::validation::{ResolveWitness, WitnessStatus};
 use rgbstd::vm::WitnessOrd;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::str::FromStr;
 
@@ -172,6 +172,67 @@ fn balance(wallet: &Wallet, asset_id: &str) -> Balance {
     wallet.get_asset_balance(asset_id.to_string()).unwrap()
 }
 
+pub(super) fn witness_ords(wallet: &Wallet) -> BTreeMap<RgbTxid, WitnessOrd> {
+    wallet
+        .rgb_runtime()
+        .unwrap()
+        .stock
+        .as_store()
+        .all_witness_ords()
+        .unwrap()
+}
+
+pub(super) fn witness_ord(wallet: &Wallet, txid: &str) -> Option<WitnessOrd> {
+    witness_ords(wallet)
+        .get(&RgbTxid::from_str(txid).unwrap())
+        .copied()
+}
+
+// a send enters the stock at its broadcast, and a dry run never does
+#[wasm_bindgen_test]
+async fn send_enters_the_stock_at_broadcast() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(3).await;
+    let (mut r, r_on) = nia_wallet(1).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    let ords = witness_ords(&a);
+
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    let map = HashMap::from([(
+        asset_id.clone(),
+        vec![recipient(&rid, 100, None, PROXY_URL)],
+    )]);
+    a.send_begin(
+        a_on.clone(),
+        map,
+        false,
+        1,
+        1,
+        default_send_expiration(),
+        Some(transport_endpoint(PROXY_URL)),
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(witness_ords(&a), ords);
+
+    let (signed, txid) = begin(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
+    assert_eq!(witness_ords(&a), ords);
+    assert!(a.send_consignment_bytes(&txid, &asset_id).is_none());
+    end(&mut a, &a_on, signed).await;
+    assert_eq!(witness_ord(&a, &txid), None);
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert!(witness_ord(&a, &txid).is_some());
+
+    // a donation enters the stock at its end
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(50), &[PROXY_URL]).await;
+    let (signed, txid) = begin(&mut a, &a_on, &asset_id, &rid, 50, PROXY_URL, true).await;
+    assert_eq!(witness_ord(&a, &txid), None);
+    end(&mut a, &a_on, signed).await;
+    assert!(witness_ord(&a, &txid).is_some());
+}
+
 // a consignment that does not pay the recipient is refused
 #[wasm_bindgen_test]
 async fn recipient_refuses_consignment_not_paying_it() {
@@ -183,8 +244,8 @@ async fn recipient_refuses_consignment_not_paying_it() {
 
     let rid1 = invoice(&mut r1, &r1_on, Assignment::Fungible(66), &[PROXY_URL]).await;
     let (signed, tx1) = begin(&mut a, &a_on, &asset_id, &rid1, 66, PROXY_URL, false).await;
-    let bytes_1 = a.send_consignment_bytes(&tx1, &asset_id).unwrap();
     end(&mut a, &a_on, signed).await;
+    let bytes_1 = a.send_consignment_bytes(&tx1, &asset_id).unwrap();
     settle_both(&mut a, &a_on, &mut r1, &r1_on).await;
 
     // the second send posts the consignment of the first one

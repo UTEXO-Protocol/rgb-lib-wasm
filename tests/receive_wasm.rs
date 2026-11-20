@@ -363,6 +363,7 @@ async fn receive_refuses_history_witness_not_on_chain() {
         .unsigned_tx
         .compute_txid()
         .to_string();
+    wallet_b.build_send_consignments(&signed).await.unwrap();
     let bytes = wallet_b.send_consignment_bytes(&w2, &asset_id).unwrap();
     let mut consignment = RgbTransfer::load(&bytes[..]).unwrap();
     assert!(

@@ -652,13 +652,13 @@ async fn test_full_wallet_flow() {
         .unsigned_tx
         .compute_txid()
         .to_string();
-    // the consignment is validated before the broadcast
-    let consignment_bytes = wallet
-        .send_consignment_bytes(&signed_txid, &nia.asset_id)
-        .unwrap();
     let send_result = wallet
         .send_end(online.clone(), signed_psbt, false)
         .await
+        .unwrap();
+    // the consignment is validated before the broadcast
+    let consignment_bytes = wallet
+        .send_consignment_bytes(&signed_txid, &nia.asset_id)
         .unwrap();
     assert!(!send_result.txid.is_empty());
     let sent = wallet
@@ -1569,6 +1569,66 @@ async fn test_restored_wallet_inflates_after_inflation() {
         .await
         .unwrap();
     assert!(height.is_some(), "the inflation transaction must be mined");
+}
+
+#[wasm_bindgen_test]
+async fn test_inflate_end_retries_after_failed_sync() {
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let online = wallet.go_online(go_online_options(false)).await.unwrap();
+    fund_and_sync(&mut wallet, &online, "1.0").await;
+    create_utxos(&mut wallet, &online, 5).await;
+    let ifa = wallet
+        .issue_asset_ifa(
+            "TIFA".to_string(),
+            "Test IFA".to_string(),
+            0,
+            vec![1000],
+            vec![5000],
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+    let unsigned = wallet
+        .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+
+    // esplora fails every call after the broadcast, so the sync after it fails
+    js_sys::Function::new_with_args(
+        "url",
+        "const orig = globalThis.fetch;
+        globalThis.__failAfterBroadcast = { orig, seen: false };
+        globalThis.fetch = function (input, init) {
+            const href = input instanceof Request ? input.url : String(input);
+            const method = (init && init.method) || (input instanceof Request ? input.method : 'GET');
+            if (href.startsWith(url)) {
+                if (globalThis.__failAfterBroadcast.seen) {
+                    return Promise.reject(new TypeError('injected failure'));
+                }
+                if (method === 'POST' && href.endsWith('/tx')) {
+                    globalThis.__failAfterBroadcast.seen = true;
+                }
+            }
+            return orig.call(this, input, init);
+        };",
+    )
+    .call1(&wasm_bindgen::JsValue::NULL, &ESPLORA_URL.into())
+    .unwrap();
+    let res = wallet.inflate_end(online.clone(), signed.clone()).await;
+    js_sys::eval("globalThis.fetch = globalThis.__failAfterBroadcast.orig").unwrap();
+    assert!(res.is_err(), "{res:?}");
+
+    wallet.inflate_end(online.clone(), signed).await.unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    refresh(&mut wallet, &online).await;
+    assert_eq!(
+        wallet.get_asset_balance(ifa.asset_id).unwrap().settled,
+        1500
+    );
 }
 
 #[wasm_bindgen_test]

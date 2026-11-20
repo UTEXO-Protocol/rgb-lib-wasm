@@ -440,6 +440,8 @@ pub(crate) struct InfoAssetTransfer {
     before_block: Option<u64>,
     /// Contract a link links the asset to
     linked_to_contract: Option<ContractId>,
+    beneficiaries_witness: Vec<ExplicitSeal<RgbTxid>>,
+    beneficiaries_blinded: Vec<SecretSeal>,
 }
 
 impl InfoAssetTransfer {
@@ -497,6 +499,12 @@ pub(crate) struct TransferArtifacts {
 }
 
 impl TransferArtifacts {
+    fn fascia(&self) -> Result<Fascia, Error> {
+        fascia_from_bytes(self.fascia.clone().ok_or(Error::Internal {
+            details: s!("missing fascia in transfer artifacts"),
+        })?)
+    }
+
     /// Whether the main transition of every asset transfer of these artifacts is accepted.
     fn is_operation(&self, is_main_transition: impl Fn(&TypeOfTransition) -> bool) -> bool {
         !self.asset_infos.is_empty()
@@ -3564,17 +3572,6 @@ impl Wallet {
                 details: format!("cannot serialize fascia: {e}"),
             })?
             .release();
-        // a burn or a link enters the store at its end: a dry run or a failed begin leaves no
-        // split output
-        let without_recipient = transfer_info_map.values().all(|ti| {
-            matches!(
-                ti.main_transition,
-                TypeOfTransition::Burn | TypeOfTransition::Link
-            )
-        });
-        if !without_recipient {
-            runtime.consume_fascia(fascia.clone(), None)?;
-        }
 
         for (asset_id, transfer_info) in transfer_info_map.iter_mut() {
             let beneficiaries = asset_beneficiaries[asset_id].clone();
@@ -3593,6 +3590,8 @@ impl Wallet {
                     (witness, blinded)
                 },
             );
+            transfer_info.beneficiaries_witness = beneficiaries_witness;
+            transfer_info.beneficiaries_blinded = beneficiaries_blinded;
 
             let contract_id = transfer_info.asset_info.contract_id;
             let reject_list_source = match transfer_info.asset_info.reject_list_url.clone() {
@@ -3607,35 +3606,17 @@ impl Wallet {
                 }
                 None => None,
             };
-            let op_without_recipient = matches!(
-                transfer_info.main_transition,
-                TypeOfTransition::Burn | TypeOfTransition::Link
-            );
-            let keeps_fascia = matches!(
-                transfer_info.main_transition,
-                TypeOfTransition::Burn | TypeOfTransition::Link | TypeOfTransition::Mint
-            );
             // check every operation, so that none spends a rejected allocation
             let should_build_dag = reject_list_source.is_some();
 
-            let mut consignment = if should_build_dag {
-                let (consignment, ops_dag) = if without_recipient {
-                    runtime.transfer_from_fascia_with_dag(
-                        contract_id,
-                        beneficiaries_witness,
-                        beneficiaries_blinded,
-                        transfer_info.requested_opids(&fascia),
-                        &fascia,
-                    )?
-                } else {
-                    runtime.transfer_with_dag(
-                        contract_id,
-                        beneficiaries_witness,
-                        beneficiaries_blinded,
-                        transfer_info.requested_opids(&fascia),
-                        Some(witness_txid),
-                    )?
-                };
+            if should_build_dag {
+                let (_, ops_dag) = runtime.transfer_from_fascia_with_dag(
+                    contract_id,
+                    transfer_info.beneficiaries_witness.clone(),
+                    transfer_info.beneficiaries_blinded.clone(),
+                    transfer_info.requested_opids(&fascia),
+                    &fascia,
+                )?;
 
                 // fetch a list once per operation, so that all retries use the same version
                 let source = reject_list_source.as_ref().unwrap();
@@ -3666,39 +3647,12 @@ impl Wallet {
                     }
                     return Ok(None);
                 }
-
-                Some(consignment)
-            } else if op_without_recipient {
-                None
-            } else {
-                Some(runtime.transfer(
-                    transfer_info.asset_info.contract_id,
-                    beneficiaries_witness,
-                    beneficiaries_blinded,
-                    Some(witness_txid),
-                )?)
-            };
-            if let Some(consignment) = &mut consignment {
-                self.attach_spv_proofs(runtime, consignment, witness_txid)
-                    .await?;
             }
 
-            let artifacts = self
-                .transfer_artifacts
+            self.transfer_artifacts
                 .entry(txid_key.to_string())
-                .or_default();
-            if keeps_fascia {
-                artifacts.fascia = Some(fascia_bytes.clone());
-            }
-            // an operation without recipient builds its consignment at the end
-            if let Some(consignment) = consignment.filter(|_| !op_without_recipient) {
-                // Store consignment bytes in memory instead of filesystem
-                let mut consignment_bytes = Vec::new();
-                consignment.save(&mut consignment_bytes)?;
-                artifacts
-                    .consignment_bytes
-                    .insert(asset_id.clone(), consignment_bytes);
-            }
+                .or_default()
+                .fascia = Some(fascia_bytes.clone());
 
             // Store asset transfer info in memory
             self.transfer_artifacts
@@ -3706,10 +3660,6 @@ impl Wallet {
                 .or_default()
                 .asset_infos
                 .insert(asset_id.clone(), transfer_info.clone());
-        }
-
-        if !without_recipient {
-            runtime.upsert_witness(witness_txid, WitnessOrd::Tentative)?;
         }
 
         // Store batch transfer info in memory instead of filesystem
@@ -5471,16 +5421,78 @@ impl Wallet {
         .await
     }
 
-    async fn _broadcast_and_update_rgb_async(
-        &mut self,
+    /// Build the consignment of each asset of an operation from its fascia.
+    async fn _consignments_from_fascia(
+        &self,
         runtime: &mut RgbRuntime,
-        witness_id: RgbTxid,
-        signed_psbt: Psbt,
-        skip_sync: bool,
-    ) -> Result<BdkTransaction, Error> {
-        let tx = self._broadcast_psbt(signed_psbt, skip_sync).await?;
+        fascia: &Fascia,
+        asset_infos: &BTreeMap<String, InfoAssetTransfer>,
+    ) -> Result<HashMap<String, Vec<u8>>, Error> {
+        let mut consignments = HashMap::new();
+        for (asset_id, ti) in asset_infos {
+            let mut consignment = runtime.transfer_from_fascia(
+                ti.asset_info.contract_id,
+                ti.beneficiaries_witness.clone(),
+                ti.beneficiaries_blinded.clone(),
+                ti.requested_opids(fascia),
+                fascia,
+            )?;
+            self.attach_spv_proofs(runtime, &mut consignment, fascia.witness_id())
+                .await?;
+            let mut bytes = Vec::new();
+            consignment.save(&mut bytes)?;
+            consignments.insert(asset_id.clone(), bytes);
+        }
+        Ok(consignments)
+    }
+
+    /// Put the operation of a broadcast TX in the stock.
+    fn _consume_broadcast_fascia(runtime: &mut RgbRuntime, fascia: Fascia) -> Result<(), Error> {
+        let witness_id = fascia.witness_id();
+        runtime.consume_fascia(fascia, None)?;
         runtime.upsert_witness(witness_id, WitnessOrd::Tentative)?;
-        Ok(tx)
+        Ok(())
+    }
+
+    /// Build the missing consignments of a pending send from its fascia, store them and return the
+    /// fascia with all of them. A donation fascia carries the signed TX, so that its recipients
+    /// can broadcast it.
+    pub(crate) async fn _build_send_consignments(
+        &mut self,
+        txid: &str,
+        tx: &BdkTransaction,
+    ) -> Result<(Fascia, HashMap<String, Vec<u8>>), Error> {
+        let artifacts = self
+            .transfer_artifacts
+            .get(txid)
+            .ok_or(Error::UnknownTransfer {
+                txid: txid.to_string(),
+            })?;
+        let mut fascia = artifacts.fascia()?;
+        if artifacts.batch_info.as_ref().is_some_and(|b| b.donation) {
+            fascia.update_witness_tx(tx.clone());
+        }
+        let mut consignment_bytes = artifacts.consignment_bytes.clone();
+        let missing: BTreeMap<String, InfoAssetTransfer> = artifacts
+            .asset_infos
+            .iter()
+            .filter(|(asset_id, _)| !consignment_bytes.contains_key(*asset_id))
+            .map(|(asset_id, ti)| (asset_id.clone(), ti.clone()))
+            .collect();
+        if missing.is_empty() {
+            return Ok((fascia, consignment_bytes));
+        }
+        let mut runtime = self.rgb_runtime()?;
+        let built = self
+            ._consignments_from_fascia(&mut runtime, &fascia, &missing)
+            .await?;
+        drop(runtime);
+        consignment_bytes.extend(built);
+        self.transfer_artifacts
+            .get_mut(txid)
+            .expect("artifacts checked above")
+            .consignment_bytes = consignment_bytes.clone();
+        Ok((fascia, consignment_bytes))
     }
 
     async fn _wait_ack_async(
@@ -5765,10 +5777,11 @@ impl Wallet {
             return Err(Error::MissingTransferArtifacts { txid });
         };
         let signed_psbt = Psbt::from_str(signed_psbt)?;
+        let fascia = self.transfer_artifacts[txid].fascia()?;
         let mut runtime = self.rgb_runtime()?;
-        let witness_id = RgbTxid::from_str(txid).unwrap();
-        self._broadcast_and_update_rgb_async(&mut runtime, witness_id, signed_psbt, skip_sync)
-            .await?;
+        self._broadcast_psbt(signed_psbt, skip_sync).await?;
+        Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
+        drop(runtime);
         // Clean up: signed PSBT no longer needed after broadcast
         self.transfer_artifacts.remove(txid);
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
@@ -7150,6 +7163,8 @@ impl Wallet {
                     burn_reason: None,
                     before_block: None,
                     linked_to_contract: None,
+                    beneficiaries_witness: vec![],
+                    beneficiaries_blinded: vec![],
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -7449,7 +7464,6 @@ impl Wallet {
             details: s!("missing batch info in transfer artifacts"),
         })?;
         let mut asset_infos = artifacts.asset_infos.clone();
-        let mut consignment_bytes = artifacts.consignment_bytes.clone();
 
         // extract the signed transaction (needed for its hash and, for donations, to embed it)
         let tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
@@ -7457,23 +7471,7 @@ impl Wallet {
         let signed_tx_hash_raw = sha256_digest(&tx_bytes);
         let signed_tx_hash = hex::encode(signed_tx_hash_raw);
 
-        // for a donation, put the signed TX in the consignments so the recipients can broadcast it
-        if info_contents.donation {
-            let witness_id = RgbTxid::from_str(&txid).unwrap();
-            for bytes in consignment_bytes.values_mut() {
-                let mut consignment = RgbTransfer::load(&bytes[..]).map_err(InternalError::from)?;
-                if !consignment.modify_bundle(witness_id, |b| b.tx = tx.clone()) {
-                    return Err(InternalError::Unexpected.into());
-                }
-                let mut v = vec![];
-                consignment.save(&mut v)?;
-                *bytes = v;
-            }
-            self.transfer_artifacts
-                .get_mut(&txid)
-                .expect("artifacts checked above")
-                .consignment_bytes = consignment_bytes.clone();
-        }
+        let (fascia, consignment_bytes) = self._build_send_consignments(&txid, &tx).await?;
 
         // sender operation key (one per operation, shared across all recipients)
         let seed: [u8; 32] = info_contents
@@ -7633,7 +7631,7 @@ impl Wallet {
             // Broadcast immediately for donations
             let mut runtime = self.rgb_runtime()?;
             self._broadcast_psbt(psbt, skip_sync).await?;
-            runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
+            Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
             let idx = self._update_or_save_transfers(
                 txid.clone(),
                 &asset_infos,
@@ -7959,6 +7957,8 @@ impl Wallet {
             burn_reason: None,
             before_block: None,
             linked_to_contract: None,
+            beneficiaries_witness: vec![],
+            beneficiaries_blinded: vec![],
         };
         let psbt_string = self
             ._prepare_single_asset_psbt(
@@ -8025,11 +8025,18 @@ impl Wallet {
         if now().unix_timestamp() >= artifacts.expiration {
             return Err(Error::CannotEndTransfer { txid });
         }
-        let artifacts = self.transfer_artifacts.remove(&txid).unwrap();
-        let info_contents = artifacts.batch_info.ok_or(Error::Internal {
+        let fascia = artifacts.fascia()?;
+        let info_contents = artifacts.batch_info.clone().ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
         })?;
-        let transfer_info_map = artifacts.asset_infos;
+        let transfer_info_map = artifacts.asset_infos.clone();
+
+        // the artifacts stay until the stock has the fascia, so a failed sync can be retried
+        let mut runtime = self.rgb_runtime()?;
+        let _ = self._broadcast_psbt(psbt, false).await?;
+        Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
 
         // Store signed PSBT for refresh() persistence
         self.transfer_artifacts.insert(
@@ -8039,13 +8046,6 @@ impl Wallet {
                 ..Default::default()
             },
         );
-
-        let mut runtime = self.rgb_runtime()?;
-        let tx = self._broadcast_psbt(psbt, false).await?;
-        let _ = tx;
-        runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
-        // Drop runtime so Stock returns to RefCell before auto-save
-        drop(runtime);
 
         let batch_transfer_idx = self._save_transfers(
             txid.clone(),
@@ -8266,6 +8266,8 @@ impl Wallet {
             burn_reason,
             before_block: None,
             linked_to_contract,
+            beneficiaries_witness: vec![],
+            beneficiaries_blinded: vec![],
         };
         let begin_data = self
             ._prepare_single_asset_psbt(
@@ -8874,6 +8876,8 @@ impl Wallet {
             burn_reason: None,
             before_block: Some(before_block),
             linked_to_contract: None,
+            beneficiaries_witness: vec![],
+            beneficiaries_blinded: vec![],
         };
         let begin_data = self
             ._prepare_single_asset_psbt(
@@ -8889,12 +8893,21 @@ impl Wallet {
                 false,
             )
             .await?;
-        drop(runtime);
-
         let txid = Psbt::from_str(&begin_data.psbt)?
             .unsigned_tx
             .compute_txid()
             .to_string();
+        let fascia = fascia_from_bytes(begin_data.fascia.clone())?;
+        let asset_infos = self.transfer_artifacts[&txid].asset_infos.clone();
+        let built = self
+            ._consignments_from_fascia(&mut runtime, &fascia, &asset_infos)
+            .await?;
+        self.transfer_artifacts
+            .get_mut(&txid)
+            .expect("prepared above")
+            .consignment_bytes = built;
+        drop(runtime);
+
         let artifacts = &self.transfer_artifacts[&txid];
         let info_contents = artifacts.batch_info.clone().ok_or(Error::Internal {
             details: s!("missing batch info in transfer artifacts"),
@@ -8997,6 +9010,7 @@ impl Wallet {
             })?
             .entropy;
         let consignment_bytes = artifacts.consignment_bytes.clone();
+        let fascia = artifacts.fascia()?;
         let mint = self._sent_mint(artifacts)?;
         let asset_id = artifacts
             .asset_infos
@@ -9018,7 +9032,7 @@ impl Wallet {
 
         let mut runtime = self.rgb_runtime()?;
         self._broadcast_psbt(psbt, false).await?;
-        runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
+        Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
 
         let mut updated: DbBatchTransferActMod = batch_transfer.into();
@@ -9104,6 +9118,8 @@ impl Wallet {
             burn_reason: None,
             before_block: Some(before_block),
             linked_to_contract: None,
+            beneficiaries_witness: vec![],
+            beneficiaries_blinded: vec![],
         };
         let mut transfer_info_map = BTreeMap::from([(asset_id, transfer_info)]);
         let PrepareTransferPsbtResult::Success(begin_data) = self
@@ -9462,6 +9478,7 @@ mod send_end_tests {
     use super::*;
     use crate::utils::recipient_id_from_script_buf;
     use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use strict_encoding::StrictDumb;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
     const ENDPOINT: &str = "http://127.0.0.1:1/json-rpc";
@@ -9721,6 +9738,8 @@ mod send_end_tests {
             burn_reason: None,
             before_block: None,
             linked_to_contract: None,
+            beneficiaries_witness: vec![],
+            beneficiaries_blinded: vec![],
         }
     }
 
@@ -9741,9 +9760,17 @@ mod send_end_tests {
         }
     }
 
+    fn dumb_fascia() -> Vec<u8> {
+        Fascia::strict_dumb()
+            .to_strict_serialized::<FASCIA_MAX_LEN>()
+            .unwrap()
+            .release()
+    }
+
     fn artifacts(asset_infos: BTreeMap<String, InfoAssetTransfer>) -> TransferArtifacts {
         TransferArtifacts {
             batch_info: Some(batch_info(None, HashMap::new())),
+            fascia: Some(dumb_fascia()),
             consignment_bytes: asset_infos.keys().map(|k| (k.clone(), vec![1])).collect(),
             asset_infos,
             signed_psbt: None,

@@ -469,8 +469,8 @@ impl Wallet {
             .and_then(|a| a.consignment_bytes.get(asset_id).cloned())
     }
 
-    /// Replace the consignment bytes of a pending send, for tests. [`Wallet::send_end`] then
-    /// hashes, encrypts and posts the replaced bytes.
+    /// Set the consignment bytes of a pending send, for tests. [`Wallet::send_end`] then hashes,
+    /// encrypts and posts them.
     #[doc(hidden)]
     pub fn set_send_consignment_bytes(
         &mut self,
@@ -478,19 +478,24 @@ impl Wallet {
         asset_id: &str,
         bytes: Vec<u8>,
     ) -> Result<(), Error> {
-        let artifacts =
-            self.transfer_artifacts
-                .get_mut(txid)
-                .ok_or_else(|| Error::UnknownTransfer {
-                    txid: txid.to_string(),
-                })?;
-        let entry = artifacts
+        self.transfer_artifacts
+            .get_mut(txid)
+            .ok_or_else(|| Error::UnknownTransfer {
+                txid: txid.to_string(),
+            })?
             .consignment_bytes
-            .get_mut(asset_id)
-            .ok_or_else(|| Error::Internal {
-                details: s!("missing consignment bytes"),
-            })?;
-        *entry = bytes;
+            .insert(asset_id.to_string(), bytes);
+        Ok(())
+    }
+
+    /// Build the consignments of a pending send before its end, for tests.
+    #[cfg(feature = "esplora")]
+    #[doc(hidden)]
+    pub async fn build_send_consignments(&mut self, signed_psbt: &str) -> Result<(), Error> {
+        let psbt = Psbt::from_str(signed_psbt)?;
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let tx = psbt.extract_tx().map_err(InternalError::from)?;
+        self._build_send_consignments(&txid, &tx).await?;
         Ok(())
     }
 
