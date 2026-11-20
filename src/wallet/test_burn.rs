@@ -6,8 +6,8 @@ use super::test_send::{consignment as saved_consignment, proven, witness_ord, wi
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
 use crate::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbOutExt, RgbTransfer,
-    TS_BURN, TransferKind, TransferStatus, wallet::rust_only::validate_consignment_offchain,
+    AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbTransfer, TS_BURN,
+    TransferKind, TransferStatus, wallet::rust_only::validate_consignment_offchain,
 };
 use amplify::confinement::{Confined, U32};
 use bdk_wallet::bitcoin::psbt::Psbt;
@@ -241,16 +241,6 @@ async fn ifa_burn_with_and_without_reason_settles() {
         serde_json::to_value(&artifacts.asset_infos[&asset_id]).unwrap()["recipients"],
         serde_json::json!([]),
         "a burn records a recipient"
-    );
-    let opret = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .position(|o| o.script_pubkey.is_op_return())
-        .unwrap();
-    assert_eq!(
-        psbt.outputs[opret].mpc_entropy(),
-        Some(begin.details.entropy)
     );
     let fascia = Fascia::from_strict_serialized::<U32>(
         Confined::try_from(begin.details.fascia.clone()).unwrap(),
@@ -839,10 +829,6 @@ async fn inflate_begin_end() {
             .all(|i| reserved.contains(&i.previous_output.into()))
     );
     assert_eq!(begin.details.min_confirmations, 1);
-    assert_eq!(
-        psbt.outputs.iter().find_map(|o| o.mpc_entropy()),
-        Some(begin.details.entropy)
-    );
     let fascia = Fascia::from_strict_serialized::<U32>(
         Confined::try_from(begin.details.fascia.clone()).unwrap(),
     )

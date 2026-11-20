@@ -6,11 +6,17 @@ use super::online::{
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{AssetFilter, Balance, Online, Recipient, RgbAllocation, Transfer, Wallet};
 use crate::{AssetSchema, Assignment, Error, RgbTransfer, TransferKind, TransferStatus};
 use amplify::confinement::Confined;
 use bdk_wallet::bitcoin::psbt::Psbt;
-use bdk_wallet::bitcoin::{TxMerkleNode, hashes::Hash};
+use bdk_wallet::bitcoin::psbt::raw::ProprietaryKey;
+use bdk_wallet::bitcoin::{
+    Amount as BdkAmount, FeeRate, OutPoint, ScriptBuf, TxMerkleNode, hashes::Hash,
+};
+use bdk_wallet::{KeychainKind, TxOrdering};
+use rgbstd::ContractId;
 use rgbstd::Txid as RgbTxid;
 use rgbstd::containers::FileContent;
 use rgbstd::persistence::RgbStore;
@@ -189,6 +195,93 @@ pub(super) fn witness_ord(wallet: &Wallet, txid: &str) -> Option<WitnessOrd> {
         .copied()
 }
 
+pub(super) fn assert_no_rgb_data(psbt: &Psbt) {
+    assert!(psbt.proprietary.is_empty());
+    assert!(psbt.inputs.iter().all(|i| i.proprietary.is_empty()));
+    assert!(psbt.outputs.iter().all(|o| o.proprietary.is_empty()));
+}
+
+/// A PSBT that spends the colored UTXO and pays 500 sat to the wallet.
+fn psbt_to_color(wallet: &mut Wallet, op_return: bool) -> Psbt {
+    let outpoint: OutPoint = wallet
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .find(|u| !u.rgb_allocations.is_empty())
+        .unwrap()
+        .utxo
+        .outpoint
+        .into();
+    let script = wallet
+        .bdk_wallet
+        .peek_address(KeychainKind::External, 0)
+        .script_pubkey();
+    let mut builder = wallet.bdk_wallet.build_tx();
+    builder
+        .add_utxo(outpoint)
+        .unwrap()
+        .manually_selected_only()
+        .ordering(TxOrdering::Untouched)
+        .fee_rate(FeeRate::from_sat_per_vb_u32(1));
+    if op_return {
+        builder.add_recipient(ScriptBuf::new_op_return([]), BdkAmount::ZERO);
+    }
+    builder.add_recipient(script, BdkAmount::from_sat(500));
+    builder.finish().unwrap()
+}
+
+/// Send the whole asset to the 500 sat output, as color_psbt supports no change.
+fn coloring_info(asset_id: &str) -> ColoringInfo {
+    ColoringInfo {
+        asset_info_map: HashMap::from([(
+            ContractId::from_str(asset_id).unwrap(),
+            AssetColoringInfo {
+                output_map: HashMap::from([(0, AMOUNT)]),
+                static_blinding: Some(777),
+            },
+        )]),
+        static_blinding: Some(777),
+        nonce: None,
+    }
+}
+
+#[wasm_bindgen_test]
+async fn color_psbt_strips_rgb_data() {
+    let _reset = ResetMocks;
+    let (mut a, _a_on) = nia_wallet(1).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    let mut psbt = psbt_to_color(&mut a, false);
+
+    a.color_psbt(&mut psbt, coloring_info(&asset_id)).unwrap();
+    assert_no_rgb_data(&psbt);
+}
+
+#[wasm_bindgen_test]
+async fn color_psbt_checks_the_psbt_parses_back() {
+    let _reset = ResetMocks;
+    let (mut a, _a_on) = nia_wallet(1).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    // with an OP_RETURN output, color_psbt keeps the given PSBT
+    let mut psbt = psbt_to_color(&mut a, true);
+    // a non-RGB value over the 4 MB global map limit survives the strip
+    psbt.proprietary.insert(
+        ProprietaryKey {
+            prefix: b"OTHER".to_vec(),
+            subtype: 0,
+            key: vec![],
+        },
+        vec![0; 5_000_000],
+    );
+
+    let err = a
+        .color_psbt(&mut psbt, coloring_info(&asset_id))
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Internal { details } if details.starts_with("PSBT can't be parsed back")),
+        "unexpected error: {err:?}"
+    );
+}
+
 // a send enters the stock at its broadcast, and a dry run never does
 #[wasm_bindgen_test]
 async fn send_enters_the_stock_at_broadcast() {
@@ -219,6 +312,7 @@ async fn send_enters_the_stock_at_broadcast() {
     assert_eq!(witness_ords(&a), ords);
 
     let (signed, txid) = begin(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
+    assert_no_rgb_data(&Psbt::from_str(&signed).unwrap());
     assert_eq!(witness_ords(&a), ords);
     assert!(a.send_consignment_bytes(&txid, &asset_id).is_none());
     end(&mut a, &a_on, signed).await;
