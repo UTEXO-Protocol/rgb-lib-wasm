@@ -20,6 +20,7 @@ use utils::*;
 
 // the maximum the wallet accepts
 const MAX_EXPIRATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+const DOWN: &str = "rpc://127.0.0.1:1/json-rpc";
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
     let keys = generate_keys(BitcoinNetwork::Regtest);
@@ -250,15 +251,22 @@ async fn begin_end() {
     .recipient_id;
     let early = recipient(&early_rid, 34, None, PROXY_URL);
     let latest = early.expiration_timestamp.unwrap() - 600;
-    let two = HashMap::from([(
+    let mut two = HashMap::from([(
         asset_id.clone(),
         vec![recipient(&rid, 66, None, PROXY_URL), early],
     )]);
+    for r in two.get_mut(&asset_id).unwrap() {
+        r.transport_endpoints.insert(0, DOWN.to_string());
+    }
+    spy_rpc();
+    clear_rpc_hooks();
     assert!(
         begin_dry(&mut wallet, &online, two.clone(), latest)
             .await
             .is_ok()
     );
+    // each distinct proxy gets one call, also a proxy that is down
+    assert_eq!(rpc_count("server.info"), 2);
     assert!(matches!(
         begin_dry(&mut wallet, &online, two, latest + 1).await,
         Err(Error::InvalidExpiration)
@@ -1200,7 +1208,11 @@ async fn invoice_not_reserved_fail() {
         begin_dry(&mut wallet, &online, map, exp).await,
         Err(Error::InvoiceExpired)
     ));
-    let map = with(|r| r.expiration_timestamp = Some(default_send_expiration() + 100));
+    // the checks that need no network come before any proxy call
+    let map = with(|r| {
+        r.transport_endpoints = vec![DOWN.to_string()];
+        r.expiration_timestamp = Some(default_send_expiration() + 100);
+    });
     assert!(matches!(
         begin_dry(&mut wallet, &online, map, exp).await,
         Err(Error::InvalidExpiration)
