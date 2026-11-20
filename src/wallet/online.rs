@@ -7843,8 +7843,27 @@ impl Wallet {
         skip_sync: bool,
     ) -> Result<OperationResult, Error> {
         let cp = self.checkpoint("send_end");
+        let txid = Psbt::from_str(&signed_psbt)
+            .map(|psbt| psbt.unsigned_tx.compute_txid().to_string())
+            .ok();
         let res = self._send_end(online, signed_psbt, skip_sync).await;
-        self.commit(cp, res, |_| false).await
+        // keep the consignments and used flags. A retry posts the same bytes and skips used endpoints.
+        let kept = match (&res, txid) {
+            (Err(_), Some(txid)) => self
+                .transfer_artifacts
+                .get(&txid)
+                .map(|a| (txid, a.consignment_bytes.clone(), a.asset_infos.clone())),
+            _ => None,
+        };
+        let res = self.commit(cp, res, |_| false).await;
+        if let Some((txid, consignment_bytes, asset_infos)) = kept
+            && let Some(artifacts) = self.transfer_artifacts.get_mut(&txid)
+        {
+            artifacts.consignment_bytes = consignment_bytes;
+            artifacts.asset_infos = asset_infos;
+            self.flush().await?;
+        }
+        res
     }
 
     async fn _send_end(
@@ -11204,9 +11223,12 @@ mod send_end_tests {
         let mut server = mockito::Server::new();
         let _info = rpc_mock(&mut server, "server.info", INFO_BODY);
         let _prepare = rpc_mock(&mut server, "ack.prepare", TRUE_BODY);
+        let _post = rpc_mock(&mut server, "consignment.post", TRUE_BODY);
+        let mut r1 = recipient("r1", false, true);
+        r1.transport_endpoints[0].endpoint = server.url();
         let transfer = info_asset(
             TypeOfTransition::Transfer,
-            vec![recipient("r1", true, true), recipient("r2", false, false)],
+            vec![r1, recipient("r2", false, false)],
             HashMap::new(),
         );
         let mut transfer_artifacts = artifacts(BTreeMap::from([(s!("asset"), transfer)]));
@@ -11221,6 +11243,7 @@ mod send_end_tests {
         wallet
             .transfer_artifacts
             .insert(txid.clone(), transfer_artifacts);
+        // r1 is posted, r2 has no usable endpoint
         let res = send_end_err(&mut wallet, &online, &psbt);
         assert_eq!(res, Error::NoValidTransportEndpoint);
         let kept = &wallet.transfer_artifacts[&txid];
