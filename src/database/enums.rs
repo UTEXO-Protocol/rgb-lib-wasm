@@ -90,6 +90,13 @@ impl AssetSchema {
         }
     }
 
+    pub(crate) fn supports_mint(&self) -> bool {
+        match self {
+            Self::Bfa => true,
+            Self::Nia | Self::Ifa => false,
+        }
+    }
+
     pub(crate) fn allowed_on_mainnet(&self) -> bool {
         match self {
             Self::Nia => true,
