@@ -391,11 +391,15 @@ async fn send_end_retry_after_post_failure() {
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, false).await;
     let idx = res.batch_transfer_idx.unwrap();
+    assert!(wallet.send_consignment_bytes(&txid, &asset_id).is_none());
     fail_posts(":3010", true);
     assert!(matches!(
         end(&mut wallet, &online, &signed).await,
         Err(Error::Proxy { .. })
     ));
+    // the failed end keeps the consignment it built
+    let built = wallet.send_consignment_bytes(&txid, &asset_id);
+    assert!(built.is_some());
     let saved = sends(&wallet, &txid);
     assert_eq!(saved.len(), 2);
     assert!(
@@ -403,10 +407,12 @@ async fn send_end_retry_after_post_failure() {
             .iter()
             .all(|t| t.status == TransferStatus::Initiated && t.batch_transfer_idx == idx)
     );
-    // a reload keeps the used flag of the post that succeeded, so the retry skips its proxy
+    // a reload keeps the built consignment and the used flag of the post that succeeded,
+    // so the retry skips its proxy
     let (reloaded, online) = saved_wallet(&wallet).await;
     drop(wallet);
     let mut wallet = reloaded;
+    assert_eq!(wallet.send_consignment_bytes(&txid, &asset_id), built);
     fail_posts(":3000", true);
     assert_eq!(
         end(&mut wallet, &online, &signed).await,
