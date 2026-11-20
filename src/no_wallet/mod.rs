@@ -213,6 +213,9 @@ impl Invoice {
                     (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
                         Assignment::LinkRight
                     }
+                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_MINT_RIGHT)) => {
+                        Assignment::MintRight
+                    }
                     (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
                     (None, None) => Assignment::Any,
                     (_, _) => {
@@ -341,6 +344,16 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidRecipientID)));
     }
 
+    fn mint_right_invoice(schema: AssetSchema) -> String {
+        RgbInvoiceBuilder::new(XChainNet::<Beneficiary>::from_str(BLINDED_RECIPIENT_ID).unwrap())
+            .set_schema(schema.into())
+            .set_contract(ContractId::from([1u8; 32]))
+            .set_void()
+            .set_assignment_name(RGB_STATE_MINT_RIGHT)
+            .finish()
+            .to_string()
+    }
+
     #[test]
     fn new_invoice() {
         let invoice = Invoice::new(format!(
@@ -356,6 +369,14 @@ mod tests {
         );
         assert_eq!(invoice_data.network, BitcoinNetwork::Regtest);
         assert_eq!(invoice_data.encryption, Encryption::Required);
+
+        let invoice = Invoice::new(mint_right_invoice(AssetSchema::Bfa)).unwrap();
+        let invoice_data = invoice.invoice_data();
+        assert_eq!(invoice_data.assignment, Assignment::MintRight);
+        assert_eq!(
+            invoice_data.assignment_name.as_deref(),
+            Some(RGB_STATE_MINT_RIGHT)
+        );
 
         let result = Invoice::new(s!("invalid"));
         assert!(matches!(result, Err(Error::InvalidInvoice { details: _ })));
