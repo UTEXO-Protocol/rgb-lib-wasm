@@ -923,6 +923,15 @@ impl WasmWallet {
         to_js(&result)
     }
 
+    /// Return the consignment of an ended burn as a Uint8Array.
+    #[wasm_bindgen(js_name = "getBurnConsignment")]
+    pub fn get_burn_consignment(&self, asset_id: &str, txid: &str) -> Result<Vec<u8>, JsValue> {
+        self.inner
+            .borrow()
+            .get_burn_consignment(asset_id.to_string(), txid.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Link an IFA or BFA asset to another contract: begin, sign with the wallet keys and end.
     /// Returns an OperationResult JS object.
     #[wasm_bindgen(js_name = "link")]
