@@ -141,7 +141,7 @@ await this durable commit before returning success.
 ### Going online
 
 ```javascript
-const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
+const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {} });
 await wallet.sync(online);
 ```
 
@@ -392,7 +392,7 @@ To protect a wallet:
 | `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
 | `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
 | `abortPendingVanillaTx(txid)` | no | Fail a begun vanilla operation and release its inputs |
-| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. |
+| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. |
 | `sync(online)` | yes | Sync wallet with indexer |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
 | `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |

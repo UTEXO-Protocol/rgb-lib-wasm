@@ -54,7 +54,7 @@ fn err(e: JsValue) -> String {
 async fn online(wallet: &WasmWallet) -> JsValue {
     let options = js_sys::JSON::parse(
         r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:8094/regtest/api"}},
-        "skipConsistencyCheck":true,"proxyAuthKeys":{}}"#,
+        "skipConsistencyCheck":true,"failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{}}"#,
     )
     .unwrap();
     wallet.go_online(options).await.unwrap()
@@ -151,7 +151,15 @@ async fn go_online_reads_options_object() {
     let wallet = wallet_with_schemas(vec![AssetSchema::Bfa]);
     let options = js_sys::JSON::parse(
         r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:1"}},"skipConsistencyCheck":true,
-        "proxyAuthKeys":{"rpc://127.0.0.1:3000/json-rpc":"not hex"}}"#,
+        "proxyAuthKeys":{}}"#,
+    )
+    .unwrap();
+    let e = err(wallet.go_online(options).await.unwrap_err());
+    assert!(e.contains("failedWitnessReceiveGraceSecs"), "{e}");
+
+    let options = js_sys::JSON::parse(
+        r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:1"}},"skipConsistencyCheck":true,
+        "failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{"rpc://127.0.0.1:3000/json-rpc":"not hex"}}"#,
     )
     .unwrap();
     let e = err(wallet.go_online(options).await.unwrap_err());
@@ -160,7 +168,7 @@ async fn go_online_reads_options_object() {
     let options = |chain_id: &str| {
         js_sys::JSON::parse(&format!(
             r#"{{"indexerConfig":{{"Esplora":{{"url":"http://127.0.0.1:8094/regtest/api"}}}},
-            "skipConsistencyCheck":true,"proxyAuthKeys":{{}},
+            "skipConsistencyCheck":true,"failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{{}},
             "evmChains":{{"{chain_id}":{{"rpcUrl":"http://127.0.0.1:8545","minMintLockBlocks":2,"maxMintLockBlocks":1000}}}}}}"#
         ))
         .unwrap()
