@@ -1029,9 +1029,39 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolverWasm<'_, '_, TRANS
     }
 }
 
+/// Remove the RGB data from a committed PSBT, so it stays small enough to parse back.
+pub(crate) fn strip_rgb_data(psbt: &mut Psbt) {
+    let is_rgb = |key: &bdk_wallet::bitcoin::psbt::raw::ProprietaryKey| {
+        [
+            &PSBT_RGB_PREFIX[..],
+            &PSBT_MPC_PREFIX[..],
+            &PSBT_OPRET_PREFIX[..],
+            &PSBT_TAPRET_PREFIX[..],
+        ]
+        .contains(&key.prefix.as_slice())
+    };
+    psbt.proprietary.retain(|key, _| !is_rgb(key));
+    for input in &mut psbt.inputs {
+        input.proprietary.retain(|key, _| !is_rgb(key));
+    }
+    for output in &mut psbt.outputs {
+        output.proprietary.retain(|key, _| !is_rgb(key));
+    }
+}
+
+/// Fail if the PSBT can't be parsed back (its global map exceeds MAX_VEC_SIZE).
+pub(crate) fn check_psbt_parsable(psbt: &Psbt) -> Result<(), Error> {
+    Psbt::deserialize(&psbt.serialize())
+        .map(|_| ())
+        .map_err(|e| Error::Internal {
+            details: format!("PSBT can't be parsed back: {e}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bdk_wallet::bitcoin::psbt::raw::ProprietaryKey;
     use std::str::FromStr;
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1665,5 +1695,74 @@ mod tests {
                 Err(WitnessResolverError::NotSupported)
             ));
         }
+    }
+
+    fn test_psbt() -> Psbt {
+        Psbt::from_unsigned_tx(BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn::default()],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    fn proprietary_key(prefix: &[u8], subtype: u8) -> ProprietaryKey {
+        ProprietaryKey {
+            prefix: prefix.to_vec(),
+            subtype,
+            key: vec![],
+        }
+    }
+
+    #[test]
+    fn strip_rgb_data_removes_only_rgb_keys() {
+        let prefixes: [&[u8]; 5] = [
+            &PSBT_RGB_PREFIX,
+            &PSBT_MPC_PREFIX,
+            &PSBT_OPRET_PREFIX,
+            &PSBT_TAPRET_PREFIX,
+            b"OTHER",
+        ];
+        let mut psbt = test_psbt();
+        for prefix in prefixes {
+            let key = proprietary_key(prefix, 0);
+            psbt.proprietary.insert(key.clone(), vec![1]);
+            psbt.inputs[0].proprietary.insert(key.clone(), vec![1]);
+            psbt.outputs[0].proprietary.insert(key, vec![1]);
+        }
+
+        strip_rgb_data(&mut psbt);
+
+        let other = vec![proprietary_key(b"OTHER", 0)];
+        for map in [
+            &psbt.proprietary,
+            &psbt.inputs[0].proprietary,
+            &psbt.outputs[0].proprietary,
+        ] {
+            assert_eq!(map.keys().cloned().collect::<Vec<_>>(), other);
+        }
+    }
+
+    #[test]
+    fn check_psbt_parsable_refuses_a_global_map_over_max_vec_size() {
+        let mut psbt = test_psbt();
+        assert_eq!(check_psbt_parsable(&psbt), Ok(()));
+        // the global map is read through a MAX_VEC_SIZE (4 MB) limit
+        for subtype in 0..5 {
+            psbt.proprietary.insert(
+                proprietary_key(&PSBT_RGB_PREFIX, subtype),
+                vec![0; 1_000_000],
+            );
+        }
+        assert!(matches!(
+            check_psbt_parsable(&psbt),
+            Err(Error::Internal { details }) if details.starts_with("PSBT can't be parsed back")
+        ));
+        strip_rgb_data(&mut psbt);
+        assert_eq!(check_psbt_parsable(&psbt), Ok(()));
     }
 }

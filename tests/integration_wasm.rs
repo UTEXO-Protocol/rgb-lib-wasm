@@ -6,7 +6,6 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 mod utils;
 
-use psrgbt::RgbOutExt;
 use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
 };
@@ -929,17 +928,11 @@ async fn test_full_wallet_flow() {
 
     // IFA inflation: inflate the IFA asset by 500
     let ifa_balance_before = ifa.balance.settled;
-    let unsigned_inflate = wallet
+    let inflate_begin = wallet
         .inflate_begin(online.clone(), ifa.asset_id.clone(), vec![500], 1, 1, false)
         .await
-        .unwrap()
-        .psbt;
-    let inflate_entropy = Psbt::from_str(&unsigned_inflate)
-        .unwrap()
-        .outputs
-        .iter()
-        .find_map(|o| o.mpc_entropy())
         .unwrap();
+    let unsigned_inflate = inflate_begin.psbt.clone();
     let signed_inflate = wallet.sign_psbt(unsigned_inflate, None).unwrap();
     let txid = psbt_txid(&signed_inflate);
     assert_refused(
@@ -955,7 +948,7 @@ async fn test_full_wallet_flow() {
         .await
         .unwrap();
     assert!(!inflate_result.txid.is_empty());
-    assert_eq!(inflate_result.entropy, inflate_entropy);
+    assert_eq!(inflate_result.entropy, inflate_begin.details.entropy);
     assert_refused(
         &mut wallet,
         &online,

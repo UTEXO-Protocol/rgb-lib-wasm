@@ -15,7 +15,7 @@ use crate::wallet::{
     ReceivedMint, Recipient, Wallet,
 };
 use crate::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, OS_MINT, RgbOutExt, TransferKind,
+    AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, OS_MINT, TransferKind,
     TransferStatus, TypeOfTransition, script_buf_from_recipient_id,
 };
 use amplify::ByteArray;
@@ -188,13 +188,6 @@ async fn bfa_mint_settles_and_is_spendable() {
     assert_eq!(res.details.opid.len(), 64);
     assert_eq!(res.details.min_confirmations, 1);
     let psbt = Psbt::from_str(&res.psbt).unwrap();
-    let opret = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .position(|o| o.script_pubkey.is_op_return())
-        .unwrap();
-    assert_eq!(psbt.outputs[opret].mpc_entropy(), Some(res.details.entropy));
 
     // an import of the mint needs an EVM RPC URL and a confirmed lock
     let txid = psbt.unsigned_tx.compute_txid().to_string();

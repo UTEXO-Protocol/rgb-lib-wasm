@@ -158,7 +158,9 @@ use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 #[cfg(feature = "esplora")]
 use hmac::{Mac, SimpleHmac};
-use psrgbt::{RgbOutExt, RgbPsbtExt};
+use psrgbt::{
+    PSBT_MPC_PREFIX, PSBT_OPRET_PREFIX, PSBT_RGB_PREFIX, PSBT_TAPRET_PREFIX, RgbOutExt, RgbPsbtExt,
+};
 use rand::{Rng, TryRng, distr::Alphanumeric, rngs::SysRng};
 #[cfg(feature = "esplora")]
 use reqwest::{Client as RestClient, header::CONTENT_TYPE, multipart};
@@ -241,6 +243,7 @@ use crate::no_wallet::{
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(feature = "esplora")]
 use crate::utils::{OffchainResolverWasm, PreFetchResolver, spv_proof_from_esplora};
+use crate::utils::{check_psbt_parsable, strip_rgb_data};
 #[cfg(feature = "esplora")]
 use crate::{
     api::{
