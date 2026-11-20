@@ -1309,6 +1309,9 @@ pub struct Wallet {
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
+    /// TXs this wallet broadcast in the running operation. A failed operation keeps them in BDK.
+    #[cfg(feature = "esplora")]
+    pub(crate) broadcast_txs: Vec<BdkTransaction>,
     pub(crate) idb_queue: std::rc::Rc<super::idb_store::SaveQueue>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Random id of this object in stored snapshots.
@@ -1476,6 +1479,8 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            broadcast_txs: Vec::new(),
             idb_queue: Default::default(),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer,
@@ -2023,6 +2028,18 @@ impl Wallet {
         precision: u8,
         amounts: Vec<u64>,
     ) -> Result<AssetNIA, Error> {
+        let cp = self.shared_checkpoint("issue_asset_nia");
+        let res = self._issue_asset_nia(ticker, name, precision, amounts);
+        self.commit_shared(cp, res)
+    }
+
+    fn _issue_asset_nia(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+    ) -> Result<AssetNIA, Error> {
         info!(
             self.logger,
             "Issuing NIA asset with ticker '{}' name '{}' precision '{}' amounts '{:?}'...",
@@ -2152,7 +2169,6 @@ impl Wallet {
         let asset = AssetNIA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.queue_save()?;
 
         info!(self.logger, "Issue asset NIA completed");
         Ok(asset)
@@ -2180,6 +2196,32 @@ impl Wallet {
     /// links and it cannot be linked yet.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+        inflation_amounts: Vec<u64>,
+        reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+    ) -> Result<AssetIFA, Error> {
+        let cp = self.shared_checkpoint("issue_asset_ifa");
+        let res = self._issue_asset_ifa(
+            ticker,
+            name,
+            precision,
+            amounts,
+            inflation_amounts,
+            reject_list_url,
+            link_right,
+            linked_from_contract,
+        );
+        self.commit_shared(cp, res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn _issue_asset_ifa(
         &self,
         ticker: String,
         name: String,
@@ -2416,7 +2458,6 @@ impl Wallet {
         let asset = AssetIFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.queue_save()?;
 
         info!(self.logger, "Issue asset IFA completed");
         Ok(asset)
@@ -2440,6 +2481,34 @@ impl Wallet {
     /// the one it replaces).
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+    ) -> Result<AssetBFA, Error> {
+        let cp = self.shared_checkpoint("issue_asset_bfa");
+        let res = self._issue_asset_bfa(
+            ticker,
+            name,
+            precision,
+            mint_rights,
+            chain_id,
+            contract_address,
+            reject_list_address,
+            link_right,
+            linked_from_contract,
+        );
+        self.commit_shared(cp, res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn _issue_asset_bfa(
         &self,
         ticker: String,
         name: String,
@@ -2629,7 +2698,6 @@ impl Wallet {
         let asset = AssetBFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.queue_save()?;
 
         info!(self.logger, "Issue asset BFA completed");
         Ok(asset)
@@ -2720,6 +2788,19 @@ impl Wallet {
         batch_transfer_idx: Option<i32>,
         no_asset_only: bool,
     ) -> Result<bool, Error> {
+        let cp = self.shared_checkpoint("delete_transfers");
+        let res = self._delete_transfers(batch_transfer_idx, no_asset_only);
+        if matches!(res, Ok(false)) {
+            return Ok(false);
+        }
+        self.commit_shared(cp, res)
+    }
+
+    fn _delete_transfers(
+        &self,
+        batch_transfer_idx: Option<i32>,
+        no_asset_only: bool,
+    ) -> Result<bool, Error> {
         info!(
             self.logger,
             "Deleting batch transfer with idx {:?}...", batch_transfer_idx
@@ -2782,7 +2863,6 @@ impl Wallet {
 
         if transfers_changed {
             self.update_backup_info(false)?;
-            self.queue_save()?;
         }
 
         info!(self.logger, "Delete transfer completed");
@@ -3134,6 +3214,12 @@ impl Wallet {
 
     /// Fail the begun vanilla operation with the given TXID and release its inputs.
     pub fn abort_pending_vanilla_tx(&self, txid: String) -> Result<(), Error> {
+        let cp = self.shared_checkpoint("abort_pending_vanilla_tx");
+        let res = self._abort_pending_vanilla_tx(txid);
+        self.commit_shared(cp, res)
+    }
+
+    fn _abort_pending_vanilla_tx(&self, txid: String) -> Result<(), Error> {
         info!(self.logger, "Aborting pending vanilla TX {}...", txid);
         let row = self
             .database
@@ -3147,7 +3233,6 @@ impl Wallet {
                 ..Default::default()
             })?;
         self.update_backup_info(false)?;
-        self.queue_save()?;
         info!(self.logger, "Abort pending vanilla TX completed");
         Ok(())
     }
@@ -3797,6 +3882,32 @@ impl Wallet {
         min_confirmations: u8,
         encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
+        let cp = self.checkpoint("blind_receive");
+        let res = self
+            ._blind_receive(
+                online,
+                asset_id,
+                assignment,
+                expiration_timestamp,
+                transport_endpoints,
+                min_confirmations,
+                encryption,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn _blind_receive(
+        &mut self,
+        online: Option<Online>,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
             "Receiving via blinded UTXO for asset '{:?}' with expiration '{}'...",
@@ -3818,7 +3929,6 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Blind receive completed");
         Ok(ReceiveData {
@@ -3868,6 +3978,32 @@ impl Wallet {
         min_confirmations: u8,
         encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
+        let cp = self.checkpoint("witness_receive");
+        let res = self
+            ._witness_receive(
+                online,
+                asset_id,
+                assignment,
+                expiration_timestamp,
+                transport_endpoints,
+                min_confirmations,
+                encryption,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn _witness_receive(
+        &mut self,
+        online: Option<Online>,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
             "Receiving via witness TX for asset '{:?}' with expiration '{}'...",
@@ -3889,7 +4025,6 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Witness receive completed");
         Ok(ReceiveData {
@@ -3925,13 +4060,18 @@ impl Wallet {
 
     /// Return a new Bitcoin address from the vanilla wallet.
     pub fn get_address(&mut self) -> Result<String, Error> {
+        let cp = self.checkpoint("get_address");
+        let res = self._get_address();
+        self.commit_queued(cp, res)
+    }
+
+    fn _get_address(&mut self) -> Result<String, Error> {
         info!(self.logger, "Getting address...");
         let address = self._get_new_address(KeychainKind::Internal)?;
 
         if !self.wallet_data.reuse_addresses {
             self.update_backup_info(false)?;
         }
-        self.queue_save()?;
 
         info!(self.logger, "Get address completed");
         Ok(address.to_string())
@@ -3942,6 +4082,12 @@ impl Wallet {
     /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
     /// index so subsequent address generation returns a fresh address.
     pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
+        let cp = self.checkpoint("rotate_address");
+        let res = self._rotate_address(keychain);
+        self.commit_queued(cp, res)
+    }
+
+    fn _rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
         if !self.wallet_data.reuse_addresses {
             return Err(Error::AddressReuseDisabled);
         }
@@ -3956,10 +4102,31 @@ impl Wallet {
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         let address = self.bdk_wallet.peek_address(keychain, new_index).address;
 
-        self.queue_save()?;
-
         Ok(address.to_string())
     }
+}
+
+/// The state an operation on `&self` can change.
+pub(crate) struct SharedCheckpoint {
+    op: &'static str,
+    database: RgbLibDb,
+    stock: Option<MemRgbStore>,
+}
+
+/// The wallet state an operation can change, restored when the operation fails.
+pub(crate) struct Checkpoint {
+    shared: SharedCheckpoint,
+    bdk_changeset: ChangeSet,
+    #[cfg(feature = "esplora")]
+    transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
+    #[cfg(feature = "esplora")]
+    received_consignments: HashMap<String, Vec<u8>>,
+    #[cfg(feature = "esplora")]
+    received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
+    #[cfg(feature = "esplora")]
+    received_signed_txs: HashMap<String, Vec<u8>>,
+    received_mints: HashMap<String, ReceivedMint>,
+    reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
 /// IndexedDB persistence: save wallet state after mutations.
@@ -4117,54 +4284,7 @@ impl Wallet {
 
         // Load the BDK wallet from the changeset into a new store
         if let Some(changeset) = snapshot.bdk_changeset {
-            let mut bdk_database: BdkPersister = super::memory_store::MemoryStore::new();
-            bdk_database.set_data(Some(changeset));
-
-            // Reconstruct descriptors (same logic as Wallet::new)
-            let wdata = &self.wallet_data;
-            let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
-            let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
-            let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
-
-            let (desc_colored, desc_vanilla) = if let Some(mnemonic) = &wdata.mnemonic {
-                get_descriptors(
-                    wdata.bitcoin_network,
-                    mnemonic,
-                    wdata.vanilla_keychain,
-                    xpub_btc,
-                    xpub_rgb,
-                )?
-            } else {
-                get_descriptors_from_xpubs(
-                    wdata.bitcoin_network,
-                    &wdata.master_fingerprint,
-                    xpub_rgb,
-                    xpub_btc,
-                    wdata.vanilla_keychain,
-                )?
-            };
-
-            let chain_net: ChainNet = wdata.bitcoin_network.into();
-            let wallet_params = BdkWallet::load()
-                .descriptor(KeychainKind::External, Some(desc_colored))
-                .descriptor(KeychainKind::Internal, Some(desc_vanilla))
-                .check_genesis_hash(BlockHash::from_byte_array(
-                    chain_net.chain_hash().to_bytes(),
-                ));
-
-            let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database) {
-                Ok(Some(wallet)) => wallet,
-                Ok(None) => {
-                    return Err(Error::Persistence {
-                        details: s!("persisted BDK changeset did not contain a loadable wallet"),
-                    });
-                }
-                Err(error) => {
-                    return Err(Error::Persistence {
-                        details: format!("failed to load persisted BDK wallet: {error}"),
-                    });
-                }
-            };
+            let (bdk_database, bdk_wallet) = self.load_bdk(changeset)?;
             // All parts are valid. Nothing below can fail.
             self.bdk_database = bdk_database;
             self.bdk_wallet = bdk_wallet;
@@ -4186,6 +4306,191 @@ impl Wallet {
         *self.rgb_stock.borrow_mut() = Some(stock);
 
         Ok(())
+    }
+
+    /// Load a BDK wallet from `changeset` into a new store.
+    fn load_bdk(
+        &self,
+        changeset: ChangeSet,
+    ) -> Result<(BdkPersister, PersistedWallet<BdkPersister>), Error> {
+        let mut bdk_database: BdkPersister = super::memory_store::MemoryStore::new();
+        bdk_database.set_data(Some(changeset));
+
+        // Reconstruct descriptors (same logic as Wallet::new)
+        let wdata = &self.wallet_data;
+        let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
+        let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
+        let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
+
+        let (desc_colored, desc_vanilla) = if let Some(mnemonic) = &wdata.mnemonic {
+            get_descriptors(
+                wdata.bitcoin_network,
+                mnemonic,
+                wdata.vanilla_keychain,
+                xpub_btc,
+                xpub_rgb,
+            )?
+        } else {
+            get_descriptors_from_xpubs(
+                wdata.bitcoin_network,
+                &wdata.master_fingerprint,
+                xpub_rgb,
+                xpub_btc,
+                wdata.vanilla_keychain,
+            )?
+        };
+
+        let chain_net: ChainNet = wdata.bitcoin_network.into();
+        let wallet_params = BdkWallet::load()
+            .descriptor(KeychainKind::External, Some(desc_colored))
+            .descriptor(KeychainKind::Internal, Some(desc_vanilla))
+            .check_genesis_hash(BlockHash::from_byte_array(
+                chain_net.chain_hash().to_bytes(),
+            ));
+
+        let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database) {
+            Ok(Some(wallet)) => wallet,
+            Ok(None) => {
+                return Err(Error::Persistence {
+                    details: s!("persisted BDK changeset did not contain a loadable wallet"),
+                });
+            }
+            Err(error) => {
+                return Err(Error::Persistence {
+                    details: format!("failed to load persisted BDK wallet: {error}"),
+                });
+            }
+        };
+        Ok((bdk_database, bdk_wallet))
+    }
+
+    /// Return the BDK changeset with the staged changes.
+    pub(crate) fn bdk_changeset(&self) -> ChangeSet {
+        let mut changeset = self.bdk_database.get_data().clone().unwrap_or_default();
+        if let Some(staged) = self.bdk_wallet.staged() {
+            changeset.merge(staged.clone());
+        }
+        changeset
+    }
+
+    pub(crate) fn shared_checkpoint(&self, op: &'static str) -> SharedCheckpoint {
+        SharedCheckpoint {
+            op,
+            database: (*self.database).clone(),
+            stock: self
+                .rgb_stock
+                .borrow()
+                .as_ref()
+                .map(|s| s.as_store().clone()),
+        }
+    }
+
+    pub(crate) fn checkpoint(&mut self, op: &'static str) -> Checkpoint {
+        #[cfg(feature = "esplora")]
+        self.broadcast_txs.clear();
+        Checkpoint {
+            shared: self.shared_checkpoint(op),
+            bdk_changeset: self.bdk_changeset(),
+            #[cfg(feature = "esplora")]
+            transfer_artifacts: self.transfer_artifacts.clone(),
+            #[cfg(feature = "esplora")]
+            received_consignments: self.received_consignments.clone(),
+            #[cfg(feature = "esplora")]
+            received_consignment_meta: self.received_consignment_meta.clone(),
+            #[cfg(feature = "esplora")]
+            received_signed_txs: self.received_signed_txs.clone(),
+            received_mints: self.received_mints.clone(),
+            reuse_address_index: self.reuse_address_index.clone(),
+        }
+    }
+
+    pub(crate) fn rollback_shared(&self, cp: SharedCheckpoint) {
+        self.database.restore(cp.database);
+        *self.rgb_stock.borrow_mut() = cp.stock.map(Stock::with);
+    }
+
+    fn rollback(&mut self, cp: Checkpoint) {
+        let op = cp.shared.op;
+        self.rollback_shared(cp.shared);
+        #[cfg(feature = "esplora")]
+        {
+            self.transfer_artifacts = cp.transfer_artifacts;
+            self.received_consignments = cp.received_consignments;
+            self.received_consignment_meta = cp.received_consignment_meta;
+            self.received_signed_txs = cp.received_signed_txs;
+        }
+        self.received_mints = cp.received_mints;
+        self.reuse_address_index = cp.reuse_address_index;
+        #[cfg(feature = "esplora")]
+        if !self.broadcast_txs.is_empty() {
+            // a broadcast TX stays in BDK, as its change can pay an address revealed here
+            let last_seen = (now().unix_timestamp() as u64).saturating_add(1);
+            let txs = self.broadcast_txs.iter().cloned().map(|tx| (tx, last_seen));
+            self.bdk_wallet.apply_unconfirmed_txs(txs);
+            if let Err(e) = self.bdk_wallet.persist(&mut self.bdk_database) {
+                error!(self.logger, "Cannot keep the TXs broadcast in {op}: {e}");
+            }
+            return;
+        }
+        if self.bdk_changeset() != cp.bdk_changeset {
+            match self.load_bdk(cp.bdk_changeset) {
+                Ok((bdk_database, bdk_wallet)) => {
+                    self.bdk_database = bdk_database;
+                    self.bdk_wallet = bdk_wallet;
+                }
+                Err(e) => error!(self.logger, "Cannot restore BDK after {op}: {e}"),
+            }
+        }
+    }
+
+    /// End an operation: save its result, or restore `cp` when it fails with an error not kept.
+    pub(crate) async fn commit<T>(
+        &mut self,
+        cp: Checkpoint,
+        res: Result<T, Error>,
+        keep: fn(&Error) -> bool,
+    ) -> Result<T, Error> {
+        let res = res.and_then(|v| fault_point(cp.shared.op).map(|()| v));
+        match res {
+            Err(e) if !keep(&e) => {
+                self.rollback(cp);
+                Err(e)
+            }
+            res => {
+                self.flush().await?;
+                res
+            }
+        }
+    }
+
+    /// End an operation as [`commit`](Wallet::commit) does, with a queued save.
+    pub(crate) fn commit_queued<T>(
+        &mut self,
+        cp: Checkpoint,
+        res: Result<T, Error>,
+    ) -> Result<T, Error> {
+        let res = res.and_then(|v| fault_point(cp.shared.op).map(|()| v));
+        if res.is_err() {
+            self.rollback(cp);
+            return res;
+        }
+        self.queue_save()?;
+        res
+    }
+
+    /// End an operation on `&self` as [`commit_queued`](Wallet::commit_queued) does.
+    pub(crate) fn commit_shared<T>(
+        &self,
+        cp: SharedCheckpoint,
+        res: Result<T, Error>,
+    ) -> Result<T, Error> {
+        let res = res.and_then(|v| fault_point(cp.op).map(|()| v));
+        if res.is_err() {
+            self.rollback_shared(cp);
+            return res;
+        }
+        self.queue_save()?;
+        res
     }
 }
 
@@ -4269,6 +4574,8 @@ pub(crate) mod address_reuse_tests {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            broadcast_txs: Vec::new(),
             idb_queue: Default::default(),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer: 0,
@@ -4277,6 +4584,82 @@ pub(crate) mod address_reuse_tests {
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Return all the state an operation can change.
+    pub(crate) fn state(wallet: &Wallet) -> serde_json::Value {
+        serde_json::json!({
+            "db": &*wallet.database,
+            "bdk": wallet.bdk_changeset(),
+            "stock": wallet
+                .rgb_stock
+                .borrow()
+                .as_ref()
+                .map(super::super::idb_store::serialize_stock),
+            "transfer_artifacts": wallet.transfer_artifacts,
+            "received_consignments": wallet.received_consignments,
+            "received_consignment_meta": wallet.received_consignment_meta,
+            "received_signed_txs": wallet.received_signed_txs,
+            "received_mints": wallet.received_mints,
+            "reuse_address_index": wallet.reuse_address_index,
+        })
+    }
+
+    /// Fail `call` at `fault` and check that it changed nothing but BDK for its broadcasts.
+    /// Return the txids it broadcast.
+    pub(crate) async fn assert_no_partial_change<T>(
+        wallet: &mut Wallet,
+        fault: &'static str,
+        broadcasts: usize,
+        call: impl AsyncFnOnce(&mut Wallet) -> Result<T, Error>,
+    ) -> Vec<String> {
+        let mut before = state(wallet);
+        crate::utils::FAULT.with(|f| f.set(Some(fault)));
+        let res = call(wallet).await;
+        crate::utils::FAULT.with(|f| f.set(None));
+        assert_eq!(
+            res.err(),
+            Some(Error::Internal {
+                details: format!("fault injected in {fault}")
+            })
+        );
+        assert_eq!(wallet.broadcast_txs.len(), broadcasts);
+        let mut after = state(wallet);
+        if broadcasts > 0 {
+            before["bdk"].take();
+            after["bdk"].take();
+            for tx in &wallet.broadcast_txs {
+                assert!(wallet.bdk_wallet.get_tx(tx.compute_txid()).is_some());
+            }
+        }
+        assert_eq!(after, before);
+        wallet
+            .broadcast_txs
+            .iter()
+            .map(|tx| tx.compute_txid().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn get_address_is_atomic() {
+        let mut wallet = make_test_wallet(false);
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "get_address",
+            0,
+            async |w| w.get_address(),
+        ));
+    }
+
+    #[test]
+    fn rotate_address_is_atomic() {
+        let mut wallet = make_test_wallet(true);
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "rotate_address",
+            0,
+            async |w| w.rotate_address(KeychainKind::Internal),
+        ));
     }
 
     #[test]

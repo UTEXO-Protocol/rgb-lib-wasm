@@ -4,6 +4,7 @@ use wasm_bindgen_test::*;
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
 use super::test_send::witness_ord;
+use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, state};
 use crate::wallet::rust_only::validate_consignment_offchain;
 use crate::wallet::{
     AssetFilter, Balance, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData,
@@ -955,8 +956,9 @@ async fn bfa_mint_begin_reserves_inputs() {
         "{result:?}"
     );
 
-    // a failed post releases the inputs
+    // a failed post leaves no transfer
     let rcv = mint_rcv(&mut b, &b_online).await;
+    let before = state(&a);
     rpc_fail(PROXY_URL, "consignment.post");
     let result = mint_begin(
         &mut a,
@@ -967,10 +969,7 @@ async fn bfa_mint_begin_reserves_inputs() {
     .await;
     clear_rpc_hooks();
     assert!(result.is_err(), "{result:?}");
-    assert_eq!(
-        transfer_status(&mut a, &rcv.recipient_id),
-        TransferStatus::Failed
-    );
+    assert_eq!(state(&a), before);
     assert!(a.get_reserved_outpoints().unwrap().is_empty());
 }
 
@@ -1037,6 +1036,12 @@ async fn bfa_mint_lock_before_block() {
         transfer_status(&mut a, &receive.recipient_id),
         TransferStatus::Failed
     );
+    let mut copy = Wallet::restore(a.get_wallet_data()).await.unwrap();
+    assert_eq!(
+        transfer_status(&mut copy, &receive.recipient_id),
+        TransferStatus::Failed
+    );
+    assert!(copy.get_reserved_outpoints().unwrap().is_empty());
     let result = mint_end(&mut a, &a_online, &res).await;
     assert!(
         matches!(result, Err(Error::CannotEndTransfer { .. })),
@@ -1453,6 +1458,11 @@ async fn bfa_mint_never_failed_by_clock() {
         evm_block_number().await,
     )
     .await;
+    assert!(
+        b.get_received_mint(receive.recipient_id.clone())
+            .unwrap()
+            .is_none()
+    );
     let result = b
         .fail_transfers(
             b_online.clone(),
@@ -1467,6 +1477,12 @@ async fn bfa_mint_never_failed_by_clock() {
     );
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    let copy = Wallet::restore(b.get_wallet_data()).await.unwrap();
+    assert!(
+        copy.get_received_mint(receive.recipient_id.clone())
             .unwrap()
             .is_some()
     );
@@ -1500,4 +1516,59 @@ async fn bfa_mint_never_failed_by_clock() {
         transfer_status(&mut b, &receive.recipient_id),
         TransferStatus::Failed
     );
+}
+
+#[wasm_bindgen_test]
+async fn bfa_mint_is_atomic() {
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(2, 1, None).await;
+    assert_no_partial_change(&mut a, "issue_asset_bfa", 0, async |w| {
+        w.issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            1,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+        )
+    })
+    .await;
+
+    let rcv = mint_rcv(&mut b, &b_online).await;
+    let before_block = evm_block_number().await + 1000;
+    let res = mint_begin_before(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&rcv, MINT_AMOUNT),
+        before_block,
+    )
+    .await
+    .unwrap();
+    // a failed refresh forgets the mint it checked
+    assert_no_partial_change(&mut b, "refresh", 0, async |w| {
+        w.refresh(b_online.clone(), None, vec![], false).await
+    })
+    .await;
+    assert!(
+        b.get_received_mint(rcv.recipient_id.clone())
+            .unwrap()
+            .is_none()
+    );
+    b.refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert!(
+        b.get_received_mint(rcv.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    lock_mint(&bridge, &res, MINT_AMOUNT).await;
+    assert_no_partial_change(&mut a, "mint_end", 1, async |w| {
+        mint_end(w, &a_online, &res).await
+    })
+    .await;
 }

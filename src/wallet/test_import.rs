@@ -3,6 +3,7 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, settle_both, wallet_data};
+use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{Balance, Invoice, Online, Wallet, WalletData};
 use crate::{AssetSchema, Assignment, Error, FileContent, OS_ASSET, RgbTransfer, TransferStatus};
 use rgbstd::Opout;
@@ -75,6 +76,10 @@ async fn import_contract_then_receive() {
     .await;
     assert!(matches!(unknown, Err(Error::AssetNotFound { .. })));
 
+    assert_no_partial_change(&mut b, "save_new_asset", 0, async |w| {
+        w.save_new_asset(b_on.clone(), &bytes, &txid).await
+    })
+    .await;
     b.save_new_asset(b_on.clone(), &bytes, &txid).await.unwrap();
     assert_eq!(nia_listed(&b), vec![(asset_id.clone(), zero())]);
     // a second import changes nothing
