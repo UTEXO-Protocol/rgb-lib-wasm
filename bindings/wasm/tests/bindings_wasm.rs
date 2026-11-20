@@ -6,7 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::wallet::{DatabaseType, ReceiveData, WalletData};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
-use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet, max_expiration_secs};
+use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet, inspect_consignment, max_expiration_secs};
 
 fn wallet() -> WasmWallet {
     wallet_with_schemas(vec![AssetSchema::Nia])
@@ -328,4 +328,31 @@ fn max_expiration_secs_is_exposed() {
         max_expiration_secs(),
         rgb_lib_wasm::wallet::MAX_EXPIRATION_SECS
     );
+}
+
+#[wasm_bindgen_test]
+fn inspect_consignment_js() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/inspection/send.rgbc"
+    ));
+    let get = |v: &JsValue, key: &str| js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap();
+    let error = |filter: JsValue, bytes: &[u8]| {
+        inspect_consignment(bytes, filter)
+            .unwrap_err()
+            .as_string()
+            .unwrap()
+    };
+
+    let inspection = inspect_consignment(bytes, JsValue::from_str("Terminals")).unwrap();
+    assert_eq!(get(&inspection, "isTransfer"), JsValue::TRUE);
+    assert_eq!(get(&inspection, "assetSchema"), JsValue::from_str("Nia"));
+    let witnesses: js_sys::Array = get(&inspection, "witnesses").dyn_into().unwrap();
+    assert_eq!(witnesses.length(), 1);
+
+    let filter = js_sys::Object::new();
+    js_sys::Reflect::set(&filter, &"Witness".into(), &"invalid".into()).unwrap();
+    assert!(error(filter.into(), bytes).contains("Invalid TXID"));
+    assert!(error(JsValue::from_str("All"), &[0]).contains("Invalid consignment"));
+    assert!(error(JsValue::from_str("Bogus"), bytes).starts_with("Invalid bundle filter"));
 }

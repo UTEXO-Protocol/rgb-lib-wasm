@@ -1,0 +1,47 @@
+{
+  "consignment_id": "rgb:csg:E8dv39_f-tO9kldg-4or7WZA-eRYFM8B-KvcUNd_-mzlE_9k#heavy-lava-bogart",
+  "version": 1,
+  "is_transfer": false,
+  "asset_id": "rgb:qBHncsSv-Zm7ghQ1-CfbrpaV-Oczo~8q-AIsvvys-tLGiRDg",
+  "asset_schema": "Ifa",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795085543,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": 666,
+    "max_supply": 666,
+    "linked_from_contract": "rgb:6SaCdk4l-ePzAB~V-MtJIYMO-0oHh4wd-n0CATt3-z3kC3nc",
+    "bridge_location": null,
+    "reject_list": null,
+    "media": [],
+    "outputs": [
+      {
+        "txid": "b40c2f0319b763ec833f05e7671aba24ccfc3c752f5f9d452ea9c6c24a463254",
+        "vout": 6,
+        "blinding": 14072836063399315029,
+        "assignment": {
+          "Fungible": 666
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      },
+      {
+        "txid": "b40c2f0319b763ec833f05e7671aba24ccfc3c752f5f9d452ea9c6c24a463254",
+        "vout": 9,
+        "blinding": 12141732221908301043,
+        "assignment": "LinkRight",
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": []
+}

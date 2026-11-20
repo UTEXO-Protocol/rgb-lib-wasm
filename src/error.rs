@@ -672,6 +672,13 @@ pub enum Error {
         details: String,
     },
 
+    /// Error during RGB inspection
+    #[error("Error during RGB inspection: {details}")]
+    RgbInspection {
+        /// Error details
+        details: String,
+    },
+
     /// The proxy's registered signed TX for this operation was previously cleared
     #[error("Signed TX was cleared")]
     SignedTxCleared,

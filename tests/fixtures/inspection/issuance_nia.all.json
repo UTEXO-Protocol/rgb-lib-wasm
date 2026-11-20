@@ -1,0 +1,37 @@
+{
+  "consignment_id": "rgb:csg:5l3qITug-sVdvZWp-em_K~aG-Ss2aiwi-Bj6F_3h-aqHNYcU#watch-static-fiesta",
+  "version": 1,
+  "is_transfer": false,
+  "asset_id": "rgb:8aQZphyw-MR8uSRT-VHjSE~I-YxpKqI9-~OQBMDK-NFKm4rk",
+  "asset_schema": "Nia",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795085543,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": 666,
+    "max_supply": null,
+    "linked_from_contract": null,
+    "bridge_location": null,
+    "reject_list": null,
+    "media": [],
+    "outputs": [
+      {
+        "txid": "867f89890411bd0c8deb51ab48b08dab274ad612dca1fbd0a0a960e291ad8a89",
+        "vout": 5,
+        "blinding": 9977732641846843130,
+        "assignment": {
+          "Fungible": 666
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": []
+}

@@ -1,0 +1,84 @@
+{
+  "consignment_id": "rgb:csg:MnpWnifQ-8ejZ5za-weG1bs1-O79mklv-nHLmBzM-8_PmKLg#academy-whiskey-cave",
+  "version": 1,
+  "is_transfer": true,
+  "asset_id": "rgb:OMsZiT5Q-mxkeZzo-HK27r8~-B9ykhUo-xSjC1Lw-1u6AvTU",
+  "asset_schema": "Ifa",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795089191,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": 666,
+    "max_supply": 666,
+    "linked_from_contract": null,
+    "bridge_location": null,
+    "reject_list": null,
+    "media": [],
+    "outputs": [
+      {
+        "txid": "e65988eb494991148296f6c3d2c79d7765672967cbab0148f9a670a52f0f1917",
+        "vout": 3,
+        "blinding": 4363122356426393658,
+        "assignment": {
+          "Fungible": 666
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      },
+      {
+        "txid": "e65988eb494991148296f6c3d2c79d7765672967cbab0148f9a670a52f0f1917",
+        "vout": 4,
+        "blinding": 606109815212414622,
+        "assignment": "LinkRight",
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": [
+    {
+      "txid": "69068922ebb0710b50b620aa7a7ca226276eb884dd3205aeabbf05c938e547ed",
+      "close_method": "opretFirst",
+      "commitment_hex": "db03813dab30ce33a09c4f88a699e471a02324bfd770d122f19f959a7f6f987a",
+      "operations": [
+        {
+          "asset_id": "rgb:OMsZiT5Q-mxkeZzo-HK27r8~-B9ykhUo-xSjC1Lw-1u6AvTU",
+          "committed_transition_count": 1,
+          "committed_input_count": 1,
+          "transitions": [
+            {
+              "type": "Link",
+              "opid": "d2faff4fdc2bf56151bc9791a3d51e049454dd22c6883bbcc7aef1f050322ce1",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "38cb19893e509b191e673a072b6eebf3f07dca4854a314a30b52f0d6ee80bd35",
+                    "assignment_type": "LinkRight",
+                    "index": 0
+                  },
+                  "vin": 0,
+                  "assignment": "LinkRight"
+                }
+              ],
+              "outputs": [],
+              "globals": [
+                {
+                  "LinkedToContract": "rgb:b2wJYApv-twfwDnz-TmSRO0F-pvp1UrD-njQ~dMS-aQg52mM"
+                }
+              ],
+              "metadata": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+{
+  "consignment_id": "rgb:csg:eS1SUUUk-H_gFM90-Hpuwj_b-72F8hlN-_AVXWlf-96DrGm4#denver-poetic-model",
+  "version": 1,
+  "is_transfer": true,
+  "asset_id": "rgb:04LMi883-k0H9UGu-jUWmJfH-Q~yRe_q-FKnQzrd-cwO~ij4",
+  "asset_schema": "Nia",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795085543,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": 666,
+    "max_supply": null,
+    "linked_from_contract": null,
+    "bridge_location": null,
+    "reject_list": null,
+    "media": [],
+    "outputs": [
+      {
+        "txid": "b40c2f0319b763ec833f05e7671aba24ccfc3c752f5f9d452ea9c6c24a463254",
+        "vout": 5,
+        "blinding": 9812260919857100156,
+        "assignment": {
+          "Fungible": 666
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": [
+    {
+      "txid": "7c0c63b24f64e00e9d6d1d0ee6834674cc1295c12a1baa8c29332a5d1fa74019",
+      "close_method": "opretFirst",
+      "commitment_hex": "c4a0d6a8330731af8fe41edc4e6c76d4ae7ffa9a297ac0803ae9d38a524c0436",
+      "operations": [
+        {
+          "asset_id": "rgb:04LMi883-k0H9UGu-jUWmJfH-Q~yRe_q-FKnQzrd-cwO~ij4",
+          "committed_transition_count": 1,
+          "committed_input_count": 1,
+          "transitions": [
+            {
+              "type": "Transfer",
+              "opid": "ab8c1822a0e344dfa66ff28c5ce8498f5b9364c3f8426a1599b26643d64e2eff",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "d382cc8bcf379341fd506ba35169897c743fc917bea852a7433add7303bf8a3e",
+                    "assignment_type": "Asset",
+                    "index": 0
+                  },
+                  "vin": 0,
+                  "assignment": {
+                    "Fungible": 666
+                  }
+                }
+              ],
+              "outputs": [
+                {
+                  "txid": "7c0c63b24f64e00e9d6d1d0ee6834674cc1295c12a1baa8c29332a5d1fa74019",
+                  "vout": 1,
+                  "blinding": 14669040338971665963,
+                  "assignment": {
+                    "Fungible": 77
+                  },
+                  "is_concealed": false,
+                  "recipient_id": null,
+                  "is_ours": null,
+                  "is_terminal": false
+                },
+                {
+                  "txid": "7c0c63b24f64e00e9d6d1d0ee6834674cc1295c12a1baa8c29332a5d1fa74019",
+                  "vout": 2,
+                  "blinding": 4105158327384542857,
+                  "assignment": {
+                    "Fungible": 523
+                  },
+                  "is_concealed": false,
+                  "recipient_id": null,
+                  "is_ours": null,
+                  "is_terminal": false
+                },
+                {
+                  "txid": "595b114cef19ece06db59e912eab81a8e54240f0aa723e6e36ec252c972019cc",
+                  "vout": 0,
+                  "blinding": 66218537120701027,
+                  "assignment": {
+                    "Fungible": 66
+                  },
+                  "is_concealed": false,
+                  "recipient_id": null,
+                  "is_ours": null,
+                  "is_terminal": false
+                }
+              ],
+              "globals": [],
+              "metadata": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "txid": "34feb25283b86e27c95d5017264978d067644015fdda9983b9f6ee2e944226be",
+      "close_method": "opretFirst",
+      "commitment_hex": "d90c05de1a59fe842127cb60d0adb4b9c4c0de05af4553b41fd568c16c7a6570",
+      "operations": [
+        {
+          "asset_id": "rgb:04LMi883-k0H9UGu-jUWmJfH-Q~yRe_q-FKnQzrd-cwO~ij4",
+          "committed_transition_count": 1,
+          "committed_input_count": 2,
+          "transitions": [
+            {
+              "type": "Transfer",
+              "opid": "dde8db0402d061d14731ba29a1dbbf7fea86385fd9589d537ae707629db11aef",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "ab8c1822a0e344dfa66ff28c5ce8498f5b9364c3f8426a1599b26643d64e2eff",
+                    "assignment_type": "Asset",
+                    "index": 0
+                  },
+                  "vin": 0,
+                  "assignment": {
+                    "Fungible": 77
+                  }
+                },
+                {
+                  "opout": {
+                    "opid": "ab8c1822a0e344dfa66ff28c5ce8498f5b9364c3f8426a1599b26643d64e2eff",
+                    "assignment_type": "Asset",
+                    "index": 2
+                  },
+                  "vin": 1,
+                  "assignment": {
+                    "Fungible": 66
+                  }
+                }
+              ],
+              "outputs": [
+                {
+                  "txid": null,
+                  "vout": null,
+                  "blinding": null,
+                  "assignment": {
+                    "Fungible": 143
+                  },
+                  "is_concealed": true,
+                  "recipient_id": "bcrt:utxob:5UwSHYZB-Ynvp8oI-Z6rknJS-D7oyH7o-Wac0sba-j_vhyqy-2MTHI",
+                  "is_ours": null,
+                  "is_terminal": true
+                }
+              ],
+              "globals": [],
+              "metadata": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
