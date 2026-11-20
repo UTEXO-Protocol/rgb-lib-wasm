@@ -1418,18 +1418,20 @@ impl InMemoryDb {
             .filter(|a| a.asset_id == Some(asset_id.clone()))
             .collect();
 
-        let settled: u64 = ass_allocations
+        // Pending transfers can double-spend each other, and an asset with no fixed supply can
+        // hold more than u64::MAX in total. So the sums use u128 and the balances cap at u64::MAX.
+        let settled: u128 = ass_allocations
             .iter()
             .filter(|a| a.settled())
-            .map(|a| a.assignment.main_amount())
+            .map(|a| u128::from(a.assignment.main_amount()))
             .sum();
 
-        let mut ass_pending_incoming: u64 = ass_allocations
+        let allocations_pending_incoming: u128 = ass_allocations
             .iter()
             .filter(|a| !a.txo_spent && a.incoming && a.status.pending())
-            .map(|a| a.assignment.main_amount())
+            .map(|a| u128::from(a.assignment.main_amount()))
             .sum();
-        let witness_pending: u64 = transfers
+        let witness_pending: u128 = transfers
             .iter()
             .filter(|t| {
                 t.incoming && matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
@@ -1441,11 +1443,12 @@ impl InMemoryDb {
                             if at.asset_id.as_deref() != Some(asset_id.as_str()) {
                                 return None;
                             }
-                            Some(Ok(t
-                                .requested_assignment
-                                .as_ref()
-                                .map(|a| a.main_amount())
-                                .unwrap_or(0)))
+                            Some(Ok(u128::from(
+                                t.requested_assignment
+                                    .as_ref()
+                                    .map(|a| a.main_amount())
+                                    .unwrap_or(0),
+                            )))
                         } else {
                             None
                         }
@@ -1453,20 +1456,21 @@ impl InMemoryDb {
                     Err(e) => Some(Err(e)),
                 },
             )
-            .collect::<Result<Vec<u64>, InternalError>>()?
+            .collect::<Result<Vec<u128>, InternalError>>()?
             .iter()
             .sum();
-        ass_pending_incoming += witness_pending;
-        let ass_pending_outgoing: u64 = ass_allocations
+        let ass_pending_incoming = allocations_pending_incoming + witness_pending;
+        let ass_pending_outgoing: u128 = ass_allocations
             .iter()
             .filter(|a| !a.incoming && a.status.pending())
-            .map(|a| a.assignment.main_amount())
+            .map(|a| u128::from(a.assignment.main_amount()))
             .sum();
-        let ass_pending: i128 = ass_pending_incoming as i128 - ass_pending_outgoing as i128;
 
-        let future = settled as i128 + ass_pending;
+        let future = (settled + ass_pending_incoming)
+            .checked_sub(ass_pending_outgoing)
+            .expect("pending outgoing cannot exceed available balance");
 
-        let unspendable: u64 = txos_allocations
+        let unspendable: u128 = txos_allocations
             .iter()
             .filter(|u| {
                 let unspent_with_pending = !u.utxo.spent
@@ -1479,21 +1483,23 @@ impl InMemoryDb {
                         .any(|a| !a.incoming && a.status.waiting_confirmations());
                 unspent_with_pending || spent_waiting
             })
-            .map(|u| {
+            .flat_map(|u| {
                 u.rgb_allocations
                     .iter()
                     .filter(|a| a.asset_id == Some(asset_id.clone()) && a.settled())
-                    .map(|a| a.assignment.main_amount())
-                    .sum::<u64>()
+                    .map(|a| u128::from(a.assignment.main_amount()))
             })
             .sum();
 
-        let spendable = settled.saturating_sub(unspendable);
+        let spendable = settled
+            .checked_sub(unspendable)
+            .expect("unspendable allocations are a subset of settled ones");
 
+        let capped = |amount: u128| u64::try_from(amount).unwrap_or(u64::MAX);
         Ok(Balance {
-            settled,
-            future: future as u64,
-            spendable,
+            settled: capped(settled),
+            future: capped(future),
+            spendable: capped(spendable),
         })
     }
 
@@ -2517,6 +2523,119 @@ mod tests {
         assert_eq!(balance.settled, 0);
         assert_eq!(balance.future, 0);
         assert_eq!(balance.spendable, 0);
+    }
+
+    fn set_balance_allocations(
+        status: TransferStatus,
+        coloring_type: ColoringType,
+        amount: u64,
+    ) -> InMemoryDb {
+        let db = make_db();
+        for i in 1..=2 {
+            let bt = db
+                .set_batch_transfer(make_batch_transfer_mod(status))
+                .unwrap();
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            db.set_transfer(make_transfer_mod(at, true)).unwrap();
+            let txo = db
+                .set_txo(make_txo_mod(&format!("tx{i}"), 0, "1000"))
+                .unwrap();
+            db.set_coloring(make_coloring_mod(txo, at, coloring_type, amount))
+                .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn test_get_asset_balance_pending_incoming_past_u64() {
+        let db = set_balance_allocations(
+            TransferStatus::WaitingConfirmations,
+            ColoringType::Receive,
+            u64::MAX - 1,
+        );
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            Balance {
+                settled: 0,
+                future: u64::MAX,
+                spendable: 0
+            }
+        );
+
+        let add_witness = |db: &InMemoryDb| {
+            let bt = db
+                .set_batch_transfer(make_batch_transfer_mod(
+                    TransferStatus::WaitingConfirmations,
+                ))
+                .unwrap();
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            db.set_transfer(DbTransferActMod {
+                requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(u64::MAX - 1))),
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None })),
+                ..make_transfer_mod(at, true)
+            })
+            .unwrap();
+        };
+        let pending_past_u64 = Balance {
+            settled: 0,
+            future: u64::MAX,
+            spendable: 0,
+        };
+
+        // witness transfers only
+        let db = make_db();
+        add_witness(&db);
+        add_witness(&db);
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            pending_past_u64
+        );
+
+        // one allocation and one witness transfer
+        let db = make_db();
+        let bt = db
+            .set_batch_transfer(make_batch_transfer_mod(
+                TransferStatus::WaitingConfirmations,
+            ))
+            .unwrap();
+        let at = db
+            .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+            .unwrap();
+        db.set_transfer(make_transfer_mod(at, true)).unwrap();
+        let txo = db.set_txo(make_txo_mod("tx1", 0, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(
+            txo,
+            at,
+            ColoringType::Receive,
+            u64::MAX - 1,
+        ))
+        .unwrap();
+        add_witness(&db);
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            pending_past_u64
+        );
+    }
+
+    #[test]
+    fn test_get_asset_balance_settled_past_u64() {
+        let db = set_balance_allocations(TransferStatus::Settled, ColoringType::Issue, u64::MAX);
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            Balance {
+                settled: u64::MAX,
+                future: u64::MAX,
+                spendable: u64::MAX
+            }
+        );
     }
 
     // ── Update with missing idx fails ──────────────────────────────
