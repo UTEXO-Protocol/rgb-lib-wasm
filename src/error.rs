@@ -600,6 +600,10 @@ pub enum Error {
     #[error("Issuance request with no provided amounts")]
     NoIssuanceAmounts,
 
+    /// Cannot allocate assets with zero allocations per UTXO
+    #[error("Cannot allocate assets with zero allocations per UTXO")]
+    NoMaxAllocationsPerUtxo,
+
     /// Cannot issue an asset with zero mint rights
     #[error("Issuance request with zero mint rights")]
     NoMintRights,

@@ -1094,6 +1094,9 @@ impl Wallet {
                 return Err(Error::FingerprintMismatch);
             }
         }
+        if wdata.max_allocations_per_utxo == 0 {
+            return Err(Error::NoMaxAllocationsPerUtxo);
+        }
         let wallet_dir = data_dir_path.join(&wdata.master_fingerprint);
         let (logger, _logger_guard) = setup_logger(&wallet_dir, None)?;
         info!(logger.clone(), "New wallet in '{:?}'", wallet_dir);
@@ -4474,6 +4477,16 @@ mod mainnet_schema_tests {
             reuse_addresses: false,
             allow_reckless_schemas: reckless,
         }
+    }
+
+    #[test]
+    fn new_refuses_zero_max_allocations_per_utxo() {
+        let mut wd = mainnet_schema_wallet_data(BitcoinNetwork::Regtest, vec![Nia], false);
+        wd.max_allocations_per_utxo = 0;
+        assert!(matches!(
+            Wallet::new(wd),
+            Err(Error::NoMaxAllocationsPerUtxo)
+        ));
     }
 
     #[test]
