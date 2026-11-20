@@ -1,7 +1,7 @@
 // RefCell borrows held across .await are safe on wasm32 (single-threaded runtime).
 #![allow(clippy::await_holding_refcell_ref)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic;
@@ -30,6 +30,54 @@ fn parse_encryption(
         .transpose()
 }
 
+#[wasm_bindgen(typescript_custom_section)]
+const SIGN_OPTIONS_TS: &'static str = r#"
+export interface SignOptions {
+    trustWitnessUtxo?: boolean;
+    assumeHeight?: number | null;
+    allowAllSighashes?: boolean;
+    tryFinalize?: boolean;
+    signWithTapInternalKey?: boolean;
+    allowGrinding?: boolean;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// JS sign options object (see the `SignOptions` TypeScript interface).
+    #[wasm_bindgen(typescript_type = "SignOptions")]
+    pub type JsSignOptions;
+}
+
+/// Mirror of the BDK sign options: a missing field keeps the BDK default.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignOptions {
+    trust_witness_utxo: Option<bool>,
+    assume_height: Option<u32>,
+    allow_all_sighashes: Option<bool>,
+    try_finalize: Option<bool>,
+    sign_with_tap_internal_key: Option<bool>,
+    allow_grinding: Option<bool>,
+}
+
+impl From<SignOptions> for rgb_lib_wasm::bdk_wallet::SignOptions {
+    fn from(o: SignOptions) -> Self {
+        let d = Self::default();
+        Self {
+            trust_witness_utxo: o.trust_witness_utxo.unwrap_or(d.trust_witness_utxo),
+            assume_height: o.assume_height.or(d.assume_height),
+            allow_all_sighashes: o.allow_all_sighashes.unwrap_or(d.allow_all_sighashes),
+            try_finalize: o.try_finalize.unwrap_or(d.try_finalize),
+            sign_with_tap_internal_key: o
+                .sign_with_tap_internal_key
+                .unwrap_or(d.sign_with_tap_internal_key),
+            allow_grinding: o.allow_grinding.unwrap_or(d.allow_grinding),
+            ..d
+        }
+    }
+}
+
 /// Parse an optional Online object, `null` and `undefined` meaning none.
 fn js_to_online_opt(value: JsValue) -> Result<Option<Online>, JsValue> {
     if value.is_null() || value.is_undefined() {
@@ -38,6 +86,18 @@ fn js_to_online_opt(value: JsValue) -> Result<Option<Online>, JsValue> {
     serde_wasm_bindgen::from_value(value)
         .map(Some)
         .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))
+}
+
+fn js_to_sign_options_opt(
+    value: Option<JsSignOptions>,
+) -> Result<Option<rgb_lib_wasm::bdk_wallet::SignOptions>, JsValue> {
+    value
+        .map(|v| {
+            serde_wasm_bindgen::from_value::<SignOptions>(v.into())
+                .map(Into::into)
+                .map_err(|e| JsValue::from_str(&format!("Invalid SignOptions object: {e}")))
+        })
+        .transpose()
 }
 
 /// Read a u64 from a JS number, BigInt or decimal string.
@@ -75,6 +135,12 @@ pub fn init() {
             console_error(&msg);
         }));
     });
+}
+
+/// Maximum seconds in the future an invoice or operation expiration can be.
+#[wasm_bindgen(js_name = "maxExpirationSecs")]
+pub fn max_expiration_secs() -> u32 {
+    rgb_lib_wasm::wallet::MAX_EXPIRATION_SECS
 }
 
 #[wasm_bindgen(js_name = "generateKeys")]
@@ -363,12 +429,17 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Sign a PSBT (base64-encoded). Returns the signed PSBT string.
+    /// Sign a PSBT (base64-encoded) with optional sign options. Returns the signed PSBT string.
     #[wasm_bindgen(js_name = "signPsbt")]
-    pub fn sign_psbt(&self, unsigned_psbt: &str) -> Result<String, JsValue> {
+    pub fn sign_psbt(
+        &self,
+        unsigned_psbt: &str,
+        sign_options: Option<JsSignOptions>,
+    ) -> Result<String, JsValue> {
+        let sign_options = js_to_sign_options_opt(sign_options)?;
         self.inner
             .borrow()
-            .sign_psbt(unsigned_psbt.to_string(), None)
+            .sign_psbt(unsigned_psbt.to_string(), sign_options)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -1261,4 +1332,36 @@ pub fn validate_consignment_offchain(
     )
     .map_err(|e| JsValue::from_str(&e.to_string()))?;
     to_js(&result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convert(json: &str) -> rgb_lib_wasm::bdk_wallet::SignOptions {
+        serde_json::from_str::<SignOptions>(json).unwrap().into()
+    }
+
+    #[test]
+    fn sign_options_conversion() {
+        let d = rgb_lib_wasm::bdk_wallet::SignOptions::default();
+        let o = convert("{}");
+        assert_eq!(o.trust_witness_utxo, d.trust_witness_utxo);
+        assert_eq!(o.assume_height, d.assume_height);
+        assert_eq!(o.allow_all_sighashes, d.allow_all_sighashes);
+        assert_eq!(o.try_finalize, d.try_finalize);
+        assert_eq!(o.sign_with_tap_internal_key, d.sign_with_tap_internal_key);
+        assert_eq!(o.allow_grinding, d.allow_grinding);
+
+        let o = convert(
+            r#"{"trustWitnessUtxo":true,"assumeHeight":7,"allowAllSighashes":true,
+            "tryFinalize":false,"signWithTapInternalKey":false,"allowGrinding":false}"#,
+        );
+        assert!(o.trust_witness_utxo);
+        assert_eq!(o.assume_height, Some(7));
+        assert!(o.allow_all_sighashes);
+        assert!(!o.try_finalize);
+        assert!(!o.sign_with_tap_internal_key);
+        assert!(!o.allow_grinding);
+    }
 }

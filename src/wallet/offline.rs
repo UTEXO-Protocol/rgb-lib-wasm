@@ -23,9 +23,9 @@ pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 #[cfg(feature = "esplora")]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
-/// Maximum seconds in the future an outgoing operation can expire: about 10 years.
-#[cfg(feature = "esplora")]
-pub(crate) const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
+/// Maximum time in the future, in seconds, the expiration of an outgoing operation can be set to:
+/// about 10 years. `send_begin` refuses a later one with [`Error::InvalidExpiration`].
+pub const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
 
 /// Minimum `retention_grace_secs` a recipient requires from the sender proxy to ACK a transfer.
 /// A transfer whose sender proxy grants less is NACKed.
@@ -50,10 +50,6 @@ pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
 
 const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
-pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
-pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
-pub(crate) const RGB_STATE_LINK_RIGHT: &str = "linkRight";
-pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
 pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
 pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
 pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
@@ -498,82 +494,6 @@ pub(crate) struct ReceiveDataInternal {
     retention_deadline: Option<i64>,
 }
 
-/// The type of an RGB recipient
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum RecipientType {
-    /// Receive via blinded UTXO
-    Blind,
-    /// Receive via witness TX
-    Witness,
-}
-
-/// RGB recipient information used to be paid
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct RecipientInfo {
-    /// Recipient ID
-    pub recipient_id: String,
-    /// Recipient type
-    pub recipient_type: RecipientType,
-    /// Recipient network
-    pub network: BitcoinNetwork,
-}
-
-impl RecipientInfo {
-    /// Builds a new [`RecipientInfo`] from the provided string, checking that it is valid.
-    pub fn new(recipient_id: String) -> Result<Self, Error> {
-        let xchainnet_beneficiary = XChainNet::<Beneficiary>::from_str(&recipient_id)
-            .map_err(|_| Error::InvalidRecipientID)?;
-        let recipient_type = match xchainnet_beneficiary.into_inner() {
-            Beneficiary::WitnessVout(_, _) => RecipientType::Witness,
-            Beneficiary::BlindedSeal(_) => RecipientType::Blind,
-        };
-        Ok(Self {
-            recipient_id,
-            recipient_type,
-            network: xchainnet_beneficiary.chain_network().try_into()?,
-        })
-    }
-}
-
-/// An RGB transport endpoint.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct TransportEndpoint {
-    /// Endpoint address
-    pub endpoint: String,
-    /// Endpoint transport type
-    pub transport_type: TransportType,
-}
-
-impl TransportEndpoint {
-    /// Builds a new [`TransportEndpoint::endpoint`] from the provided string, checking that it is
-    /// valid.
-    pub fn new(transport_endpoint: String) -> Result<Self, Error> {
-        let rgb_transport = RgbTransport::from_str(&transport_endpoint)?;
-        TransportEndpoint::try_from(rgb_transport)
-    }
-
-    /// Return the transport type of this transport endpoint.
-    pub fn transport_type(&self) -> TransportType {
-        self.transport_type
-    }
-}
-
-impl TryFrom<RgbTransport> for TransportEndpoint {
-    type Error = Error;
-
-    fn try_from(x: RgbTransport) -> Result<Self, Self::Error> {
-        match x {
-            RgbTransport::JsonRpc { tls, host } => Ok(TransportEndpoint {
-                endpoint: format!("http{}://{host}", if tls { "s" } else { "" }),
-                transport_type: TransportType::JsonRpc,
-            }),
-            _ => Err(Error::UnsupportedTransportType),
-        }
-    }
-}
-
 /// Supported database types.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DatabaseType {
@@ -604,178 +524,6 @@ impl Address {
     }
 }
 
-/// An RGB invoice.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct Invoice {
-    /// The RGB invoice string
-    invoice_string: String,
-    /// The data of the RGB invoice
-    pub(crate) invoice_data: InvoiceData,
-}
-
-impl Invoice {
-    /// Parse the provided `invoice_string`.
-    /// Throws an error if the provided string is not a valid RGB invoice.
-    pub fn new(invoice_string: String) -> Result<Self, Error> {
-        let decoded = RgbInvoice::from_str(&invoice_string).map_err(|e| Error::InvalidInvoice {
-            details: e.to_string(),
-        })?;
-        let asset_id = decoded.contract.map(|cid| cid.to_string());
-        let asset_schema = if let Some(schema_id) = decoded.schema {
-            Some(<AssetSchema as std::convert::TryFrom<_>>::try_from(
-                schema_id,
-            )?)
-        } else {
-            None
-        };
-        let assignment_name = decoded.assignment_name.map(|a| a.to_string());
-        let assignment = match asset_schema {
-            None => match (decoded.assignment_state, assignment_name.as_deref()) {
-                (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
-                    Assignment::Fungible(v.value())
-                }
-                (Some(InvoiceState::Amount(v)), Some(RGB_STATE_INFLATION_ALLOWANCE)) => {
-                    Assignment::InflationRight(v.value())
-                }
-                (Some(InvoiceState::Amount(_)), _) => Assignment::Any,
-                (Some(InvoiceState::Data(_)), Some(RGB_STATE_ASSET_OWNER) | None) => {
-                    Assignment::NonFungible
-                }
-                (None, None) => Assignment::Any,
-                (_, _) => {
-                    return Err(Error::InvalidInvoice {
-                        details: s!("unsupported assignment"),
-                    });
-                }
-            },
-            Some(AssetSchema::Nia) => {
-                match (decoded.assignment_state, assignment_name.as_deref()) {
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER) | None) => {
-                        Assignment::Fungible(v.value())
-                    }
-                    (None, Some(RGB_STATE_ASSET_OWNER) | None) => Assignment::Fungible(0),
-                    (_, _) => {
-                        return Err(Error::InvalidInvoice {
-                            details: s!("invalid assignment"),
-                        });
-                    }
-                }
-            }
-            Some(AssetSchema::Ifa) => {
-                match (decoded.assignment_state, assignment_name.as_deref()) {
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
-                        Assignment::Fungible(v.value())
-                    }
-                    (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_INFLATION_ALLOWANCE)) => {
-                        Assignment::InflationRight(v.value())
-                    }
-                    (None, Some(RGB_STATE_INFLATION_ALLOWANCE)) => Assignment::InflationRight(0),
-                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
-                        Assignment::LinkRight
-                    }
-                    (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
-                    (None, None) => Assignment::Any,
-                    (_, _) => {
-                        return Err(Error::InvalidInvoice {
-                            details: s!("invalid assignment"),
-                        });
-                    }
-                }
-            }
-            Some(AssetSchema::Bfa) => {
-                match (decoded.assignment_state, assignment_name.as_deref()) {
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
-                        Assignment::Fungible(v.value())
-                    }
-                    (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
-                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
-                        Assignment::LinkRight
-                    }
-                    (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
-                    (None, None) => Assignment::Any,
-                    (_, _) => {
-                        return Err(Error::InvalidInvoice {
-                            details: s!("invalid assignment"),
-                        });
-                    }
-                }
-            }
-        };
-        let recipient_id = decoded.beneficiary.to_string();
-        let transport_endpoints: Vec<String> =
-            decoded.transports.iter().map(|t| t.to_string()).collect();
-
-        let layer_1 = decoded.beneficiary.layer1();
-        let network = match layer_1 {
-            Layer1::Bitcoin => decoded.beneficiary.chain_network().try_into().unwrap(),
-            _ => {
-                return Err(Error::UnsupportedLayer1 {
-                    layer_1: layer_1.to_string(),
-                });
-            }
-        };
-
-        let invoice_data = InvoiceData {
-            recipient_id,
-            asset_schema,
-            asset_id,
-            assignment,
-            assignment_name,
-            expiration_timestamp: decoded.expiry.map(|t| t as u64),
-            transport_endpoints,
-            network,
-            public_key: decoded.public_key,
-            encryption: Encryption::from(decoded.encryption),
-            unknown_query_params: decoded.unknown_query.into_iter().collect(),
-        };
-
-        Ok(Invoice {
-            invoice_string,
-            invoice_data,
-        })
-    }
-
-    /// Return the data associated with this [`Invoice`].
-    pub fn invoice_data(&self) -> InvoiceData {
-        self.invoice_data.clone()
-    }
-
-    /// Return the string associated with this [`Invoice`].
-    pub fn invoice_string(&self) -> String {
-        self.invoice_string.clone()
-    }
-}
-
-/// The data of an RGB invoice.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct InvoiceData {
-    /// ID of the receive operation (blinded UTXO or Bitcoin script)
-    pub recipient_id: String,
-    /// RGB schema
-    pub asset_schema: Option<AssetSchema>,
-    /// RGB asset ID
-    pub asset_id: Option<String>,
-    /// RGB assignment
-    pub assignment: Assignment,
-    /// RGB assignment name
-    pub assignment_name: Option<String>,
-    /// Bitcoin network
-    pub network: BitcoinNetwork,
-    /// Invoice expiration
-    pub expiration_timestamp: Option<u64>,
-    /// Transport endpoints
-    pub transport_endpoints: Vec<String>,
-    /// Recipient's Ed25519 public key (hex-encoded), from the invoice `pk` field (if present)
-    pub public_key: Option<String>,
-    /// Consignment/media encryption preference, from the invoice `enc` field
-    pub encryption: Encryption,
-    /// Unknown query parameters carried by the invoice
-    pub unknown_query_params: HashMap<String, String>,
-}
-
 /// Data for operations that require the wallet to be online.
 ///
 /// Methods not requiring an `Online` object don't need network access and can be performed
@@ -793,43 +541,12 @@ pub struct Online {
     pub indexer_url: String,
 }
 
-/// Bitcoin transaction outpoint.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct Outpoint {
-    /// ID of the transaction
-    pub txid: String,
-    /// Output index
-    pub vout: u32,
-}
-
-impl fmt::Display for Outpoint {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "{}:{}", self.txid, self.vout)
-    }
-}
-
-impl From<OutPoint> for Outpoint {
-    fn from(x: OutPoint) -> Outpoint {
-        Outpoint {
-            txid: x.txid.to_string(),
-            vout: x.vout,
-        }
-    }
-}
-
 impl From<DbTxo> for Outpoint {
     fn from(x: DbTxo) -> Outpoint {
         Outpoint {
             txid: x.txid,
             vout: x.vout,
         }
-    }
-}
-
-impl From<Outpoint> for OutPoint {
-    fn from(x: Outpoint) -> OutPoint {
-        OutPoint::from_str(&x.to_string()).expect("outpoint should be parsable")
     }
 }
 

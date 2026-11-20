@@ -61,7 +61,7 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 
 ```javascript
 import init, {
-  generateKeys, restoreKeys, checkProxyUrl,
+  generateKeys, restoreKeys, checkProxyUrl, maxExpirationSecs,
   validateConsignmentOffchain,
   WasmWallet, WasmInvoice,
 } from './pkg/rgb_lib_wasm.js';
@@ -354,6 +354,7 @@ To protect a wallet:
 | Function | Description |
 |----------|-------------|
 | `generateKeys(network)` | Generate a new BIP39 mnemonic and derive xpubs |
+| `maxExpirationSecs()` | Maximum seconds in the future an expiration can be |
 | `restoreKeys(network, mnemonic)` | Restore xpubs from a mnemonic |
 | `checkProxyUrl(url)` | Validate an RGB proxy server URL |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
@@ -417,7 +418,7 @@ To protect a wallet:
 | `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
 | `deleteTransfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
-| `signPsbt(psbt)` | no | Sign a PSBT |
+| `signPsbt(psbt, signOptions?)` | no | Sign a PSBT. `signOptions` (`SignOptions`) takes `trustWitnessUtxo`, `assumeHeight`, `allowAllSighashes`, `tryFinalize`, `signWithTapInternalKey`, `allowGrinding`; an omitted field takes the BDK default |
 | `finalizePsbt(psbt)` | no | Finalize a signed PSBT |
 | `backup(password)` | no | Create encrypted backup (returns bytes) |
 | `restoreBackup(bytes, password)` | no | Restore from encrypted backup |

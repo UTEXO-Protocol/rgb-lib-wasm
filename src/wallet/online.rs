@@ -452,9 +452,7 @@ impl InfoAssetTransfer {
         let transition_type = match self.main_transition {
             TypeOfTransition::Burn => TS_BURN,
             TypeOfTransition::Link => TS_LINK,
-            TypeOfTransition::Transfer | TypeOfTransition::Inflate | TypeOfTransition::Mint => {
-                return vec![];
-            }
+            _ => return vec![],
         };
         fascia
             .bundles()
@@ -9788,7 +9786,7 @@ mod separate_signer_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod send_end_tests {
     use super::*;
-    use crate::utils::recipient_id_from_script_buf;
+    use crate::no_wallet::recipient_id_from_script_buf;
     use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, make_test_wallet};
     use strict_encoding::StrictDumb;
 

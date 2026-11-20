@@ -7,7 +7,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
-use rgb_lib_wasm::utils::script_buf_from_recipient_id;
+use rgb_lib_wasm::no_wallet::script_buf_from_recipient_id;
 use rgb_lib_wasm::wallet::{
     Balance, DatabaseType, Online, ReceiveData, Recipient, Wallet, WalletData,
 };
