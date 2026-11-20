@@ -13,6 +13,7 @@ use crate::database::enums::{
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
+use crate::utils::now;
 use crate::wallet::{Balance, Outpoint};
 
 /// Lightweight ActiveValue (mirrors sea_orm::ActiveValue without the dependency).
@@ -1039,9 +1040,7 @@ impl InMemoryDb {
         if let ActiveValue::Set(v) = b.status {
             row.status = v;
         }
-        if let ActiveValue::Set(v) = b.updated_at {
-            row.updated_at = v;
-        }
+        row.updated_at = now().unix_timestamp();
         if let ActiveValue::Set(v) = &b.expiration {
             row.expiration = *v;
         }
@@ -1828,10 +1827,12 @@ mod tests {
         let mut upd: DbBatchTransferActMod = bt.clone().into();
         upd.status = ActiveValue::Set(TransferStatus::Settled);
         upd.txid = ActiveValue::Set(Some("abc123".to_string()));
+        let before = now().unix_timestamp();
         let updated = db.update_batch_transfer(&mut upd).unwrap();
 
         assert_eq!(updated.status, TransferStatus::Settled);
         assert_eq!(updated.txid, Some("abc123".to_string()));
+        assert!(updated.updated_at >= before);
     }
 
     #[test]

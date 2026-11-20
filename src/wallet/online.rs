@@ -1085,6 +1085,10 @@ pub struct OnlineOptions {
     /// spent by a transaction of this wallet. The same holds for the outputs that such a
     /// transaction pays to this wallet. A mismatch returns [`Error::Inconsistency`].
     pub skip_consistency_check: bool,
+    /// Seconds after a witness receive fails during which the wallet keeps its script.
+    /// A payment to the script in that time becomes an ordinary UTXO.
+    /// 0 drops the script at the next sync after the fail.
+    pub failed_witness_receive_grace_secs: u32,
     /// Keys that sign calls to proxies that require authentication.
     ///
     /// Maps a transport endpoint (e.g. `rpc://host/json-rpc`) to a hex-encoded 32-byte Ed25519 seed.
@@ -1109,6 +1113,10 @@ impl std::fmt::Debug for OnlineOptions {
         f.debug_struct("OnlineOptions")
             .field("indexer_config", &self.indexer_config)
             .field("skip_consistency_check", &self.skip_consistency_check)
+            .field(
+                "failed_witness_receive_grace_secs",
+                &self.failed_witness_receive_grace_secs,
+            )
             .field("proxy_auth_keys", &self.proxy_auth_keys.keys())
             .field("evm_chains", &self.evm_chains)
             .finish()
@@ -1198,6 +1206,7 @@ pub(crate) struct OnlineData {
     pub(crate) indexer_url: String,
     indexer: Indexer,
     pub(crate) proxy_auth_keys: HashMap<String, [u8; 32]>,
+    pub(crate) failed_witness_receive_grace_secs: u32,
     // EVM chains by chain ID, checked when going online
     evm_chains: HashMap<u64, EvmChain>,
 }
@@ -1224,6 +1233,7 @@ impl OnlineData {
             indexer_url: indexer_url.to_string(),
             indexer: crate::utils::build_indexer(indexer_url).unwrap(),
             proxy_auth_keys: HashMap::new(),
+            failed_witness_receive_grace_secs: 604_800,
             evm_chains: HashMap::new(),
         }
     }
@@ -1568,18 +1578,31 @@ impl Wallet {
 
     /// Drop the pending witness state of the witness receives that are not pending anymore and
     /// return the scripts still watched.
-    fn _reconcile_pending_witness(&self) -> Result<HashSet<String>, Error> {
+    ///
+    /// Returns the kept scripts, each mapped to whether its receive is pending.
+    fn _reconcile_pending_witness(&self) -> Result<HashMap<String, bool>, Error> {
         let pending_witness_scripts = self.database.iter_pending_witness_scripts()?;
         let pending_witness_txos = self.database.iter_pending_witness_txos()?;
         if pending_witness_scripts.is_empty() && pending_witness_txos.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(HashMap::new());
         }
 
+        // keep the receives that are pending or failed within the grace time
+        let failed_since = now().unix_timestamp()
+            - i64::from(
+                self.online_data
+                    .as_ref()
+                    .unwrap()
+                    .failed_witness_receive_grace_secs,
+            );
         let db_data = self.database.get_db_data(false)?;
-        let mut pending_scripts = HashSet::new();
+        let mut receives: HashMap<String, bool> = HashMap::new();
         let mut pending_asset_transfers = HashSet::new();
         for batch_transfer in &db_data.batch_transfers {
-            if !batch_transfer.status.pending()
+            let pending = batch_transfer.status.pending();
+            let recently_failed = batch_transfer.status == TransferStatus::Failed
+                && batch_transfer.updated_at > failed_since;
+            if !(pending || recently_failed)
                 || !batch_transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?
             {
                 continue;
@@ -1600,16 +1623,18 @@ impl Wallet {
                 if let Some(recipient_id) = transfer.recipient_id
                     && let Some(script) = script_buf_from_recipient_id(recipient_id)?
                 {
-                    pending_scripts.insert(script.to_hex_string());
-                    pending_asset_transfers.insert(transfer.asset_transfer_idx);
+                    *receives.entry(script.to_hex_string()).or_insert(false) |= pending;
+                    if pending {
+                        pending_asset_transfers.insert(transfer.asset_transfer_idx);
+                    }
                 }
             }
         }
 
-        let mut kept_scripts = HashSet::new();
+        let mut kept_scripts = HashMap::new();
         for pending_witness_script in pending_witness_scripts {
-            if pending_scripts.contains(&pending_witness_script.script) {
-                kept_scripts.insert(pending_witness_script.script);
+            if let Some(receive_pending) = receives.get(&pending_witness_script.script) {
+                kept_scripts.insert(pending_witness_script.script, *receive_pending);
             } else {
                 self.database
                     .del_pending_witness_script(pending_witness_script.script)?;
@@ -1627,7 +1652,7 @@ impl Wallet {
                     .tx_graph()
                     .get_txout(txo.outpoint().into())
                     .is_some_and(|txout| {
-                        pending_scripts.contains(&txout.script_pubkey.to_hex_string())
+                        receives.get(&txout.script_pubkey.to_hex_string()) == Some(&true)
                     })
             };
             if has_pending_coloring || pays_pending_script() {
@@ -2695,6 +2720,7 @@ impl Wallet {
             indexer_url,
             indexer,
             proxy_auth_keys,
+            failed_witness_receive_grace_secs: online_options.failed_witness_receive_grace_secs,
             evm_chains: HashMap::new(),
         };
         Ok((online, online_data))
@@ -2757,11 +2783,14 @@ impl Wallet {
                 let OnlineOptions {
                     indexer_config: _,         // unchanged here
                     skip_consistency_check: _, // checked below
+                    failed_witness_receive_grace_secs,
                     proxy_auth_keys,
                     evm_chains: _, // set below
                 } = &online_options;
                 let proxy_auth_keys = parse_proxy_auth_keys(proxy_auth_keys)?;
-                self.online_data.as_mut().unwrap().proxy_auth_keys = proxy_auth_keys;
+                let online_data = self.online_data.as_mut().unwrap();
+                online_data.proxy_auth_keys = proxy_auth_keys;
+                online_data.failed_witness_receive_grace_secs = *failed_witness_receive_grace_secs;
                 online
             }
         } else {
@@ -2886,7 +2915,17 @@ impl Wallet {
         self.bdk_wallet.persist(&mut self.bdk_database)?;
 
         let pending_witness_scripts = self._reconcile_pending_witness()?;
+        self._update_db_colored_txos_from_bdk(&pending_witness_scripts)?;
 
+        debug!(self.logger, "Synced TXOs");
+
+        Ok(())
+    }
+
+    fn _update_db_colored_txos_from_bdk(
+        &self,
+        pending_witness_scripts: &HashMap<String, bool>,
+    ) -> Result<(), Error> {
         let db_txos = self.database.iter_txos()?;
 
         let db_outpoints: HashSet<String> = db_txos
@@ -2908,16 +2947,13 @@ impl Wallet {
 
         for new_utxo in new_utxos.iter().cloned() {
             let mut new_db_utxo: DbTxoActMod = new_utxo.clone().into();
-            let pending_witness_script = new_utxo.txout.script_pubkey.to_hex_string();
-            if pending_witness_scripts.contains(&pending_witness_script) {
-                new_db_utxo.pending_witness = ActiveValue::Set(true);
-                self.database
-                    .del_pending_witness_script(pending_witness_script)?;
+            let script = new_utxo.txout.script_pubkey.to_hex_string();
+            if let Some(receive_pending) = pending_witness_scripts.get(&script) {
+                new_db_utxo.pending_witness = ActiveValue::Set(*receive_pending);
+                self.database.del_pending_witness_script(script)?;
             }
             self.database.set_txo(new_db_utxo.clone())?;
         }
-
-        debug!(self.logger, "Synced TXOs");
 
         Ok(())
     }
@@ -9672,6 +9708,7 @@ mod go_online_tests {
                 url: url.to_string(),
             },
             skip_consistency_check: true,
+            failed_witness_receive_grace_secs: 604_800,
             proxy_auth_keys: keys
                 .iter()
                 .map(|(e, k)| (e.to_string(), k.to_string()))
@@ -9697,6 +9734,14 @@ mod go_online_tests {
 
     fn stored_keys(wallet: &Wallet) -> HashMap<String, [u8; 32]> {
         wallet.online_data.as_ref().unwrap().proxy_auth_keys.clone()
+    }
+
+    fn stored_grace(wallet: &Wallet) -> u32 {
+        wallet
+            .online_data
+            .as_ref()
+            .unwrap()
+            .failed_witness_receive_grace_secs
     }
 
     #[test]
@@ -9730,9 +9775,16 @@ mod go_online_tests {
             HashMap::from([(PROXY_URL.to_string(), [0x22; 32])])
         );
 
-        let res = go_online(&mut wallet, options(INDEXER_URL, &[]));
+        let res = go_online(
+            &mut wallet,
+            OnlineOptions {
+                failed_witness_receive_grace_secs: 0,
+                ..options(INDEXER_URL, &[])
+            },
+        );
         assert_eq!(res, Ok(online));
         assert!(stored_keys(&wallet).is_empty());
+        assert_eq!(stored_grace(&wallet), 0);
     }
 
     #[test]
@@ -9782,22 +9834,33 @@ mod go_online_tests {
         let seed1 = "11".repeat(32);
         let seed2 = "22".repeat(32);
 
-        let res = go_online(&mut wallet, options(&url, &[(PROXY_ENDPOINT, &seed1)]));
+        let res = go_online(
+            &mut wallet,
+            OnlineOptions {
+                failed_witness_receive_grace_secs: 3600,
+                ..options(&url, &[(PROXY_ENDPOINT, &seed1)])
+            },
+        );
         assert!(res.is_ok());
         assert_eq!(
             stored_keys(&wallet),
             HashMap::from([(PROXY_URL.to_string(), [0x11; 32])])
         );
+        assert_eq!(stored_grace(&wallet), 3600);
 
         let res = go_online(
             &mut wallet,
-            options(&other_url, &[(PROXY_ENDPOINT, &seed2)]),
+            OnlineOptions {
+                failed_witness_receive_grace_secs: 7200,
+                ..options(&other_url, &[(PROXY_ENDPOINT, &seed2)])
+            },
         );
         assert!(res.is_ok());
         assert_eq!(
             stored_keys(&wallet),
             HashMap::from([(PROXY_URL.to_string(), [0x22; 32])])
         );
+        assert_eq!(stored_grace(&wallet), 7200);
     }
 
     #[test]
@@ -10297,8 +10360,8 @@ mod send_end_tests {
             .script_pubkey()
     }
 
-    // Make the wallet know a TX that pays `script` and return its TXID.
-    fn apply_tx_paying(wallet: &mut Wallet, script: ScriptBuf) -> String {
+    // Make the wallet know a TX that pays each of `scripts`, in order, and return its TXID.
+    fn apply_tx_paying(wallet: &mut Wallet, scripts: &[ScriptBuf]) -> String {
         let tx = BdkTransaction {
             version: bdk_wallet::bitcoin::transaction::Version::TWO,
             lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
@@ -10306,10 +10369,13 @@ mod send_end_tests {
                 previous_output: OutPoint::new(Txid::from_byte_array([2; 32]), 0),
                 ..Default::default()
             }],
-            output: vec![bdk_wallet::bitcoin::TxOut {
-                value: BdkAmount::from_sat(1000),
-                script_pubkey: script,
-            }],
+            output: scripts
+                .iter()
+                .map(|script| bdk_wallet::bitcoin::TxOut {
+                    value: BdkAmount::from_sat(1000),
+                    script_pubkey: script.clone(),
+                })
+                .collect(),
         };
         let txid = tx.compute_txid().to_string();
         wallet.bdk_wallet.apply_unconfirmed_txs([(tx, 0)]);
@@ -12636,7 +12702,7 @@ mod send_end_tests {
         wallet
             .received_signed_txs
             .insert(rid.clone(), raw_tx(&dummy_psbt().0));
-        let txid = apply_tx_paying(&mut wallet, script);
+        let txid = apply_tx_paying(&mut wallet, &[script]);
         let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
         let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
         let kept = |w: &Wallet| {
@@ -12677,7 +12743,7 @@ mod send_end_tests {
         // the TXO a sync flagged before any consignment
         let script = new_script(&mut wallet);
         let by_script = seed_witness_receive(&wallet, "", status_before, None, &script);
-        let txid = apply_tx_paying(&mut wallet, script);
+        let txid = apply_tx_paying(&mut wallet, &[script]);
         let script_txo = seed_pending_witness_txo(&wallet, &txid, 0);
 
         let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
@@ -12698,15 +12764,118 @@ mod send_end_tests {
         assert!(pending_witness(&wallet, unrelated_txo));
     }
 
+    fn set_pending_witness_scripts(wallet: &Wallet, scripts: &[&ScriptBuf]) {
+        for script in scripts {
+            wallet
+                .database
+                .set_pending_witness_script(DbPendingWitnessScriptActMod {
+                    script: ActiveValue::Set(script.to_hex_string()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    }
+
+    fn fail_receive(wallet: &mut Wallet, batch_idx: i32) {
+        let batch_transfer = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.idx == batch_idx)
+            .unwrap();
+        wallet._fail_batch_transfer(&batch_transfer).unwrap();
+    }
+
+    fn db_pending_witness_scripts(wallet: &Wallet) -> HashSet<String> {
+        wallet
+            .database
+            .iter_pending_witness_scripts()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.script)
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_keeps_failed_witness_receive_scripts_for_the_grace_time() {
+        let (mut wallet, _) = setup();
+        let status = TransferStatus::WaitingCounterparty;
+        let recent = new_script(&mut wallet);
+        let pending = new_script(&mut wallet);
+        let recent_idx = seed_witness_receive(&wallet, "", status, None, &recent);
+        seed_witness_receive(&wallet, "", status, None, &pending);
+        fail_receive(&mut wallet, recent_idx);
+        set_pending_witness_scripts(&wallet, &[&recent, &pending]);
+
+        let kept = wallet._reconcile_pending_witness().unwrap();
+
+        assert_eq!(
+            kept,
+            HashMap::from([
+                (recent.to_hex_string(), false),
+                (pending.to_hex_string(), true),
+            ])
+        );
+        assert_eq!(
+            db_pending_witness_scripts(&wallet),
+            HashSet::from([recent.to_hex_string(), pending.to_hex_string()])
+        );
+
+        wallet
+            .online_data
+            .as_mut()
+            .unwrap()
+            .failed_witness_receive_grace_secs = 0;
+        let kept = wallet._reconcile_pending_witness().unwrap();
+
+        assert_eq!(kept, HashMap::from([(pending.to_hex_string(), true)]));
+        assert_eq!(
+            db_pending_witness_scripts(&wallet),
+            HashSet::from([pending.to_hex_string()])
+        );
+    }
+
+    #[test]
+    fn new_txo_paying_a_failed_receive_script_is_not_pending_witness() {
+        let (mut wallet, _) = setup();
+        let status = TransferStatus::WaitingCounterparty;
+        let pending = new_script(&mut wallet);
+        let recent = new_script(&mut wallet);
+        seed_witness_receive(&wallet, "", status, None, &pending);
+        let recent_idx = seed_witness_receive(&wallet, "", status, None, &recent);
+        fail_receive(&mut wallet, recent_idx);
+        set_pending_witness_scripts(&wallet, &[&pending, &recent]);
+
+        let txid = apply_tx_paying(&mut wallet, &[pending, recent]);
+        let kept = wallet._reconcile_pending_witness().unwrap();
+        wallet._update_db_colored_txos_from_bdk(&kept).unwrap();
+
+        let txo = |vout: u32| {
+            wallet
+                .database
+                .iter_txos()
+                .unwrap()
+                .into_iter()
+                .find(|t| t.txid == txid && t.vout == vout)
+                .unwrap()
+        };
+        assert!(txo(0).pending_witness);
+        assert!(!txo(1).pending_witness);
+        assert!(db_pending_witness_scripts(&wallet).is_empty());
+    }
+
     #[test]
     fn reconcile_follows_the_witness_receive_status() {
         let (mut wallet, _) = setup();
         let mut scripts = vec![];
         let mut txos = vec![];
+        let mut idxs = vec![];
         for (i, status) in [
             TransferStatus::WaitingConfirmations,
             TransferStatus::Failed,
             TransferStatus::Settled,
+            TransferStatus::Failed,
         ]
         .into_iter()
         .enumerate()
@@ -12714,6 +12883,7 @@ mod send_end_tests {
             let txid = format!("{}{}", i + 1, i + 1).repeat(32);
             let script = new_script(&mut wallet);
             let idx = seed_witness_receive(&wallet, &txid, status, Some(0), &script);
+            idxs.push(idx);
             let txo_idx = seed_pending_witness_txo(&wallet, &txid, 0);
             wallet
                 .database
@@ -12739,8 +12909,30 @@ mod send_end_tests {
             None,
             &script,
         );
-        let txid = apply_tx_paying(&mut wallet, script);
+        let txid = apply_tx_paying(&mut wallet, &[script]);
         let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+        // a receive that failed within the grace time, paid with no coloring
+        let failed_script = new_script(&mut wallet);
+        idxs.push(seed_witness_receive(
+            &wallet,
+            "",
+            TransferStatus::Failed,
+            None,
+            &failed_script,
+        ));
+        let txid = apply_tx_paying(&mut wallet, &[failed_script.clone()]);
+        let failed_paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+        scripts.push(failed_script.to_hex_string());
+        // the update sets the fail time to now for the last two failed receives
+        for idx in &idxs[3..] {
+            wallet
+                .database
+                .update_batch_transfer(&mut DbBatchTransferActMod {
+                    idx: ActiveValue::Set(*idx),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
         // the script of a deleted receive has no transfer
         let deleted = new_script(&mut wallet).to_hex_string();
         for script in scripts.iter().chain([&deleted]) {
@@ -12755,19 +12947,24 @@ mod send_end_tests {
 
         let kept = wallet._reconcile_pending_witness().unwrap();
 
-        assert_eq!(kept, HashSet::from([scripts[0].clone()]));
-        let rows: Vec<String> = wallet
-            .database
-            .iter_pending_witness_scripts()
-            .unwrap()
-            .into_iter()
-            .map(|s| s.script)
-            .collect();
-        assert_eq!(rows, vec![scripts[0].clone()]);
+        assert_eq!(
+            kept,
+            HashMap::from([
+                (scripts[0].clone(), true),
+                (scripts[3].clone(), false),
+                (scripts[4].clone(), false),
+            ])
+        );
+        assert_eq!(
+            db_pending_witness_scripts(&wallet),
+            HashSet::from([scripts[0].clone(), scripts[3].clone(), scripts[4].clone()])
+        );
         assert!(pending_witness(&wallet, txos[0]));
         assert!(pending_witness(&wallet, paid_txo));
         assert!(!pending_witness(&wallet, txos[1]));
         assert!(!pending_witness(&wallet, txos[2]));
+        assert!(!pending_witness(&wallet, txos[3]));
+        assert!(!pending_witness(&wallet, failed_paid_txo));
     }
 }
 
@@ -13416,6 +13613,7 @@ mod bfa_tests {
                 url: s!("http://127.0.0.1:1"),
             },
             skip_consistency_check: false,
+            failed_witness_receive_grace_secs: 604_800,
             proxy_auth_keys: HashMap::new(),
             evm_chains: HashMap::from([(
                 31337,
@@ -13465,7 +13663,7 @@ mod bfa_tests {
         let options = |urls: &str| {
             serde_json::from_str::<OnlineOptions>(&format!(
                 r#"{{"indexer_config":{{"Esplora":{{"url":"u"}}}},"skip_consistency_check":true,
-                "proxy_auth_keys":{{}}{urls}}}"#
+                "failed_witness_receive_grace_secs":604800,"proxy_auth_keys":{{}}{urls}}}"#
             ))
         };
         let chain =
