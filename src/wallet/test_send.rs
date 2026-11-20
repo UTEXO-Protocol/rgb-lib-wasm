@@ -6,6 +6,7 @@ use super::online::{
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
+use crate::utils::TRANSITION_BUILDERS_LOADED;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
@@ -761,6 +762,51 @@ async fn utxo_allocations_limit_across_assets_x_first() {
 #[wasm_bindgen_test]
 async fn utxo_allocations_limit_across_assets_y_first() {
     utxo_allocations_limit_across_assets(false).await;
+}
+
+/// A send loads one transition builder for all the extra allocations of an asset.
+#[wasm_bindgen_test]
+async fn extra_allocations_share_one_builder() {
+    let _reset = ResetMocks;
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
+    let (mut a, a_on) = nia_wallet(5).await;
+    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    wd.max_allocations_per_utxo = u32::MAX;
+    let (mut r, r_on) = funded_wallet(wd, 1).await;
+    let (mut r2, r2_on) = nia_wallet(1).await;
+    let x = issue(&a, vec![AMOUNT]);
+    let y = issue(&a, vec![AMOUNT + 1]);
+
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    send_to(&mut a, &a_on, &x, &rid, 100, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(60), &[PROXY_URL]).await;
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(Some((5, 10)));
+    send_to(&mut a, &a_on, &y, &rid, 60, PROXY_URL, false).await;
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    // the only colored UTXO holds 1 allocation of X and 6 of Y
+    assert_eq!(colored_allocations(&mut r).len(), 7);
+
+    let rid = invoice(&mut r2, &r2_on, Assignment::Fungible(50), &[PROXY_URL]).await;
+    TRANSITION_BUILDERS_LOADED.set(0);
+    let (signed, txid) = begin(&mut r, &r_on, &x, &rid, 50, PROXY_URL, false).await;
+    // the 6 allocations of Y are extra and share one builder
+    assert_eq!(TRANSITION_BUILDERS_LOADED.get(), 1);
+    end(&mut r, &r_on, signed).await;
+    settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
+
+    assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
+    assert_eq!(balance(&r2, &x).settled, 50);
+    assert_eq!(balance(&r, &x).settled, 50);
+    assert_eq!(balance(&r, &y).settled, 60);
+    let y_allocations = r
+        .list_unspents(None, false, true)
+        .unwrap()
+        .into_iter()
+        .flat_map(|u| u.rgb_allocations)
+        .filter(|a| a.asset_id == Some(y.clone()))
+        .count();
+    assert_eq!(y_allocations, 6);
 }
 
 /// A funded wallet with no UTXOs.
