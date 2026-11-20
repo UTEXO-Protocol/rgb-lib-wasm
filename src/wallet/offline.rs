@@ -3860,55 +3860,41 @@ impl Wallet {
     ) -> Result<Option<DbBackupInfo>, Error> {
         use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 
-        let now_str = {
-            #[cfg(target_arch = "wasm32")]
-            let ms = js_sys::Date::now() as i64;
-            #[cfg(not(target_arch = "wasm32"))]
-            let ms = (now().unix_timestamp_nanos() / 1_000_000) as i64;
-            let secs = ms / 1000;
-            let nanos = ((ms % 1000) * 1_000_000) as u32;
-            let dt = time::OffsetDateTime::from_unix_timestamp(secs)
-                .unwrap()
-                .replace_nanosecond(nanos)
-                .unwrap();
-            dt.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default()
-        };
-
         let existing = self.database.get_backup_info()?;
-        if doing_backup {
-            if let Some(_info) = existing {
-                let mut act = DbBackupInfoActMod {
-                    last_backup_timestamp: ActiveValue::Set(now_str),
-                    ..Default::default()
-                };
-                let updated = self.database.update_backup_info(&mut act)?;
-                Ok(Some(updated))
+        #[cfg(not(target_arch = "wasm32"))]
+        let time = now().unix_timestamp_nanos();
+        // The browser clock counts milliseconds. Each time comes after the last saved time.
+        #[cfg(target_arch = "wasm32")]
+        let time = {
+            use super::backup::parse_backup_timestamp;
+            let last = existing.as_ref().map_or(0, |i| {
+                parse_backup_timestamp(&i.last_backup_timestamp)
+                    .max(parse_backup_timestamp(&i.last_operation_timestamp))
+            });
+            (js_sys::Date::now() as i128 * 1_000_000).max(last + 1)
+        };
+        let timestamp = ActiveValue::Set(time.to_string());
+
+        if existing.is_some() {
+            let mut act = DbBackupInfoActMod::default();
+            if doing_backup {
+                act.last_backup_timestamp = timestamp;
             } else {
-                let act = DbBackupInfoActMod {
-                    last_backup_timestamp: ActiveValue::Set(now_str.clone()),
-                    last_operation_timestamp: ActiveValue::Set(now_str),
-                    ..Default::default()
-                };
-                self.database.set_backup_info(act)?;
-                Ok(self.database.get_backup_info()?)
+                act.last_operation_timestamp = timestamp;
             }
-        } else if let Some(_info) = existing {
-            let mut act = DbBackupInfoActMod {
-                last_operation_timestamp: ActiveValue::Set(now_str),
-                ..Default::default()
-            };
-            let updated = self.database.update_backup_info(&mut act)?;
-            Ok(Some(updated))
-        } else {
-            let act = DbBackupInfoActMod {
-                last_backup_timestamp: ActiveValue::Set(String::new()),
-                last_operation_timestamp: ActiveValue::Set(now_str),
-                ..Default::default()
-            };
-            self.database.set_backup_info(act)?;
-            Ok(self.database.get_backup_info()?)
+            return Ok(Some(self.database.update_backup_info(&mut act)?));
         }
+        let (last_backup_timestamp, last_operation_timestamp) = if doing_backup {
+            (timestamp, ActiveValue::Set(s!("0")))
+        } else {
+            (ActiveValue::Set(s!("0")), timestamp)
+        };
+        self.database.set_backup_info(DbBackupInfoActMod {
+            last_backup_timestamp,
+            last_operation_timestamp,
+            ..Default::default()
+        })?;
+        Ok(self.database.get_backup_info()?)
     }
 
     /// Return the IndexedDB key of this wallet: its directory and its network.

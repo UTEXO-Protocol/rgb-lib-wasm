@@ -3,11 +3,14 @@ use wasm_bindgen_test::*;
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, wallet_data};
 use crate::database::DbWalletTransaction;
+use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::vss::VssBackupConfig;
 use crate::wallet::{Online, Outpoint, PendingVanillaTx, TransactionType, Wallet};
 use crate::{AssetSchema, Error, TransferStatus, WalletTransactionType};
 use bdk_wallet::bitcoin::OutPoint;
 use bdk_wallet::bitcoin::psbt::Psbt;
+use bdk_wallet::bitcoin::secp256k1::SecretKey;
 use std::str::FromStr;
 
 const AMOUNT: u64 = 1000;
@@ -143,7 +146,6 @@ async fn abort_pending_vanilla_tx_success() {
 
     w.backup("pw").unwrap();
     assert!(!w.backup_info().unwrap());
-    sleep_ms(1100).await;
     w.abort_pending_vanilla_tx(txid.clone()).unwrap();
     assert!(w.backup_info().unwrap());
 
@@ -438,4 +440,42 @@ async fn vanilla_operations_are_atomic() {
         row(&w, &txid_of(&psbt)).status,
         TransferStatus::WaitingConfirmations
     );
+}
+
+#[wasm_bindgen_test]
+async fn operation_after_a_later_backup_time_needs_backup() {
+    let w = Wallet::new(wallet_data(vec![AssetSchema::Nia])).unwrap();
+    // a saved backup time one hour after the clock
+    let ahead = (js_sys::Date::now() as i128 + 3_600_000) * 1_000_000;
+    w.database
+        .set_backup_info(DbBackupInfoActMod {
+            last_backup_timestamp: ActiveValue::Set(ahead.to_string()),
+            last_operation_timestamp: ActiveValue::Set("0".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!w.backup_info().unwrap());
+    let op = w.update_backup_info(false).unwrap().unwrap();
+    assert!(w.backup_info().unwrap());
+    // a backup time also comes after the last operation time
+    let info = w.update_backup_info(true).unwrap().unwrap();
+    assert!(
+        info.last_backup_timestamp.parse::<i128>().unwrap()
+            > op.last_operation_timestamp.parse::<i128>().unwrap()
+    );
+    assert!(!w.backup_info().unwrap());
+}
+
+#[wasm_bindgen_test]
+async fn ensure_initial_backup_uploads_without_record() {
+    let mut w = Wallet::new(wallet_data(vec![AssetSchema::Nia])).unwrap();
+    w.configure_vss_backup(&VssBackupConfig::new(
+        "http://127.0.0.1:9/vss".to_string(),
+        "store".to_string(),
+        SecretKey::from_slice(&[1; 32]).unwrap(),
+    ));
+    assert!(w.database.get_backup_info().unwrap().is_none());
+    assert!(w.ensure_initial_backup().await.is_err());
+    // the wallet tried an upload
+    assert!(w.database.get_backup_info().unwrap().is_some());
 }

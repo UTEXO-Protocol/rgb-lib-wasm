@@ -13,6 +13,10 @@ pub(crate) const BACKUP_VERSION: u8 = 1;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
+pub(crate) fn parse_backup_timestamp(timestamp: &str) -> i128 {
+    timestamp.parse().expect("backup timestamp is an integer")
+}
+
 /// Public (unencrypted) metadata stored alongside the encrypted payload.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct BackupPubData {
@@ -199,17 +203,10 @@ impl super::Wallet {
 
     /// Returns true if the wallet has been modified since the last backup.
     pub fn backup_info(&self) -> Result<bool, Error> {
-        let info = self.database.get_backup_info()?;
-        match info {
-            None => Ok(true), // never backed up
-            Some(info) => {
-                if info.last_backup_timestamp.is_empty() {
-                    Ok(true)
-                } else {
-                    Ok(info.last_operation_timestamp > info.last_backup_timestamp)
-                }
-            }
-        }
+        Ok(self.database.get_backup_info()?.is_some_and(|info| {
+            parse_backup_timestamp(&info.last_operation_timestamp)
+                > parse_backup_timestamp(&info.last_backup_timestamp)
+        }))
     }
 }
 
@@ -252,7 +249,7 @@ impl super::Wallet {
         res
     }
 
-    /// Upload a backup if the wallet has changes not yet backed up. Call after
+    /// Upload a backup if the wallet has no backup record or has changes not yet backed up. Call after
     /// `configure_vss_backup` so enabling backups never leaves an empty store.
     /// Returns the new server version, or `None` when no upload was needed.
     pub async fn ensure_initial_backup(&self) -> Result<Option<i64>, Error> {
@@ -261,7 +258,7 @@ impl super::Wallet {
                 details: s!("VSS backup not configured"),
             });
         }
-        if !self.backup_info()? {
+        if self.database.get_backup_info()?.is_some() && !self.backup_info()? {
             return Ok(None);
         }
         self.vss_backup().await.map(Some)
@@ -420,6 +417,42 @@ mod tests {
 
         let k3 = derive_key("different", &salt).unwrap();
         assert_ne!(k1, k3);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_info_is_false_without_row() {
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        assert!(wallet.database.get_backup_info().unwrap().is_none());
+        assert!(!wallet.backup_info().unwrap());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_info_compares_integer_timestamps() {
+        use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        let info = wallet.update_backup_info(true).unwrap().unwrap();
+        assert_eq!(info.last_operation_timestamp, "0");
+        assert!(!wallet.backup_info().unwrap());
+
+        wallet.update_backup_info(false).unwrap();
+        assert!(wallet.backup_info().unwrap());
+
+        // as text "10" < "9"
+        wallet
+            .database
+            .update_backup_info(&mut DbBackupInfoActMod {
+                last_backup_timestamp: ActiveValue::Set(s!("9")),
+                last_operation_timestamp: ActiveValue::Set(s!("10")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(wallet.backup_info().unwrap());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
