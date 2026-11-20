@@ -163,6 +163,7 @@ async fn link_and_settle(
             linked_to.to_string(),
             1,
             1,
+            false,
         )
         .await
         .unwrap();
@@ -186,16 +187,17 @@ fn issue_ifa_link(wallet: &Wallet, linked_from: Option<String>) -> String {
             None,
             true,
             linked_from,
+            false,
         )
         .unwrap()
         .asset_id
 }
 
+/// The checks on the linked contracts can be skipped, to link contracts the wallet cannot check.
 #[wasm_bindgen_test]
-async fn issue_linked_from_unknown_contract() {
-    let (wallet, _online) = funded_wallet(nia_ifa(), 2).await;
-    let unknown = contract(1);
-    let err = wallet
+async fn skip_contract_checks() {
+    let (mut wallet, online) = funded_wallet(nia_ifa(), 5).await;
+    let asset_id = wallet
         .issue_asset_ifa(
             s("IFA"),
             s("Inflatable"),
@@ -204,12 +206,32 @@ async fn issue_linked_from_unknown_contract() {
             vec![],
             None,
             true,
-            Some(unknown.clone()),
+            Some(contract(1)),
+            true,
         )
-        .unwrap_err();
+        .unwrap()
+        .asset_id;
     assert_eq!(
-        err.to_string(),
-        format!("Contract {unknown} is not known to the wallet")
+        metadata_links(&wallet, &asset_id),
+        (Some(contract(1)), None)
+    );
+
+    // the NIA asset is not issued linked from the IFA asset: only skip_contract_checks links it
+    let nia = wallet
+        .issue_asset_nia(s("NIA"), s("Fixed"), 0, vec![10])
+        .unwrap()
+        .asset_id;
+    let res = wallet
+        .link(online.clone(), asset_id.clone(), nia.clone(), 1, 1, true)
+        .await
+        .unwrap();
+    mine_and_refresh(&mut wallet, &online).await;
+    let linked = transfer(&wallet, &asset_id, res.batch_transfer_idx);
+    assert_eq!(linked.kind, TransferKind::Link);
+    assert_eq!(linked.status, TransferStatus::Settled);
+    assert_eq!(
+        metadata_links(&wallet, &asset_id),
+        (Some(contract(1)), Some(nia))
     );
 }
 
@@ -257,9 +279,10 @@ async fn ifa_link_right_sent_and_linked() {
 #[wasm_bindgen_test]
 async fn bfa_link_keeps_mint_rights() {
     let (mut wallet, online) =
-        funded_wallet(wallet_data(vec![AssetSchema::Bfa, AssetSchema::Ifa]), 5).await;
+        funded_wallet(wallet_data(vec![AssetSchema::Bfa, AssetSchema::Ifa]), 7).await;
     let bridge = new_evm_address();
     deploy_bridge(&bridge).await;
+    let linked_from = issue_ifa_link(&wallet, None);
     let asset_id = wallet
         .issue_asset_bfa(
             s("BFA"),
@@ -270,13 +293,14 @@ async fn bfa_link_keeps_mint_rights() {
             bridge,
             None,
             true,
-            Some(contract(1)),
+            Some(linked_from.clone()),
+            false,
         )
         .unwrap()
         .asset_id;
     assert_eq!(
         metadata_links(&wallet, &asset_id),
-        (Some(contract(1)), None)
+        (Some(linked_from.clone()), None)
     );
     let issued = receive_assignments(&wallet, &asset_id, TransferKind::Issuance);
     assert!(issued.contains(&Assignment::LinkRight));
@@ -287,7 +311,7 @@ async fn bfa_link_keeps_mint_rights() {
     assert_eq!(mint_rights(&mut wallet, &asset_id), 1);
     assert_eq!(
         metadata_links(&wallet, &asset_id),
-        (Some(contract(1)), Some(replacement))
+        (Some(linked_from), Some(replacement))
     );
 }
 
@@ -369,6 +393,7 @@ async fn link_fails() {
             None,
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -378,7 +403,15 @@ async fn link_fails() {
 
     // no link right
     let res = a
-        .link_begin(a_online.clone(), no_link, no_link_replacement, 1, 1, true)
+        .link_begin(
+            a_online.clone(),
+            no_link,
+            no_link_replacement,
+            1,
+            1,
+            false,
+            true,
+        )
         .await;
     assert!(matches!(res, Err(Error::InsufficientAssignments { .. })));
 
@@ -394,6 +427,7 @@ async fn link_fails() {
             replacement.clone(),
             1,
             1,
+            false,
             true,
         )
         .await
@@ -438,7 +472,15 @@ async fn link_fails() {
     // an asset already linked
     link_and_settle(&mut a, &a_online, &asset_id, &replacement).await;
     let res = a
-        .link_begin(a_online.clone(), asset_id.clone(), replacement, 1, 1, true)
+        .link_begin(
+            a_online.clone(),
+            asset_id.clone(),
+            replacement,
+            1,
+            1,
+            false,
+            true,
+        )
         .await;
     assert!(matches!(res, Err(Error::InsufficientAssignments { .. })));
 }
@@ -465,6 +507,7 @@ async fn link_begin_end() {
             replacement.clone(),
             1,
             1,
+            false,
             true,
         )
         .await
@@ -479,6 +522,7 @@ async fn link_begin_end() {
             replacement.clone(),
             1,
             1,
+            false,
             false,
         )
         .await
@@ -527,6 +571,7 @@ async fn bfa_link_right_received_rejected_and_linked() {
             Some(reject_list.clone()),
             true,
             Some(contract(1)),
+            true,
         )
         .unwrap()
         .asset_id;
@@ -559,6 +604,7 @@ async fn bfa_link_right_received_rejected_and_linked() {
             replacement.clone(),
             1,
             1,
+            false,
         )
         .await;
     assert!(
@@ -634,6 +680,7 @@ async fn link_right_moves_with_spent_utxo() {
             None,
             false,
             None,
+            false,
         )
         .unwrap()
         .asset_id;
@@ -677,6 +724,7 @@ async fn link_is_atomic() {
             1,
             1,
             false,
+            false,
         )
         .await
     })
@@ -688,6 +736,7 @@ async fn link_is_atomic() {
             replacement.clone(),
             1,
             1,
+            false,
             false,
         )
         .await
@@ -707,6 +756,7 @@ async fn link_is_atomic() {
             other_replacement.clone(),
             1,
             1,
+            false,
         )
         .await
     })

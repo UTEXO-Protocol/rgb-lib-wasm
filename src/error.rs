@@ -70,10 +70,10 @@ pub enum Error {
     CannotLinkToItself,
 
     /// The schema cannot be used on mainnet, unless `allow_reckless_schemas` is set (see `WalletData`)
-    #[error("Cannot use {schema} schema on mainnet")]
+    #[error("Cannot use {asset_schema} schema on mainnet")]
     CannotUseSchemaOnMainnet {
         /// Asset schema
-        schema: AssetSchema,
+        asset_schema: AssetSchema,
     },
 
     /// The reject list refuses opouts of the consignment

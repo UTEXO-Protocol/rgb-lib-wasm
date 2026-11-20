@@ -424,6 +424,7 @@ async fn inflate_begin_returns_result_object() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     let asset_id = prop(&asset, "assetId").as_string().unwrap();

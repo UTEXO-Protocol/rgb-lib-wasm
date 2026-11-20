@@ -402,6 +402,7 @@ async fn test_no_inflate_end_after_fail() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
 
@@ -599,6 +600,7 @@ async fn test_full_wallet_flow() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     assert!(!ifa.asset_id.is_empty());
@@ -1541,6 +1543,7 @@ async fn test_restored_wallet_inflates_after_inflation() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
 
@@ -1628,6 +1631,7 @@ async fn test_inflate_end_retries_after_failed_sync() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     let unsigned = wallet

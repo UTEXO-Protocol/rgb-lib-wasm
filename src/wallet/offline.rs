@@ -1151,7 +1151,9 @@ impl Wallet {
             && let Some(schema) = supported_schemas.iter().find(|s| !s.allowed_on_mainnet())
         {
             if !wdata.allow_reckless_schemas {
-                return Err(Error::CannotUseSchemaOnMainnet { schema: *schema });
+                return Err(Error::CannotUseSchemaOnMainnet {
+                    asset_schema: *schema,
+                });
             }
             let msg = format!("Reckless schema {schema} allowed on mainnet");
             warn!(logger, "{msg}");
@@ -1299,6 +1301,24 @@ impl Wallet {
             .ok_or_else(|| Error::UnknownLinkedContract {
                 contract_id: contract_id.to_string(),
             })
+    }
+
+    /// Check that a new asset can link from this contract.
+    fn check_linked_from_contract(&self, linked_from_contract: &ContractId) -> Result<(), Error> {
+        let linked_from = self.check_linked_contract_known(linked_from_contract)?;
+        if !linked_from.schema.supports_link() {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: linked_from.id,
+                details: format!("schema {} doesn't support links", linked_from.schema),
+            });
+        }
+        if let Some(linked_to_contract) = linked_from.linked_to_contract {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: linked_from.id,
+                details: format!("it's already linked to contract {linked_to_contract}"),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn check_transport_endpoints(
@@ -1915,9 +1935,10 @@ impl Wallet {
     #[cfg_attr(feature = "esplora", doc = "[`link`](Wallet::link)).")]
     #[cfg_attr(not(feature = "esplora"), doc = "`link`).")]
     ///
-    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
-    /// the one it replaces). The wallet needs to know this contract. Its schema needs to support
-    /// links and it cannot be linked yet.
+    /// The optional `linked_from_contract` is the ID of the contract this is linked from. The wallet
+    /// needs to know it, to check it can link to the contract being issued: its schema needs to
+    /// support links and it needs to be unlinked. Set `skip_contract_checks` to skip these checks
+    /// and link from a contract the wallet cannot check, e.g. one it doesn't know.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
@@ -1929,6 +1950,7 @@ impl Wallet {
         reject_list_url: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetIFA, Error> {
         let cp = self.shared_checkpoint("issue_asset_ifa");
         let res = self._issue_asset_ifa(
@@ -1940,6 +1962,7 @@ impl Wallet {
             reject_list_url,
             link_right,
             linked_from_contract,
+            skip_contract_checks,
         );
         self.commit_shared(cp, res)
     }
@@ -1955,6 +1978,7 @@ impl Wallet {
         reject_list_url: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetIFA, Error> {
         info!(
             self.logger,
@@ -1976,20 +2000,10 @@ impl Wallet {
                     .map_err(|_| Error::InvalidContractId { contract_id })
             })
             .transpose()?;
-        if let Some(linked_from_contract) = &linked_from_contract {
-            let linked_from = self.check_linked_contract_known(linked_from_contract)?;
-            if !linked_from.schema.supports_link() {
-                return Err(Error::InvalidLinkedContract {
-                    contract_id: linked_from.id,
-                    details: format!("schema {} doesn't support links", linked_from.schema),
-                });
-            }
-            if let Some(linked_to_contract) = linked_from.linked_to_contract {
-                return Err(Error::InvalidLinkedContract {
-                    contract_id: linked_from.id,
-                    details: format!("it's already linked to contract {linked_to_contract}"),
-                });
-            }
+        if let Some(linked_from_contract) = &linked_from_contract
+            && !skip_contract_checks
+        {
+            self.check_linked_from_contract(linked_from_contract)?;
         }
 
         let settled = self._get_total_issue_amount(&amounts, true)?;
@@ -2201,8 +2215,10 @@ impl Wallet {
     #[cfg_attr(feature = "esplora", doc = "[`link`](Wallet::link)).")]
     #[cfg_attr(not(feature = "esplora"), doc = "`link`).")]
     ///
-    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
-    /// the one it replaces).
+    /// The optional `linked_from_contract` is the ID of the contract this is linked from. The wallet
+    /// needs to know it, to check it can link to the contract being issued: its schema needs to
+    /// support links and it needs to be unlinked. Set `skip_contract_checks` to skip these checks
+    /// and link from a contract the wallet cannot check, e.g. one it doesn't know.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_bfa(
         &self,
@@ -2215,6 +2231,7 @@ impl Wallet {
         reject_list_address: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetBFA, Error> {
         let cp = self.shared_checkpoint("issue_asset_bfa");
         let res = self._issue_asset_bfa(
@@ -2227,6 +2244,7 @@ impl Wallet {
             reject_list_address,
             link_right,
             linked_from_contract,
+            skip_contract_checks,
         );
         self.commit_shared(cp, res)
     }
@@ -2243,6 +2261,7 @@ impl Wallet {
         reject_list_address: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetBFA, Error> {
         info!(
             self.logger,
@@ -2263,6 +2282,11 @@ impl Wallet {
                     .map_err(|_| Error::InvalidContractId { contract_id })
             })
             .transpose()?;
+        if let Some(linked_from_contract) = &linked_from_contract
+            && !skip_contract_checks
+        {
+            self.check_linked_from_contract(linked_from_contract)?;
+        }
 
         if mint_rights == 0 {
             return Err(Error::NoMintRights);
@@ -4483,7 +4507,7 @@ mod mainnet_schema_tests {
                 mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, expected], false);
             assert!(matches!(
                 Wallet::new(wd),
-                Err(Error::CannotUseSchemaOnMainnet { schema }) if schema == expected
+                Err(Error::CannotUseSchemaOnMainnet { asset_schema }) if asset_schema == expected
             ));
         }
         let wd = mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia], false);

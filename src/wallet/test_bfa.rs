@@ -252,7 +252,8 @@ async fn bfa_issue_list_and_backup() {
             s(BRIDGE),
             None,
             false,
-            None
+            None,
+            false
         ),
         Err(Error::NoMintRights)
     ));
@@ -266,7 +267,8 @@ async fn bfa_issue_list_and_backup() {
             s("0x12"),
             None,
             false,
-            None
+            None,
+            false
         ),
         Err(Error::InvalidEvmContractAddress { .. })
     ));
@@ -283,6 +285,7 @@ async fn bfa_issue_list_and_backup() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     assert_eq!(bfa.ticker, ticker);
@@ -383,6 +386,7 @@ async fn bfa_mint_right_moves_with_another_asset() {
             None,
             false,
             None,
+            false,
         )
         .unwrap();
     let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Nia]), 3).await;
@@ -540,6 +544,7 @@ pub(super) async fn bfa_with_units(
             reject_list,
             false,
             None,
+            false,
         )
         .unwrap();
     let before_block = evm_block_number().await + 1000;

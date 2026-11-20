@@ -122,6 +122,7 @@ async fn ifa(
             reject_list_url,
             false,
             None,
+            false,
         )
         .unwrap();
     (wallet, online, asset.asset_id, wd)
@@ -742,6 +743,7 @@ async fn inflate_and_burn_are_atomic() {
             None,
             false,
             None,
+            false,
         )
     })
     .await;
