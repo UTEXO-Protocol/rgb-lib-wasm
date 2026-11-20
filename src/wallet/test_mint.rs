@@ -477,6 +477,7 @@ async fn bfa_mint_settles_and_is_spendable() {
 
 #[wasm_bindgen_test]
 async fn bfa_mint_begin_refusals() {
+    const DOWN_URL: &str = "http://127.0.0.1:1/json-rpc";
     let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 5).await;
     let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
     let bridge = new_evm_address();
@@ -522,10 +523,19 @@ async fn bfa_mint_begin_refusals() {
         )
         .unwrap();
     let id = &bfa.asset_id;
-    let recipient = recipient(&rcv.recipient_id, 100, None, PROXY_URL);
-    let result = mint_begin(&mut a, &a_online, id, recipient).await;
+    let mut rcpt = recipient(&rcv.recipient_id, 100, None, PROXY_URL);
+    // the checks that need no network come before any proxy call
+    rcpt.transport_endpoints = vec![transport_endpoint(DOWN_URL)];
+    let result = mint_begin(&mut a, &a_online, id, rcpt.clone()).await;
     assert!(
         matches!(result, Err(Error::InvalidRecipientData { ref details }) if details.contains("cannot have an expiration")),
+        "{result:?}"
+    );
+    // mint contacts the recipient proxy
+    rcpt.expiration_timestamp = None;
+    let result = mint_begin(&mut a, &a_online, id, rcpt).await;
+    assert!(
+        matches!(result, Err(Error::InvalidTransportEndpoints { ref details }) if details == "no valid transport endpoints"),
         "{result:?}"
     );
 
