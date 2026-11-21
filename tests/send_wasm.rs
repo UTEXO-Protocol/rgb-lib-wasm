@@ -66,7 +66,7 @@ async fn create_utxos(
         }
         sleep_ms(500).await;
     }
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 async fn new_wallet() -> (Wallet, Online) {
@@ -186,7 +186,7 @@ async fn begin_dry_as(
 
 async fn end(wallet: &mut Wallet, online: &Online, signed: &str) -> Result<(String, i32), Error> {
     wallet
-        .send_end(online.clone(), signed.to_string(), false)
+        .send_end(online.clone(), signed.to_string())
         .await
         .map(|r| (r.txid, r.batch_transfer_idx))
 }
@@ -317,7 +317,7 @@ async fn begin_end() {
     assert!(!res.details.fascia.is_empty());
 
     let ended = wallet
-        .send_end(online.clone(), signed.to_string(), false)
+        .send_end(online.clone(), signed.to_string())
         .await
         .unwrap();
     assert_eq!((ended.txid, ended.batch_transfer_idx), (txid.clone(), idx));
@@ -522,18 +522,19 @@ async fn send_extra_allocations_no_dry_run_impl(donation: bool) {
     create_utxos(&mut wallet, &online, false, Some(1), None).await;
     let asset_a = issue(&wallet, "TSTA", 1000);
     let asset_b = issue(&wallet, "TSTB", 2000);
-    let colorable = |w: &mut Wallet| {
+    let colorable = async |w: &mut Wallet| {
         w.list_unspents(None, false, true)
+            .await
             .unwrap()
             .into_iter()
             .filter(|u| u.utxo.colorable)
             .collect::<Vec<_>>()
     };
-    let unspents = colorable(&mut wallet);
+    let unspents = colorable(&mut wallet).await;
     assert_eq!(unspents.len(), 1);
     assert_eq!(unspents[0].rgb_allocations.len(), 2);
     create_utxos(&mut wallet, &online, false, Some(1), None).await;
-    assert_eq!(colorable(&mut wallet).len(), 2);
+    assert_eq!(colorable(&mut wallet).await.len(), 2);
 
     let (mut rcv, rcv_online) = sender().await;
     let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
@@ -571,7 +572,7 @@ async fn send_extra_allocations_no_dry_run_impl(donation: bool) {
     assert_eq!(balance(&wallet, &asset_a), 934);
     assert_eq!(balance(&rcv, &asset_a), 66);
     assert_eq!(balance(&wallet, &asset_b), 2000);
-    assert!(colorable(&mut wallet).iter().any(|u| {
+    assert!(colorable(&mut wallet).await.iter().any(|u| {
         u.rgb_allocations
             .iter()
             .any(|a| a.asset_id.as_deref() == Some(asset_b.as_str()) && a.settled)
@@ -725,9 +726,10 @@ async fn batch_donation_success() {
 }
 
 // Settled amount of an asset on each colorable UTXO that holds some.
-fn amounts(wallet: &mut Wallet, asset_id: &str) -> Vec<(Outpoint, u64)> {
+async fn amounts(wallet: &mut Wallet, asset_id: &str) -> Vec<(Outpoint, u64)> {
     wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| u.utxo.colorable)
@@ -778,10 +780,13 @@ async fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
     settle(&mut wallet, &online, &[rid.clone()]).await;
     settle(&mut rcv, &rcv_online, &[rid]).await;
 
-    let mut x = amounts(&mut wallet, &asset_x);
+    let mut x = amounts(&mut wallet, &asset_x).await;
     x.sort_by_key(|(_, n)| *n);
     assert_eq!(x.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![10, 934]);
-    assert_eq!(amounts(&mut wallet, &asset_y), vec![(x[1].0.clone(), 2000)]);
+    assert_eq!(
+        amounts(&mut wallet, &asset_y).await,
+        vec![(x[1].0.clone(), 2000)]
+    );
     assert_eq!(balance(&wallet, &asset_x), 944);
     assert_eq!(balance(&wallet, &asset_y), 2000);
 
