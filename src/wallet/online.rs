@@ -622,10 +622,81 @@ impl From<RejectListLocation> for RejectListSource {
 /// The reject and allow opouts of each reject list fetched by an operation.
 type RejectLists = HashMap<RejectListSource, (HashSet<Opout>, HashSet<Opout>)>;
 
+/// Return where the reject list of the asset is published, if any.
+/// The genesis is already validated, so an invalid global is an internal error.
+fn genesis_reject_list_source_validated(
+    asset_schema: AssetSchema,
+    genesis: &Genesis,
+) -> Result<Option<RejectListSource>, Error> {
+    let global = |global_type: GlobalStateType| {
+        genesis
+            .globals
+            .get(&global_type)
+            .and_then(|values| values.first())
+            .map(|value| value.to_inner())
+    };
+    let source = match asset_schema {
+        AssetSchema::Bfa => global(GS_REJECT_LIST)
+            .map(RejectListLocation::from_strict_serialized)
+            .transpose()
+            .map(|location| location.map(RejectListSource::from)),
+        AssetSchema::Ifa => global(GS_REJECT_LIST_URL)
+            .map(RejectListUrl::from_strict_serialized)
+            .transpose()
+            .map(|url| url.map(|url| RejectListSource::Url(url.to_string()))),
+        AssetSchema::Nia => Ok(None),
+    };
+    source.map_err(|e| Error::Internal {
+        details: format!("invalid reject list in a validated genesis: {e}"),
+    })
+}
+
+/// Whether an opout the reject list rejects is on an unshielded path, caching each operation.
+fn history_rejected(
+    ops_dag: &OpsDag,
+    reject_opouts: &HashSet<Opout>,
+    allow_opouts: &HashSet<Opout>,
+    start: NodeIndex,
+    rejected: &mut HashMap<NodeIndex, bool>,
+) -> bool {
+    // Depth first. An operation settles after the operations it spends from.
+    let mut stack = vec![start];
+    while let Some(&node) = stack.last() {
+        if rejected.contains_key(&node) {
+            stack.pop();
+            continue;
+        }
+        let base = stack.len();
+        let mut node_rejected = false;
+        for (spent_opout, parent) in ops_dag.spent_opouts(node) {
+            // An allow opout shields this branch.
+            if allow_opouts.contains(&spent_opout) {
+                continue;
+            }
+            if reject_opouts.contains(&spent_opout) || rejected.get(&parent) == Some(&true) {
+                node_rejected = true;
+                break;
+            }
+            if !rejected.contains_key(&parent) {
+                stack.push(parent);
+            }
+        }
+        if node_rejected {
+            stack.truncate(base);
+        } else if stack.len() > base {
+            // Settle the parents first, then come back.
+            continue;
+        }
+        rejected.insert(node, node_rejected);
+        stack.pop();
+    }
+    rejected[&start]
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AssetInfo {
     contract_id: ContractId,
-    reject_list_url: Option<String>,
+    schema: AssetSchema,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2518,9 +2589,11 @@ impl Wallet {
         check_opouts: &HashSet<Opout>,
     ) -> Result<HashSet<Opout>, Error> {
         let mut to_reject = HashSet::new();
+        // Shared by the walks: a common history is walked once.
+        let mut rejected = HashMap::new();
 
         // for each opout we are checking, traverse its ancestor chain
-        'check: for check_opout in check_opouts {
+        for check_opout in check_opouts {
             // allow shields this path upward: do not traverse this branch further
             if allow_opouts.contains(check_opout) {
                 continue;
@@ -2534,24 +2607,8 @@ impl Wallet {
                 details: s!("opout not found in DAG"),
             })?;
 
-            // traverse from the operation creating it to its ancestors, depth first, checking the
-            // opouts each operation spends
-            let mut stack = vec![op_node];
-            let mut visited = HashSet::new();
-            while let Some(node) = stack.pop() {
-                if !visited.insert(node) {
-                    continue;
-                }
-                for (spent_opout, parent) in ops_dag.spent_opouts(node) {
-                    if allow_opouts.contains(&spent_opout) {
-                        continue;
-                    }
-                    if reject_opouts.contains(&spent_opout) {
-                        to_reject.insert(*check_opout);
-                        continue 'check;
-                    }
-                    stack.push(parent);
-                }
+            if history_rejected(ops_dag, reject_opouts, allow_opouts, op_node, &mut rejected) {
+                to_reject.insert(*check_opout);
             }
         }
         Ok(to_reject)
@@ -4094,19 +4151,11 @@ impl Wallet {
             transfer_info.beneficiaries_blinded = beneficiaries_blinded;
 
             let contract_id = transfer_info.asset_info.contract_id;
-            let reject_list_source = match transfer_info.asset_info.reject_list_url.clone() {
-                Some(url) => Some(RejectListSource::Url(url)),
-                None if AssetSchema::get_from_contract_id(contract_id, runtime)?
-                    == AssetSchema::Bfa =>
-                {
-                    runtime
-                        .contract_wrapper::<BridgedFungibleAsset>(contract_id)?
-                        .reject_list()
-                        .map(RejectListSource::from)
-                }
-                None => None,
-            };
-            // check every operation, so that none spends a rejected allocation
+            // Check every operation, also those with no recipient (inflation, burn).
+            let reject_list_source = genesis_reject_list_source_validated(
+                transfer_info.asset_info.schema,
+                &runtime.genesis(contract_id)?,
+            )?;
             let should_build_dag = reject_list_source.is_some();
 
             if should_build_dag {
@@ -5133,13 +5182,11 @@ impl Wallet {
     #[allow(clippy::too_many_arguments)]
     async fn _check_received_consignment(
         &self,
-        runtime: &RgbRuntime,
         mut pending: PendingConsignment<true>,
         consignment: &RgbTransfer,
         witness_id: RgbTxid,
         receiving: &HashMap<Opout, Assignment>,
         asset_schema: AssetSchema,
-        asset_id: &str,
         check_reject_list: bool,
     ) -> Result<
         Option<(
@@ -5175,21 +5222,10 @@ impl Wallet {
         debug!(self.logger, "Consignment validity: {:?}", validity);
 
         let received = receiving.clone();
-        let reject_list_source = match asset_schema {
-            _ if !check_reject_list => None,
-            AssetSchema::Ifa => {
-                let url = if let Ok(ass) = self.database.check_asset_exists(asset_id.to_string()) {
-                    ass.reject_list_url
-                } else {
-                    let contract = IfaWrapper::with(runtime.consignment_data(&valid_consignment)?);
-                    contract.reject_list_url().map(|u| u.to_string())
-                };
-                url.map(RejectListSource::Url)
-            }
-            AssetSchema::Bfa => BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
-                .reject_list()
-                .map(RejectListSource::from),
-            AssetSchema::Nia => None,
+        let reject_list_source = if check_reject_list && asset_schema.supports_reject_list() {
+            genesis_reject_list_source_validated(asset_schema, &consignment.genesis)?
+        } else {
+            None
         };
         if let Some(source) = &reject_list_source {
             let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
@@ -5612,7 +5648,8 @@ impl Wallet {
             NonZeroU32::new(self.safe_height(batch_transfer.min_confirmations).await?);
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            build_ops_dag: true,
+            // Only schemas with a reject list need the DAG.
+            build_ops_dag: asset_schema.supports_reject_list(),
             safe_height,
         };
         #[cfg(test)]
@@ -5975,13 +6012,11 @@ impl Wallet {
                         }
                         let checked = self
                             ._check_received_consignment(
-                                &runtime,
                                 assumed,
                                 &consignment,
                                 witness_id,
                                 &receiving,
                                 asset_schema,
-                                &asset_id,
                                 !committed_mint,
                             )
                             .await?;
@@ -6055,13 +6090,11 @@ impl Wallet {
         }
         let Some((valid_consignment, received, chain_resolver)) = self
             ._check_received_consignment(
-                &runtime,
                 pending,
                 &consignment,
                 witness_id,
                 &receiving,
                 asset_schema,
-                &asset_id,
                 !committed_mint,
             )
             .await?
@@ -7233,7 +7266,7 @@ impl Wallet {
         };
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            build_ops_dag: true,
+            build_ops_dag: asset_schema.supports_reject_list(),
             ..Default::default()
         };
         let mut pending = consignment
@@ -7281,15 +7314,8 @@ impl Wallet {
 
         let valid_consignment = pending.finalize();
         let mut runtime = self.rgb_runtime()?;
-        let reject_list_source = match asset_schema {
-            AssetSchema::Ifa => IfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
-                .reject_list_url()
-                .map(|u| RejectListSource::Url(u.to_string())),
-            AssetSchema::Bfa => BfaWrapper::with(runtime.consignment_data(&valid_consignment)?)
-                .reject_list()
-                .map(RejectListSource::from),
-            AssetSchema::Nia => None,
-        };
+        let reject_list_source =
+            genesis_reject_list_source_validated(asset_schema, &consignment.genesis)?;
         if let Some(source) = &reject_list_source {
             let (reject_opouts, allow_opouts) = self._get_reject_list_async(source).await?;
             // check from the inputs and outputs of the terminal operations
@@ -8134,7 +8160,7 @@ impl Wallet {
                 (
                     AssetInfo {
                         contract_id,
-                        reject_list_url: asset.reject_list_url,
+                        schema: asset.schema,
                     },
                     original_assignments_needed,
                 ),
@@ -9083,7 +9109,7 @@ impl Wallet {
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
         let asset_info = AssetInfo {
             contract_id,
-            reject_list_url: asset.reject_list_url,
+            schema: asset.schema,
         };
         let transfer_info = InfoAssetTransfer {
             asset_info,
@@ -9462,7 +9488,7 @@ impl Wallet {
         let transfer_info = InfoAssetTransfer {
             asset_info: AssetInfo {
                 contract_id,
-                reject_list_url: asset.reject_list_url,
+                schema: asset.schema,
             },
             recipients: vec![],
             asset_spend,
@@ -10164,7 +10190,7 @@ impl Wallet {
         let transfer_info = InfoAssetTransfer {
             asset_info: AssetInfo {
                 contract_id,
-                reject_list_url: asset.reject_list_url,
+                schema: asset.schema,
             },
             recipients: vec![local_recipient],
             asset_spend,
@@ -10412,7 +10438,7 @@ impl Wallet {
         let transfer_info = InfoAssetTransfer {
             asset_info: AssetInfo {
                 contract_id,
-                reject_list_url: asset.reject_list_url,
+                schema: asset.schema,
             },
             recipients: local_recipients,
             asset_spend,
@@ -11061,7 +11087,7 @@ mod send_end_tests {
         InfoAssetTransfer {
             asset_info: AssetInfo {
                 contract_id: ContractId::copy_from_slice([9; 32]).unwrap(),
-                reject_list_url: None,
+                schema: AssetSchema::Nia,
             },
             recipients,
             asset_spend: AssetSpend {
@@ -15048,6 +15074,108 @@ mod bfa_tests {
             block_on(wallet._get_reject_list_async(&source)),
             Err(Error::NoEvmRpcUrl { chain_id: 31337 })
         ));
+    }
+
+    // Walk the history of an operation with no shared cache.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn history_rejected_unshared(
+        ops_dag: &OpsDag,
+        reject_opouts: &HashSet<Opout>,
+        allow_opouts: &HashSet<Opout>,
+        start: NodeIndex,
+    ) -> bool {
+        let mut stack = vec![start];
+        let mut visited = HashSet::new();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            for (spent_opout, parent) in ops_dag.spent_opouts(node) {
+                if allow_opouts.contains(&spent_opout) {
+                    continue;
+                }
+                if reject_opouts.contains(&spent_opout) {
+                    return true;
+                }
+                stack.push(parent);
+            }
+        }
+        false
+    }
+
+    // Shared walks give the same answers as fresh walks on random DAGs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn history_rejected_matches_unshared_walks() {
+        // Xorshift, so a failure repeats.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let op = |i: u64| {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            OpId::from(id)
+        };
+        let (mut rejected_count, mut not_rejected_count) = (0, 0);
+        for _ in 0..1000 {
+            let op_count = 1 + next(40);
+            let mut ops_dag = OpsDag::new();
+            let mut reject = HashSet::new();
+            let mut allow = HashSet::new();
+            // Each operation spends opouts of earlier ones, so the DAG has no cycles.
+            let density = 1 + next(4);
+            for i in 0..op_count {
+                ops_dag.register_op(op(i));
+                for j in 0..i {
+                    for no in 0..3 {
+                        if next(3 * i + 1) >= density {
+                            continue;
+                        }
+                        let input = Opout::new(op(j), AssignmentType::with(4000), no);
+                        match next(10) {
+                            0 => {
+                                reject.insert(input);
+                            }
+                            1 => {
+                                allow.insert(input);
+                            }
+                            2 if next(4) == 0 => {
+                                reject.insert(input);
+                                allow.insert(input);
+                            }
+                            _ => {}
+                        }
+                        ops_dag.connect_input(input, op(i));
+                    }
+                }
+            }
+
+            let mut starts: Vec<NodeIndex> = (0..op_count)
+                .map(|i| ops_dag.op_node(&op(i)).unwrap())
+                .collect();
+            for i in (1..starts.len()).rev() {
+                starts.swap(i, next(i as u64 + 1) as usize);
+            }
+            let mut rejected = HashMap::new();
+            for start in starts {
+                let expected = history_rejected_unshared(&ops_dag, &reject, &allow, start);
+                assert_eq!(
+                    history_rejected(&ops_dag, &reject, &allow, start, &mut rejected),
+                    expected
+                );
+                if expected {
+                    rejected_count += 1;
+                } else {
+                    not_rejected_count += 1;
+                }
+            }
+        }
+        // Both answers occur.
+        assert!(rejected_count > 1000 && not_rejected_count > 1000);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

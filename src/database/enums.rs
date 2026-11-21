@@ -83,6 +83,11 @@ impl AssetSchema {
         Self::from_schema_id(schema_id)
     }
 
+    /// Whether the schema can carry a reject list.
+    pub(crate) fn supports_reject_list(&self) -> bool {
+        matches!(self, Self::Ifa | Self::Bfa)
+    }
+
     pub(crate) fn supports_link(&self) -> bool {
         match self {
             Self::Ifa | Self::Bfa => true,
