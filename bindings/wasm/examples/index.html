@@ -129,14 +129,16 @@ code.snippet {
   bitcoinNetwork: "Regtest",
   databaseType: "Sqlite",
   maxAllocationsPerUtxo: 5,
-  accountXpubVanilla: keys.accountXpubVanilla,
-  accountXpubColored: keys.accountXpubColored,
-  mnemonic: keys.mnemonic,
-  masterFingerprint: keys.masterFingerprint,
-  vanillaKeychain: null,
   supportedSchemas: ["Nia", "Ifa"],
 };
-const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
+const walletKeys = {
+  accountXpubVanilla: keys.accountXpubVanilla,
+  accountXpubColored: keys.accountXpubColored,
+  masterFingerprint: keys.masterFingerprint,
+  mnemonic: keys.mnemonic,
+  vanillaKeychain: null,
+};
+const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));</code>
     </div>
 
     <div class="step">
@@ -241,6 +243,7 @@ bash tests/regtest.sh stop</pre>
       fundAddress,
       mineAndWait,
       fillWalletData,
+      fillWalletKeys,
       ESPLORA_API,
       PROXY_URL,
     } from './lib/shared.js';
@@ -294,8 +297,9 @@ bash tests/regtest.sh stop</pre>
 
         // Step 3: Create wallet
         log('[3/12] Creating wallet...', 'log-info');
-        const walletData = fillWalletData(keys, 'regtest');
-        const wallet = await WasmWallet.create(JSON.stringify(walletData));
+        const walletData = fillWalletData('regtest');
+        const walletKeys = fillWalletKeys(keys);
+        const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));
         state.wallet = wallet;
         append('[3/12] Wallet created');
         log('[3/12] Wallet created', 'log-ok');
@@ -419,8 +423,9 @@ bash tests/regtest.sh stop</pre>
 
         // Step 3: Create wallet
         log('[3/6] Creating wallet...', 'log-info');
-        const walletData = fillWalletData(keys, 'regtest');
-        const wallet = await WasmWallet.create(JSON.stringify(walletData));
+        const walletData = fillWalletData('regtest');
+        const walletKeys = fillWalletKeys(keys);
+        const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));
         state.wallet = wallet;
         append('[3/6] Wallet created');
         log('[3/6] Wallet created', 'log-ok');
@@ -467,7 +472,7 @@ bash tests/regtest.sh stop</pre>
         // Test: bad wallet data
         errCount++;
         try {
-          await WasmWallet.create('{"invalid": "data"}');
+          await WasmWallet.create('{"invalid": "data"}', '{}');
           append('[6/6] ERROR: bad wallet data should have thrown');
         } catch (e) {
           errPassed++;

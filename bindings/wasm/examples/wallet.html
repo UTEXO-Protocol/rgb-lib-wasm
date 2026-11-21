@@ -136,6 +136,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     <div>
       <label for="wallet-data">WalletData JSON (auto-filled from generated keys)</label>
       <textarea id="wallet-data" rows="8" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
+      <label for="wallet-keys">SinglesigKeys JSON (auto-filled from generated keys)</label>
+      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-create-wallet" disabled>Create Wallet</button>
@@ -315,6 +317,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       initWasm,
       enableBtns,
       fillWalletData,
+      fillWalletKeys,
     } from './lib/shared.js';
 
     // -----------------------------------------------------------------
@@ -360,7 +363,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         document.getElementById('rt-status').innerHTML = '';
         if (keys.mnemonic) {
           document.getElementById('restore-mnemonic').value = keys.mnemonic;
-          fillWalletData(keys, network);
+          fillWalletData(network);
+          fillWalletKeys(keys);
         }
         log('generateKeys(' + network + ') OK', 'log-ok');
       } catch (e) {
@@ -428,13 +432,14 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
     document.getElementById('btn-create-wallet').addEventListener('click', async () => {
       const walletDataJson = document.getElementById('wallet-data').value.trim();
+      const keysJson = document.getElementById('wallet-keys').value.trim();
       if (!walletDataJson) {
         showResult('wallet-output', 'wallet-result', 'Error: Please enter WalletData JSON or generate keys first');
         return;
       }
       try {
         log('Creating wallet...', 'log-warn');
-        state.wallet = await WasmWallet.create(walletDataJson);
+        state.wallet = await WasmWallet.create(walletDataJson, keysJson);
         const wd = state.wallet.getWalletData();
         showResult('wallet-output', 'wallet-result',
           'Wallet created successfully (with IndexedDB restore)!\n\n' + json(wd));

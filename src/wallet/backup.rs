@@ -47,6 +47,8 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
     /// Mint locks a received consignment waits for, keyed by recipient_id.
     pub(crate) pending_mint_locks: std::collections::HashMap<String, super::PendingMintLocks>,
+    /// Settings and public keys of the wallet.
+    pub(crate) manifest: super::WalletManifest,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -163,8 +165,8 @@ impl super::Wallet {
     }
 
     /// Restore wallet state from an encrypted backup.
-    /// The wallet must be created first via `Wallet::new()` with the same mnemonic/xpubs.
-    /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()`, or its data directory holds no snapshot.
+    /// The wallet must be created first with the same keys and vanilla keychain; other keys give `WalletSettingMismatch`. The wallet keeps its own mutable settings.
+    /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()` or `Wallet::load()`, or its data directory holds no snapshot.
     /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
         let (pub_data, ciphertext) = decode_backup(backup_bytes)?;
@@ -200,6 +202,7 @@ impl super::Wallet {
             pending_mint_locks: payload.pending_mint_locks,
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
+            manifest: payload.manifest,
         };
         self.restore_from_snapshot(snapshot)
     }
@@ -234,7 +237,7 @@ impl super::Wallet {
         })?;
 
         let payload_json = self.serialize_backup_payload()?;
-        let fingerprint = self.wallet_data.master_fingerprint.clone();
+        let fingerprint = self.keys.master_fingerprint.clone();
 
         self.update_backup_info(true)?;
         let res = match client.upload_backup(&payload_json, &fingerprint).await {
@@ -275,7 +278,7 @@ impl super::Wallet {
         })?;
 
         let payload_json = client
-            .download_backup(&self.wallet_data.master_fingerprint)
+            .download_backup(&self.keys.master_fingerprint)
             .await?;
         self.restore_payload(&payload_json)?;
 
@@ -327,6 +330,7 @@ impl super::Wallet {
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
+            manifest: super::WalletManifest::new(&self.wallet_data, &self.keys),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -990,11 +994,11 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn backup_payload_of(keys: crate::keys::Keys) -> WalletBackupPayload {
+    fn backup_payload_of(keys: crate::wallet::SinglesigKeys) -> WalletBackupPayload {
         use crate::utils::MemStock;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_singlesig_keys;
 
-        let source = make_test_wallet_with_keys(keys, false);
+        let source = make_test_wallet_with_singlesig_keys(keys, false);
         *source.rgb_stock.borrow_mut() = Some(MemStock::default());
         serde_json::from_slice(&source.serialize_backup_payload().unwrap()).unwrap()
     }
@@ -1003,20 +1007,22 @@ mod tests {
     fn assert_failed_restore_keeps_wallet(
         wallet: &mut crate::wallet::Wallet,
         payload: &WalletBackupPayload,
-    ) {
+    ) -> Error {
         let before = wallet.serialize_backup_payload().unwrap();
         let (ciphertext, pub_data) =
             encrypt_payload(&serde_json::to_vec(payload).unwrap(), "pw").unwrap();
         let backup = encode_backup(&ciphertext, &pub_data).unwrap();
 
-        let result = wallet.restore_backup(&backup, "pw");
+        let err = wallet
+            .restore_backup(&backup, "pw")
+            .expect_err("restore of a broken backup succeeded");
 
-        assert!(result.is_err(), "restore of a broken backup succeeded");
         assert_eq!(
             wallet.serialize_backup_payload().unwrap(),
             before,
             "the failed restore changed the wallet"
         );
+        err
     }
 
     #[test]
@@ -1024,7 +1030,7 @@ mod tests {
     fn failed_restore_with_bad_rgb_store_keeps_wallet() {
         let keys = crate::keys::generate_keys(crate::BitcoinNetwork::Regtest);
         let mut wallet = wallet_with_transfer(keys.clone());
-        let mut payload = backup_payload_of(keys);
+        let mut payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(&keys, None));
         payload.rgb_store = s!("not base64!");
 
         assert_failed_restore_keeps_wallet(&mut wallet, &payload);
@@ -1036,12 +1042,34 @@ mod tests {
         use crate::keys::generate_keys;
 
         let mut wallet = wallet_with_transfer(generate_keys(crate::BitcoinNetwork::Regtest));
-        let mut payload = backup_payload_of(generate_keys(crate::BitcoinNetwork::Regtest));
+        let mut payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(
+            &generate_keys(crate::BitcoinNetwork::Regtest),
+            None,
+        ));
         assert!(payload.bdk_changeset.is_some());
 
         assert_failed_restore_keeps_wallet(&mut wallet, &payload);
 
         payload.bdk_changeset = None;
         assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn restore_backup_refuses_changed_settings() {
+        let keys = crate::keys::generate_keys(crate::BitcoinNetwork::Regtest);
+        let mut wallet = wallet_with_transfer(keys.clone());
+        let payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(&keys, Some(1)));
+
+        let err = assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+
+        assert!(
+            matches!(
+                &err,
+                Error::WalletSettingMismatch { setting, expected, provided }
+                    if setting == "vanilla_keychain" && expected == "1" && provided == "0"
+            ),
+            "{err:?}"
+        );
     }
 }

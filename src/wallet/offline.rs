@@ -979,7 +979,7 @@ impl From<LocalOutput> for Utxo {
 }
 
 /// Data that defines a [`Wallet`].
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct WalletData {
     /// Directory where the wallet directory is stored
@@ -991,17 +991,6 @@ pub struct WalletData {
     /// The max number of RGB allocations allowed per UTXO
     #[serde(deserialize_with = "from_str_or_number_mandatory")]
     pub max_allocations_per_utxo: u32,
-    /// Wallet account-level xPub for the vanilla-side of the wallet
-    pub account_xpub_vanilla: String,
-    /// Wallet account-level xPub for the colored-side of the wallet
-    pub account_xpub_colored: String,
-    /// Wallet mnemonic phrase
-    pub mnemonic: Option<Zeroizing<String>>,
-    /// Wallet master fingerprint
-    pub master_fingerprint: String,
-    /// Keychain index for the vanilla-side of the wallet (default: 0)
-    #[serde(deserialize_with = "from_str_or_number_optional")]
-    pub vanilla_keychain: Option<u8>,
     /// List of schemas the wallet should support (when issuing, sending and receiving). Empty list
     /// means the wallet should support all the schemas rgb-lib supports.
     pub supported_schemas: Vec<AssetSchema>,
@@ -1016,22 +1005,193 @@ pub struct WalletData {
     pub allow_reckless_schemas: bool,
 }
 
-impl std::fmt::Debug for WalletData {
+/// Keys for the singlesig wallet.
+#[derive(Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct SinglesigKeys {
+    /// Wallet account-level xPub for the vanilla side of the wallet
+    pub account_xpub_vanilla: String,
+    /// Wallet account-level xPub for the colored side of the wallet
+    pub account_xpub_colored: String,
+    /// Keychain index for the vanilla-side of the wallet (default: 0)
+    #[serde(deserialize_with = "from_str_or_number_optional")]
+    pub vanilla_keychain: Option<u8>,
+    /// Wallet master fingerprint
+    pub master_fingerprint: String,
+    /// Wallet mnemonic phrase
+    pub mnemonic: Option<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for SinglesigKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WalletData")
-            .field("data_dir", &self.data_dir)
-            .field("bitcoin_network", &self.bitcoin_network)
-            .field("database_type", &self.database_type)
-            .field("max_allocations_per_utxo", &self.max_allocations_per_utxo)
+        f.debug_struct("SinglesigKeys")
             .field("account_xpub_vanilla", &self.account_xpub_vanilla)
             .field("account_xpub_colored", &self.account_xpub_colored)
-            .field("mnemonic", &self.mnemonic.as_ref().map(|_| crate::REDACTED))
-            .field("master_fingerprint", &self.master_fingerprint)
             .field("vanilla_keychain", &self.vanilla_keychain)
-            .field("supported_schemas", &self.supported_schemas)
-            .field("reuse_addresses", &self.reuse_addresses)
-            .field("allow_reckless_schemas", &self.allow_reckless_schemas)
+            .field("master_fingerprint", &self.master_fingerprint)
+            .field("mnemonic", &self.mnemonic.as_ref().map(|_| crate::REDACTED))
             .finish()
+    }
+}
+
+impl SinglesigKeys {
+    pub(crate) fn build_descriptors(
+        &self,
+        bitcoin_network: BitcoinNetwork,
+    ) -> Result<(WalletDescriptors, bool), Error> {
+        let bdk_network = BdkNetwork::from(bitcoin_network);
+        let xpub_rgb = str_to_xpub(&self.account_xpub_colored, bdk_network)?;
+        let xpub_btc = str_to_xpub(&self.account_xpub_vanilla, bdk_network)?;
+        let ((colored, vanilla), watch_only) = if let Some(mnemonic) = &self.mnemonic {
+            let descs = get_descriptors(
+                bitcoin_network,
+                mnemonic,
+                self.vanilla_keychain,
+                xpub_btc,
+                xpub_rgb,
+            )?;
+            // check master fingerprint derived from mnemonic matches provided one
+            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.as_str())?;
+            let master_xprv = Xpriv::new_master(bitcoin_network, &mnemonic.to_seed("")).unwrap();
+            let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
+            if master_xpub.fingerprint()
+                != Fingerprint::from_str(&self.master_fingerprint)
+                    .map_err(|_| Error::InvalidFingerprint)?
+            {
+                return Err(Error::FingerprintMismatch);
+            }
+            (descs, false)
+        } else {
+            let descs = get_descriptors_from_xpubs(
+                bitcoin_network,
+                &self.master_fingerprint,
+                xpub_rgb,
+                xpub_btc,
+                self.vanilla_keychain,
+            )?;
+            (descs, true)
+        };
+        Ok((WalletDescriptors { colored, vanilla }, watch_only))
+    }
+
+    /// Create a new [`SinglesigKeys`] from a [`crate::keys::Keys`] object.
+    pub fn from_keys(keys: &crate::keys::Keys, vanilla_keychain: Option<u8>) -> Self {
+        Self {
+            mnemonic: Some(keys.mnemonic.clone()),
+            ..Self::from_keys_no_mnemonic(keys, vanilla_keychain)
+        }
+    }
+
+    /// Create a new [`SinglesigKeys`] from a [`crate::keys::Keys`] object without a mnemonic.
+    pub fn from_keys_no_mnemonic(keys: &crate::keys::Keys, vanilla_keychain: Option<u8>) -> Self {
+        Self {
+            account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
+            account_xpub_colored: keys.account_xpub_colored.clone(),
+            vanilla_keychain,
+            master_fingerprint: keys.master_fingerprint.clone(),
+            mnemonic: None,
+        }
+    }
+}
+
+/// Descriptors for an RGB wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct WalletDescriptors {
+    /// Colored descriptor
+    pub colored: String,
+    /// Vanilla descriptor
+    pub vanilla: String,
+}
+
+// The non-secret settings and keys of a wallet, saved with each snapshot and backup.
+// The mnemonic is never stored here.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct WalletManifest {
+    pub(crate) bitcoin_network: BitcoinNetwork,
+    pub(crate) database_type: DatabaseType,
+    pub(crate) max_allocations_per_utxo: u32,
+    pub(crate) supported_schemas: Vec<AssetSchema>,
+    pub(crate) reuse_addresses: bool,
+    pub(crate) allow_reckless_schemas: bool,
+    pub(crate) account_xpub_vanilla: String,
+    pub(crate) account_xpub_colored: String,
+    pub(crate) vanilla_keychain: u8,
+    pub(crate) master_fingerprint: String,
+}
+
+impl WalletManifest {
+    pub(crate) fn new(wallet_data: &WalletData, keys: &SinglesigKeys) -> Self {
+        Self {
+            bitcoin_network: wallet_data.bitcoin_network,
+            database_type: wallet_data.database_type.clone(),
+            max_allocations_per_utxo: wallet_data.max_allocations_per_utxo,
+            supported_schemas: wallet_data.supported_schemas.clone(),
+            reuse_addresses: wallet_data.reuse_addresses,
+            allow_reckless_schemas: wallet_data.allow_reckless_schemas,
+            account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
+            account_xpub_colored: keys.account_xpub_colored.clone(),
+            vanilla_keychain: keys.vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
+            master_fingerprint: keys.master_fingerprint.clone(),
+        }
+    }
+
+    // Fail if wallet_data or keys disagree with the settings fixed at wallet creation.
+    pub(crate) fn check_settings_unchanged(
+        &self,
+        wallet_data: &WalletData,
+        keys: &SinglesigKeys,
+    ) -> Result<(), Error> {
+        let requested = Self::new(wallet_data, keys);
+
+        if self.bitcoin_network != requested.bitcoin_network {
+            return Err(Error::BitcoinNetworkMismatch);
+        }
+
+        macro_rules! check {
+            ($($field:ident),+ $(,)?) => {
+                $(if self.$field != requested.$field {
+                    return Err(Error::WalletSettingMismatch {
+                        setting: stringify!($field).to_string(),
+                        expected: format!("{:?}", self.$field),
+                        provided: format!("{:?}", requested.$field),
+                    });
+                })+
+            };
+        }
+
+        check!(
+            master_fingerprint,
+            vanilla_keychain,
+            account_xpub_colored,
+            account_xpub_vanilla,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn into_parts(
+        self,
+        data_dir: String,
+        mnemonic: Option<Zeroizing<String>>,
+    ) -> (WalletData, SinglesigKeys) {
+        (
+            WalletData {
+                data_dir,
+                bitcoin_network: self.bitcoin_network,
+                database_type: self.database_type,
+                max_allocations_per_utxo: self.max_allocations_per_utxo,
+                supported_schemas: self.supported_schemas,
+                reuse_addresses: self.reuse_addresses,
+                allow_reckless_schemas: self.allow_reckless_schemas,
+            },
+            SinglesigKeys {
+                account_xpub_vanilla: self.account_xpub_vanilla,
+                account_xpub_colored: self.account_xpub_colored,
+                vanilla_keychain: Some(self.vanilla_keychain),
+                master_fingerprint: self.master_fingerprint,
+                mnemonic,
+            },
+        )
     }
 }
 
@@ -1073,6 +1233,8 @@ pub(crate) type RgbLibDb = crate::database::memory_db::InMemoryDb;
 /// method.
 pub struct Wallet {
     pub(crate) wallet_data: WalletData,
+    /// Keys the wallet was created with. The mnemonic is missing for a watch-only wallet.
+    pub(crate) keys: SinglesigKeys,
     pub(crate) logger: Logger,
     pub(crate) _logger_guard: LoggerGuard,
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -1128,78 +1290,84 @@ impl Wallet {
     ///
     /// The returned wallet is ready for use only after the IndexedDB read and snapshot
     /// restoration complete. IndexedDB and snapshot decoding failures are returned to the caller.
+    /// A snapshot saved with another fingerprint, vanilla keychain or account xPub gives
+    /// [`Error::WalletSettingMismatch`]. Other settings come from `wallet_data` and are saved
+    /// with the next save.
     /// It asks the browser to keep the storage. A refusal does not fail the call.
-    pub async fn restore(wallet_data: WalletData) -> Result<Self, Error> {
-        let mut wallet = Self::new(wallet_data)?;
+    pub async fn restore(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
+        let wallet = Self::new(wallet_data, keys)?;
         let snapshot = super::idb_store::load_snapshot(&wallet.idb_key())
             .await
             .map_err(|details| Error::Persistence { details })?;
-        if let Some(snapshot) = snapshot {
-            wallet.idb_loaded = Some((snapshot.writer, snapshot.sequence));
-            wallet
-                .idb_sequence
-                .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
-            wallet.restore_from_snapshot(snapshot)?;
-        }
-        super::idb_store::request_persistent_storage();
-        Ok(wallet)
+        wallet.apply_snapshot(snapshot)
     }
 
-    /// Create a new RGB wallet based on the provided [`WalletData`].
+    /// Load a saved wallet, identified by its data directory, network and master fingerprint.
     ///
-    /// It does not load IndexedDB. It cannot save over a stored snapshot; use [`Wallet::restore`] for that.
+    /// The settings come from the last save. Pass the `mnemonic` to load a wallet able to sign,
+    /// or `None` to load it watch-only. A wallet that was never saved cannot be loaded.
+    pub async fn load(
+        data_dir: &str,
+        bitcoin_network: BitcoinNetwork,
+        master_fingerprint: &str,
+        mnemonic: Option<String>,
+    ) -> Result<Self, Error> {
+        let key = idb_key_for(
+            &PathBuf::from(data_dir).join(master_fingerprint),
+            bitcoin_network,
+        );
+        let snapshot = super::idb_store::load_snapshot(&key)
+            .await
+            .map_err(|details| Error::Persistence { details })?
+            .ok_or(Error::InexistentWalletManifest { path: key })?;
+        if snapshot.manifest.master_fingerprint != master_fingerprint {
+            return Err(Error::FingerprintMismatch);
+        }
+        let (wallet_data, keys) = snapshot
+            .manifest
+            .clone()
+            .into_parts(data_dir.to_string(), mnemonic.map(Zeroizing::new));
+        Self::new(wallet_data, keys)?.apply_snapshot(Some(snapshot))
+    }
+
+    fn apply_snapshot(
+        mut self,
+        snapshot: Option<super::idb_store::WalletSnapshot>,
+    ) -> Result<Self, Error> {
+        if let Some(snapshot) = snapshot {
+            self.idb_loaded = Some((snapshot.writer, snapshot.sequence));
+            self.idb_sequence
+                .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
+            self.restore_from_snapshot(snapshot)?;
+        }
+        super::idb_store::request_persistent_storage();
+        Ok(self)
+    }
+
+    /// Create a new RGB wallet based on the provided [`WalletData`] and [`SinglesigKeys`].
+    ///
+    /// It does not load IndexedDB. It cannot save over a stored snapshot; use [`Wallet::restore`]
+    /// or [`Wallet::load`] for that.
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
-    pub fn new(wallet_data: WalletData) -> Result<Self, Error> {
+    pub fn new(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
         let wdata = wallet_data.clone();
 
-        // wallet account xPubs
+        let (descs, watch_only) = keys.build_descriptors(wdata.bitcoin_network)?;
         let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
-        let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
-        let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
-
-        // wallet directory and file logging setup
-        let data_dir_path = PathBuf::from(&wdata.data_dir);
-        if let Some(mnemonic) = &wdata.mnemonic {
-            // check master fingerprint derived from mnemonic matches provided one
-            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.as_str())?;
-            let master_xprv =
-                Xpriv::new_master(wdata.bitcoin_network, &mnemonic.to_seed("")).unwrap();
-            let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
-            let master_fingerprint = master_xpub.fingerprint();
-            if master_fingerprint
-                != Fingerprint::from_str(&wdata.master_fingerprint)
-                    .map_err(|_| Error::InvalidFingerprint)?
-            {
-                return Err(Error::FingerprintMismatch);
-            }
-        }
         if wdata.max_allocations_per_utxo == 0 {
             return Err(Error::NoMaxAllocationsPerUtxo);
         }
-        let wallet_dir = data_dir_path.join(&wdata.master_fingerprint);
+
+        // wallet directory and file logging setup
+        let wallet_dir = PathBuf::from(&wdata.data_dir).join(&keys.master_fingerprint);
         let (logger, _logger_guard) = setup_logger(&wallet_dir, None)?;
         info!(logger.clone(), "New wallet in '{:?}'", wallet_dir);
 
         // BDK setup
-        let (desc_colored, desc_vanilla, watch_only) = if let Some(mnemonic) = wdata.mnemonic {
-            let (desc_colored, desc_vanilla) = get_descriptors(
-                wdata.bitcoin_network,
-                &mnemonic,
-                wdata.vanilla_keychain,
-                xpub_btc,
-                xpub_rgb,
-            )?;
-            (desc_colored, desc_vanilla, false)
-        } else {
-            let (desc_colored, desc_vanilla) = get_descriptors_from_xpubs(
-                wdata.bitcoin_network,
-                &wdata.master_fingerprint,
-                xpub_rgb,
-                xpub_btc,
-                wdata.vanilla_keychain,
-            )?;
-            (desc_colored, desc_vanilla, true)
-        };
+        let WalletDescriptors {
+            colored: desc_colored,
+            vanilla: desc_vanilla,
+        } = descs;
         let chain_net: ChainNet = wdata.bitcoin_network.into();
         let wallet_params = BdkWallet::load()
             .descriptor(KeychainKind::External, Some(desc_colored.clone()))
@@ -1263,6 +1431,7 @@ impl Wallet {
         info!(logger, "New wallet completed");
         Ok(Wallet {
             wallet_data,
+            keys,
             logger,
             _logger_guard,
             watch_only,
@@ -1328,6 +1497,19 @@ impl Wallet {
     /// Return the data that defines the wallet.
     pub fn get_wallet_data(&self) -> WalletData {
         self.wallet_data.clone()
+    }
+
+    /// Return the bitcoin keys of the wallet.
+    pub fn get_keys(&self) -> SinglesigKeys {
+        self.keys.clone()
+    }
+
+    /// Return the descriptors of the wallet.
+    pub fn get_descriptors(&self) -> WalletDescriptors {
+        self.keys
+            .build_descriptors(self.bitcoin_network())
+            .expect("already succeeded at wallet creation")
+            .0
     }
 
     /// Return the wallet directory.
@@ -4009,6 +4191,13 @@ pub(crate) struct Checkpoint {
     reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
+fn idb_key_for(wallet_dir: &Path, bitcoin_network: BitcoinNetwork) -> String {
+    wallet_dir
+        .join(bitcoin_network.to_string())
+        .to_string_lossy()
+        .to_string()
+}
+
 /// IndexedDB persistence: save wallet state after mutations.
 impl Wallet {
     pub(crate) fn update_backup_info(
@@ -4056,10 +4245,7 @@ impl Wallet {
 
     /// Return the IndexedDB key of this wallet: its directory and its network.
     pub fn idb_key(&self) -> String {
-        self.wallet_dir
-            .join(self.wallet_data.bitcoin_network.to_string())
-            .to_string_lossy()
-            .to_string()
+        idb_key_for(&self.wallet_dir, self.wallet_data.bitcoin_network)
     }
 
     /// Return the error of the last failed IndexedDB save, until a save commits.
@@ -4118,6 +4304,7 @@ impl Wallet {
             pending_mint_locks: self.pending_mint_locks.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
+            manifest: WalletManifest::new(&self.wallet_data, &self.keys),
         })
     }
 
@@ -4140,12 +4327,16 @@ impl Wallet {
     }
 
     /// Restore wallet state from an IndexedDB snapshot.
+    /// It refuses a snapshot of other fixed settings with [`Error::WalletSettingMismatch`].
     /// It changes nothing when it fails.
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
     pub fn restore_from_snapshot(
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
+        snapshot
+            .manifest
+            .check_settings_unchanged(&self.wallet_data, &self.keys)?;
         let stock = super::idb_store::deserialize_stock(&snapshot.rgb_store)
             .map_err(|details| Error::Internal { details })?;
 
@@ -4184,29 +4375,11 @@ impl Wallet {
         let mut bdk_database: BdkPersister = super::memory_store::MemoryStore::new();
         bdk_database.set_data(Some(changeset));
 
-        // Reconstruct descriptors (same logic as Wallet::new)
         let wdata = &self.wallet_data;
-        let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
-        let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
-        let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
-
-        let (desc_colored, desc_vanilla) = if let Some(mnemonic) = &wdata.mnemonic {
-            get_descriptors(
-                wdata.bitcoin_network,
-                mnemonic,
-                wdata.vanilla_keychain,
-                xpub_btc,
-                xpub_rgb,
-            )?
-        } else {
-            get_descriptors_from_xpubs(
-                wdata.bitcoin_network,
-                &wdata.master_fingerprint,
-                xpub_rgb,
-                xpub_btc,
-                wdata.vanilla_keychain,
-            )?
-        };
+        let WalletDescriptors {
+            colored: desc_colored,
+            vanilla: desc_vanilla,
+        } = self.keys.build_descriptors(wdata.bitcoin_network)?.0;
 
         let chain_net: ChainNet = wdata.bitcoin_network.into();
         let wallet_params = BdkWallet::load()
@@ -4368,7 +4541,6 @@ impl Wallet {
 pub(crate) mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
-    use crate::utils::{get_descriptors, str_to_xpub};
 
     pub(crate) fn pending_mint_locks() -> PendingMintLocks {
         PendingMintLocks {
@@ -4396,17 +4568,15 @@ pub(crate) mod address_reuse_tests {
     }
 
     pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys, reuse: bool) -> Wallet {
+        make_test_wallet_with_singlesig_keys(SinglesigKeys::from_keys(&keys, None), reuse)
+    }
+
+    pub(crate) fn make_test_wallet_with_singlesig_keys(keys: SinglesigKeys, reuse: bool) -> Wallet {
         let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
-        let xpub_rgb = str_to_xpub(&keys.account_xpub_colored, bdk_network).unwrap();
-        let xpub_btc = str_to_xpub(&keys.account_xpub_vanilla, bdk_network).unwrap();
-        let (desc_colored, desc_vanilla) = get_descriptors(
-            BitcoinNetwork::Regtest,
-            &keys.mnemonic,
-            None,
-            xpub_btc,
-            xpub_rgb,
-        )
-        .unwrap();
+        let WalletDescriptors {
+            colored: desc_colored,
+            vanilla: desc_vanilla,
+        } = keys.build_descriptors(BitcoinNetwork::Regtest).unwrap().0;
         let mut bdk_database: BdkPersister = super::super::memory_store::MemoryStore::new();
         let bdk_wallet = BdkWallet::create(desc_colored.clone(), desc_vanilla.clone())
             .network(bdk_network)
@@ -4425,11 +4595,6 @@ pub(crate) mod address_reuse_tests {
             bitcoin_network: BitcoinNetwork::Regtest,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
-            account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
-            account_xpub_colored: keys.account_xpub_colored.clone(),
-            mnemonic: Some(keys.mnemonic.clone()),
-            master_fingerprint: keys.master_fingerprint.clone(),
-            vanilla_keychain: None,
             supported_schemas: vec![AssetSchema::Nia],
             reuse_addresses: reuse,
             allow_reckless_schemas: false,
@@ -4440,6 +4605,7 @@ pub(crate) mod address_reuse_tests {
 
         Wallet {
             wallet_data: wd,
+            keys,
             logger,
             _logger_guard: (),
             watch_only: false,
@@ -4612,9 +4778,9 @@ mod debug_tests {
 
     #[test]
     fn debug_hides_wallet_mnemonic() {
-        let wd = make_test_wallet(false).get_wallet_data();
-        let phrase = wd.mnemonic.clone().unwrap();
-        assert!(!format!("{wd:?}").contains(phrase.as_str()));
+        let keys = make_test_wallet(false).get_keys();
+        let phrase = keys.mnemonic.clone().unwrap();
+        assert!(!format!("{keys:?}").contains(phrase.as_str()));
     }
 }
 
@@ -4628,30 +4794,26 @@ mod mainnet_schema_tests {
         network: BitcoinNetwork,
         schemas: Vec<AssetSchema>,
         reckless: bool,
-    ) -> WalletData {
+    ) -> (WalletData, SinglesigKeys) {
         let keys = generate_keys(network);
-        WalletData {
+        let wd = WalletData {
             data_dir: s!(":memory:"),
             bitcoin_network: network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
-            account_xpub_vanilla: keys.account_xpub_vanilla,
-            account_xpub_colored: keys.account_xpub_colored,
-            mnemonic: Some(keys.mnemonic),
-            master_fingerprint: keys.master_fingerprint,
-            vanilla_keychain: None,
             supported_schemas: schemas,
             reuse_addresses: false,
             allow_reckless_schemas: reckless,
-        }
+        };
+        (wd, SinglesigKeys::from_keys(&keys, None))
     }
 
     #[test]
     fn new_refuses_zero_max_allocations_per_utxo() {
-        let mut wd = mainnet_schema_wallet_data(BitcoinNetwork::Regtest, vec![Nia], false);
+        let (mut wd, keys) = mainnet_schema_wallet_data(BitcoinNetwork::Regtest, vec![Nia], false);
         wd.max_allocations_per_utxo = 0;
         assert!(matches!(
-            Wallet::new(wd),
+            Wallet::new(wd, keys),
             Err(Error::NoMaxAllocationsPerUtxo)
         ));
     }
@@ -4659,22 +4821,231 @@ mod mainnet_schema_tests {
     #[test]
     fn mainnet_schema_refuses_ifa_and_bfa() {
         for expected in [Ifa, Bfa] {
-            let wd =
+            let (wd, keys) =
                 mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, expected], false);
             assert!(matches!(
-                Wallet::new(wd),
+                Wallet::new(wd, keys),
                 Err(Error::CannotUseSchemaOnMainnet { asset_schema }) if asset_schema == expected
             ));
         }
-        let wd = mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia], false);
-        assert!(Wallet::new(wd).is_ok());
+        let (wd, keys) = mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia], false);
+        assert!(Wallet::new(wd, keys).is_ok());
     }
 
     #[test]
     fn mainnet_schema_reckless_allowed() {
-        let wd = mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, Ifa, Bfa], true);
-        let wallet = Wallet::new(wd).unwrap();
+        let (wd, keys) =
+            mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, Ifa, Bfa], true);
+        let wallet = Wallet::new(wd, keys).unwrap();
         assert!(wallet.get_wallet_data().allow_reckless_schemas);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod keys_and_settings_tests {
+    use super::*;
+    use crate::keys::generate_keys;
+
+    const NET: BitcoinNetwork = BitcoinNetwork::Regtest;
+
+    fn wallet_data() -> WalletData {
+        WalletData {
+            data_dir: s!(":memory:"),
+            bitcoin_network: NET,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: vec![AssetSchema::Nia],
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        }
+    }
+
+    fn new_err(keys: SinglesigKeys) -> Error {
+        Wallet::new(wallet_data(), keys).err().unwrap()
+    }
+
+    // Return the expected and provided values of a mismatch of `setting`.
+    fn mismatch(res: Result<(), Error>, setting: &str) -> (String, String) {
+        match res {
+            Err(Error::WalletSettingMismatch {
+                setting: s,
+                expected,
+                provided,
+            }) if s == setting => (expected, provided),
+            other => panic!("expected a {setting} mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_descriptors_success() {
+        let keys = generate_keys(NET);
+        let signing = SinglesigKeys::from_keys(&keys, None);
+        let wallet = Wallet::new(wallet_data(), signing.clone()).unwrap();
+        let descs = wallet.get_descriptors();
+        assert_eq!(signing.build_descriptors(NET).unwrap().0, descs);
+        assert!(descs.colored.contains("tprv") && descs.vanilla.contains("tprv"));
+
+        let watch_only = SinglesigKeys::from_keys_no_mnemonic(&keys, None);
+        let wo_descs = Wallet::new(wallet_data(), watch_only)
+            .unwrap()
+            .get_descriptors();
+        for desc in [&wo_descs.colored, &wo_descs.vanilla] {
+            assert!(desc.contains("tpub") && !desc.contains("tprv"), "{desc}");
+        }
+        assert_ne!(wo_descs, descs);
+    }
+
+    #[test]
+    fn new_fail() {
+        let keys = generate_keys(NET);
+        let other = generate_keys(NET);
+        let signing = SinglesigKeys::from_keys(&keys, None);
+
+        // invalid colored xPub
+        for xpub in ["", "l1iI0"] {
+            let err = new_err(SinglesigKeys {
+                account_xpub_colored: xpub.to_string(),
+                ..signing.clone()
+            });
+            assert!(matches!(err, Error::InvalidPubkey { .. }), "{err:?}");
+        }
+
+        // invalid mnemonic
+        let err = new_err(SinglesigKeys {
+            mnemonic: Some(Zeroizing::new(s!(""))),
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::InvalidMnemonic { .. }), "{err:?}");
+
+        // xPub not derived from the mnemonic
+        let err = new_err(SinglesigKeys {
+            account_xpub_colored: other.xpub.clone(),
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
+
+        // invalid fingerprint, signing and watch-only
+        for keys in [
+            signing.clone(),
+            SinglesigKeys::from_keys_no_mnemonic(&keys, None),
+        ] {
+            let err = new_err(SinglesigKeys {
+                master_fingerprint: s!("invalid"),
+                ..keys
+            });
+            assert!(matches!(err, Error::InvalidFingerprint), "{err:?}");
+        }
+
+        // fingerprint not derived from the mnemonic
+        let err = new_err(SinglesigKeys {
+            master_fingerprint: s!("badbadff"),
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::FingerprintMismatch), "{err:?}");
+
+        // mnemonic of another wallet: the keys are checked before the fingerprint
+        let err = new_err(SinglesigKeys {
+            mnemonic: Some(other.mnemonic.clone()),
+            ..signing
+        });
+        assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
+    }
+
+    #[test]
+    fn settings_check_refuses_fixed_settings() {
+        let wd = wallet_data();
+        let keys = generate_keys(NET);
+        let sk = SinglesigKeys::from_keys(&keys, None);
+        let manifest = WalletManifest::new(&wd, &sk);
+        let check = |wd: &WalletData, sk: &SinglesigKeys| manifest.check_settings_unchanged(wd, sk);
+
+        let testnet = WalletData {
+            bitcoin_network: BitcoinNetwork::Testnet,
+            ..wallet_data()
+        };
+        assert!(matches!(
+            check(&testnet, &sk),
+            Err(Error::BitcoinNetworkMismatch)
+        ));
+
+        // all keys change: the fingerprint is reported first
+        let other = SinglesigKeys::from_keys_no_mnemonic(&generate_keys(NET), None);
+        mismatch(check(&wd, &other), "master_fingerprint");
+
+        let keychain = SinglesigKeys::from_keys(&keys, Some(2));
+        let (expected, provided) = mismatch(check(&wd, &keychain), "vanilla_keychain");
+        assert_eq!((expected.as_str(), provided.as_str()), ("0", "2"));
+
+        let colored = SinglesigKeys {
+            account_xpub_colored: other.account_xpub_colored.clone(),
+            ..sk.clone()
+        };
+        mismatch(check(&wd, &colored), "account_xpub_colored");
+
+        let vanilla = SinglesigKeys {
+            account_xpub_vanilla: other.account_xpub_vanilla,
+            ..sk
+        };
+        mismatch(check(&wd, &vanilla), "account_xpub_vanilla");
+    }
+
+    #[test]
+    fn settings_check_allows_mutable_settings() {
+        let wd = wallet_data();
+        let keys = generate_keys(NET);
+        let manifest = WalletManifest::new(&wd, &SinglesigKeys::from_keys(&keys, None));
+
+        manifest
+            .check_settings_unchanged(&wd, &SinglesigKeys::from_keys(&keys, Some(0)))
+            .unwrap();
+        manifest
+            .check_settings_unchanged(&wd, &SinglesigKeys::from_keys_no_mnemonic(&keys, None))
+            .unwrap();
+        let changed = WalletData {
+            data_dir: s!("other"),
+            max_allocations_per_utxo: 1,
+            supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
+            reuse_addresses: true,
+            allow_reckless_schemas: true,
+            ..wallet_data()
+        };
+        manifest
+            .check_settings_unchanged(&changed, &SinglesigKeys::from_keys(&keys, None))
+            .unwrap();
+    }
+
+    #[test]
+    fn manifest_round_trip() {
+        let keys = generate_keys(NET);
+        let wd = WalletData {
+            max_allocations_per_utxo: 1,
+            supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
+            reuse_addresses: true,
+            allow_reckless_schemas: true,
+            ..wallet_data()
+        };
+        let sk = SinglesigKeys::from_keys(&keys, Some(2));
+        let json = serde_json::to_string(&WalletManifest::new(&wd, &sk)).unwrap();
+        assert!(!json.contains(keys.mnemonic.as_str()));
+
+        let manifest: WalletManifest = serde_json::from_str(&json).unwrap();
+        let (got_wd, got_sk) = manifest.into_parts(s!("dir"), Some(keys.mnemonic.clone()));
+        let expected_wd = WalletData {
+            data_dir: s!("dir"),
+            ..wd.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&got_wd).unwrap(),
+            serde_json::to_value(&expected_wd).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&got_sk).unwrap(),
+            serde_json::to_value(&sk).unwrap()
+        );
+
+        let (_, got_sk) = WalletManifest::new(&wd, &SinglesigKeys::from_keys(&keys, None))
+            .into_parts(s!("dir"), None);
+        assert_eq!(got_sk.vanilla_keychain, Some(0));
     }
 }
 

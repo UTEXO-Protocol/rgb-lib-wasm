@@ -8,7 +8,9 @@ use std::panic;
 use wasm_bindgen::prelude::*;
 
 use rgb_lib_wasm::Wallet;
-use rgb_lib_wasm::wallet::{Online, OnlineOptions, Recipient, RefreshFilter, WalletData};
+use rgb_lib_wasm::wallet::{
+    Online, OnlineOptions, Recipient, RefreshFilter, SinglesigKeys, WalletData,
+};
 
 /// Serialize to JsValue using BigInt for u64/i64 values that exceed Number.MAX_SAFE_INTEGER.
 fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
@@ -169,13 +171,15 @@ pub struct WasmWallet {
 
 #[wasm_bindgen]
 impl WasmWallet {
-    /// Create a new RGB wallet from a JSON-encoded WalletData.
+    /// Create a new RGB wallet from a JSON-encoded WalletData and SinglesigKeys.
     /// It does not load IndexedDB and cannot save over a stored snapshot; use `create()`.
     #[wasm_bindgen(constructor)]
-    pub fn new(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
+    pub fn new(wallet_data_json: &str, keys_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid WalletData JSON: {e}")))?;
-        let wallet = Wallet::new(wd).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let keys: SinglesigKeys = serde_json::from_str(keys_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid SinglesigKeys JSON: {e}")))?;
+        let wallet = Wallet::new(wd, keys).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmWallet {
             inner: RefCell::new(wallet),
         })
@@ -186,10 +190,32 @@ impl WasmWallet {
     /// Like `new()`, but asynchronously checks IndexedDB for a previously saved
     /// snapshot and restores it, so wallet state survives page refreshes.
     #[wasm_bindgen(js_name = "create")]
-    pub async fn create(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
+    pub async fn create(wallet_data_json: &str, keys_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid WalletData JSON: {e}")))?;
-        let wallet = Wallet::restore(wd)
+        let keys: SinglesigKeys = serde_json::from_str(keys_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid SinglesigKeys JSON: {e}")))?;
+        let wallet = Wallet::restore(wd, keys)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(WasmWallet {
+            inner: RefCell::new(wallet),
+        })
+    }
+
+    /// Load a saved wallet with its saved settings.
+    /// A null `mnemonic` loads it watch-only.
+    #[wasm_bindgen(js_name = "load")]
+    pub async fn load(
+        data_dir: &str,
+        bitcoin_network: &str,
+        master_fingerprint: &str,
+        mnemonic: Option<String>,
+    ) -> Result<WasmWallet, JsValue> {
+        let bitcoin_network = bitcoin_network
+            .parse::<rgb_lib_wasm::BitcoinNetwork>()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let wallet = Wallet::load(data_dir, bitcoin_network, master_fingerprint, mnemonic)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmWallet {
@@ -214,14 +240,27 @@ impl WasmWallet {
     }
 
     /// Return the WalletData as a JS object.
-    /// The mnemonic is not returned: `mnemonic` is null.
     #[wasm_bindgen(js_name = "getWalletData")]
     pub fn get_wallet_data(&self) -> Result<JsValue, JsValue> {
-        let mut wd = self.inner.borrow().get_wallet_data();
-        wd.mnemonic = None;
-        let data = to_js(&wd)?;
+        to_js(&self.inner.borrow().get_wallet_data())
+    }
+
+    /// Return the SinglesigKeys as a JS object.
+    /// The mnemonic is not returned: `mnemonic` is null.
+    #[wasm_bindgen(js_name = "getKeys")]
+    pub fn get_keys(&self) -> Result<JsValue, JsValue> {
+        let mut keys = self.inner.borrow().get_keys();
+        keys.mnemonic = None;
+        let data = to_js(&keys)?;
         js_sys::Reflect::set(&data, &JsValue::from_str("mnemonic"), &JsValue::NULL)?;
         Ok(data)
+    }
+
+    /// Return the colored and vanilla descriptors as a JS object.
+    /// The descriptors of a signing wallet hold its account private keys.
+    #[wasm_bindgen(js_name = "getDescriptors")]
+    pub fn get_descriptors(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.inner.borrow().get_descriptors())
     }
 
     /// Issue a new NIA (Non-Inflatable Asset).

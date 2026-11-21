@@ -231,6 +231,13 @@ pub enum Error {
     #[error("Inexistent data directory")]
     InexistentDataDir,
 
+    /// IndexedDB holds no saved wallet to load
+    #[error("Inexistent wallet manifest: {path}")]
+    InexistentWalletManifest {
+        /// The IndexedDB key
+        path: String,
+    },
+
     /// There are not enough available allocation slots (UTXOs with available slots)
     #[error("Insufficient allocations")]
     InsufficientAllocationSlots,
@@ -807,6 +814,19 @@ pub enum Error {
     WalletDirAlreadyExists {
         /// The directory path
         path: String,
+    },
+
+    /// A wallet setting fixed when the wallet was created has been given a different value
+    #[error(
+        "Wallet setting '{setting}' cannot be changed: the wallet was created with '{expected}', got '{provided}'"
+    )]
+    WalletSettingMismatch {
+        /// The setting name
+        setting: String,
+        /// The value the wallet was created with
+        expected: String,
+        /// The value that has been provided
+        provided: String,
     },
 
     /// The requested operation cannot be processed by a watch-only wallet

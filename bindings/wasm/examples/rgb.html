@@ -125,6 +125,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     <div>
       <label for="wallet-data">WalletData JSON (auto-filled from Generate / Auto Setup)</label>
       <textarea id="wallet-data" rows="6" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
+      <label for="wallet-keys">SinglesigKeys JSON (auto-filled from generated keys)</label>
+      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-generate" disabled>Generate Keys</button>
@@ -491,6 +493,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       fundAddress,
       mineAndWait,
       fillWalletData,
+      fillWalletKeys,
       enableBtns,
     } from './lib/shared.js';
 
@@ -558,9 +561,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         const keys = generateKeys(network);
         log('Keys generated', 'log-ok');
 
-        const wd = fillWalletData(keys, network);
+        const wd = fillWalletData(network);
+        const sk = fillWalletKeys(keys);
         log('Auto setup: creating wallet...', 'log-warn');
-        state.wallet = await WasmWallet.create(JSON.stringify(wd));
+        state.wallet = await WasmWallet.create(JSON.stringify(wd), JSON.stringify(sk));
         log('Wallet created', 'log-ok');
 
         const url = document.getElementById('setup-indexer-url').value.trim();
@@ -588,7 +592,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const network = document.getElementById('setup-network').value;
       try {
         const keys = generateKeys(network);
-        fillWalletData(keys, network);
+        fillWalletData(network);
+        fillWalletKeys(keys);
         showResult('setup-output', 'setup-result', 'Keys generated.\n\n' + json(keys));
         log('generateKeys(' + network + ') OK', 'log-ok');
       } catch (e) {
@@ -602,13 +607,14 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     // =======================================================================
     document.getElementById('btn-create-wallet').addEventListener('click', async () => {
       const walletDataJson = document.getElementById('wallet-data').value.trim();
+      const keysJson = document.getElementById('wallet-keys').value.trim();
       if (!walletDataJson) {
         showResult('setup-output', 'setup-result', 'Enter WalletData JSON or generate keys first');
         return;
       }
       try {
         log('Creating wallet...', 'log-warn');
-        state.wallet = await WasmWallet.create(walletDataJson);
+        state.wallet = await WasmWallet.create(walletDataJson, keysJson);
         showResult('setup-output', 'setup-result', 'Wallet created.\n\n' + json(state.wallet.getWalletData()));
         enableBtns(walletBtns);
         log('Wallet created', 'log-ok');
