@@ -45,6 +45,8 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
     /// Received mints, keyed by recipient_id.
     pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
+    pub(crate) pending_mint_locks: std::collections::HashMap<String, super::PendingMintLocks>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -195,6 +197,7 @@ impl super::Wallet {
             received_consignment_meta: payload.received_consignment_meta,
             received_signed_txs: payload.received_signed_txs,
             received_mints: payload.received_mints,
+            pending_mint_locks: payload.pending_mint_locks,
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
         };
@@ -323,6 +326,7 @@ impl super::Wallet {
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
+            pending_mint_locks: self.pending_mint_locks.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -918,6 +922,10 @@ mod tests {
         sender
             .received_signed_txs
             .insert(s!("recipient"), vec![4, 5, 6]);
+        let pml = crate::wallet::offline::address_reuse_tests::pending_mint_locks();
+        sender
+            .pending_mint_locks
+            .insert(s!("recipient"), pml.clone());
         let payload_json = sender.serialize_backup_payload().unwrap();
 
         let mut restored = make_test_wallet_with_keys(keys.clone(), false);
@@ -947,6 +955,7 @@ mod tests {
                 restored.received_signed_txs.get("recipient"),
                 Some(&vec![4, 5, 6])
             );
+            assert_eq!(restored.pending_mint_locks.get("recipient"), Some(&pml));
         }
     }
 
