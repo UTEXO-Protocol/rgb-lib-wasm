@@ -1224,6 +1224,14 @@ impl Indexer {
         })
     }
 
+    pub(crate) async fn get_latest_block_height(&self) -> Result<u32, Error> {
+        Ok(match self {
+            Indexer::EsploraAsync(client) => {
+                client.get_height().await.map_err(IndexerError::from)?
+            }
+        })
+    }
+
     pub(crate) async fn get_tx_height(&self, txid: &str) -> Result<Option<u32>, Error> {
         Ok(match self {
             Indexer::EsploraAsync(client) => {
@@ -1512,6 +1520,8 @@ impl RefreshResultTrait for RefreshResult {
 pub enum RefreshTransferStatus {
     /// Waiting for the counterparty to take action
     WaitingCounterparty = 1,
+    /// Waiting for the safe height to be reached
+    WaitingSafeHeight = 6,
     /// Waiting for the transfer transaction to be broadcasted
     WaitingBroadcast = 7,
     /// Waiting for the transfer transaction to reach the minimum number of confirmations
@@ -1524,6 +1534,7 @@ impl TryFrom<TransferStatus> for RefreshTransferStatus {
     fn try_from(x: TransferStatus) -> Result<Self, Self::Error> {
         match x {
             TransferStatus::WaitingCounterparty => Ok(RefreshTransferStatus::WaitingCounterparty),
+            TransferStatus::WaitingSafeHeight => Ok(RefreshTransferStatus::WaitingSafeHeight),
             TransferStatus::WaitingBroadcast => Ok(RefreshTransferStatus::WaitingBroadcast),
             TransferStatus::WaitingConfirmations => Ok(RefreshTransferStatus::WaitingConfirmations),
             _ => Err("RefreshTransferStatus only accepts waiting statuses"),
@@ -1534,6 +1545,15 @@ impl TryFrom<TransferStatus> for RefreshTransferStatus {
 impl Wallet {
     pub(crate) fn indexer(&self) -> &Indexer {
         &self.online_data.as_ref().unwrap().indexer
+    }
+
+    pub(crate) async fn safe_height(&self, min_confirmations: u8) -> Result<u32, Error> {
+        Ok(self
+            .indexer()
+            .get_latest_block_height()
+            .await?
+            .saturating_sub(min_confirmations as u32)
+            + 1)
     }
 
     /// Fetch the status of each witness from the indexer.
@@ -4952,6 +4972,70 @@ impl Wallet {
         ))
     }
 
+    /// ACK a received consignment. A mint gets no ACK: wait for its broadcast.
+    #[allow(clippy::too_many_arguments)]
+    async fn _ack_received_consignment(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        transfer: &DbTransfer,
+        updated_batch_transfer: &mut DbBatchTransferActMod,
+        data: &ProxyReceiveData,
+        recipient_seed: &[u8],
+        donation_tx: Option<BdkTransaction>,
+        mint: bool,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        // a mint has no operation on the sender proxy: wait for the minter to broadcast its TX
+        if mint {
+            let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+            updated_transfer.ack = ActiveValue::Set(Some(true));
+            self.database.update_transfer(&mut updated_transfer)?;
+            updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingBroadcast);
+            return Ok(Some(
+                self.database
+                    .update_batch_transfer(updated_batch_transfer)?,
+            ));
+        }
+
+        // the sender proxy retention grace is how long after the operation expiration a released
+        // signed TX can still be retrieved: a non-donation transfer whose sender proxy grants
+        // less than the acceptable minimum is NACKed
+        let mut retention_grace = None;
+        if donation_tx.is_none() {
+            let grace = sender_proxy_retention_grace(&data.sender_proxy).await?;
+            if grace < MIN_SENDER_RETENTION_GRACE_SECS {
+                warn!(
+                    self.logger,
+                    "Sender proxy retention grace ({grace}s) is below the acceptable minimum"
+                );
+                let recipient_id = transfer
+                    .recipient_id
+                    .clone()
+                    .expect("transfer should have a recipient ID");
+                return self
+                    ._refuse_consignment_async(
+                        data,
+                        &recipient_id,
+                        recipient_seed,
+                        updated_batch_transfer,
+                        false,
+                    )
+                    .await;
+            }
+            retention_grace = Some(grace);
+        }
+
+        self.ack_consignment(
+            batch_transfer,
+            transfer,
+            updated_batch_transfer,
+            data,
+            recipient_seed,
+            retention_grace,
+            donation_tx,
+        )
+        .await
+    }
+
     /// Fetch the media of a contract from the proxy and check it against the contract. Return
     /// `false` if it is missing or does not match.
     #[allow(clippy::too_many_arguments)]
@@ -5331,6 +5415,7 @@ impl Wallet {
                     sender_pubkey: data.sender_pubkey.clone(),
                     consignment_hash: data.consignment_hash.clone(),
                     batch: data.batch,
+                    unsafe_txids: BTreeSet::new(),
                 },
             );
 
@@ -5636,10 +5721,12 @@ impl Wallet {
 
         debug!(self.logger, "Validating consignment...");
         let schema_rules = asset_schema.schema_rules();
+        let safe_height =
+            NonZeroU32::new(self.safe_height(batch_transfer.min_confirmations).await?);
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
             build_ops_dag: true,
-            ..Default::default()
+            safe_height,
         };
         #[cfg(test)]
         RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow_mut(|n| *n += 1);
@@ -5955,6 +6042,18 @@ impl Wallet {
                 )
                 .await;
         };
+        let unsafe_txids: BTreeSet<String> = valid_consignment
+            .validation_status()
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                Warning::UnsafeHistory(h) => Some(h),
+                _ => None,
+            })
+            .flat_map(|h| h.values().flatten())
+            .map(|t| t.to_string())
+            .filter(|t| *t != txid)
+            .collect();
         let is_mint = received_mint.is_some();
         if let Some(mint) = received_mint {
             self.received_mints.insert(recipient_id.clone(), mint);
@@ -6017,30 +6116,6 @@ impl Wallet {
             "Consignment is valid. Received '{:?}' of contract '{}'", received, asset_id
         );
 
-        // the sender proxy retention grace is how long after the operation expiration a released
-        // signed TX can still be retrieved: a non-donation transfer whose sender proxy grants
-        // less than the acceptable minimum is NACKed
-        let mut retention_grace = None;
-        if donation_tx.is_none() && !is_mint {
-            let grace = sender_proxy_retention_grace(&data.sender_proxy).await?;
-            if grace < MIN_SENDER_RETENTION_GRACE_SECS {
-                warn!(
-                    self.logger,
-                    "Sender proxy retention grace ({grace}s) is below the acceptable minimum"
-                );
-                return self
-                    ._refuse_consignment_async(
-                        data,
-                        &recipient_id,
-                        recipient_seed,
-                        updated_batch_transfer,
-                        mint_known,
-                    )
-                    .await;
-            }
-            retention_grace = Some(grace);
-        }
-
         updated_batch_transfer.txid = ActiveValue::Set(Some(txid.clone()));
 
         let utxo_idx = match transfer.recipient_type {
@@ -6091,26 +6166,32 @@ impl Wallet {
         // release the stock before awaiting the proxy
         drop(runtime);
 
-        // a mint has no operation on the sender proxy: wait for the minter to broadcast its TX
-        if is_mint {
-            let mut updated_transfer: DbTransferActMod = transfer.clone().into();
-            updated_transfer.ack = ActiveValue::Set(Some(true));
-            self.database.update_transfer(&mut updated_transfer)?;
-            updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingBroadcast);
+        if !unsafe_txids.is_empty() {
+            warn!(
+                self.logger,
+                "Unsafe history detected in consignment: {unsafe_txids:?}"
+            );
+            self.received_consignment_meta
+                .get_mut(&recipient_id)
+                .ok_or_else(|| Error::Internal {
+                    details: s!("consignment meta not found in memory"),
+                })?
+                .unsafe_txids = unsafe_txids;
+            updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingSafeHeight);
             return Ok(Some(
                 self.database
                     .update_batch_transfer(updated_batch_transfer)?,
             ));
         }
 
-        self.ack_consignment(
+        self._ack_received_consignment(
             batch_transfer,
             transfer,
             updated_batch_transfer,
             data,
             recipient_seed,
-            retention_grace,
             donation_tx,
+            is_mint,
         )
         .await
     }
@@ -6657,7 +6738,6 @@ impl Wallet {
                 }
             };
             let valid_consignment = pending.finalize();
-            let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
             runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
             if asset_schema == AssetSchema::Ifa {
@@ -6687,21 +6767,6 @@ impl Wallet {
                     asset_transfer.asset_id.clone().unwrap(),
                 )
                 .await?;
-            }
-
-            match validation_status.validity() {
-                Validity::Valid => {}
-                Validity::Warnings => {
-                    if let Warning::UnsafeHistory(ref unsafe_history) =
-                        validation_status.warnings[0]
-                    {
-                        warn!(
-                            self.logger,
-                            "Cannot accept transfer because of unsafe history: {unsafe_history:?}"
-                        );
-                        return Ok(None);
-                    }
-                }
             }
         }
 
@@ -6737,6 +6802,92 @@ impl Wallet {
         } else {
             self._wait_ack_async(transfer, db_data, skip_sync).await
         }
+    }
+
+    pub(crate) async fn _wait_safe_height_async(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        db_data: &DbData,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        debug!(self.logger, "Waiting safe height...");
+
+        let (_, transfer) = self.database.get_incoming_transfer(
+            &batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?,
+        )?;
+        let recipient_id = transfer
+            .recipient_id
+            .clone()
+            .expect("transfer should have a recipient ID");
+        let txid = batch_transfer
+            .txid
+            .clone()
+            .expect("batch_transfer in WaitingSafeHeight must have a txid");
+        let meta = self
+            .received_consignment_meta
+            .get(&recipient_id)
+            .cloned()
+            .ok_or_else(|| Error::Internal {
+                details: s!("consignment meta not found in memory"),
+            })?;
+
+        let safe_height = self.safe_height(batch_transfer.min_confirmations).await?;
+        for unsafe_txid in &meta.unsafe_txids {
+            let Some(tx_height) = self.indexer().get_tx_height(unsafe_txid).await? else {
+                return Ok(None);
+            };
+            if tx_height > safe_height {
+                return Ok(None);
+            }
+        }
+
+        let consignment_bytes = self
+            .received_consignments
+            .get(&recipient_id)
+            .ok_or_else(|| Error::Internal {
+                details: s!("consignment not found in memory"),
+            })?;
+        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
+        let donation_tx = consignment
+            .bundles
+            .iter()
+            .find(|b| b.witness_id().to_string() == txid)
+            .and_then(|b| Self::donation_signed_tx(&b.tx));
+        let mint = self.received_mints.contains_key(&recipient_id);
+        let recipient_seed =
+            batch_transfer
+                .operation_secret_key
+                .clone()
+                .ok_or_else(|| Error::Internal {
+                    details: s!("missing operation secret key"),
+                })?;
+        let data = ProxyReceiveData {
+            proxy_url: meta.proxy_url.clone().ok_or_else(|| Error::Internal {
+                details: s!("missing proxy URL"),
+            })?,
+            transfer_id: transfer
+                .proxy_transfer_id
+                .clone()
+                .or(meta.transfer_id.clone())
+                .ok_or_else(|| Error::Internal {
+                    details: s!("missing transfer ID"),
+                })?,
+            sender_proxy: meta.sender_transport_endpoint,
+            sender_pubkey: meta.sender_pubkey,
+            consignment_hash: meta.consignment_hash,
+            recipient_encryption: transfer.recipient_encryption,
+            batch: meta.batch,
+        };
+        let mut updated: DbBatchTransferActMod = batch_transfer.clone().into();
+        self._ack_received_consignment(
+            batch_transfer,
+            &transfer,
+            &mut updated,
+            &data,
+            &recipient_seed,
+            donation_tx,
+            mint,
+        )
+        .await
     }
 
     /// Whether another confirmed TX spends an input of the TX of the mint that the given transfer
@@ -6963,6 +7114,9 @@ impl Wallet {
             TransferStatus::WaitingCounterparty => {
                 self._wait_counterparty_async(transfer, db_data, incoming, skip_sync)
                     .await
+            }
+            TransferStatus::WaitingSafeHeight => {
+                self._wait_safe_height_async(transfer, db_data).await
             }
             // a proxy recipient that ACKed polls the sender proxy for the TX (or expiration), if
             // the TX is not on-chain already (broadcast by the sender when the batch completed,
@@ -11067,6 +11221,7 @@ mod send_end_tests {
                 ),
                 consignment_hash: "00".repeat(32),
                 batch: false,
+                unsafe_txids: BTreeSet::new(),
             },
         );
         batch_idx
@@ -14235,6 +14390,120 @@ mod send_end_tests {
         assert_eq!(side_transition_chunks(1, 0, 1), None);
         assert_eq!(side_transition_chunks(0, 2, 1), Some(1));
         assert_eq!(side_transition_chunks(3, 1, usize::MAX), Some(1));
+    }
+
+    #[test]
+    fn refresh_filter_with_waiting_safe_height() {
+        let (mut wallet, online) = setup();
+        let idx = seed_batch(
+            &wallet,
+            "t",
+            TransferStatus::WaitingSafeHeight,
+            true,
+            Some(i64::MAX),
+        );
+        let filter = vec![RefreshFilter {
+            status: RefreshTransferStatus::WaitingCounterparty,
+            incoming: true,
+        }];
+        let res = block_on(wallet.refresh(online, None, filter, true)).unwrap();
+        assert_eq!(res[&idx].updated_status, None);
+        assert!(res[&idx].failure.is_none());
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingSafeHeight);
+        let filter = RefreshFilter {
+            status: RefreshTransferStatus::WaitingSafeHeight,
+            incoming: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&filter).unwrap(),
+            r#"{"status":"WaitingSafeHeight","incoming":true}"#
+        );
+    }
+
+    // A received batch in WaitingSafeHeight with two history TXs. Esplora reports tip 100 and
+    // the given heights of the two TXs.
+    fn park_on_safe_height(heights: [Option<u32>; 2]) -> (Wallet, Online, DbBatchTransfer) {
+        let txids = ["55".repeat(32), "66".repeat(32)];
+        let routes = txids.clone();
+        let url = fake_esplora(move |path| {
+            if path == "/blocks/tip/height" {
+                return ("200 OK", b"100".to_vec());
+            }
+            let Some(i) = routes
+                .iter()
+                .position(|t| path == format!("/tx/{t}/status"))
+            else {
+                return ("404 Not Found", vec![]);
+            };
+            let body = match heights[i] {
+                Some(h) => format!(
+                    r#"{{"confirmed":true,"block_height":{h},"block_hash":"{}","block_time":1600000000}}"#,
+                    "00".repeat(32)
+                ),
+                None => s!(r#"{"confirmed":false}"#),
+            };
+            ("200 OK", body.into_bytes())
+        });
+        let (mut wallet, online) = setup_at(&url);
+        let idx = seed_batch(
+            &wallet,
+            &"44".repeat(32),
+            TransferStatus::WaitingSafeHeight,
+            true,
+            Some(i64::MAX),
+        );
+        let mut batch = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|bt| bt.idx == idx)
+            .unwrap();
+        batch.min_confirmations = 2;
+        wallet.received_consignment_meta.insert(
+            s!("recipient"),
+            ReceivedConsignmentMeta {
+                proxy_url: Some(ENDPOINT.to_string()),
+                transfer_id: Some(s!("transfer")),
+                sender_transport_endpoint: ENDPOINT.to_string(),
+                sender_pubkey: s!("pk"),
+                consignment_hash: "00".repeat(32),
+                batch: false,
+                unsafe_txids: BTreeSet::from(txids),
+            },
+        );
+        (wallet, online, batch)
+    }
+
+    #[test]
+    fn wait_safe_height_waits_for_unsafe_history() {
+        let check = |heights| {
+            let (mut wallet, _online, batch) = park_on_safe_height(heights);
+            assert_eq!(block_on(wallet.safe_height(2)), Ok(99));
+            assert_eq!(block_on(wallet.safe_height(0)), Ok(101));
+            let db_data = wallet.database.get_db_data(false).unwrap();
+            block_on(wallet._wait_safe_height_async(&batch, &db_data))
+        };
+        for heights in [
+            [None, Some(99)],
+            [Some(100), Some(99)],
+            [Some(99), None],
+            [Some(99), Some(100)],
+        ] {
+            assert!(matches!(check(heights), Ok(None)), "{heights:?}");
+        }
+        assert!(matches!(
+            check([Some(99), Some(99)]),
+            Err(Error::Internal { details }) if details == "consignment not found in memory"
+        ));
+    }
+
+    #[test]
+    fn waiting_safe_height_can_be_failed() {
+        let (mut wallet, online, batch) = park_on_safe_height([None, None]);
+        let res = block_on(wallet.fail_transfers(online, Some(batch.idx), false, true));
+        assert_eq!(res, Ok(true));
+        assert_eq!(status(&wallet, batch.idx), TransferStatus::Failed);
     }
 }
 

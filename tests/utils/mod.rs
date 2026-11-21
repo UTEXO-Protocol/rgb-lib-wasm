@@ -215,7 +215,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-fn register_receive(data: &ReceiveData, encryption: Encryption) {
+pub fn register_receive(data: &ReceiveData, encryption: Encryption) {
     RECEIVES.with(|r| {
         r.borrow_mut().insert(
             data.recipient_id.clone(),

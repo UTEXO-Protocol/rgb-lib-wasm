@@ -887,6 +887,7 @@ mod tests {
     #[test]
     fn vss_restore_payload_keeps_transfer_artifacts() {
         // vss_restore_backup uses restore_payload, so this covers the VSS path.
+        use crate::BTreeSet;
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::offline::ReceivedConsignmentMeta;
@@ -912,6 +913,7 @@ mod tests {
             sender_pubkey: "11".repeat(32),
             consignment_hash: "22".repeat(32),
             batch: true,
+            unsafe_txids: BTreeSet::from(["33".repeat(32)]),
         };
         sender
             .received_consignments

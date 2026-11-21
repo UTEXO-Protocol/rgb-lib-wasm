@@ -213,6 +213,8 @@ pub enum TransferStatus {
     Initiated = 5,
     /// Waiting for the counterparty to take action
     WaitingCounterparty = 1,
+    /// Waiting for safe height to be reached
+    WaitingSafeHeight = 6,
     /// Waiting for the transfer transaction to be broadcasted
     WaitingBroadcast = 7,
     /// Waiting for the transfer transaction to reach the required number of confirmations
@@ -236,6 +238,7 @@ impl TransferStatus {
         [
             TransferStatus::Initiated,
             TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingSafeHeight,
             TransferStatus::WaitingConfirmations,
             TransferStatus::WaitingBroadcast,
         ]
@@ -258,6 +261,7 @@ impl TransferStatus {
     pub(crate) fn waiting(&self) -> bool {
         [
             TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingSafeHeight,
             TransferStatus::WaitingConfirmations,
             TransferStatus::WaitingBroadcast,
         ]
@@ -269,6 +273,7 @@ impl TransferStatus {
         [
             TransferStatus::Initiated,
             TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingSafeHeight,
             TransferStatus::WaitingBroadcast,
         ]
         .contains(self)
@@ -484,12 +489,14 @@ mod tests {
         assert!(TransferStatus::Initiated.pending());
         assert!(TransferStatus::WaitingCounterparty.pending());
         assert!(TransferStatus::WaitingConfirmations.pending());
+        assert!(TransferStatus::WaitingSafeHeight.pending());
         assert!(TransferStatus::WaitingBroadcast.pending());
         assert!(!TransferStatus::Settled.pending());
         assert!(!TransferStatus::Failed.pending());
 
         assert!(TransferStatus::WaitingCounterparty.waiting());
         assert!(TransferStatus::WaitingConfirmations.waiting());
+        assert!(TransferStatus::WaitingSafeHeight.waiting());
         assert!(TransferStatus::WaitingBroadcast.waiting());
         assert!(!TransferStatus::Initiated.waiting());
         assert!(!TransferStatus::Settled.waiting());
@@ -497,10 +504,17 @@ mod tests {
 
         assert!(TransferStatus::Initiated.is_fallible());
         assert!(TransferStatus::WaitingCounterparty.is_fallible());
+        assert!(TransferStatus::WaitingSafeHeight.is_fallible());
         assert!(TransferStatus::WaitingBroadcast.is_fallible());
         assert!(!TransferStatus::WaitingConfirmations.is_fallible());
         assert!(!TransferStatus::Settled.is_fallible());
         assert!(!TransferStatus::Failed.is_fallible());
+
+        assert!(!TransferStatus::WaitingSafeHeight.failed());
+        assert!(!TransferStatus::WaitingSafeHeight.initiated());
+        assert!(!TransferStatus::WaitingSafeHeight.settled());
+        assert!(!TransferStatus::WaitingSafeHeight.waiting_confirmations());
+        assert!(!TransferStatus::WaitingSafeHeight.waiting_counterparty());
     }
 
     #[test]

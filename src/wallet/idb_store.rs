@@ -247,6 +247,7 @@ pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BTreeSet;
     use rgbstd::containers::ConsignmentExt;
     use rgbstd::contract::IssuerWrapper;
     use schemata::NonInflatableAsset;
@@ -343,6 +344,7 @@ mod tests {
                     sender_pubkey: "pk".to_owned(),
                     consignment_hash: "hash".to_owned(),
                     batch: true,
+                    unsafe_txids: BTreeSet::from(["txid".to_owned()]),
                 },
             )]),
             received_signed_txs: HashMap::from([("rid".to_owned(), vec![6])]),
