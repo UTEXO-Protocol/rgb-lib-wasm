@@ -10,10 +10,12 @@ use crate::utils::TRANSITION_BUILDERS_LOADED;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
-    AssetFilter, Balance, Online, Outpoint, Recipient, RgbAllocation, Transfer, Unspent, Wallet,
-    WalletData,
+    AssetFilter, Balance, Online, Outpoint, ReceiveData, Recipient, RefreshFilter,
+    RefreshTransferStatus, RgbAllocation, Transfer, Unspent, Wallet, WalletData,
 };
-use crate::{AssetSchema, Assignment, Error, RgbTransfer, TransferKind, TransferStatus};
+use crate::{
+    AssetSchema, Assignment, Encryption, Error, RgbTransfer, TransferKind, TransferStatus,
+};
 use amplify::confinement::Confined;
 use bdk_wallet::bitcoin::psbt::Psbt;
 use bdk_wallet::bitcoin::psbt::raw::ProprietaryKey;
@@ -1305,4 +1307,137 @@ async fn send_and_refresh_are_atomic() {
         w.send_end(a_on.clone(), signed.clone(), false).await
     })
     .await;
+}
+
+const WAITING_SAFE_HEIGHT: RefreshFilter = RefreshFilter {
+    status: RefreshTransferStatus::WaitingSafeHeight,
+    incoming: true,
+};
+
+/// Receive a send whose history TX has 1 confirmation, with `min_confirmations` 2.
+async fn park_on_safe_height(
+    donation: bool,
+) -> (Wallet, Online, Wallet, Online, String, ReceiveData, String) {
+    let (mut a, a_on) = nia_wallet(3).await;
+    let (mut r, r_on) = nia_wallet(2).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+
+    let rid1 = invoice(&mut r, &r_on, Assignment::Fungible(66), &[PROXY_URL]).await;
+    let txid1 = send_to(&mut a, &a_on, &asset_id, &rid1, 66, PROXY_URL, false).await;
+    refresh(&mut r, &r_on).await;
+    refresh(&mut a, &a_on).await;
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    refresh(&mut r, &r_on).await;
+    refresh(&mut a, &a_on).await;
+    assert_eq!(transfer_of(&r, &rid1).status, TransferStatus::Settled);
+    assert_eq!(sent(&a, &txid1).status, TransferStatus::Settled);
+
+    let rcv2 = r
+        .blind_receive(
+            Some(r_on.clone()),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+    register_receive(&rcv2, Encryption::Required);
+    let txid2 = send_to(
+        &mut a,
+        &a_on,
+        &asset_id,
+        &rcv2.recipient_id,
+        33,
+        PROXY_URL,
+        donation,
+    )
+    .await;
+    let res = r.refresh(r_on.clone(), None, vec![], false).await.unwrap();
+    assert_eq!(
+        res[&rcv2.batch_transfer_idx].updated_status,
+        Some(TransferStatus::WaitingSafeHeight)
+    );
+    assert_eq!(
+        transfer_of(&r, &rcv2.recipient_id).status,
+        TransferStatus::WaitingSafeHeight
+    );
+    (a, a_on, r, r_on, asset_id, rcv2, txid2)
+}
+
+// a receive with unsafe history waits for the safe height before the ACK
+#[wasm_bindgen_test]
+async fn unsafe_history_waits_for_safe_height() {
+    let _reset = ResetMocks;
+    let (mut a, a_on, mut r, r_on, asset_id, rcv2, txid2) = park_on_safe_height(false).await;
+    refresh(&mut a, &a_on).await;
+    assert_eq!(sent(&a, &txid2).status, TransferStatus::WaitingCounterparty);
+
+    let res = r
+        .refresh(r_on.clone(), None, vec![WAITING_SAFE_HEIGHT], false)
+        .await
+        .unwrap();
+    assert!(
+        res.values()
+            .all(|t| t.updated_status.is_none() && t.failure.is_none())
+    );
+    assert_eq!(
+        transfer_of(&r, &rcv2.recipient_id).status,
+        TransferStatus::WaitingSafeHeight
+    );
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    let res = r
+        .refresh(r_on.clone(), None, vec![WAITING_SAFE_HEIGHT], false)
+        .await
+        .unwrap();
+    let refreshed = &res[&rcv2.batch_transfer_idx];
+    assert!(matches!(
+        refreshed.updated_status,
+        Some(TransferStatus::WaitingBroadcast | TransferStatus::WaitingConfirmations)
+    ));
+    assert!(refreshed.failure.is_none());
+
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(
+        transfer_of(&r, &rcv2.recipient_id).status,
+        TransferStatus::Settled
+    );
+    assert_eq!(sent(&a, &txid2).status, TransferStatus::Settled);
+    assert_eq!(balance(&r, &asset_id).settled, 99);
+}
+
+// a donation that waits for the safe height is broadcast when the sender proxy has no operation
+#[wasm_bindgen_test]
+async fn unsafe_history_donation_resumes() {
+    let _reset = ResetMocks;
+    let (mut a, a_on, mut r, r_on, asset_id, rcv2, _) = park_on_safe_height(true).await;
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    rpc_hook(
+        PROXY_URL,
+        "ack.post",
+        "res.error = { code: -104, message: 'not found' }; delete res.result; return res;",
+    );
+    let res = r
+        .refresh(r_on.clone(), None, vec![WAITING_SAFE_HEIGHT], false)
+        .await;
+    clear_rpc_hooks();
+    let refreshed = &res.unwrap()[&rcv2.batch_transfer_idx];
+    assert_eq!(
+        refreshed.updated_status,
+        Some(TransferStatus::WaitingConfirmations)
+    );
+    assert!(refreshed.failure.is_none());
+
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(
+        transfer_of(&r, &rcv2.recipient_id).status,
+        TransferStatus::Settled
+    );
+    assert_eq!(balance(&r, &asset_id).settled, 99);
 }
