@@ -433,7 +433,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     );
     assert_eq!(transfer.txid, Some(minted.txid));
     assert!(transfer.consignment_path.is_some());
-    assert_eq!(mint_rights(&mut a, &asset_id), 2);
+    assert_eq!(mint_rights(&mut a, &asset_id).await, 2);
     let b_balance = b.get_asset_balance(asset_id.clone()).unwrap();
     assert_eq!(
         (b_balance.settled, b_balance.spendable),
@@ -496,7 +496,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     lock_mint(&bridge, &res, MINT_AMOUNT).await;
     mint_end(&mut a, &a_online, &res).await.unwrap();
     for _ in 0..3 {
-        b.sync(b_online.clone()).await.unwrap();
+        b.full_sync(b_online.clone()).await.unwrap();
         refresh(&mut b, &b_online).await;
         if transfer_status(&mut b, &receive.recipient_id) == TransferStatus::WaitingConfirmations {
             break;
@@ -512,7 +512,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     let no_evm = b.go_online(go_online_options(false)).await.unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    b.sync(no_evm.clone()).await.unwrap();
+    b.full_sync(no_evm.clone()).await.unwrap();
     let refreshed = b.refresh(no_evm, None, vec![], false).await.unwrap();
     assert!(
         refreshed.values().all(|t| t.failure.is_none()),
@@ -717,6 +717,7 @@ async fn bfa_mint_history_refused_by_reject_list() {
 
     // the list rejects all the mint rights left: the minter cannot mint anymore
     let mut rejected: Vec<Opout> = mint_right_opouts(&mut a, &asset_id)
+        .await
         .into_iter()
         .flatten()
         .collect();
@@ -739,8 +740,9 @@ async fn bfa_mint_history_refused_by_reject_list() {
 }
 
 /// The mint right opouts of `asset_id`, by UTXO, in the order the wallet selects the UTXOs.
-fn mint_right_opouts(wallet: &mut Wallet, asset_id: &str) -> Vec<Vec<Opout>> {
+async fn mint_right_opouts(wallet: &mut Wallet, asset_id: &str) -> Vec<Vec<Opout>> {
     opouts_holding(wallet, asset_id, &Assignment::MintRight)
+        .await
         .into_iter()
         .map(|opouts| opouts.into_iter().filter(|o| o.ty == OS_MINT).collect())
         .collect()
@@ -771,7 +773,7 @@ async fn bfa_mint_multi_right_utxo() {
         .asset_id;
 
     // each mint right is on its own UTXO
-    let rights = mint_right_opouts(&mut a, &asset_id);
+    let rights = mint_right_opouts(&mut a, &asset_id).await;
     assert_eq!(rights.len(), 4);
     assert!(rights.iter().all(|opouts| opouts.len() == 1));
 
@@ -791,7 +793,7 @@ async fn bfa_mint_multi_right_utxo() {
     .await;
     deploy_reject_list(&reject_list, &[]).await;
     finalize_evm().await;
-    let rights = mint_right_opouts(&mut a, &asset_id);
+    let rights = mint_right_opouts(&mut a, &asset_id).await;
     assert_eq!(rights.len(), 3);
     assert!(rights.iter().all(|opouts| opouts.len() == 1));
 
@@ -809,7 +811,7 @@ async fn bfa_mint_multi_right_utxo() {
         MINT_AMOUNT,
     )
     .await;
-    let rights = mint_right_opouts(&mut a, &asset_id);
+    let rights = mint_right_opouts(&mut a, &asset_id).await;
     assert_eq!(rights.len(), 2);
     assert!(rights.iter().all(|opouts| opouts.len() == 1));
     assert_eq!(
@@ -1472,7 +1474,7 @@ async fn bfa_mint_reject_list_not_repeated() {
         minter_and_receiver(3, 3, Some(reject_list.clone())).await;
 
     // a checked mint is not refused by a later reject list
-    let rights = mint_right_opouts(&mut a, &asset_id).concat();
+    let rights = mint_right_opouts(&mut a, &asset_id).await.concat();
     let before_block = evm_block_number().await + 1000;
     let (res, _) = begin_checked_mint(
         &mut a,
@@ -1508,7 +1510,7 @@ async fn bfa_mint_reject_list_not_repeated() {
         )
         .unwrap()
         .asset_id;
-    let rights = mint_right_opouts(&mut a, &asset_id).concat();
+    let rights = mint_right_opouts(&mut a, &asset_id).await.concat();
     let receive = mint_rcv(&mut b, &b_online).await;
     let res = mint_begin(
         &mut a,
@@ -1543,7 +1545,7 @@ async fn bfa_mint_reject_list_not_repeated() {
     a.create_utxos_end(a_online.clone(), signed).await.unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    a.sync(a_online.clone()).await.unwrap();
+    a.full_sync(a_online.clone()).await.unwrap();
     let reject_list = new_evm_address();
     deploy_reject_list(&reject_list, &[]).await;
     let asset_id = a
@@ -1561,7 +1563,7 @@ async fn bfa_mint_reject_list_not_repeated() {
         )
         .unwrap()
         .asset_id;
-    let rights = mint_right_opouts(&mut a, &asset_id).concat();
+    let rights = mint_right_opouts(&mut a, &asset_id).await.concat();
     let receive = mint_rcv(&mut b, &b_online).await;
     let res = mint_begin(
         &mut a,
@@ -1896,7 +1898,7 @@ async fn bfa_mint_retry_looks_up_lock() {
     );
     mint_end(&mut a, &a_online, &res).await.unwrap();
     for _ in 0..3 {
-        b.sync(b_online.clone()).await.unwrap();
+        b.full_sync(b_online.clone()).await.unwrap();
         refresh(&mut b, &b_online).await;
         if transfer_status(&mut b, &rcv.recipient_id) == TransferStatus::WaitingConfirmations {
             break;
@@ -2209,9 +2211,10 @@ fn issue_bfa(wallet: &mut Wallet, rights: u8, bridge: &str) -> String {
 }
 
 /// The number of mint rights of `asset_id` on each UTXO that holds one.
-fn rights_by_utxo(wallet: &mut Wallet, asset_id: &str) -> Vec<usize> {
+async fn rights_by_utxo(wallet: &mut Wallet, asset_id: &str) -> Vec<usize> {
     wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .iter()
         .map(|u| {
@@ -2356,8 +2359,8 @@ async fn bfa_send_mint_right() {
             .iter()
             .all(|t| t.assignments == vec![Assignment::MintRight])
     );
-    assert_eq!(mint_rights(&mut b, &asset_id), 3);
-    assert_eq!(mint_rights(&mut a, &asset_id), 1);
+    assert_eq!(mint_rights(&mut b, &asset_id).await, 3);
+    assert_eq!(mint_rights(&mut a, &asset_id).await, 1);
 
     // the sender keeps its last mint right
     let rcv = mint_rcv(&mut b, &b_online).await;
@@ -2388,7 +2391,7 @@ async fn bfa_send_mint_right() {
         a.get_asset_balance(asset_id.clone()).unwrap().settled,
         MINT_AMOUNT
     );
-    assert_eq!(mint_rights(&mut b, &asset_id), 2);
+    assert_eq!(mint_rights(&mut b, &asset_id).await, 2);
 }
 
 // a UTXO receives at most one mint right of an asset
@@ -2464,6 +2467,7 @@ async fn bfa_receive_mint_right_on_utxo_with_one() {
     );
     let held: Vec<_> = b
         .list_unspents(None, true, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| !u.rgb_allocations.is_empty())
@@ -2504,7 +2508,7 @@ async fn bfa_receive_mint_right_on_utxo_with_one() {
         transfer_status(&mut b, &i4.recipient_id),
         TransferStatus::Settled
     );
-    assert_eq!(rights_by_utxo(&mut b, &asset_id), vec![1, 1]);
+    assert_eq!(rights_by_utxo(&mut b, &asset_id).await, vec![1, 1]);
 }
 
 /// Wallet A with 2 UTXOs, each holding a mint right of a new BFA, and wallet N with 1000 of a new
@@ -2531,11 +2535,12 @@ async fn rights_and_nia(size: Option<u32>) -> (Wallet, Online, String, Wallet, O
 #[wasm_bindgen_test]
 async fn bfa_moved_mint_rights_on_separate_utxos() {
     let (mut a, a_online, bfa, mut n, n_online, nia) = rights_and_nia(None).await;
-    assert_eq!(rights_by_utxo(&mut a, &bfa), vec![1, 1]);
+    assert_eq!(rights_by_utxo(&mut a, &bfa).await, vec![1, 1]);
     send_and_settle(&mut n, &n_online, &mut a, &a_online, &nia, 100).await;
     send_and_settle(&mut n, &n_online, &mut a, &a_online, &nia, 100).await;
     let colored: Vec<_> = a
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| !u.rgb_allocations.is_empty())
@@ -2545,7 +2550,7 @@ async fn bfa_moved_mint_rights_on_separate_utxos() {
 
     add_utxos(&mut a, &a_online, 2, None).await;
     send_and_settle(&mut a, &a_online, &mut n, &n_online, &nia, 150).await;
-    assert_eq!(rights_by_utxo(&mut a, &bfa), vec![1, 1]);
+    assert_eq!(rights_by_utxo(&mut a, &bfa).await, vec![1, 1]);
     assert_eq!(a.get_asset_balance(nia).unwrap().settled, 50);
 }
 
@@ -2565,6 +2570,7 @@ async fn bfa_moved_mint_right_no_btc_change() {
     let s_utxo = transfer_of(&a, &rs.recipient_id).receive_utxo.unwrap();
     let colored: Vec<_> = a
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| !u.rgb_allocations.is_empty())
@@ -2614,11 +2620,12 @@ async fn bfa_moved_mint_right_no_btc_change() {
     )
     .await;
     settle_both(&mut a, &a_online, &mut n, &n_online).await;
-    let rights = rights_by_utxo(&mut a, &bfa);
+    let rights = rights_by_utxo(&mut a, &bfa).await;
     assert!(rights.iter().all(|r| *r == 1));
     assert_eq!(rights.iter().sum::<usize>(), 2);
     assert!(
         a.list_unspents(None, false, true)
+            .await
             .unwrap()
             .iter()
             .all(|u| u.utxo.outpoint != s_utxo)

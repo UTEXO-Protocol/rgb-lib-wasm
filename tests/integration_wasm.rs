@@ -7,7 +7,8 @@ wasm_bindgen_test_configure!(run_in_browser);
 mod utils;
 
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
+    AssetFilter, DatabaseType, Outpoint, Recipient, SyncKeychain, SyncOptions, SyncStrategy,
+    Wallet, WalletData, WitnessData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
@@ -63,7 +64,7 @@ async fn assert_refused(
     for end in ends {
         let (online, signed) = (online.clone(), signed.to_string());
         let res = match end {
-            End::Send => wallet.send_end(online, signed, true).await.map(|_| ()),
+            End::Send => wallet.send_end(online, signed).await.map(|_| ()),
             End::SendBtc => wallet.send_btc_end(online, signed).await.map(|_| ()),
             End::CreateUtxos => wallet.create_utxos_end(online, signed).await.map(|_| ()),
             End::Drain => wallet.drain_to_end(online, signed).await.map(|_| ()),
@@ -81,7 +82,7 @@ async fn fund_and_sync(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Onlin
     let addr = wallet.get_address().unwrap();
     fund_address(&addr, amount).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, num: u8) {
@@ -96,7 +97,7 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 #[wasm_bindgen_test]
@@ -123,7 +124,7 @@ async fn test_no_receive_on_pending_send_input() {
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
     let asset = wallet
         .issue_asset_nia(
             "PSI".to_string(),
@@ -162,10 +163,11 @@ async fn test_no_receive_on_pending_send_input() {
     .await;
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     let colored: HashSet<Outpoint> = wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| u.utxo.colorable)
@@ -333,7 +335,7 @@ async fn test_no_receive_on_pending_send_input() {
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
     let txid = wallet
         .send_begin(
             online.clone(),
@@ -387,7 +389,7 @@ async fn test_no_inflate_end_after_fail() {
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
     let asset = wallet
         .issue_asset_ifa(
             "FIN".to_string(),
@@ -414,10 +416,11 @@ async fn test_no_inflate_end_after_fail() {
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     let colored: HashSet<Outpoint> = wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| u.utxo.colorable)
@@ -522,9 +525,10 @@ async fn test_no_inflate_end_after_fail() {
     assert!(inputs.contains(&receive.receive_utxo.unwrap()));
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
     let unspents: HashSet<Outpoint> = wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         // the outputs of the failed inflation never exist
@@ -542,14 +546,14 @@ async fn test_full_wallet_flow() {
 
     fund_and_sync(&mut wallet, &online, "1.0").await;
 
-    let balance = wallet.get_btc_balance(None, true).unwrap();
+    let balance = wallet.get_btc_balance(None, true).await.unwrap();
     let total = balance.vanilla.settled
         + balance.vanilla.future
         + balance.colored.settled
         + balance.colored.future;
     assert!(total > 0);
 
-    let txs = wallet.list_transactions(None, true).unwrap();
+    let txs = wallet.list_transactions(None, true).await.unwrap();
     assert!(!txs.is_empty());
     assert!(txs[0].received > 0);
 
@@ -580,7 +584,7 @@ async fn test_full_wallet_flow() {
     assert_eq!(wd_returned.max_allocations_per_utxo, 5);
 
     // list_unspents (colored): verify UTXOs exist after issuance
-    let colored_unspents = wallet.list_unspents(None, false, true).unwrap();
+    let colored_unspents = wallet.list_unspents(None, false, true).await.unwrap();
     assert!(
         !colored_unspents.is_empty(),
         "Should have colored unspents after issuance"
@@ -676,10 +680,7 @@ async fn test_full_wallet_flow() {
         .unsigned_tx
         .compute_txid()
         .to_string();
-    let send_result = wallet
-        .send_end(online.clone(), signed_psbt, false)
-        .await
-        .unwrap();
+    let send_result = wallet.send_end(online.clone(), signed_psbt).await.unwrap();
     // the consignment is validated before the broadcast
     let consignment_bytes = wallet
         .send_consignment_bytes(&signed_txid, &nia.asset_id)
@@ -725,8 +726,8 @@ async fn test_full_wallet_flow() {
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-    wallet_b.sync(online_b.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
+    full_sync(&mut wallet_b, &online_b).await;
 
     // Receiver refreshes first: picks up consignment from proxy, validates, ACKs
     let recv_refresh = wallet_b
@@ -744,7 +745,7 @@ async fn test_full_wallet_flow() {
     // Mine the ACK so sender can see it
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     // Sender refreshes: sees ACK, broadcasts TX → WaitingConfirmations
     // This is the exact flow that failed with "signed PSBT not found in transfer artifacts"
@@ -841,7 +842,7 @@ async fn test_full_wallet_flow() {
 
     // BTC send: wallet A → wallet B
     let addr_b2 = wallet_b.get_address().unwrap();
-    let btc_before = wallet.get_btc_balance(None, true).unwrap();
+    let btc_before = wallet.get_btc_balance(None, true).await.unwrap();
     let total_before = btc_before.vanilla.settled + btc_before.vanilla.future;
 
     // 50_000 sats
@@ -906,9 +907,9 @@ async fn test_full_wallet_flow() {
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
-    let btc_after = wallet.get_btc_balance(None, true).unwrap();
+    let btc_after = wallet.get_btc_balance(None, true).await.unwrap();
     let total_after = btc_after.vanilla.settled + btc_after.vanilla.future;
     assert!(
         total_after < total_before,
@@ -976,7 +977,7 @@ async fn test_full_wallet_flow() {
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     let ifa_assets = wallet.list_assets(vec![AssetSchema::Ifa]).unwrap();
     let ifa_after = ifa_assets
@@ -1039,16 +1040,13 @@ async fn test_full_wallet_flow() {
         .unwrap()
         .psbt;
     let signed_ifa = wallet.sign_psbt(unsigned_ifa, None).unwrap();
-    let ifa_send = wallet
-        .send_end(online.clone(), signed_ifa, false)
-        .await
-        .unwrap();
+    let ifa_send = wallet.send_end(online.clone(), signed_ifa).await.unwrap();
     assert!(!ifa_send.txid.is_empty());
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-    wallet_b.sync(online_b.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
+    full_sync(&mut wallet_b, &online_b).await;
 
     // Receiver refreshes: must accept the IFA consignment and ACK it
     let ifa_recv_refresh = wallet_b
@@ -1065,7 +1063,7 @@ async fn test_full_wallet_flow() {
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     // Sender refreshes: must see the ACK and leave WaitingCounterparty
     let ifa_send_refresh = wallet
@@ -1130,6 +1128,7 @@ async fn test_full_wallet_flow() {
         .unwrap();
     let colorable: Vec<Outpoint> = wallet_b
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| u.utxo.colorable)
@@ -1172,18 +1171,19 @@ async fn test_full_wallet_flow() {
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-    wallet_b.sync(online_b.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
+    full_sync(&mut wallet_b, &online_b).await;
     assert!(
         wallet_b
             .list_unspents(None, false, true)
+            .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(ifa_units(&wallet_b), 0);
 
     // Drain verification: wallet_b vanilla balance should be ~0
-    let b_balance_after_drain = wallet_b.get_btc_balance(None, true).unwrap();
+    let b_balance_after_drain = wallet_b.get_btc_balance(None, true).await.unwrap();
     let b_vanilla_after =
         b_balance_after_drain.vanilla.settled + b_balance_after_drain.vanilla.future;
     assert!(
@@ -1193,7 +1193,7 @@ async fn test_full_wallet_flow() {
     );
 
     // wallet_a should have received the drained funds
-    let a_balance_after_drain = wallet.get_btc_balance(None, true).unwrap();
+    let a_balance_after_drain = wallet.get_btc_balance(None, true).await.unwrap();
     let a_total_after_drain =
         a_balance_after_drain.vanilla.settled + a_balance_after_drain.vanilla.future;
     assert!(
@@ -1254,7 +1254,7 @@ async fn test_full_wallet_flow() {
         "NIA asset should survive backup/restore"
     );
 
-    let balance_after = wallet.get_btc_balance(None, true).unwrap();
+    let balance_after = wallet.get_btc_balance(None, true).await.unwrap();
     let total_after_restore = balance_after.vanilla.settled
         + balance_after.vanilla.future
         + balance_after.colored.settled
@@ -1288,7 +1288,7 @@ async fn test_full_wallet_flow() {
 
     // The restored RGB state must allow a new inflation
     let online_r = restored.go_online(go_online_options(false)).await.unwrap();
-    restored.sync(online_r.clone()).await.unwrap();
+    full_sync(&mut restored, &online_r).await;
     let unsigned_inflate = restored
         .inflate_begin(
             online_r.clone(),
@@ -1357,12 +1357,12 @@ async fn test_full_wallet_flow() {
             .nia
             .is_some_and(|nia| nia.iter().any(|a| a.ticker == "TEST"))
     };
-    let btc_total = |w: &mut Wallet| {
-        let b = w.get_btc_balance(None, true).unwrap();
+    let btc_total = async |w: &mut Wallet| {
+        let b = w.get_btc_balance(None, true).await.unwrap();
         b.vanilla.settled + b.vanilla.future + b.colored.settled + b.colored.future
     };
     assert!(!has_test_nia(&vss_restored));
-    assert_eq!(btc_total(&mut vss_restored), 0);
+    assert_eq!(btc_total(&mut vss_restored).await, 0);
     vss_restored.configure_vss_backup(&vss_config);
     // The restore asks for persistent storage
     js_sys::Function::new_no_args(
@@ -1392,7 +1392,7 @@ async fn test_full_wallet_flow() {
         "NIA asset should survive VSS backup/restore"
     );
     assert!(
-        btc_total(&mut vss_restored) > 0,
+        btc_total(&mut vss_restored).await > 0,
         "BTC balance should survive VSS backup/restore"
     );
 
@@ -1527,13 +1527,18 @@ async fn test_sync_after_block_sees_new_utxo() {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     let addr = wallet.get_address().unwrap();
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     fund_address(&addr, "0.001").await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
     assert_eq!(
-        wallet.get_btc_balance(None, true).unwrap().vanilla.settled,
+        wallet
+            .get_btc_balance(None, true)
+            .await
+            .unwrap()
+            .vanilla
+            .settled,
         100_000
     );
 
@@ -1578,7 +1583,7 @@ async fn test_restored_wallet_inflates_after_inflation() {
         .txid;
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
     refresh(&mut wallet, &online).await;
     let height = wallet
         .get_tx_height(online.clone(), inflate_txid)
@@ -1609,7 +1614,7 @@ async fn test_restored_wallet_inflates_after_inflation() {
     );
 
     let online_r = restored.go_online(go_online_options(false)).await.unwrap();
-    restored.sync(online_r.clone()).await.unwrap();
+    full_sync(&mut restored, &online_r).await;
     let r = restored
         .inflate_begin(
             online_r.clone(),
@@ -1634,7 +1639,7 @@ async fn test_restored_wallet_inflates_after_inflation() {
 }
 
 #[wasm_bindgen_test]
-async fn test_inflate_end_retries_after_failed_sync() {
+async fn test_inflate_end_needs_no_indexer_after_broadcast() {
     let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
@@ -1659,7 +1664,7 @@ async fn test_inflate_end_retries_after_failed_sync() {
         .psbt;
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
 
-    // esplora fails every call after the broadcast, so the sync after it fails
+    // esplora fails every call after the broadcast
     js_sys::Function::new_with_args(
         "url",
         "const orig = globalThis.fetch;
@@ -1680,14 +1685,12 @@ async fn test_inflate_end_retries_after_failed_sync() {
     )
     .call1(&wasm_bindgen::JsValue::NULL, &ESPLORA_URL.into())
     .unwrap();
-    let res = wallet.inflate_end(online.clone(), signed.clone()).await;
+    let res = wallet.inflate_end(online.clone(), signed).await;
     js_sys::eval("globalThis.fetch = globalThis.__failAfterBroadcast.orig").unwrap();
-    assert!(res.is_err(), "{res:?}");
-
-    wallet.inflate_end(online.clone(), signed).await.unwrap();
+    assert!(res.is_ok(), "{res:?}");
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
     refresh(&mut wallet, &online).await;
     assert_eq!(
         wallet.get_asset_balance(ifa.asset_id).unwrap().settled,
@@ -1705,6 +1708,7 @@ async fn test_go_online_checks_outputs_spent_after_backup() {
     wallet.go_online(go_online_options(false)).await.unwrap();
     let colored: Vec<String> = wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| u.utxo.colorable && u.utxo.exists)
@@ -1809,7 +1813,7 @@ async fn test_go_online_checks_own_spends() {
         .psbt;
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let send_txid = psbt_txid(&signed);
-    wallet.send_end(online.clone(), signed, true).await.unwrap();
+    wallet.send_end(online.clone(), signed).await.unwrap();
     let password = "test_password_123";
     let backup_bytes = wallet.backup(password).unwrap();
 
@@ -1864,4 +1868,36 @@ async fn test_go_online_checks_own_spends() {
             if change.iter().all(|o| details.contains(o.as_str()))),
         "{change:?} {res:?}"
     );
+}
+
+#[wasm_bindgen_test]
+async fn test_sync_options_keychain_and_lookback() {
+    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let online = wallet.go_online(go_online_options(true)).await.unwrap();
+    let addresses: Vec<String> = (0..5).map(|_| wallet.get_address().unwrap()).collect();
+    fund_address(&addresses[0], "0.001").await;
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    let settled = async |wallet: &mut Wallet| {
+        let balance = wallet.get_btc_balance(None, true).await.unwrap();
+        balance.vanilla.settled
+    };
+
+    for strategy in [SyncStrategy::FullSync, SyncStrategy::FullScan] {
+        let colored = SyncOptions {
+            keychain: SyncKeychain::Colored,
+            strategy,
+        };
+        wallet.sync(online.clone(), colored).await.unwrap();
+        assert_eq!(settled(&mut wallet).await, 0);
+    }
+    // nothing is used yet: the lookback counts back from the last revealed address
+    for (lookback, expected) in [(3, 0), (4, 100_000)] {
+        let vanilla = SyncOptions {
+            keychain: SyncKeychain::Vanilla { lookback },
+            strategy: SyncStrategy::FastSync,
+        };
+        wallet.sync(online.clone(), vanilla).await.unwrap();
+        assert_eq!(settled(&mut wallet).await, expected);
+    }
 }

@@ -347,10 +347,6 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     <label class="checkbox-label">
       <input type="checkbox" id="send-rgb-donation"> Donation
     </label>
-    <br />
-    <label class="checkbox-label">
-      <input type="checkbox" id="send-rgb-skip-sync"> Skip sync
-    </label>
     <div class="btn-group">
       <button id="btn-send-rgb-begin" disabled>1. Begin</button>
       <button id="btn-send-rgb-sign" disabled>2. Sign</button>
@@ -565,7 +561,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
         const url = document.getElementById('setup-indexer-url').value.trim();
         log('Auto setup: going online (' + url + ')...', 'log-warn');
-        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {} });
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         log('Online', 'log-ok');
 
         enableBtns(walletBtns);
@@ -627,7 +623,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('setup-indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {} });
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         enableBtns(onlineBtns);
         showResult('setup-output', 'setup-result', 'Online!\n\n' + json(state.online));
         log('Online: ' + url, 'log-ok');
@@ -656,9 +652,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         log('Mined to height ' + mineResult.height, 'log-info');
 
         log('Syncing wallet...', 'log-warn');
-        await state.wallet.sync(state.online);
+        await state.wallet.sync(state.online, { keychain: 'Colored', strategy: 'FastSync' });
+        await state.wallet.sync(state.online, { keychain: { Vanilla: { lookback: 20 } }, strategy: 'FastSync' });
 
-        const balance = state.wallet.getBtcBalance();
+        const balance = await state.wallet.getBtcBalance(state.online, false);
         showResult('setup-output', 'setup-result',
           'Funded ' + address + ' with ' + amount + ' BTC\n' +
           'Mine height: ' + mineResult.height + '\n\n' +
@@ -882,10 +879,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         showResult('send-rgb-output', 'send-rgb-result', 'No signed PSBT. Run Sign first.');
         return;
       }
-      const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
         log('sendEnd (RGB)...', 'log-warn');
-        const result = await state.wallet.sendEnd(state.online, signed, skipSync);
+        const result = await state.wallet.sendEnd(state.online, signed);
         showJson('send-rgb-output', 'send-rgb-result', result);
         log('sendEnd OK', 'log-ok');
       } catch (e) {
@@ -909,7 +905,6 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const donation = document.getElementById('send-rgb-donation').checked;
       const feeRate = parseInt(document.getElementById('send-rgb-fee-rate').value, 10) || 1;
       const minConf = parseInt(document.getElementById('send-rgb-min-conf').value, 10) || 1;
-      const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
         log('send RGB (auto) begin...', 'log-warn');
         const unsignedPsbt = (await state.wallet.sendBegin(
@@ -923,7 +918,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         document.getElementById('send-rgb-signed-psbt').value = signed;
 
         log('send RGB (auto) end...', 'log-warn');
-        const result = await state.wallet.sendEnd(state.online, signed, skipSync);
+        const result = await state.wallet.sendEnd(state.online, signed);
         showJson('send-rgb-output', 'send-rgb-result', result);
         log('send RGB (auto) complete', 'log-ok');
       } catch (e) {

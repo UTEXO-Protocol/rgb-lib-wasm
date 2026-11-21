@@ -22,8 +22,9 @@ fn nia_ifa() -> crate::wallet::WalletData {
     wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa])
 }
 
-fn link_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
+async fn link_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
     assignments(wallet, asset_id)
+        .await
         .iter()
         .filter(|a| **a == Assignment::LinkRight)
         .count()
@@ -112,7 +113,7 @@ async fn send_all(
         .unwrap();
     let signed = sender.sign_psbt(psbt, None).unwrap();
     sender
-        .send_end(sender_online.clone(), signed, false)
+        .send_end(sender_online.clone(), signed)
         .await
         .unwrap()
         .txid
@@ -172,7 +173,7 @@ async fn link_and_settle(
     assert_eq!(linked.kind, TransferKind::Link);
     assert_eq!(linked.status, TransferStatus::Settled);
     assert_eq!(linked.requested_assignment, Some(Assignment::LinkRight));
-    assert_eq!(link_rights(wallet, asset_id), 0);
+    assert_eq!(link_rights(wallet, asset_id).await, 0);
     (res.batch_transfer_idx, res.txid)
 }
 
@@ -247,7 +248,7 @@ async fn ifa_link_right_sent_and_linked() {
         metadata_links(&a, &asset_id),
         (Some(linked_from.clone()), None)
     );
-    assert_eq!(link_rights(&mut a, &asset_id), 1);
+    assert_eq!(link_rights(&mut a, &asset_id).await, 1);
     assert!(
         receive_assignments(&a, &asset_id, TransferKind::Issuance).contains(&Assignment::LinkRight)
     );
@@ -255,8 +256,8 @@ async fn ifa_link_right_sent_and_linked() {
     // the receiver sees the contract the asset is linked from
     send_link_right(&mut a, &a_online, &mut b, &b_online, &asset_id).await;
     settle_both(&mut a, &a_online, &mut b, &b_online).await;
-    assert_eq!(link_rights(&mut a, &asset_id), 0);
-    assert_eq!(link_rights(&mut b, &asset_id), 1);
+    assert_eq!(link_rights(&mut a, &asset_id).await, 0);
+    assert_eq!(link_rights(&mut b, &asset_id).await, 1);
     assert_eq!(
         receive_assignments(&b, &asset_id, TransferKind::ReceiveBlind),
         vec![Assignment::LinkRight]
@@ -308,7 +309,7 @@ async fn bfa_link_keeps_mint_rights() {
 
     let replacement = issue_ifa_link(&wallet, Some(asset_id.clone()));
     link_and_settle(&mut wallet, &online, &asset_id, &replacement).await;
-    assert_eq!(mint_rights(&mut wallet, &asset_id), 1);
+    assert_eq!(mint_rights(&mut wallet, &asset_id).await, 1);
     assert_eq!(
         metadata_links(&wallet, &asset_id),
         (Some(linked_from), Some(replacement))
@@ -362,8 +363,8 @@ async fn link_right_sent_beside_fungible() {
     assert_eq!(types, expected);
 
     settle_both(&mut a, &a_online, &mut b, &b_online).await;
-    assert_eq!(link_rights(&mut a, &asset_id), 0);
-    assert_eq!(link_rights(&mut b, &asset_id), 1);
+    assert_eq!(link_rights(&mut a, &asset_id).await, 0);
+    assert_eq!(link_rights(&mut b, &asset_id).await, 1);
     assert_eq!(b.get_asset_balance(asset_id.clone()).unwrap().settled, 66);
     assert_eq!(
         receive_assignments(&b, &asset_id, TransferKind::ReceiveBlind),
@@ -548,7 +549,7 @@ async fn link_begin_end() {
     let linked = transfer(&wallet, &asset_id, idx);
     assert_eq!(linked.status, TransferStatus::Settled);
     assert_eq!(linked.kind, TransferKind::Link);
-    assert_eq!(link_rights(&mut wallet, &asset_id), 0);
+    assert_eq!(link_rights(&mut wallet, &asset_id).await, 0);
 }
 
 #[wasm_bindgen_test]
@@ -587,7 +588,7 @@ async fn bfa_link_right_received_rejected_and_linked() {
     let opout = Opout::new(opid, OS_LINK, 0);
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
-    assert_eq!(link_rights(&mut b, &asset_id), 1);
+    assert_eq!(link_rights(&mut b, &asset_id).await, 1);
     assert_eq!(
         receive_assignments(&b, &asset_id, TransferKind::ReceiveBlind),
         vec![Assignment::LinkRight]
@@ -611,7 +612,7 @@ async fn bfa_link_right_received_rejected_and_linked() {
         matches!(res, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if *id == asset_id),
         "{res:?}"
     );
-    assert_eq!(link_rights(&mut b, &asset_id), 1);
+    assert_eq!(link_rights(&mut b, &asset_id).await, 1);
 
     // once allowed, the link right is spent
     deploy_reject_list_opouts(&reject_list, &[]).await;
@@ -627,9 +628,10 @@ async fn bfa_link_right_received_rejected_and_linked() {
 async fn link_right_moves_with_spent_utxo() {
     let (mut a, a_online) = funded_wallet(nia_ifa(), 3).await;
     let (mut b, b_online) = funded_wallet(nia_ifa(), 2).await;
-    let link_right_outpoints = |wallet: &mut Wallet, asset_id: &str| {
+    let link_right_outpoints = async |wallet: &mut Wallet, asset_id: &str| {
         let unspents: Vec<OutPoint> = wallet
             .list_unspents(None, false, true)
+            .await
             .unwrap()
             .into_iter()
             .map(|u| OutPoint::from(u.utxo.outpoint))
@@ -688,17 +690,18 @@ async fn link_right_moves_with_spent_utxo() {
     send_all(&mut a, &a_online, &asset_id, recipients).await;
     settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(
-        link_right_outpoints(&mut b, &asset_id),
+        link_right_outpoints(&mut b, &asset_id).await,
         vec![receive_outpoint]
     );
 
     // spending the UTXO moves the link right along
     send_and_settle(&mut b, &b_online, &mut a, &a_online, &asset_id, 66).await;
-    let moved = link_right_outpoints(&mut b, &asset_id);
+    let moved = link_right_outpoints(&mut b, &asset_id).await;
     assert_eq!(moved.len(), 1);
     assert_ne!(moved[0], receive_outpoint);
     let unspent = b
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .find(|u| OutPoint::from(u.utxo.outpoint.clone()) == moved[0])
