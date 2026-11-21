@@ -18,7 +18,7 @@ use schemata::{GS_LINKED_TO_CONTRACT, TS_TRANSFER, TS_TRANSFER_LINK};
 use std::collections::HashMap;
 use std::str::FromStr;
 
-fn nia_ifa() -> crate::wallet::WalletData {
+fn nia_ifa() -> (crate::wallet::WalletData, crate::wallet::SinglesigKeys) {
     wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa])
 }
 

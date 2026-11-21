@@ -9,7 +9,8 @@ use super::test_send::{
 use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{
-    AssetFilter, Online, Outpoint, Recipient, Transfer, TransferScope, Wallet, WalletData,
+    AssetFilter, Online, Outpoint, Recipient, SinglesigKeys, Transfer, TransferScope, Wallet,
+    WalletData,
 };
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbTransfer, TS_BURN,
@@ -115,7 +116,7 @@ pub(super) fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment
 async fn ifa(
     wallet_utxos: u8,
     reject_list_url: Option<String>,
-) -> (Wallet, Online, String, WalletData) {
+) -> (Wallet, Online, String, (WalletData, SinglesigKeys)) {
     let wd = wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let (wallet, online) = funded_wallet(wd.clone(), wallet_utxos).await;
     let asset = wallet
@@ -138,7 +139,7 @@ async fn ifa(
 async fn ifa_burn_with_and_without_reason_settles() {
     let url = format!("{REGTEST_HELPER_URL}/reject-list/test/burn");
     serve_reject_list(&url, "");
-    let (mut wallet, online, asset_id, wd) = ifa(5, Some(url.clone())).await;
+    let (mut wallet, online, asset_id, (wd, keys)) = ifa(5, Some(url.clone())).await;
 
     // a burn only the rejected allocation could cover fails
     let rejected = opouts_holding(&mut wallet, &asset_id, &Assignment::Fungible(600)).concat();
@@ -283,9 +284,9 @@ async fn ifa_burn_with_and_without_reason_settles() {
     // a reload and a restore keep the burns
     wallet.flush().await.unwrap();
     drop(wallet);
-    let wallet = Wallet::restore(wd.clone()).await.unwrap();
+    let wallet = Wallet::restore(wd.clone(), keys.clone()).await.unwrap();
     let backup = wallet.backup("password").unwrap();
-    let mut restored = Wallet::new(wd).unwrap();
+    let mut restored = Wallet::new(wd, keys).unwrap();
     restored.restore_backup(&backup, "password").unwrap();
     let expected = vec![
         (TransferKind::Burn, Some(reason())),
@@ -486,7 +487,8 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
     wallet.inflate_end(online.clone(), inflate).await.unwrap();
 
     // a burn of another wallet
-    let mut other = Wallet::new(wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let (other_wd, other_keys) = wallet_data(vec![AssetSchema::Ifa]);
+    let mut other = Wallet::new(other_wd, other_keys).unwrap();
     let other_online = other.go_online(go_online_options(false)).await.unwrap();
     assert!(matches!(
         other.burn_end(other_online, signed).await,

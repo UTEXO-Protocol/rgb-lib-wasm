@@ -42,7 +42,9 @@ pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
 /// Load what the wallet saved in IndexedDB as a second wallet, with no flush.
 #[allow(dead_code)]
 pub async fn saved_wallet(wallet: &Wallet) -> (Wallet, Online) {
-    let mut saved = Wallet::restore(wallet.get_wallet_data()).await.unwrap();
+    let mut saved = Wallet::restore(wallet.get_wallet_data(), wallet.get_keys())
+        .await
+        .unwrap();
     let online = saved.go_online(go_online_options(true)).await.unwrap();
     (saved, online)
 }

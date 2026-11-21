@@ -9,8 +9,8 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, Outpoint, Recipient, SendBeginResult, Transfer,
-    TransferScope, Wallet, WalletData,
+    AssetFilter, DatabaseType, Online, Outpoint, Recipient, SendBeginResult, SinglesigKeys,
+    Transfer, TransferScope, Wallet, WalletData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
@@ -22,22 +22,20 @@ use utils::*;
 const MAX_EXPIRATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 const DOWN: &str = "rpc://127.0.0.1:1/json-rpc";
 
-fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
+fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
     let keys = generate_keys(BitcoinNetwork::Regtest);
-    WalletData {
-        data_dir: "/tmp/rgb_send".to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: DatabaseType::Sqlite,
-        max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: schemas,
-        reuse_addresses: false,
-        allow_reckless_schemas: false,
-    }
+    (
+        WalletData {
+            data_dir: "/tmp/rgb_send".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
 }
 
 async fn create_utxos(
@@ -72,7 +70,8 @@ async fn create_utxos(
 }
 
 async fn new_wallet() -> (Wallet, Online) {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     (wallet, online)
 }
@@ -1264,7 +1263,8 @@ async fn invoice_not_reserved_fail() {
 
 #[wasm_bindgen_test]
 async fn proxy_auth() {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let endpoint = transport_endpoint(PROXY_AUTH_URL);
     let mut options = go_online_options(false);
     let online = wallet.go_online(options.clone()).await.unwrap();

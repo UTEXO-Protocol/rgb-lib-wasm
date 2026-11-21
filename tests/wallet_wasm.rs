@@ -11,34 +11,32 @@ use rgb_lib_wasm::wallet::vss::{
     WasmVssClient, decrypt_data,
 };
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, IndexerConfig, Invoice, OnlineOptions, TransferScope, Wallet,
-    WalletData,
+    AssetFilter, DatabaseType, IndexerConfig, Invoice, OnlineOptions, SinglesigKeys, TransferScope,
+    Wallet, WalletData,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
 use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, run_js, transport_endpoint, within};
 
-fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
+fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
     let keys = generate_keys(BitcoinNetwork::Regtest);
-    WalletData {
-        data_dir: "/tmp/rgb_test".to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: DatabaseType::Sqlite,
-        max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: schemas,
-        reuse_addresses: false,
-        allow_reckless_schemas: false,
-    }
+    (
+        WalletData {
+            data_dir: "/tmp/rgb_test".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
 }
 
 #[wasm_bindgen_test]
 fn test_wallet_new_signing() {
-    let wd = test_wallet_data(vec![AssetSchema::Nia]);
-    assert!(Wallet::new(wd).is_ok());
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    assert!(Wallet::new(wd, keys).is_ok());
 }
 
 #[wasm_bindgen_test]
@@ -49,16 +47,12 @@ fn test_wallet_new_watch_only() {
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: None,
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
         reuse_addresses: false,
         allow_reckless_schemas: false,
     };
-    assert!(Wallet::new(wd).is_ok());
+    let keys = SinglesigKeys::from_keys_no_mnemonic(&keys, None);
+    assert!(Wallet::new(wd, keys).is_ok());
 }
 
 #[wasm_bindgen_test]
@@ -69,16 +63,15 @@ fn test_wallet_new_fingerprint_mismatch() {
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: "deadbeef".to_string(),
-        vanilla_keychain: None,
         supported_schemas: vec![AssetSchema::Nia],
         reuse_addresses: false,
         allow_reckless_schemas: false,
     };
-    let result = Wallet::new(wd);
+    let keys = SinglesigKeys {
+        master_fingerprint: "deadbeef".to_string(),
+        ..SinglesigKeys::from_keys(&keys, None)
+    };
+    let result = Wallet::new(wd, keys);
     assert!(result.is_err());
     let err = format!("{:?}", result.err().unwrap());
     assert!(err.contains("FingerprintMismatch"));
@@ -88,8 +81,8 @@ fn test_wallet_new_fingerprint_mismatch() {
 /// transfers, unspents, list_assets, get_wallet_data, delete_transfers, backup_info
 #[wasm_bindgen_test]
 fn test_wallet_queries_fresh() {
-    let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
-    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd.clone(), keys.clone()).unwrap();
 
     // get_address: two calls return different regtest addresses
     let addr1 = wallet.get_address().unwrap();
@@ -104,11 +97,14 @@ fn test_wallet_queries_fresh() {
         returned.max_allocations_per_utxo,
         wd.max_allocations_per_utxo
     );
-    assert_eq!(returned.account_xpub_vanilla, wd.account_xpub_vanilla);
-    assert_eq!(returned.account_xpub_colored, wd.account_xpub_colored);
-    assert_eq!(returned.mnemonic, wd.mnemonic);
-    assert_eq!(returned.master_fingerprint, wd.master_fingerprint);
     assert_eq!(returned.supported_schemas, wd.supported_schemas);
+
+    // get_keys: round-trip matches input
+    let returned = wallet.get_keys();
+    assert_eq!(returned.account_xpub_vanilla, keys.account_xpub_vanilla);
+    assert_eq!(returned.account_xpub_colored, keys.account_xpub_colored);
+    assert_eq!(returned.mnemonic, keys.mnemonic);
+    assert_eq!(returned.master_fingerprint, keys.master_fingerprint);
 
     // get_btc_balance: zero on unfunded wallet
     let balance = wallet.get_btc_balance(None, true).unwrap();
@@ -157,7 +153,8 @@ fn rcv_expiration() -> u64 {
 /// Note: blind_receive requires funded UTXOs so it's tested in integration_wasm.
 #[wasm_bindgen_test]
 async fn test_receive_and_transfers() {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(true)).await.unwrap();
 
     // witness_receive: success
@@ -321,7 +318,8 @@ fn public_api_exports() {
 /// nonexistent asset balance, backup/restore round-trip
 #[wasm_bindgen_test]
 async fn test_errors_and_backup() {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(true)).await.unwrap();
 
     // sign_psbt: invalid PSBT
@@ -384,7 +382,8 @@ async fn test_errors_and_backup() {
 
 #[wasm_bindgen_test]
 fn test_restore_backup_wrapping_length_fails() {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     assert!(matches!(
         wallet.restore_backup(&[0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4], "pw"),
         Err(Error::InvalidBackup)
@@ -425,7 +424,8 @@ async fn test_save_uses_strict_durability() {
             return original.apply(this, arguments);
         };",
     );
-    let wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let wallet = Wallet::new(wd, keys).unwrap();
     let flushed = wallet.flush().await;
     let transactions: Vec<String> = js_sys::Array::from(&run_js(
         "IDBDatabase.prototype.transaction = globalThis.__idbTransactionOriginal;
@@ -460,9 +460,8 @@ async fn test_create_and_restore_request_persistent_storage() {
             .as_f64()
             .unwrap()
     };
-    let mut wallet = Wallet::restore(test_wallet_data(vec![AssetSchema::Nia]))
-        .await
-        .unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::restore(wd, keys).await.unwrap();
     let after_create = persist_calls();
     let backup = wallet.backup("password").unwrap();
     let restored = wallet.restore_backup(&backup, "password");
@@ -477,29 +476,27 @@ async fn test_create_and_restore_request_persistent_storage() {
 // Address reuse e2e tests
 // ---------------------------------------------------------------------------
 
-fn test_wallet_data_reuse(schemas: Vec<AssetSchema>) -> WalletData {
+fn test_wallet_data_reuse(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
     let keys = generate_keys(BitcoinNetwork::Regtest);
-    WalletData {
-        data_dir: "/tmp/rgb_test_reuse".to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: DatabaseType::Sqlite,
-        max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: schemas,
-        reuse_addresses: true,
-        allow_reckless_schemas: false,
-    }
+    (
+        WalletData {
+            data_dir: "/tmp/rgb_test_reuse".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: true,
+            allow_reckless_schemas: false,
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
 }
 
 /// With reuse enabled, get_address returns the same address every time.
 #[wasm_bindgen_test]
 fn test_address_reuse_returns_same() {
-    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
-    let mut wallet = Wallet::new(wd).unwrap();
+    let (wd, keys) = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
 
     let addr1 = wallet.get_address().unwrap();
     let addr2 = wallet.get_address().unwrap();
@@ -512,8 +509,8 @@ fn test_address_reuse_returns_same() {
 /// Without reuse, addresses differ (existing behavior preserved).
 #[wasm_bindgen_test]
 fn test_address_no_reuse_returns_different() {
-    let wd = test_wallet_data(vec![AssetSchema::Nia]);
-    let mut wallet = Wallet::new(wd).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
 
     let addr1 = wallet.get_address().unwrap();
     let addr2 = wallet.get_address().unwrap();
@@ -525,8 +522,8 @@ fn test_address_no_reuse_returns_different() {
 fn test_rotate_address() {
     use rgb_lib_wasm::bdk_wallet::KeychainKind;
 
-    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
-    let mut wallet = Wallet::new(wd).unwrap();
+    let (wd, keys) = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
 
     let old_addr = wallet.get_address().unwrap();
     let rotated = wallet.rotate_address(KeychainKind::Internal).unwrap();
@@ -551,8 +548,8 @@ fn test_rotate_address() {
 fn test_rotate_address_disabled_errors() {
     use rgb_lib_wasm::bdk_wallet::KeychainKind;
 
-    let wd = test_wallet_data(vec![AssetSchema::Nia]);
-    let mut wallet = Wallet::new(wd).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
 
     let result = wallet.rotate_address(KeychainKind::Internal);
     assert!(result.is_err());
@@ -564,8 +561,8 @@ fn test_rotate_address_disabled_errors() {
 fn test_keychains_independent() {
     use rgb_lib_wasm::bdk_wallet::KeychainKind;
 
-    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
-    let mut wallet = Wallet::new(wd).unwrap();
+    let (wd, keys) = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
 
     // get_address uses Internal keychain
     let internal_addr = wallet.get_address().unwrap();
@@ -584,13 +581,13 @@ fn test_keychains_independent() {
 /// WalletData round-trip preserves the reuse_addresses field.
 #[wasm_bindgen_test]
 fn test_wallet_data_preserves_reuse_field() {
-    let wd = test_wallet_data_reuse(vec![AssetSchema::Nia]);
-    let wallet = Wallet::new(wd).unwrap();
+    let (wd, keys) = test_wallet_data_reuse(vec![AssetSchema::Nia]);
+    let wallet = Wallet::new(wd, keys).unwrap();
     let returned = wallet.get_wallet_data();
     assert!(returned.reuse_addresses, "reuse_addresses should be true");
 
-    let wd2 = test_wallet_data(vec![AssetSchema::Nia]);
-    let wallet2 = Wallet::new(wd2).unwrap();
+    let (wd2, keys2) = test_wallet_data(vec![AssetSchema::Nia]);
+    let wallet2 = Wallet::new(wd2, keys2).unwrap();
     let returned2 = wallet2.get_wallet_data();
     assert!(
         !returned2.reuse_addresses,
@@ -602,26 +599,14 @@ fn test_wallet_data_preserves_reuse_field() {
 #[wasm_bindgen_test]
 fn test_reuse_addresses_serde_default() {
     // JSON without the reuse_addresses field should deserialize to false
-    let keys = generate_keys(BitcoinNetwork::Regtest);
-    let json = format!(
-        r#"{{
+    let json = r#"{
             "data_dir": "/tmp/serde_test",
             "bitcoin_network": "Regtest",
             "database_type": "Sqlite",
             "max_allocations_per_utxo": 5,
-            "account_xpub_vanilla": "{}",
-            "account_xpub_colored": "{}",
-            "mnemonic": "{}",
-            "master_fingerprint": "{}",
-            "vanilla_keychain": null,
             "supported_schemas": ["Nia"]
-        }}"#,
-        keys.account_xpub_vanilla,
-        keys.account_xpub_colored,
-        keys.mnemonic.as_str(),
-        keys.master_fingerprint,
-    );
-    let wd: WalletData = serde_json::from_str(&json).unwrap();
+        }"#;
+    let wd: WalletData = serde_json::from_str(json).unwrap();
     assert!(!wd.reuse_addresses, "missing field should default to false");
 }
 
@@ -701,7 +686,8 @@ impl VssStore {
 }
 
 async fn wallet_with_vss_backup() -> (Wallet, VssStore) {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let store = VssStore::new();
     wallet.configure_vss_backup(&store.config());
     wallet.vss_backup().await.unwrap();
@@ -747,7 +733,7 @@ async fn test_vss_restore_refuses_other_wallet_state() {
         .await;
     store_a.set_manifest("encrypted", false.into()).await;
     store_a.set_manifest("version", 99.into()).await;
-    let fingerprint = b.get_wallet_data().master_fingerprint;
+    let fingerprint = b.get_keys().master_fingerprint;
     store_a
         .put("backup/fingerprint", fingerprint.into_bytes())
         .await;
@@ -825,7 +811,8 @@ async fn test_stalled_indexer_and_vss_time_out() {
             }));
         };",
     );
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let options = OnlineOptions {
         indexer_config: IndexerConfig::Esplora {
             url: "http://STALL.invalid:80/indexer".to_string(),
@@ -888,7 +875,8 @@ async fn test_busy_indexer_retried_after_pauses() {
             return Promise.resolve(resp);
         };",
     );
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let options = OnlineOptions {
         indexer_config: IndexerConfig::Esplora {
             url: "http://busy.invalid/indexer".to_string(),
@@ -915,4 +903,236 @@ async fn test_busy_indexer_retried_after_pauses() {
     assert_eq!(hits, 4.0);
     // the pauses are 256, 512 and 1024 ms
     assert!(online_ms >= 1_700.0, "go_online after {online_ms} ms");
+}
+
+// ---------------------------------------------------------------------------
+// Saved wallet configuration
+// ---------------------------------------------------------------------------
+
+use AssetSchema::{Ifa, Nia};
+use BitcoinNetwork::{Regtest, Signet};
+use rgb_lib_wasm::wallet::idb_store::{load_snapshot, save_snapshot};
+
+fn config_data(name: &str, bitcoin_network: BitcoinNetwork) -> WalletData {
+    WalletData {
+        data_dir: format!("/tmp/config-{name}-{}", js_sys::Date::now()),
+        bitcoin_network,
+        database_type: DatabaseType::Sqlite,
+        max_allocations_per_utxo: 5,
+        supported_schemas: vec![Nia],
+        reuse_addresses: false,
+        allow_reckless_schemas: false,
+    }
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap()
+}
+
+fn mnemonic(keys: &rgb_lib_wasm::keys::Keys) -> Option<String> {
+    Some(keys.mnemonic.to_string())
+}
+
+async fn saved(wd: &WalletData, keys: SinglesigKeys) {
+    Wallet::new(wd.clone(), keys)
+        .unwrap()
+        .flush()
+        .await
+        .unwrap();
+}
+
+fn assert_mismatch(err: Error, expected: &str) {
+    assert!(
+        matches!(&err, Error::WalletSettingMismatch { setting, .. } if setting == expected),
+        "{err:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn config_load_success() {
+    let keys = generate_keys(Signet);
+    let wd = WalletData {
+        max_allocations_per_utxo: 1,
+        supported_schemas: vec![Nia, Ifa],
+        allow_reckless_schemas: true,
+        ..config_data("load", Signet)
+    };
+    let sk = SinglesigKeys::from_keys(&keys, Some(2));
+    let wallet = Wallet::new(wd.clone(), sk.clone()).unwrap();
+    wallet.flush().await.unwrap();
+    let (dir, descriptors) = (wallet.get_wallet_dir(), wallet.get_descriptors());
+    drop(wallet);
+
+    let mut loaded = Wallet::load(
+        &wd.data_dir,
+        Signet,
+        &keys.master_fingerprint,
+        mnemonic(&keys),
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded.get_wallet_dir(), dir);
+    assert_eq!(loaded.get_descriptors(), descriptors);
+    assert_eq!(to_json(&loaded.get_wallet_data()), to_json(&wd));
+    assert_eq!(to_json(&loaded.get_keys()), to_json(&sk));
+    loaded.get_address().unwrap();
+    loaded.flush().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn config_restore_updates_saved_settings() {
+    let keys = generate_keys(Regtest);
+    let wd = WalletData {
+        max_allocations_per_utxo: 1,
+        ..config_data("update", Regtest)
+    };
+    saved(&wd, SinglesigKeys::from_keys(&keys, None)).await;
+    let load = || Wallet::load(&wd.data_dir, Regtest, &keys.master_fingerprint, None);
+    assert_eq!(
+        load()
+            .await
+            .unwrap()
+            .get_wallet_data()
+            .max_allocations_per_utxo,
+        1
+    );
+
+    let changed = WalletData {
+        max_allocations_per_utxo: 3,
+        supported_schemas: vec![Nia, Ifa],
+        ..wd.clone()
+    };
+    let wallet = Wallet::restore(changed, SinglesigKeys::from_keys_no_mnemonic(&keys, None))
+        .await
+        .unwrap();
+    wallet.flush().await.unwrap();
+    drop(wallet);
+    let got = load().await.unwrap().get_wallet_data();
+    assert_eq!(got.max_allocations_per_utxo, 3);
+    assert_eq!(got.supported_schemas, vec![Nia, Ifa]);
+}
+
+#[wasm_bindgen_test]
+async fn config_restore_refuses_fixed_settings() {
+    let keys = generate_keys(Regtest);
+    let wd = config_data("fixed", Regtest);
+    saved(&wd, SinglesigKeys::from_keys(&keys, None)).await;
+
+    let err = Wallet::restore(wd.clone(), SinglesigKeys::from_keys(&keys, Some(2)))
+        .await
+        .err()
+        .unwrap();
+    assert_mismatch(err, "vanilla_keychain");
+}
+
+#[wasm_bindgen_test]
+async fn config_watch_only_toggle_success() {
+    let keys = generate_keys(Regtest);
+    let fp = &keys.master_fingerprint;
+    let wd = config_data("toggle", Regtest);
+    saved(&wd, SinglesigKeys::from_keys(&keys, None)).await;
+    let loaded = Wallet::load(&wd.data_dir, Regtest, fp, None).await.unwrap();
+    assert!(loaded.get_keys().mnemonic.is_none());
+    let watch_only = Wallet::new(
+        wd.clone(),
+        SinglesigKeys::from_keys_no_mnemonic(&keys, None),
+    )
+    .unwrap();
+    assert_eq!(loaded.get_descriptors(), watch_only.get_descriptors());
+    let loaded = Wallet::load(&wd.data_dir, Regtest, fp, mnemonic(&keys))
+        .await
+        .unwrap();
+    assert_eq!(loaded.get_keys().mnemonic, Some(keys.mnemonic.clone()));
+
+    let wd = config_data("toggle-watch-only", Regtest);
+    saved(&wd, SinglesigKeys::from_keys_no_mnemonic(&keys, None)).await;
+    let loaded = Wallet::load(&wd.data_dir, Regtest, fp, mnemonic(&keys))
+        .await
+        .unwrap();
+    assert_eq!(loaded.get_keys().mnemonic, Some(keys.mnemonic.clone()));
+}
+
+#[wasm_bindgen_test]
+async fn config_load_inexistent_manifest_fail() {
+    let keys = generate_keys(Regtest);
+    let wd = config_data("inexistent", Regtest);
+    let wallet = Wallet::new(wd.clone(), SinglesigKeys::from_keys(&keys, None)).unwrap();
+    let load = || Wallet::load(&wd.data_dir, Regtest, &keys.master_fingerprint, None);
+    let err = load().await.err().unwrap();
+    assert!(
+        matches!(&err, Error::InexistentWalletManifest { path } if *path == wallet.idb_key()),
+        "{err:?}"
+    );
+    wallet.flush().await.unwrap();
+    assert!(load().await.is_ok());
+}
+
+#[wasm_bindgen_test]
+async fn config_load_fingerprint_mismatch_fail() {
+    let wd = config_data("fingerprint", Regtest);
+    let (keys_1, keys_2) = (generate_keys(Regtest), generate_keys(Regtest));
+    let wallet_1 = Wallet::new(wd.clone(), SinglesigKeys::from_keys(&keys_1, None)).unwrap();
+    wallet_1.flush().await.unwrap();
+    let wallet_2 = Wallet::new(wd.clone(), SinglesigKeys::from_keys(&keys_2, None)).unwrap();
+    let snapshot = load_snapshot(&wallet_1.idb_key()).await.unwrap().unwrap();
+    save_snapshot(&wallet_2.idb_key(), &snapshot, None)
+        .await
+        .unwrap();
+
+    let err = Wallet::load(&wd.data_dir, Regtest, &keys_2.master_fingerprint, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::FingerprintMismatch), "{err:?}");
+}
+
+#[wasm_bindgen_test]
+async fn config_load_wrong_mnemonic_fail() {
+    let keys = generate_keys(Regtest);
+    let wd = config_data("wrong-mnemonic", Regtest);
+    saved(&wd, SinglesigKeys::from_keys(&keys, None)).await;
+    let other = generate_keys(Regtest);
+    let err = Wallet::load(
+        &wd.data_dir,
+        Regtest,
+        &keys.master_fingerprint,
+        mnemonic(&other),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
+}
+
+#[wasm_bindgen_test]
+async fn config_load_after_backup_restore_success() {
+    let keys = generate_keys(Regtest);
+    let wd_a = WalletData {
+        max_allocations_per_utxo: 1,
+        ..config_data("backup-a", Regtest)
+    };
+    let source = Wallet::new(wd_a, SinglesigKeys::from_keys(&keys, None)).unwrap();
+    let backup = source.backup("password").unwrap();
+
+    let wd_b = WalletData {
+        max_allocations_per_utxo: 3,
+        ..config_data("backup-b", Regtest)
+    };
+    let mut wallet = Wallet::new(wd_b.clone(), SinglesigKeys::from_keys(&keys, None)).unwrap();
+    wallet.restore_backup(&backup, "password").unwrap();
+    wallet.flush().await.unwrap();
+    drop(wallet);
+
+    let loaded = Wallet::load(
+        &wd_b.data_dir,
+        Regtest,
+        &keys.master_fingerprint,
+        mnemonic(&keys),
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded.get_descriptors(), source.get_descriptors());
+    let got = loaded.get_wallet_data();
+    assert_eq!(got.data_dir, wd_b.data_dir);
+    assert_eq!(got.max_allocations_per_utxo, 3);
 }

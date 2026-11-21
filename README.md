@@ -86,17 +86,19 @@ const walletData = {
   bitcoinNetwork: 'Regtest',
   databaseType: 'Sqlite',
   maxAllocationsPerUtxo: 5,
-  accountXpubVanilla: keys.accountXpubVanilla,
-  accountXpubColored: keys.accountXpubColored,
-  mnemonic: keys.mnemonic,
-  masterFingerprint: keys.masterFingerprint,
-  vanillaKeychain: null,
   supportedSchemas: ['Nia', 'Ifa'],
   allowRecklessSchemas: false,
 };
+const walletKeys = {
+  accountXpubVanilla: keys.accountXpubVanilla,
+  accountXpubColored: keys.accountXpubColored,
+  masterFingerprint: keys.masterFingerprint,
+  mnemonic: keys.mnemonic,
+  vanillaKeychain: null,
+};
 
 // create() restores state from IndexedDB if available
-const wallet = await WasmWallet.create(JSON.stringify(walletData));
+const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));
 
 // Await durable IndexedDB commit before persisting dependent application state.
 await wallet.flush();
@@ -118,9 +120,15 @@ acknowledge accepted RGB funding, or broadcast a transaction that depends on an
 RGB mutation only after the flush succeeds. A failed flush leaves the current
 in-memory wallet state intact and can be retried. A flush that writes nothing
 fails. A wallet saves over a stored snapshot only if it loaded that snapshot
-through `create()` or `Wallet::restore()`, or wrote it itself. A wallet built with
+through `create()`, `Wallet::restore()` or `Wallet::load()`, or wrote it itself. A wallet built with
 `new` on a data directory that holds a snapshot cannot save: its saves fail and
 its calls return a persistence error.
+
+Every save and backup stores the wallet settings and public keys, without the
+mnemonic. `create`, `restore`, `restoreBackup` and `vssRestoreBackup` refuse a
+changed vanilla keychain or account xpub with `WalletSettingMismatch`, and
+`restoreBackup` also refuses a changed fingerprint with it.
+Other settings changed in `create` are stored with the next save.
 
 Every call that changes the wallet saves it. Saves are written in order, and
 none is dropped. An async call returns after its save commits, and returns a
@@ -345,13 +353,13 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 
 ## Security
 
-The wallet trusts every script on its page. A script in the same page can call every wallet method, read the wasm memory, which holds the mnemonic while the wallet exists, and read the IndexedDB snapshot, which holds the wallet database without the mnemonic. `getWalletData` and `Debug` output do not show the mnemonic. This stops accidental leaks, not a hostile script.
+The wallet trusts every script on its page. A script in the same page can call every wallet method, read the wasm memory, which holds the mnemonic while the wallet exists, and read the IndexedDB snapshot, which holds the wallet database without the mnemonic. `getWalletData`, `getKeys` and `Debug` output do not show the mnemonic. `getDescriptors` of a signing wallet returns the account private keys. This stops accidental leaks, not a hostile script.
 
 To protect a wallet:
 
 - Load no third-party scripts on the wallet's origin. Set a strict Content Security Policy and use Subresource Integrity on the scripts you load.
 - Run the wallet on its own origin, for example in an iframe on a dedicated subdomain, and talk to it with `postMessage`. Scripts on the main page then cannot reach its memory or its storage.
-- To keep the mnemonic out of the page, create the wallet with `mnemonic: null` (watch-only). Sign the PSBT of each `*Begin` call elsewhere, for example on a hardware wallet, and pass the signed PSBT to the matching `*End` call.
+- To keep the mnemonic out of the page, create the wallet with keys whose `mnemonic` is null (watch-only). Sign the PSBT of each `*Begin` call elsewhere, for example on a hardware wallet, and pass the signed PSBT to the matching `*End` call.
 
 ## API reference
 
@@ -378,10 +386,13 @@ To protect a wallet:
 
 | Method | Async | Description |
 |--------|-------|-------------|
-| `new(walletDataJson)` | no | Create wallet (no IndexedDB restore) |
-| `create(walletDataJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
+| `new(walletDataJson, keysJson)` | no | Create wallet (no IndexedDB restore) |
+| `create(walletDataJson, keysJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
+| `load(dataDir, network, masterFingerprint, mnemonic?)` | yes | Load a saved wallet with its saved settings; `mnemonic` null loads it watch-only |
 | `flush()` | yes | Durably commit current wallet state to IndexedDB |
-| `getWalletData()` | no | Return WalletData as JS object; the mnemonic is not returned (`mnemonic` is null) |
+| `getWalletData()` | no | Return WalletData as JS object |
+| `getKeys()` | no | Return SinglesigKeys; `mnemonic` is null |
+| `getDescriptors()` | no | Return `{colored, vanilla}`; a signing wallet's descriptors hold its account private keys |
 | `getAddress()` | no | Get a new Bitcoin address |
 | `getBtcBalance()` | no | Get BTC balance |
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |

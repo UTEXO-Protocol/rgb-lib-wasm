@@ -7,7 +7,8 @@ wasm_bindgen_test_configure!(run_in_browser);
 mod utils;
 
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Outpoint, Recipient, TransferScope, Wallet, WalletData, WitnessData,
+    AssetFilter, DatabaseType, Outpoint, Recipient, SinglesigKeys, TransferScope, Wallet,
+    WalletData, WitnessData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
@@ -15,22 +16,20 @@ use rgb_lib_wasm::{
 };
 use utils::*;
 
-fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
+fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
     let keys = generate_keys(BitcoinNetwork::Regtest);
-    WalletData {
-        data_dir: "/tmp/rgb_integration".to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: DatabaseType::Sqlite,
-        max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: schemas,
-        reuse_addresses: false,
-        allow_reckless_schemas: false,
-    }
+    (
+        WalletData {
+            data_dir: "/tmp/rgb_integration".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -102,10 +101,12 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
 #[wasm_bindgen_test]
 async fn test_no_receive_on_pending_send_input() {
     let transport = transport_endpoint();
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
-    let mut rcv_wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (rcv_wd, rcv_keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut rcv_wallet = Wallet::new(rcv_wd, rcv_keys).unwrap();
     let rcv_online = rcv_wallet
         .go_online(go_online_options(false))
         .await
@@ -377,7 +378,8 @@ async fn test_no_receive_on_pending_send_input() {
 #[wasm_bindgen_test]
 async fn test_no_inflate_end_after_fail() {
     let transport = transport_endpoint();
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
 
@@ -542,8 +544,8 @@ async fn test_no_inflate_end_after_fail() {
 
 #[wasm_bindgen_test]
 async fn test_full_wallet_flow() {
-    let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
-    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd.clone(), keys.clone()).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet, &online, "1.0").await;
@@ -613,8 +615,8 @@ async fn test_full_wallet_flow() {
 
     // Two-wallet NIA send: wallet A → wallet B
     // Must happen before blind_receive which locks the NIA UTXO via pending_blinded
-    let wd_b = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
-    let mut wallet_b = Wallet::new(wd_b.clone()).unwrap();
+    let (wd_b, keys_b) = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
+    let mut wallet_b = Wallet::new(wd_b.clone(), keys_b.clone()).unwrap();
     let online_b = wallet_b.go_online(go_online_options(false)).await.unwrap();
 
     fund_and_sync(&mut wallet_b, &online_b, "1.0").await;
@@ -677,7 +679,7 @@ async fn test_full_wallet_flow() {
             .all(|t| t.psbt.as_ref() == Some(&unsigned_psbt_bytes))
     );
     // A signer that never synced has no chain data
-    let signer = Wallet::new(wd.clone()).unwrap();
+    let signer = Wallet::new(wd.clone(), keys.clone()).unwrap();
     let signed_psbt = signer.sign_psbt(unsigned_psbt, None).unwrap();
     let signed_txid = rgb_lib_wasm::bitcoin::psbt::Psbt::from_str(&signed_psbt)
         .unwrap()
@@ -1177,7 +1179,7 @@ async fn test_full_wallet_flow() {
         .map(|i| i.previous_output.into())
         .collect();
     assert!(colorable.iter().all(|o| drain_inputs.contains(o)));
-    let signer_b = Wallet::new(wd_b).unwrap();
+    let signer_b = Wallet::new(wd_b, keys_b).unwrap();
     let signed_drain = signer_b.sign_psbt(unsigned_drain, None).unwrap();
     let txid = psbt_txid(&signed_drain);
     assert_refused(
@@ -1297,10 +1299,13 @@ async fn test_full_wallet_flow() {
     );
 
     // Restore into a fresh wallet on an empty data directory: IFA units and inflation rights must survive
-    let mut restored = Wallet::new(WalletData {
-        data_dir: "/tmp/rgb_integration_restored".to_string(),
-        ..wd.clone()
-    })
+    let mut restored = Wallet::new(
+        WalletData {
+            data_dir: "/tmp/rgb_integration_restored".to_string(),
+            ..wd.clone()
+        },
+        keys.clone(),
+    )
     .unwrap();
     restored.restore_backup(&backup_bytes, password).unwrap();
     let restored_ifa = restored
@@ -1378,10 +1383,13 @@ async fn test_full_wallet_flow() {
     assert!(info_after.server_version.is_some());
 
     // Restore from VSS into a fresh wallet with the same keys
-    let mut vss_restored = Wallet::new(WalletData {
-        data_dir: "/tmp/rgb_integration_vss_restored".to_string(),
-        ..wd
-    })
+    let mut vss_restored = Wallet::new(
+        WalletData {
+            data_dir: "/tmp/rgb_integration_vss_restored".to_string(),
+            ..wd
+        },
+        keys.clone(),
+    )
     .unwrap();
     let has_test_nia = |w: &Wallet| {
         w.list_assets(vec![AssetSchema::Nia])
@@ -1541,10 +1549,14 @@ async fn test_full_wallet_flow() {
 
 #[wasm_bindgen_test]
 async fn test_go_online_other_network() {
-    let mut wallet = Wallet::new(WalletData {
-        bitcoin_network: BitcoinNetwork::Testnet,
-        ..test_wallet_data(vec![AssetSchema::Nia])
-    })
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(
+        WalletData {
+            bitcoin_network: BitcoinNetwork::Testnet,
+            ..wd
+        },
+        keys,
+    )
     .unwrap();
     let result = wallet.go_online(go_online_options(false)).await;
     assert!(
@@ -1556,7 +1568,8 @@ async fn test_go_online_other_network() {
 #[wasm_bindgen_test]
 async fn test_sync_after_block_sees_new_utxo() {
     spy_esplora_cache();
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     let addr = wallet.get_address().unwrap();
     wallet.sync(online.clone()).await.unwrap();
@@ -1578,8 +1591,8 @@ async fn test_sync_after_block_sees_new_utxo() {
 
 #[wasm_bindgen_test]
 async fn test_restored_wallet_inflates_after_inflation() {
-    let wd = test_wallet_data(vec![AssetSchema::Ifa]);
-    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd.clone(), keys.clone()).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
     create_utxos(&mut wallet, &online, 5).await;
@@ -1628,10 +1641,13 @@ async fn test_restored_wallet_inflates_after_inflation() {
     let password = "test_password_123";
     let backup_bytes = wallet.backup(password).unwrap();
 
-    let mut restored = Wallet::new(WalletData {
-        data_dir: "/tmp/rgb_integration_restored_inflate".to_string(),
-        ..wd
-    })
+    let mut restored = Wallet::new(
+        WalletData {
+            data_dir: "/tmp/rgb_integration_restored_inflate".to_string(),
+            ..wd
+        },
+        keys.clone(),
+    )
     .unwrap();
     restored.restore_backup(&backup_bytes, password).unwrap();
     assert_eq!(
@@ -1667,7 +1683,8 @@ async fn test_restored_wallet_inflates_after_inflation() {
 
 #[wasm_bindgen_test]
 async fn test_inflate_end_retries_after_failed_sync() {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Ifa]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
     create_utxos(&mut wallet, &online, 5).await;
@@ -1729,8 +1746,8 @@ async fn test_inflate_end_retries_after_failed_sync() {
 
 #[wasm_bindgen_test]
 async fn test_go_online_checks_outputs_spent_after_backup() {
-    let wd = test_wallet_data(vec![AssetSchema::Nia]);
-    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd.clone(), keys.clone()).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
     create_utxos(&mut wallet, &online, 1).await;
@@ -1747,7 +1764,8 @@ async fn test_go_online_checks_outputs_spent_after_backup() {
     let backup_bytes = wallet.backup(password).unwrap();
 
     // spend every output after the backup
-    let addr = Wallet::new(test_wallet_data(vec![AssetSchema::Nia]))
+    let (addr_wd, addr_keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let addr = Wallet::new(addr_wd, addr_keys)
         .unwrap()
         .get_address()
         .unwrap();
@@ -1771,10 +1789,13 @@ async fn test_go_online_checks_outputs_spent_after_backup() {
     wallet.drain_to_end(online.clone(), signed).await.unwrap();
     mine_blocks(1).await;
 
-    let mut restored = Wallet::new(WalletData {
-        data_dir: "/tmp/rgb_integration_restored_consistency".to_string(),
-        ..wd
-    })
+    let mut restored = Wallet::new(
+        WalletData {
+            data_dir: "/tmp/rgb_integration_restored_consistency".to_string(),
+            ..wd
+        },
+        keys.clone(),
+    )
     .unwrap();
     restored.restore_backup(&backup_bytes, password).unwrap();
     for _ in 0..2 {
@@ -1792,15 +1813,16 @@ async fn test_go_online_checks_outputs_spent_after_backup() {
 #[wasm_bindgen_test]
 async fn test_go_online_checks_own_spends() {
     let transport = transport_endpoint();
-    let wd = test_wallet_data(vec![AssetSchema::Nia]);
-    let mut wallet = Wallet::new(wd.clone()).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd.clone(), keys.clone()).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
     create_utxos(&mut wallet, &online, 2).await;
     let asset = wallet
         .issue_asset_nia("OWN".to_string(), "Own spends".to_string(), 0, vec![1000])
         .unwrap();
-    let mut rcv_wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (rcv_wd, rcv_keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut rcv_wallet = Wallet::new(rcv_wd, rcv_keys).unwrap();
     let rcv_online = rcv_wallet
         .go_online(go_online_options(false))
         .await
@@ -1884,10 +1906,13 @@ async fn test_go_online_checks_own_spends() {
     wallet.go_online(go_online_options(false)).await.unwrap();
 
     // the backup does not hold the drain that spends the send's change
-    let mut restored = Wallet::new(WalletData {
-        data_dir: "/tmp/rgb_integration_restored_own_spends".to_string(),
-        ..wd
-    })
+    let mut restored = Wallet::new(
+        WalletData {
+            data_dir: "/tmp/rgb_integration_restored_own_spends".to_string(),
+            ..wd
+        },
+        keys.clone(),
+    )
     .unwrap();
     restored.restore_backup(&backup_bytes, password).unwrap();
     let res = restored.go_online(go_online_options(false)).await;

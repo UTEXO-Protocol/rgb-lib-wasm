@@ -157,9 +157,9 @@ async fn mint(
 
 #[wasm_bindgen_test]
 async fn bfa_mint_settles_and_is_spendable() {
-    let wd = wallet_data(vec![AssetSchema::Bfa]);
+    let (wd, keys) = wallet_data(vec![AssetSchema::Bfa]);
     let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 5).await;
-    let (mut b, b_online) = funded_wallet(wd.clone(), 3).await;
+    let (mut b, b_online) = funded_wallet((wd.clone(), keys.clone()), 3).await;
     let bridge = new_evm_address();
     deploy_bridge(&bridge).await;
     let asset = a
@@ -268,13 +268,15 @@ async fn bfa_mint_settles_and_is_spendable() {
     assert!(!unsupported_claims(AssetSchema::Bfa, &mut pending));
     assert!(unsupported_claims(AssetSchema::Nia, &mut pending));
     // an import of the mint needs an EVM RPC URL and a confirmed lock
-    let mut d1 = Wallet::new(wallet_data(vec![AssetSchema::Bfa])).unwrap();
+    let (d1_wd, d1_keys) = wallet_data(vec![AssetSchema::Bfa]);
+    let mut d1 = Wallet::new(d1_wd, d1_keys).unwrap();
     let d1_online = d1.go_online(go_online_options(false)).await.unwrap();
     assert!(matches!(
         d1.save_new_asset(d1_online, &bytes, &txid).await,
         Err(Error::NoEvmRpcUrl { chain_id: CHAIN_ID })
     ));
-    let mut d2 = Wallet::new(wallet_data(vec![AssetSchema::Bfa])).unwrap();
+    let (d2_wd, d2_keys) = wallet_data(vec![AssetSchema::Bfa]);
+    let mut d2 = Wallet::new(d2_wd, d2_keys).unwrap();
     let d2_online = d2
         .go_online(OnlineOptions {
             evm_chains: evm_chains(2, 1_000_000),
@@ -448,7 +450,7 @@ async fn bfa_mint_settles_and_is_spendable() {
         Some(received.clone())
     );
     let backup = b.backup("password").unwrap();
-    let mut restored = Wallet::new(wd).unwrap();
+    let mut restored = Wallet::new(wd, keys).unwrap();
     restored.restore_backup(&backup, "password").unwrap();
     assert_eq!(
         restored
@@ -510,7 +512,9 @@ async fn bfa_mint_settles_and_is_spendable() {
     );
 
     // after a reload, settlement checks the lock again: with no EVM RPC URL it waits
-    let mut b = Wallet::restore(b.get_wallet_data()).await.unwrap();
+    let mut b = Wallet::restore(b.get_wallet_data(), b.get_keys())
+        .await
+        .unwrap();
     let no_evm = b.go_online(go_online_options(false)).await.unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
@@ -1276,7 +1280,9 @@ async fn bfa_mint_lock_before_block() {
         transfer_status(&mut a, &receive.recipient_id),
         TransferStatus::Failed
     );
-    let mut copy = Wallet::restore(a.get_wallet_data()).await.unwrap();
+    let mut copy = Wallet::restore(a.get_wallet_data(), a.get_keys())
+        .await
+        .unwrap();
     assert_eq!(
         transfer_status(&mut copy, &receive.recipient_id),
         TransferStatus::Failed
@@ -1724,7 +1730,9 @@ async fn bfa_mint_never_failed_by_clock() {
             .unwrap()
             .is_some()
     );
-    let copy = Wallet::restore(b.get_wallet_data()).await.unwrap();
+    let copy = Wallet::restore(b.get_wallet_data(), b.get_keys())
+        .await
+        .unwrap();
     assert!(
         copy.get_received_mint(receive.recipient_id.clone())
             .unwrap()
@@ -1846,7 +1854,7 @@ async fn bfa_mint_retry_looks_up_lock() {
     );
     assert_eq!(validations(), v0 + 1);
     assert!(
-        Wallet::restore(b.get_wallet_data())
+        Wallet::restore(b.get_wallet_data(), b.get_keys())
             .await
             .unwrap()
             .pending_mint_locks

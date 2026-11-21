@@ -12,7 +12,8 @@ use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
     AssetFilter, Balance, Online, Outpoint, ReceiveData, Recipient, RefreshFilter,
-    RefreshTransferStatus, RgbAllocation, Transfer, TransferScope, Unspent, Wallet, WalletData,
+    RefreshTransferStatus, RgbAllocation, SinglesigKeys, Transfer, TransferScope, Unspent, Wallet,
+    WalletData,
 };
 use crate::{
     AssetSchema, Assignment, Attachment, Bytes32, Encryption, Error, MediaType, RgbTransfer,
@@ -598,7 +599,9 @@ async fn receive_settles_after_reload() {
             .is_none()
     );
 
-    let mut r = Wallet::restore(r.get_wallet_data()).await.unwrap();
+    let mut r = Wallet::restore(r.get_wallet_data(), r.get_keys())
+        .await
+        .unwrap();
     let r_on = r.go_online(go_online_options(false)).await.unwrap();
     let v = validations();
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
@@ -787,9 +790,9 @@ async fn utxo_allocations_limit_across_inputs() {
     MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
     MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(10));
     let (mut a, a_on) = nia_wallet(5).await;
-    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    let (mut wd, keys) = wallet_data(vec![AssetSchema::Nia]);
     wd.max_allocations_per_utxo = u32::MAX;
-    let (mut r, r_on) = funded_wallet(wd, 3).await;
+    let (mut r, r_on) = funded_wallet((wd, keys), 3).await;
     let (mut r2, r2_on) = nia_wallet(1).await;
     let asset_id = issue(&a, vec![33_000 + 34_000 + 50_000 + AMOUNT]);
 
@@ -841,9 +844,9 @@ async fn utxo_allocations_limit_across_assets(x_first: bool) {
     MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
     MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(10));
     let (mut a, a_on) = nia_wallet(5).await;
-    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    let (mut wd, keys) = wallet_data(vec![AssetSchema::Nia]);
     wd.max_allocations_per_utxo = u32::MAX;
-    let (mut r, r_on) = funded_wallet(wd, 1).await;
+    let (mut r, r_on) = funded_wallet((wd, keys), 1).await;
     let (mut r2, r2_on) = nia_wallet(2).await;
 
     // the send selects inputs in asset ID order
@@ -938,9 +941,9 @@ async fn extra_allocations_share_one_builder() {
     let _reset = ResetMocks;
     MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
     let (mut a, a_on) = nia_wallet(5).await;
-    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    let (mut wd, keys) = wallet_data(vec![AssetSchema::Nia]);
     wd.max_allocations_per_utxo = u32::MAX;
-    let (mut r, r_on) = funded_wallet(wd, 1).await;
+    let (mut r, r_on) = funded_wallet((wd, keys), 1).await;
     let (mut r2, r2_on) = nia_wallet(1).await;
     let x = issue(&a, vec![AMOUNT]);
     let y = issue(&a, vec![AMOUNT + 1]);
@@ -978,8 +981,8 @@ async fn extra_allocations_share_one_builder() {
 }
 
 /// A funded wallet with no UTXOs.
-async fn noutxo_wallet(wd: WalletData) -> (Wallet, Online) {
-    let mut wallet = Wallet::new(wd).unwrap();
+async fn noutxo_wallet((wd, keys): (WalletData, SinglesigKeys)) -> (Wallet, Online) {
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
     (wallet, online)
@@ -1029,9 +1032,9 @@ async fn begin_result(
 async fn change_respects_invoice_slots() {
     let _reset = ResetMocks;
     let (mut a, a_on) = nia_wallet(5).await;
-    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    let (mut wd, keys) = wallet_data(vec![AssetSchema::Nia]);
     wd.max_allocations_per_utxo = 3;
-    let (mut r, r_on) = noutxo_wallet(wd).await;
+    let (mut r, r_on) = noutxo_wallet((wd, keys)).await;
     let (mut r2, r2_on) = nia_wallet(1).await;
     // tiny UTXOs, so that a send at 1 sat/vB has no BTC change
     create_utxos(&mut r, &r_on, 2, Some(400)).await;
@@ -1074,9 +1077,9 @@ async fn change_utxo_allocations_limit() {
     MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(true);
     MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(10));
     let (mut a, a_on) = nia_wallet(5).await;
-    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    let (mut wd, keys) = wallet_data(vec![AssetSchema::Nia]);
     wd.max_allocations_per_utxo = u32::MAX;
-    let (mut r, r_on) = noutxo_wallet(wd).await;
+    let (mut r, r_on) = noutxo_wallet((wd, keys)).await;
     let (mut r2, r2_on) = nia_wallet(1).await;
     // tiny UTXOs, so that a send at 1 sat/vB has no BTC change
     create_utxos(&mut r, &r_on, 2, Some(400)).await;
@@ -1127,9 +1130,9 @@ async fn change_utxo_allocations_limit() {
 async fn change_spread_over_utxos() {
     let _reset = ResetMocks;
     let (mut a, a_on) = nia_wallet(5).await;
-    let mut wd = wallet_data(vec![AssetSchema::Nia]);
+    let (mut wd, keys) = wallet_data(vec![AssetSchema::Nia]);
     wd.max_allocations_per_utxo = 4;
-    let (mut r, r_on) = noutxo_wallet(wd).await;
+    let (mut r, r_on) = noutxo_wallet((wd, keys)).await;
     let (mut r2, r2_on) = nia_wallet(1).await;
     let ids: Vec<String> = (0..5).map(|_| issue(&a, vec![AMOUNT])).collect();
 

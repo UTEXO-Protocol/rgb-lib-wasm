@@ -46,6 +46,8 @@ pub struct WalletSnapshot {
     /// Pinned derivation index per keychain for address reuse.
     #[serde(default)]
     pub reuse_address_index: HashMap<KeychainKind, u32>,
+    /// Settings and public keys of the wallet.
+    pub(crate) manifest: super::WalletManifest,
 }
 
 #[wasm_bindgen]
@@ -328,6 +330,7 @@ mod tests {
         transfer_artifact.signed_tx = Some(vec![9]);
         transfer_artifact.fascia = Some(vec![7, 8]);
         let pml = crate::wallet::offline::address_reuse_tests::pending_mint_locks();
+        let w = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
         let snapshot = WalletSnapshot {
             writer: 1,
             sequence: 1,
@@ -362,6 +365,7 @@ mod tests {
             pending_mint_locks: HashMap::from([("rid".to_owned(), pml)]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
+            manifest: super::super::WalletManifest::new(&w.wallet_data, &w.keys),
         };
 
         // JSON round-trip (what IndexedDB does)
@@ -395,6 +399,10 @@ mod tests {
         assert_eq!(
             restored_snapshot.pending_mint_locks,
             snapshot.pending_mint_locks
+        );
+        assert_eq!(
+            serde_json::to_string(&restored_snapshot.manifest).unwrap(),
+            serde_json::to_string(&snapshot.manifest).unwrap()
         );
 
         let restored = deserialize_stock(&restored_snapshot.rgb_store).expect("deserialize stock");

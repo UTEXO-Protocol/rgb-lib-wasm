@@ -18,7 +18,8 @@ fn zero() -> Balance {
 
 /// A wallet with no UTXOs, online.
 async fn online_wallet(schemas: Vec<AssetSchema>) -> (Wallet, Online) {
-    let mut wallet = Wallet::new(wallet_data(schemas)).unwrap();
+    let (wd, keys) = wallet_data(schemas);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     (wallet, online)
 }
@@ -88,17 +89,20 @@ async fn import_contract_then_receive() {
     assert_eq!(b.rgb_contract_ids().unwrap().len(), 1);
 
     // the import is saved: reload with no flush
-    let wd_b = b.get_wallet_data();
+    let (wd_b, keys_b) = (b.get_wallet_data(), b.get_keys());
     drop(b);
-    let mut b = Wallet::restore(wd_b.clone()).await.unwrap();
+    let mut b = Wallet::restore(wd_b.clone(), keys_b.clone()).await.unwrap();
     let b_on = b.go_online(go_online_options(true)).await.unwrap();
     assert_eq!(nia_listed(&b), vec![(asset_id.clone(), zero())]);
 
     let backup = b.backup("import").unwrap();
-    let mut restored = Wallet::new(WalletData {
-        data_dir: format!("/tmp/import-{}", js_sys::Math::random()),
-        ..wd_b
-    })
+    let mut restored = Wallet::new(
+        WalletData {
+            data_dir: format!("/tmp/import-{}", js_sys::Math::random()),
+            ..wd_b
+        },
+        keys_b.clone(),
+    )
     .unwrap();
     restored.restore_backup(&backup, "import").unwrap();
     assert_eq!(nia_listed(&restored), vec![(asset_id.clone(), zero())]);
