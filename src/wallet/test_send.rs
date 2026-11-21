@@ -152,10 +152,7 @@ async fn begin(
 }
 
 async fn end(wallet: &mut Wallet, online: &Online, signed: String) {
-    wallet
-        .send_end(online.clone(), signed, false)
-        .await
-        .unwrap();
+    wallet.send_end(online.clone(), signed).await.unwrap();
 }
 
 async fn send_to(
@@ -208,9 +205,10 @@ async fn send_refused(
 }
 
 /// The allocations of the only colored unspent of `wallet`.
-fn colored_allocations(wallet: &mut Wallet) -> Vec<RgbAllocation> {
+async fn colored_allocations(wallet: &mut Wallet) -> Vec<RgbAllocation> {
     let mut colored: Vec<_> = wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| !u.rgb_allocations.is_empty())
@@ -246,9 +244,10 @@ pub(super) fn assert_no_rgb_data(psbt: &Psbt) {
 }
 
 /// A PSBT that spends the colored UTXO and pays 500 sat to the wallet.
-fn psbt_to_color(wallet: &mut Wallet, op_return: bool) -> Psbt {
+async fn psbt_to_color(wallet: &mut Wallet, op_return: bool) -> Psbt {
     let outpoint: OutPoint = wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .find(|u| !u.rgb_allocations.is_empty())
@@ -294,7 +293,7 @@ async fn color_psbt_strips_rgb_data() {
     let _reset = ResetMocks;
     let (mut a, _a_on) = nia_wallet(1).await;
     let asset_id = issue(&a, vec![AMOUNT]);
-    let mut psbt = psbt_to_color(&mut a, false);
+    let mut psbt = psbt_to_color(&mut a, false).await;
 
     a.color_psbt(&mut psbt, coloring_info(&asset_id)).unwrap();
     assert_no_rgb_data(&psbt);
@@ -306,7 +305,7 @@ async fn color_psbt_checks_the_psbt_parses_back() {
     let (mut a, _a_on) = nia_wallet(1).await;
     let asset_id = issue(&a, vec![AMOUNT]);
     // with an OP_RETURN output, color_psbt keeps the given PSBT
-    let mut psbt = psbt_to_color(&mut a, true);
+    let mut psbt = psbt_to_color(&mut a, true).await;
     // a non-RGB value over the 4 MB global map limit survives the strip
     psbt.proprietary.insert(
         ProprietaryKey {
@@ -398,6 +397,7 @@ async fn recipient_refuses_consignment_not_paying_it() {
     assert_eq!(transfer_of(&r2, &rid2).status, TransferStatus::Failed);
     assert!(
         r2.list_unspents(None, false, true)
+            .await
             .unwrap()
             .iter()
             .flat_map(|u| &u.rgb_allocations)
@@ -425,7 +425,7 @@ async fn receive_paying_two_destinations_refused() {
     for _ in 0..3 {
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
-        a.sync(a_on.clone()).await.unwrap();
+        a.full_sync(a_on.clone()).await.unwrap();
         refresh(&mut a, &a_on).await;
     }
     assert_eq!(sent(&a, &tx1).status, TransferStatus::Settled);
@@ -434,7 +434,7 @@ async fn receive_paying_two_destinations_refused() {
     send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, true).await;
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    r.sync(r_on.clone()).await.unwrap();
+    r.full_sync(r_on.clone()).await.unwrap();
     refresh(&mut r, &r_on).await;
 
     assert_eq!(transfer_of(&r, &rid).status, TransferStatus::Failed);
@@ -467,7 +467,7 @@ async fn receive_multiple_allocations_refused() {
 
     assert_eq!(balance(&a, &asset_id).spendable, 900);
     assert_eq!(balance(&r, &asset_id).spendable, 100);
-    assert_eq!(colored_allocations(&mut r).len(), 1);
+    assert_eq!(colored_allocations(&mut r).await.len(), 1);
     send_and_settle(&mut r, &r_on, &mut r2, &r2_on, &asset_id, 100).await;
     assert_eq!(balance(&r2, &asset_id).settled, 100);
 }
@@ -495,7 +495,7 @@ async fn receive_processed_again_counted_once() {
 
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert_eq!(transfer_of(&r, &rid).status, TransferStatus::Settled);
-    assert_eq!(colored_allocations(&mut r).len(), 2);
+    assert_eq!(colored_allocations(&mut r).await.len(), 2);
     assert_eq!(balance(&r, &asset_id).settled, 200);
 }
 
@@ -547,6 +547,7 @@ async fn receive_media_mismatch_retried() {
         assert!(r.database.check_asset_exists(asset_id.clone()).is_err());
         assert!(
             r.list_unspents(None, false, true)
+                .await
                 .unwrap()
                 .iter()
                 .all(|u| u.rgb_allocations.is_empty())
@@ -641,7 +642,7 @@ async fn utxo_freeze_limit() {
     let asset_id = issue(&a, vec![AMOUNT]);
     send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
     send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
-    assert_eq!(colored_allocations(&mut r).len(), 2);
+    assert_eq!(colored_allocations(&mut r).await.len(), 2);
 
     // the UTXO is full, so the wallet does not pick it for an invoice
     assert!(matches!(
@@ -660,7 +661,7 @@ async fn utxo_freeze_limit() {
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
     MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(2));
     send_refused(&mut a, &a_on, &mut r, &r_on, &asset_id, &rid, 100).await;
-    assert_eq!(colored_allocations(&mut r).len(), 2);
+    assert_eq!(colored_allocations(&mut r).await.len(), 2);
 
     assert_eq!(balance(&r, &asset_id).spendable, 200);
     send_and_settle(&mut r, &r_on, &mut r2, &r2_on, &asset_id, 200).await;
@@ -700,7 +701,7 @@ async fn utxo_freeze_concurrent_receives() {
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert_eq!(sent(&a, &accepted).status, TransferStatus::Settled);
     assert_eq!(sent(&a, &refused).status, TransferStatus::Failed);
-    assert_eq!(colored_allocations(&mut r).len(), 1);
+    assert_eq!(colored_allocations(&mut r).await.len(), 1);
     assert_eq!(balance(&r, &asset_id).settled, 50);
 }
 
@@ -720,11 +721,11 @@ async fn receive_max_allocations_per_utxo() {
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
     r.wallet_data.max_allocations_per_utxo = 2;
     send_refused(&mut a, &a_on, &mut r, &r_on, &asset_id, &rid, 100).await;
-    assert_eq!(colored_allocations(&mut r).len(), 2);
+    assert_eq!(colored_allocations(&mut r).await.len(), 2);
 
     r.wallet_data.max_allocations_per_utxo = 3;
     send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
-    assert_eq!(colored_allocations(&mut r).len(), 3);
+    assert_eq!(colored_allocations(&mut r).await.len(), 3);
     assert_eq!(balance(&r, &asset_id).settled, 200);
     assert_eq!(balance(&r, &other).settled, 100);
 }
@@ -751,7 +752,7 @@ async fn receive_counts_unpaid_invoices() {
     send_to(&mut a, &a_on, &asset_id, &rid1, 100, PROXY_URL, false).await;
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert_eq!(transfer_of(&r, &rid1).status, TransferStatus::Settled);
-    assert_eq!(colored_allocations(&mut r).len(), 2);
+    assert_eq!(colored_allocations(&mut r).await.len(), 2);
 
     // the invoice also counts toward the allocations a bundle can spend
     r.wallet_data.max_allocations_per_utxo = 10;
@@ -767,13 +768,14 @@ async fn receive_counts_unpaid_invoices() {
     send_to(&mut a, &a_on, &asset_id, &rid3, 100, PROXY_URL, false).await;
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert_eq!(transfer_of(&r, &rid3).status, TransferStatus::Settled);
-    assert_eq!(colored_allocations(&mut r).len(), 3);
+    assert_eq!(colored_allocations(&mut r).await.len(), 3);
 }
 
 /// The RGB unspent of `wallet` at `outpoint`.
-fn unspent_at(wallet: &mut Wallet, outpoint: &Outpoint) -> Unspent {
+async fn unspent_at(wallet: &mut Wallet, outpoint: &Outpoint) -> Unspent {
     wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .find(|u| &u.utxo.outpoint == outpoint)
@@ -810,6 +812,7 @@ async fn utxo_allocations_limit_across_inputs() {
     assert_eq!(receive_utxos.iter().collect::<HashSet<_>>().len(), 3);
     let mut allocations: Vec<(u64, usize)> = r
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .iter()
         .filter(|u| !u.rgb_allocations.is_empty())
@@ -829,7 +832,10 @@ async fn utxo_allocations_limit_across_inputs() {
     send_and_settle(&mut r, &r_on, &mut r2, &r2_on, &asset_id, 40_000).await;
     assert_eq!(balance(&r2, &asset_id).settled, 40_000);
     assert_eq!(
-        unspent_at(&mut r, &receive_utxos[1]).rgb_allocations.len(),
+        unspent_at(&mut r, &receive_utxos[1])
+            .await
+            .rgb_allocations
+            .len(),
         6
     );
 }
@@ -863,7 +869,7 @@ async fn utxo_allocations_limit_across_assets(x_first: bool) {
     MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(Some((5, 10)));
     send_to(&mut a, &a_on, &y, &rid, 60, PROXY_URL, false).await;
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
-    assert_eq!(colored_allocations(&mut r).len(), 7);
+    assert_eq!(colored_allocations(&mut r).await.len(), 7);
 
     let unsigned = r
         .create_utxos_begin(r_on.clone(), false, Some(1), None, 1, true, false)
@@ -873,7 +879,7 @@ async fn utxo_allocations_limit_across_assets(x_first: bool) {
     r.create_utxos_end(r_on.clone(), signed).await.unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    r.sync(r_on.clone()).await.unwrap();
+    r.full_sync(r_on.clone()).await.unwrap();
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(30), &[PROXY_URL]).await;
     let utxo_2 = transfer_of(&r, &rid).receive_utxo.unwrap();
     MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(Some((5, 5)));
@@ -914,12 +920,12 @@ async fn utxo_allocations_limit_across_assets(x_first: bool) {
         .unwrap()
         .psbt;
     let signed = r.sign_psbt(unsigned, None).unwrap();
-    let txid = r.send_end(r_on.clone(), signed, false).await.unwrap().txid;
+    let txid = r.send_end(r_on.clone(), signed).await.unwrap().txid;
     settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
     assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
     assert_eq!(balance(&r2, &x).settled, 100);
     assert_eq!(balance(&r2, &y).settled, y_amount);
-    assert_eq!(unspent_at(&mut r, &utxo_2).rgb_allocations.len(), 6);
+    assert_eq!(unspent_at(&mut r, &utxo_2).await.rgb_allocations.len(), 6);
 }
 
 #[wasm_bindgen_test]
@@ -953,7 +959,7 @@ async fn extra_allocations_share_one_builder() {
     send_to(&mut a, &a_on, &y, &rid, 60, PROXY_URL, false).await;
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     // the only colored UTXO holds 1 allocation of X and 6 of Y
-    assert_eq!(colored_allocations(&mut r).len(), 7);
+    assert_eq!(colored_allocations(&mut r).await.len(), 7);
 
     let rid = invoice(&mut r2, &r2_on, Assignment::Fungible(50), &[PROXY_URL]).await;
     TRANSITION_BUILDERS_LOADED.set(0);
@@ -969,6 +975,7 @@ async fn extra_allocations_share_one_builder() {
     assert_eq!(balance(&r, &y).settled, 60);
     let y_allocations = r
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .flat_map(|u| u.rgb_allocations)
@@ -997,12 +1004,13 @@ async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8, size: Optio
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    wallet.full_sync(online.clone()).await.unwrap();
 }
 
-fn utxo_num_allocations(wallet: &mut Wallet, outpoint: &Outpoint) -> Option<usize> {
+async fn utxo_num_allocations(wallet: &mut Wallet, outpoint: &Outpoint) -> Option<usize> {
     wallet
         .list_unspents(None, true, true)
+        .await
         .unwrap()
         .into_iter()
         .find(|u| &u.utxo.outpoint == outpoint)
@@ -1043,7 +1051,7 @@ async fn change_respects_invoice_slots() {
     // the invoice goes on the UTXO with 1 allocation (U), the send spends the other one
     let rid = invoice(&mut r, &r_on, Assignment::Any, &[PROXY_URL]).await;
     let utxo_u = transfer_of(&r, &rid).receive_utxo.unwrap();
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_u), Some(1));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_u).await, Some(1));
     let rid2 = invoice(&mut r2, &r2_on, Assignment::Any, &[PROXY_URL]).await;
     let res = begin_result(&mut r, &r_on, &asset_id, &rid2, 1).await;
     assert!(
@@ -1064,7 +1072,7 @@ async fn change_respects_invoice_slots() {
     send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert_eq!(transfer_of(&r, &rid).status, TransferStatus::Settled);
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_u), Some(2));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_u).await, Some(2));
 }
 
 // the RGB change does not take a UTXO past the allocations a bundle can spend
@@ -1097,8 +1105,8 @@ async fn change_utxo_allocations_limit() {
     let utxo_d = transfer_of(&r, &rid_d).receive_utxo.unwrap();
     let utxo_s = transfer_of(&r, &rid_s).receive_utxo.unwrap();
     assert_ne!(utxo_d, utxo_s);
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_d), Some(1));
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_s), Some(10));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_d).await, Some(1));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_s).await, Some(10));
 
     // the send spends S and its 10 allocations go to the change, which D cannot take
     let rid2 = invoice(&mut r2, &r2_on, Assignment::Any, &[PROXY_URL]).await;
@@ -1118,8 +1126,8 @@ async fn change_utxo_allocations_limit() {
     assert_ne!(utxo_change, utxo_s);
     settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
     assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_d), Some(1));
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_change), Some(10));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_d).await, Some(1));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_change).await, Some(10));
 }
 
 // the RGB change goes to the BTC change output and to other UTXOs, as many as needed
@@ -1140,13 +1148,14 @@ async fn change_spread_over_utxos() {
     }
     let utxo_s = r
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .find(|u| !u.rgb_allocations.is_empty())
         .unwrap()
         .utxo
         .outpoint;
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_s), Some(4));
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_s).await, Some(4));
 
     // the 4 change allocations do not fit on the BTC change output alone
     r.wallet_data.max_allocations_per_utxo = 2;
@@ -1178,9 +1187,9 @@ async fn change_spread_over_utxos() {
     assert_eq!(change_utxos[0].txid, txid);
     settle_both(&mut r, &r_on, &mut r2, &r2_on).await;
     assert_eq!(sent(&r, &txid).status, TransferStatus::Settled);
-    assert_eq!(utxo_num_allocations(&mut r, &utxo_s), None);
+    assert_eq!(utxo_num_allocations(&mut r, &utxo_s).await, None);
     for utxo in [&change_utxos[0], &utxos_u[0], &utxos_u[1]] {
-        assert_eq!(utxo_num_allocations(&mut r, utxo), Some(2));
+        assert_eq!(utxo_num_allocations(&mut r, utxo).await, Some(2));
     }
     assert_eq!(balance(&r, &ids[0]).spendable, 90);
     for asset_id in &ids[1..4] {
@@ -1222,7 +1231,7 @@ async fn change_allocations_placed_separately() {
     let map = HashMap::from([(asset_id.clone(), vec![rec_f, rec_i])]);
     let unsigned = begin_map(&mut a, &a_on, map, false).await.unwrap();
     let signed = a.sign_psbt(unsigned, None).unwrap();
-    let txid = a.send_end(a_on.clone(), signed, false).await.unwrap().txid;
+    let txid = a.send_end(a_on.clone(), signed).await.unwrap().txid;
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     let t = sent(&a, &txid);
     assert_eq!(t.status, TransferStatus::Settled);
@@ -1230,7 +1239,7 @@ async fn change_allocations_placed_separately() {
     // the BTC change output and a pre-existing UTXO get 1 allocation each
     assert_eq!(t.change_utxos.len(), 2);
     assert_eq!(t.change_utxos.iter().filter(|o| o.txid == txid).count(), 1);
-    let unspents = a.list_unspents(None, false, true).unwrap();
+    let unspents = a.list_unspents(None, false, true).await.unwrap();
     let mut change: Vec<Assignment> = t
         .change_utxos
         .iter()
@@ -1322,7 +1331,7 @@ async fn spv_proofs() {
     // C settles the transfer with the lookups of txid_1 refused
     for _ in 0..3 {
         refuse_tx_lookups(&[&txid_1]);
-        c.sync(c_on.clone()).await.unwrap();
+        c.full_sync(c_on.clone()).await.unwrap();
         for (idx, refreshed) in c.refresh(c_on.clone(), None, vec![], false).await.unwrap() {
             assert!(
                 refreshed.failure.is_none(),
@@ -1332,7 +1341,7 @@ async fn spv_proofs() {
         }
         assert_eq!(refused_tx_lookups(), 0);
         refuse_tx_lookups(&[]);
-        a.sync(a_on.clone()).await.unwrap();
+        a.full_sync(a_on.clone()).await.unwrap();
         a.refresh(a_on.clone(), None, vec![], false).await.unwrap();
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
@@ -1470,7 +1479,7 @@ async fn send_and_refresh_are_atomic() {
         .psbt;
     let signed = a.sign_psbt(unsigned, None).unwrap();
     assert_no_partial_change(&mut a, "send_end", 0, async |w| {
-        w.send_end(a_on.clone(), signed.clone(), false).await
+        w.send_end(a_on.clone(), signed.clone()).await
     })
     .await;
 }

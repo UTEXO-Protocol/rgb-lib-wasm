@@ -86,7 +86,7 @@ fn test_wallet_new_fingerprint_mismatch() {
 /// Tests wallet queries on a fresh wallet: address, balance, transactions,
 /// transfers, unspents, list_assets, get_wallet_data, delete_transfers, backup_info
 #[wasm_bindgen_test]
-fn test_wallet_queries_fresh() {
+async fn test_wallet_queries_fresh() {
     let wd = test_wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let mut wallet = Wallet::new(wd.clone()).unwrap();
 
@@ -110,14 +110,14 @@ fn test_wallet_queries_fresh() {
     assert_eq!(returned.supported_schemas, wd.supported_schemas);
 
     // get_btc_balance: zero on unfunded wallet
-    let balance = wallet.get_btc_balance(None, true).unwrap();
+    let balance = wallet.get_btc_balance(None, true).await.unwrap();
     assert_eq!(balance.vanilla.settled, 0);
     assert_eq!(balance.vanilla.future, 0);
     assert_eq!(balance.colored.settled, 0);
     assert_eq!(balance.colored.future, 0);
 
     // list_transactions: empty on fresh wallet
-    let txs = wallet.list_transactions(None, true).unwrap();
+    let txs = wallet.list_transactions(None, true).await.unwrap();
     assert!(txs.is_empty());
 
     // list_transfers: empty on fresh wallet
@@ -125,7 +125,7 @@ fn test_wallet_queries_fresh() {
     assert!(transfers.is_empty());
 
     // list_unspents: empty on fresh wallet
-    let unspents = wallet.list_unspents(None, false, true).unwrap();
+    let unspents = wallet.list_unspents(None, false, true).await.unwrap();
     assert!(unspents.is_empty());
 
     // list_assets: empty for all schema types

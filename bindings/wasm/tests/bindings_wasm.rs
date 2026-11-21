@@ -54,10 +54,21 @@ fn err(e: JsValue) -> String {
 async fn online(wallet: &WasmWallet) -> JsValue {
     let options = js_sys::JSON::parse(
         r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:8094/regtest/api"}},
-        "skipConsistencyCheck":true,"failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{}}"#,
+        "skipConsistencyCheck":true,"failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{},
+        "vanillaSyncLookback":20}"#,
     )
     .unwrap();
     wallet.go_online(options).await.unwrap()
+}
+
+async fn full_sync(wallet: &WasmWallet, online: &JsValue) {
+    for options in [
+        r#"{"keychain":"Colored","strategy":"FullSync"}"#,
+        r#"{"keychain":{"Vanilla":{"lookback":20}},"strategy":"FullSync"}"#,
+    ] {
+        let options = js_sys::JSON::parse(options).unwrap();
+        wallet.sync(online.clone(), options).await.unwrap();
+    }
 }
 
 #[wasm_bindgen_test]
@@ -159,7 +170,16 @@ async fn go_online_reads_options_object() {
 
     let options = js_sys::JSON::parse(
         r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:1"}},"skipConsistencyCheck":true,
-        "failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{"rpc://127.0.0.1:3000/json-rpc":"not hex"}}"#,
+        "failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{}}"#,
+    )
+    .unwrap();
+    let e = err(wallet.go_online(options).await.unwrap_err());
+    assert!(e.contains("vanillaSyncLookback"), "{e}");
+
+    let options = js_sys::JSON::parse(
+        r#"{"indexerConfig":{"Esplora":{"url":"http://127.0.0.1:1"}},"skipConsistencyCheck":true,
+        "failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{"rpc://127.0.0.1:3000/json-rpc":"not hex"},
+        "vanillaSyncLookback":20}"#,
     )
     .unwrap();
     let e = err(wallet.go_online(options).await.unwrap_err());
@@ -169,7 +189,7 @@ async fn go_online_reads_options_object() {
         js_sys::JSON::parse(&format!(
             r#"{{"indexerConfig":{{"Esplora":{{"url":"http://127.0.0.1:8094/regtest/api"}}}},
             "skipConsistencyCheck":true,"failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{{}},
-            "evmChains":{{"{chain_id}":{{"rpcUrl":"http://127.0.0.1:8545","minMintLockBlocks":2,"maxMintLockBlocks":1000}}}}}}"#
+            "vanillaSyncLookback":20,"evmChains":{{"{chain_id}":{{"rpcUrl":"http://127.0.0.1:8545","minMintLockBlocks":2,"maxMintLockBlocks":1000}}}}}}"#
         ))
         .unwrap()
     };
@@ -408,7 +428,7 @@ async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsVa
     )
     .await;
     esplora_synced().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&wallet, &online).await;
     let unsigned = wallet
         .create_utxos_begin(online.clone(), true, Some(5), None, 1, true, false)
         .await
@@ -420,7 +440,7 @@ async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsVa
         .unwrap();
     helper_post("mine", r#"{"blocks":1}"#).await;
     esplora_synced().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&wallet, &online).await;
     (wallet, online)
 }
 
@@ -497,4 +517,73 @@ async fn inflate_begin_returns_result_object() {
     let change_utxos: js_sys::Array = prop(&inflation, "changeUtxos").dyn_into().unwrap();
     assert_eq!(change_utxos.length(), 1);
     assert!(prop(&inflation, "changeUtxo").is_undefined());
+}
+
+#[wasm_bindgen_test]
+async fn listing_sync_and_send_end_take_js_values() {
+    let wallet = wallet();
+    let online = online(&wallet).await;
+    let pay = async || {
+        let address = wallet.get_address().unwrap();
+        helper_post(
+            "fund",
+            &format!(r#"{{"address":"{address}","amount":"0.001"}}"#),
+        )
+        .await;
+        helper_post("mine", r#"{"blocks":1}"#).await;
+        esplora_synced().await;
+    };
+    pay().await;
+    let settled = |b: &JsValue| prop(&prop(b, "vanilla"), "settled");
+
+    let balance = wallet.get_btc_balance(JsValue::NULL, true).await.unwrap();
+    assert!(settled(&balance).loose_eq(&JsValue::from(0u64)));
+    let e = err(wallet
+        .get_btc_balance(JsValue::NULL, false)
+        .await
+        .unwrap_err());
+    assert_eq!(e, "The Online object is needed to perform this operation");
+    let balance = wallet.get_btc_balance(online.clone(), false).await.unwrap();
+    assert!(settled(&balance).loose_eq(&JsValue::from(100_000u64)));
+    // each listing call sees a new payment only when it syncs
+    pay().await;
+    for (skip_sync, expected) in [(true, 1), (false, 2)] {
+        let unspents: js_sys::Array = wallet
+            .list_unspents(online.clone(), false, skip_sync)
+            .await
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(unspents.length(), expected);
+    }
+    pay().await;
+    for (online, skip_sync, expected) in [(JsValue::UNDEFINED, true, 2), (online.clone(), false, 3)]
+    {
+        let txs: js_sys::Array = wallet
+            .list_transactions(online, skip_sync)
+            .await
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(txs.length(), expected);
+    }
+
+    let e = err(wallet
+        .sync(online.clone(), JsValue::from_str("bogus"))
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("Invalid sync options"), "{e}");
+    for options in [
+        r#"{"keychain":{"Vanilla":{"lookback":20}},"strategy":"FastSync"}"#,
+        r#"{"keychain":"Colored","strategy":"FullScan"}"#,
+    ] {
+        let options = js_sys::JSON::parse(options).unwrap();
+        wallet.sync(online.clone(), options).await.unwrap();
+    }
+
+    let e = err(wallet
+        .send_end(online.clone(), "not a psbt")
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("Invalid PSBT"), "{e}");
 }
