@@ -2,7 +2,7 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-use rgb_lib_wasm::{BitcoinNetwork, generate_keys, restore_keys};
+use rgb_lib_wasm::{BitcoinNetwork, WitnessVersion, generate_keys, restore_keys};
 
 #[wasm_bindgen_test]
 fn test_generate_keys_all_networks() {
@@ -12,7 +12,7 @@ fn test_generate_keys_all_networks() {
         BitcoinNetwork::Regtest,
         BitcoinNetwork::Signet,
     ] {
-        let keys = generate_keys(network);
+        let keys = generate_keys(network, WitnessVersion::Taproot);
         assert!(!keys.mnemonic.is_empty());
         assert!(!keys.xpub.is_empty());
         assert!(!keys.master_fingerprint.is_empty());
@@ -24,8 +24,13 @@ fn test_generate_keys_all_networks() {
 
 #[wasm_bindgen_test]
 fn test_restore_keys_roundtrip() {
-    let original = generate_keys(BitcoinNetwork::Regtest);
-    let restored = restore_keys(BitcoinNetwork::Regtest, original.mnemonic.to_string()).unwrap();
+    let original = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let restored = restore_keys(
+        BitcoinNetwork::Regtest,
+        original.mnemonic.to_string(),
+        WitnessVersion::Taproot,
+    )
+    .unwrap();
     assert_eq!(original.mnemonic, restored.mnemonic);
     assert_eq!(original.xpub, restored.xpub);
     assert_eq!(original.master_fingerprint, restored.master_fingerprint);
@@ -35,9 +40,13 @@ fn test_restore_keys_roundtrip() {
 
 #[wasm_bindgen_test]
 fn test_restore_keys_cross_network() {
-    let mainnet_keys = generate_keys(BitcoinNetwork::Mainnet);
-    let testnet_keys =
-        restore_keys(BitcoinNetwork::Testnet, mainnet_keys.mnemonic.to_string()).unwrap();
+    let mainnet_keys = generate_keys(BitcoinNetwork::Mainnet, WitnessVersion::Taproot);
+    let testnet_keys = restore_keys(
+        BitcoinNetwork::Testnet,
+        mainnet_keys.mnemonic.to_string(),
+        WitnessVersion::Taproot,
+    )
+    .unwrap();
     assert_eq!(mainnet_keys.mnemonic, testnet_keys.mnemonic);
     // xpubs differ because derivation path includes coin type
     assert_ne!(mainnet_keys.xpub, testnet_keys.xpub);
@@ -48,14 +57,15 @@ fn test_restore_keys_invalid_mnemonic() {
     let result = restore_keys(
         BitcoinNetwork::Regtest,
         "invalid mnemonic words".to_string(),
+        WitnessVersion::Taproot,
     );
     assert!(result.is_err());
 }
 
 #[wasm_bindgen_test]
 fn test_generate_keys_unique() {
-    let keys1 = generate_keys(BitcoinNetwork::Regtest);
-    let keys2 = generate_keys(BitcoinNetwork::Regtest);
+    let keys1 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let keys2 = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     assert_ne!(keys1.mnemonic, keys2.mnemonic);
     assert_ne!(keys1.xpub, keys2.xpub);
 }

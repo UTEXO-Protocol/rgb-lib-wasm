@@ -22,7 +22,8 @@ use rgb_lib_wasm::wallet::{
     WitnessData,
 };
 use rgb_lib_wasm::{
-    AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferStatus, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferStatus, WitnessVersion,
+    generate_keys,
 };
 use utils::*;
 
@@ -78,7 +79,7 @@ async fn simulate_reload(wallet: Wallet, wd: &WalletData) -> Wallet {
 }
 
 async fn flushed_wallet_with_asset(name: &str) -> (WalletData, SinglesigKeys, String) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd, sk) = test_wallet_data(
         &keys,
         vec![AssetSchema::Nia],
@@ -101,7 +102,7 @@ async fn stored_sequence(key: &str) -> u64 {
 }
 
 async fn flushed_empty_wallet(name: &str) -> (WalletData, SinglesigKeys) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd, sk) = test_wallet_data(
         &keys,
         vec![AssetSchema::Nia],
@@ -182,7 +183,7 @@ async fn test_second_loader_cannot_overwrite_winner() {
     assert_eq!((after.writer, after.sequence), (ww, ws));
 
     // The writer saves again after a loader loads its snapshot.
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd, sk) = test_wallet_data(
         &keys,
         vec![AssetSchema::Nia],
@@ -207,7 +208,7 @@ async fn test_second_loader_cannot_overwrite_winner() {
 /// Test: one seed keeps a wallet on each network in one data directory.
 #[wasm_bindgen_test]
 async fn test_one_seed_on_two_networks_in_one_data_dir() {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (regtest, sk) = test_wallet_data(
         &keys,
         vec![AssetSchema::Nia],
@@ -243,7 +244,7 @@ async fn test_one_seed_on_two_networks_in_one_data_dir() {
 async fn test_address_reuse_persists_across_reload() {
     use rgb_lib_wasm::bdk_wallet::KeychainKind;
 
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wd = WalletData {
         data_dir: "/tmp/persist_reuse".to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
@@ -314,7 +315,7 @@ async fn test_address_reuse_persists_across_reload() {
 async fn test_address_reuse_persists_across_backup_restore() {
     use rgb_lib_wasm::bdk_wallet::KeychainKind;
 
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wd = WalletData {
         data_dir: "/tmp/persist_reuse_backup".to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
@@ -362,7 +363,7 @@ async fn test_address_reuse_persists_across_backup_restore() {
 #[wasm_bindgen_test]
 async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     let unique = js_sys::Date::now().to_string();
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
 
     // Fund a vanilla address and confirm a non-zero BTC balance.
     let (wd1, sk1) = test_wallet_data(
@@ -429,8 +430,8 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
 #[wasm_bindgen_test]
 async fn test_persistence_across_reload() {
     // Generate keys once — reused across reloads (same wallet identity)
-    let keys_a = generate_keys(BitcoinNetwork::Regtest);
-    let keys_b = generate_keys(BitcoinNetwork::Regtest);
+    let keys_a = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let keys_b = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd_a, sk_a) = test_wallet_data(&keys_a, vec![AssetSchema::Nia], "/tmp/persist_a");
     let mut wallet = Wallet::new(wd_a.clone(), sk_a.clone()).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
@@ -656,8 +657,8 @@ async fn test_persistence_across_reload() {
 /// consignment has been flushed.
 #[wasm_bindgen_test]
 async fn test_received_contract_survives_reload() {
-    let keys_a = generate_keys(BitcoinNetwork::Regtest);
-    let keys_b = generate_keys(BitcoinNetwork::Regtest);
+    let keys_a = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let keys_b = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd_a, sk_a) = test_wallet_data(&keys_a, vec![AssetSchema::Nia], "/tmp/persist_accept_a");
     let (wd_b, sk_b) = test_wallet_data(&keys_b, vec![AssetSchema::Nia], "/tmp/persist_accept_b");
     let mut wallet_a = Wallet::new(wd_a, sk_a).unwrap();
@@ -749,8 +750,8 @@ async fn test_received_contract_survives_reload() {
 #[wasm_bindgen_test]
 async fn test_initiated_send_completes_after_reload() {
     let unique = js_sys::Date::now().to_string();
-    let keys_a = generate_keys(BitcoinNetwork::Regtest);
-    let keys_b = generate_keys(BitcoinNetwork::Regtest);
+    let keys_a = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let keys_b = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd_a, sk_a) = test_wallet_data(
         &keys_a,
         vec![AssetSchema::Nia],
@@ -845,8 +846,8 @@ fn settled_nia(wallet: &Wallet, asset_id: &str) -> u64 {
 /// Return the receiver, its Online, the recipient id and the asset id.
 async fn incoming_nia(case: &str) -> (Wallet, Online, String, String) {
     let now = js_sys::Date::now();
-    let keys_a = generate_keys(BitcoinNetwork::Regtest);
-    let keys_b = generate_keys(BitcoinNetwork::Regtest);
+    let keys_a = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let keys_b = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd_a, sk_a) = test_wallet_data(
         &keys_a,
         vec![AssetSchema::Nia],
@@ -904,7 +905,7 @@ async fn incoming_nia(case: &str) -> (Wallet, Online, String, String) {
 /// Test: two changes in a row are both saved.
 #[wasm_bindgen_test]
 async fn test_issue_after_issue_is_saved() {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd, sk) = test_wallet_data(
         &keys,
         vec![AssetSchema::Nia],
@@ -941,7 +942,7 @@ async fn test_issue_after_issue_is_saved() {
 /// Test: a sync is saved.
 #[wasm_bindgen_test]
 async fn test_synced_balance_is_saved() {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd, sk) = test_wallet_data(
         &keys,
         vec![AssetSchema::Nia],
@@ -1013,7 +1014,7 @@ async fn test_failed_queued_save_is_an_error() {
 /// Test: a backup returns its bytes when only the save fails, and the save error stays.
 #[wasm_bindgen_test]
 async fn test_backup_returns_bytes_when_save_fails() {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let (wd, sk) = test_wallet_data(
         &keys,
         vec![AssetSchema::Nia],

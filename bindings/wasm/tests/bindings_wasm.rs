@@ -7,7 +7,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, ReceiveData, SinglesigKeys, WalletData, WalletDescriptors,
 };
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
+use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet, inspect_consignment, max_expiration_secs};
 
 fn wallet() -> WasmWallet {
@@ -20,7 +20,7 @@ fn wallet_with_schemas(supported_schemas: Vec<AssetSchema>) -> WasmWallet {
 }
 
 fn wallet_json(supported_schemas: Vec<AssetSchema>) -> (String, String) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wd = WalletData {
         data_dir: "/tmp/rgb_bindings_test".to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
@@ -220,6 +220,26 @@ fn get_keys_hides_mnemonic() {
 }
 
 #[wasm_bindgen_test]
+fn keys_take_witness_version() {
+    let keys = rgb_lib_wasm_bindings::generate_keys("regtest", "SegWitV0").unwrap();
+    assert_eq!(
+        prop(&keys, "witnessVersion").as_string().unwrap(),
+        "SegWitV0"
+    );
+    let mnemonic = prop(&keys, "mnemonic").as_string().unwrap();
+    let colored = |wv| {
+        let keys = rgb_lib_wasm_bindings::restore_keys("regtest", &mnemonic, wv).unwrap();
+        prop(&keys, "accountXpubColored").as_string().unwrap()
+    };
+    let expected = prop(&keys, "accountXpubColored").as_string().unwrap();
+    assert_eq!(colored("segwitv0"), expected);
+    assert_ne!(colored("Taproot"), expected);
+
+    let e = err(rgb_lib_wasm_bindings::generate_keys("regtest", "nonsense").unwrap_err());
+    assert_eq!(e, "Invalid witness version: nonsense");
+}
+
+#[wasm_bindgen_test]
 fn get_descriptors_match_rust() {
     let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
     let wallet = WasmWallet::new(&wd, &keys).unwrap();
@@ -258,7 +278,7 @@ async fn load_restores_flushed_wallet() {
 fn allow_reckless_schemas_opens_mainnet_ifa() {
     let base: WalletData =
         serde_json::from_str(&wallet_json(vec![AssetSchema::Nia, AssetSchema::Ifa]).0).unwrap();
-    let keys = generate_keys(BitcoinNetwork::Mainnet);
+    let keys = generate_keys(BitcoinNetwork::Mainnet, WitnessVersion::Taproot);
     let keys = serde_json::to_string(&SinglesigKeys::from_keys(&keys, None)).unwrap();
     let wd = WalletData {
         bitcoin_network: BitcoinNetwork::Mainnet,
