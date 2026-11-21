@@ -751,6 +751,8 @@ pub(crate) struct ReceivedConsignmentMeta {
     pub(crate) sender_pubkey: String,
     pub(crate) consignment_hash: String,
     pub(crate) batch: bool,
+    /// History TXs that must reach the safe height before the ACK
+    pub(crate) unsafe_txids: BTreeSet<String>,
 }
 
 /// An RGB transfer.
