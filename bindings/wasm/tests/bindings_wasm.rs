@@ -4,7 +4,9 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-use rgb_lib_wasm::wallet::{AssetFilter, DatabaseType, ReceiveData, WalletData};
+use rgb_lib_wasm::wallet::{
+    AssetFilter, DatabaseType, ReceiveData, SinglesigKeys, WalletData, WalletDescriptors,
+};
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
 use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet, inspect_consignment, max_expiration_secs};
 
@@ -13,26 +15,25 @@ fn wallet() -> WasmWallet {
 }
 
 fn wallet_with_schemas(supported_schemas: Vec<AssetSchema>) -> WasmWallet {
-    WasmWallet::new(&wallet_json(supported_schemas)).unwrap()
+    let (wd, keys) = wallet_json(supported_schemas);
+    WasmWallet::new(&wd, &keys).unwrap()
 }
 
-fn wallet_json(supported_schemas: Vec<AssetSchema>) -> String {
+fn wallet_json(supported_schemas: Vec<AssetSchema>) -> (String, String) {
     let keys = generate_keys(BitcoinNetwork::Regtest);
     let wd = WalletData {
         data_dir: "/tmp/rgb_bindings_test".to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
         supported_schemas,
         reuse_addresses: false,
         allow_reckless_schemas: false,
     };
-    serde_json::to_string(&wd).unwrap()
+    (
+        serde_json::to_string(&wd).unwrap(),
+        serde_json::to_string(&SinglesigKeys::from_keys(&keys, None)).unwrap(),
+    )
 }
 
 fn now_secs() -> u64 {
@@ -203,31 +204,64 @@ fn get_burn_consignment_fails_for_unknown_asset() {
 }
 
 #[wasm_bindgen_test]
-fn get_wallet_data_hides_mnemonic() {
-    let mut wd: WalletData = serde_json::from_str(&wallet_json(vec![AssetSchema::Nia])).unwrap();
-    wd.vanilla_keychain = Some(1);
-    let wallet = WasmWallet::new(&serde_json::to_string(&wd).unwrap()).unwrap();
-    let data = wallet.get_wallet_data().unwrap();
+fn get_keys_hides_mnemonic() {
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let mut keys: SinglesigKeys = serde_json::from_str(&keys).unwrap();
+    keys.vanilla_keychain = Some(1);
+    let wallet = WasmWallet::new(&wd, &serde_json::to_string(&keys).unwrap()).unwrap();
+    let data = wallet.get_keys().unwrap();
     let mnemonic = js_sys::Reflect::get(&data, &JsValue::from_str("mnemonic")).unwrap();
-    assert!(mnemonic.is_null(), "getWalletData returns the mnemonic");
-    wd.mnemonic = None;
+    assert!(mnemonic.is_null(), "getKeys returns the mnemonic");
+    keys.mnemonic = None;
     assert_eq!(
         String::from(js_sys::JSON::stringify(&data).unwrap()),
-        serde_json::to_string(&wd).unwrap()
+        serde_json::to_string(&keys).unwrap()
+    );
+}
+
+#[wasm_bindgen_test]
+fn get_descriptors_match_rust() {
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let wallet = WasmWallet::new(&wd, &keys).unwrap();
+    let descriptors: WalletDescriptors =
+        serde_wasm_bindgen::from_value(wallet.get_descriptors().unwrap()).unwrap();
+    let rust = rgb_lib_wasm::Wallet::new(
+        serde_json::from_str(&wd).unwrap(),
+        serde_json::from_str(&keys).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(descriptors, rust.get_descriptors());
+}
+
+#[wasm_bindgen_test]
+async fn load_restores_flushed_wallet() {
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let mut data: WalletData = serde_json::from_str(&wd).unwrap();
+    data.data_dir = format!("/tmp/rgb_bindings_load-{}", js_sys::Date::now());
+    let wd = serde_json::to_string(&data).unwrap();
+    let wallet = WasmWallet::create(&wd, &keys).await.unwrap();
+    wallet.flush().await.unwrap();
+    let fingerprint = serde_json::from_str::<SinglesigKeys>(&keys)
+        .unwrap()
+        .master_fingerprint;
+
+    let loaded = WasmWallet::load(&data.data_dir, "regtest", &fingerprint, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from(js_sys::JSON::stringify(&loaded.get_wallet_data().unwrap()).unwrap()),
+        wd
     );
 }
 
 #[wasm_bindgen_test]
 fn allow_reckless_schemas_opens_mainnet_ifa() {
     let base: WalletData =
-        serde_json::from_str(&wallet_json(vec![AssetSchema::Nia, AssetSchema::Ifa])).unwrap();
+        serde_json::from_str(&wallet_json(vec![AssetSchema::Nia, AssetSchema::Ifa]).0).unwrap();
     let keys = generate_keys(BitcoinNetwork::Mainnet);
+    let keys = serde_json::to_string(&SinglesigKeys::from_keys(&keys, None)).unwrap();
     let wd = WalletData {
         bitcoin_network: BitcoinNetwork::Mainnet,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
         ..base
     };
     let mut json = serde_json::to_value(&wd).unwrap();
@@ -236,11 +270,11 @@ fn allow_reckless_schemas_opens_mainnet_ifa() {
         .remove("allowRecklessSchemas")
         .unwrap();
     assert_eq!(
-        err(WasmWallet::new(&json.to_string()).err().unwrap()),
+        err(WasmWallet::new(&json.to_string(), &keys).err().unwrap()),
         "Cannot use Ifa schema on mainnet"
     );
     json["allowRecklessSchemas"] = true.into();
-    assert!(WasmWallet::new(&json.to_string()).is_ok());
+    assert!(WasmWallet::new(&json.to_string(), &keys).is_ok());
 }
 
 #[wasm_bindgen_test]
@@ -281,16 +315,17 @@ async fn wallet_builds_after_trap() {
     .unchecked_into();
     assert!(trap.call0(&JsValue::NULL).is_err());
 
-    let json = wallet_json(vec![AssetSchema::Nia]);
-    let json_new = json.clone();
+    let (json, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let (json_new, keys_new) = (json.clone(), keys.clone());
     let build: js_sys::Function =
-        Closure::once_into_js(move || WasmWallet::new(&json_new).is_ok()).unchecked_into();
+        Closure::once_into_js(move || WasmWallet::new(&json_new, &keys_new).is_ok())
+            .unchecked_into();
     assert_eq!(
         build.call0(&JsValue::NULL).ok().and_then(|v| v.as_bool()),
         Some(true),
         "no wallet after a trap"
     );
-    assert!(WasmWallet::create(&json).await.is_ok());
+    assert!(WasmWallet::create(&json, &keys).await.is_ok());
 }
 
 #[wasm_bindgen_test]

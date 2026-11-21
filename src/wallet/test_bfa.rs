@@ -7,7 +7,8 @@ wasm_bindgen_test_configure!(run_in_browser);
 pub(super) mod utils;
 
 use crate::wallet::{
-    AssetFilter, EvmChain, Online, OnlineOptions, Recipient, TransferScope, Wallet, WalletData,
+    AssetFilter, EvmChain, Online, OnlineOptions, Recipient, SinglesigKeys, TransferScope, Wallet,
+    WalletData,
 };
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferStatus, generate_keys,
@@ -24,22 +25,20 @@ use utils::*;
 pub(super) const CHAIN_ID: u64 = 31337;
 pub(super) const BRIDGE: &str = "0x00000000000000000000000000000000000000b1";
 
-pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
+pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
     let keys = generate_keys(BitcoinNetwork::Regtest);
-    WalletData {
-        data_dir: "/tmp/rgb_bfa".to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: crate::wallet::DatabaseType::Sqlite,
-        max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: schemas,
-        reuse_addresses: false,
-        allow_reckless_schemas: false,
-    }
+    (
+        WalletData {
+            data_dir: "/tmp/rgb_bfa".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: crate::wallet::DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
 }
 
 pub(super) fn evm_chains(min: u64, max: u64) -> HashMap<u64, EvmChain> {
@@ -53,20 +52,20 @@ pub(super) fn evm_chains(min: u64, max: u64) -> HashMap<u64, EvmChain> {
     )])
 }
 
-pub(super) async fn funded_wallet(wd: WalletData, utxos: u8) -> (Wallet, Online) {
+pub(super) async fn funded_wallet(wd: (WalletData, SinglesigKeys), utxos: u8) -> (Wallet, Online) {
     funded_wallet_with(wd, utxos, None, 2, 1_000_000).await
 }
 
 /// A funded wallet whose UTXOs hold `size` sats and whose mint lock blocks are between `min` and
 /// `max`.
 pub(super) async fn funded_wallet_with(
-    wd: WalletData,
+    (wd, keys): (WalletData, SinglesigKeys),
     utxos: u8,
     size: Option<u32>,
     min: u64,
     max: u64,
 ) -> (Wallet, Online) {
-    let mut wallet = Wallet::new(wd).unwrap();
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet
         .go_online(OnlineOptions {
             evm_chains: evm_chains(min, max),
@@ -268,9 +267,9 @@ pub(super) fn opouts_holding(
 
 #[wasm_bindgen_test]
 async fn bfa_issue_list_and_backup() {
-    let wd = wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa]);
+    let (wd, keys) = wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa]);
 
-    let (mut wallet, _online) = funded_wallet(wd.clone(), 3).await;
+    let (mut wallet, _online) = funded_wallet((wd.clone(), keys.clone()), 3).await;
 
     assert!(matches!(
         wallet.issue_asset_bfa(
@@ -336,7 +335,7 @@ async fn bfa_issue_list_and_backup() {
     assert_eq!(mint_rights(&mut wallet, &bfa.asset_id), 2);
 
     let backup = wallet.backup("password").unwrap();
-    let mut restored = Wallet::new(wd).unwrap();
+    let mut restored = Wallet::new(wd, keys).unwrap();
     restored.restore_backup(&backup, "password").unwrap();
     let restored_bfa = restored
         .list_assets(vec![AssetSchema::Bfa])
@@ -351,7 +350,8 @@ async fn bfa_issue_list_and_backup() {
 
 #[wasm_bindgen_test]
 async fn bfa_go_online_checks_evm_chains() {
-    let mut wallet = Wallet::new(wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa])).unwrap();
+    let (wd, keys) = wallet_data(vec![AssetSchema::Nia, AssetSchema::Bfa]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let go_online = |evm_chains: HashMap<u64, EvmChain>| OnlineOptions {
         evm_chains,
         ..go_online_options(false)
@@ -396,7 +396,8 @@ async fn bfa_go_online_checks_evm_chains() {
         .unwrap();
 
     // a wallet without BFA does not check the chains
-    let mut other = Wallet::new(wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (other_wd, other_keys) = wallet_data(vec![AssetSchema::Nia]);
+    let mut other = Wallet::new(other_wd, other_keys).unwrap();
     other.go_online(go_online(unreachable)).await.unwrap();
 }
 

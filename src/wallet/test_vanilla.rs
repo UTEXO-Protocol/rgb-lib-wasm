@@ -31,10 +31,8 @@ async fn vanilla_wallet(utxos: u8) -> (Wallet, Online) {
 }
 
 fn rcv_address() -> String {
-    Wallet::new(wallet_data(vec![AssetSchema::Nia]))
-        .unwrap()
-        .get_address()
-        .unwrap()
+    let (wd, keys) = wallet_data(vec![AssetSchema::Nia]);
+    Wallet::new(wd, keys).unwrap().get_address().unwrap()
 }
 
 fn txid_of(psbt: &str) -> String {
@@ -273,7 +271,8 @@ async fn drain_to_reservation_interaction() {
 #[wasm_bindgen_test]
 async fn drain_to_repeated_begin_keeps_one_row() {
     // one UTXO: BDK shuffles the inputs of a drain
-    let mut w = Wallet::new(wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (w_wd, w_keys) = wallet_data(vec![AssetSchema::Nia]);
+    let mut w = Wallet::new(w_wd, w_keys).unwrap();
     let online = w.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut w, &online, "1.0").await;
     let address = rcv_address();
@@ -459,7 +458,8 @@ async fn vanilla_operations_are_atomic() {
 
 #[wasm_bindgen_test]
 async fn operation_after_a_later_backup_time_needs_backup() {
-    let w = Wallet::new(wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (w_wd, w_keys) = wallet_data(vec![AssetSchema::Nia]);
+    let w = Wallet::new(w_wd, w_keys).unwrap();
     // a saved backup time one hour after the clock
     let ahead = (js_sys::Date::now() as i128 + 3_600_000) * 1_000_000;
     w.database
@@ -483,7 +483,8 @@ async fn operation_after_a_later_backup_time_needs_backup() {
 
 #[wasm_bindgen_test]
 async fn ensure_initial_backup_uploads_without_record() {
-    let mut w = Wallet::new(wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (w_wd, w_keys) = wallet_data(vec![AssetSchema::Nia]);
+    let mut w = Wallet::new(w_wd, w_keys).unwrap();
     w.configure_vss_backup(&VssBackupConfig::new(
         "http://127.0.0.1:9/vss".to_string(),
         "store".to_string(),

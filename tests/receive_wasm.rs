@@ -9,7 +9,7 @@ mod utils;
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::no_wallet::script_buf_from_recipient_id;
 use rgb_lib_wasm::wallet::{
-    Balance, DatabaseType, Online, ReceiveData, Recipient, Wallet, WalletData,
+    Balance, DatabaseType, Online, ReceiveData, Recipient, SinglesigKeys, Wallet, WalletData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Error, FileContent, RgbTransfer, RgbTxid,
@@ -17,22 +17,20 @@ use rgb_lib_wasm::{
 };
 use utils::*;
 
-fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
+fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
     let keys = generate_keys(BitcoinNetwork::Regtest);
-    WalletData {
-        data_dir: "/tmp/rgb_receive".to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: DatabaseType::Sqlite,
-        max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: schemas,
-        reuse_addresses: false,
-        allow_reckless_schemas: false,
-    }
+    (
+        WalletData {
+            data_dir: "/tmp/rgb_receive".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
 }
 
 async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8) {
@@ -51,7 +49,8 @@ async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8) {
 }
 
 async fn new_wallet() -> (Wallet, Online) {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     (wallet, online)
 }
