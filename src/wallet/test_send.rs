@@ -590,6 +590,13 @@ async fn receive_settles_after_reload() {
         transfer_of(&r, &rid).status,
         TransferStatus::WaitingConfirmations
     );
+    // A NIA consignment has no reject list, so no DAG is built.
+    assert!(
+        r.received_valid_consignments[&rid]
+            .validation_status()
+            .ops_dag
+            .is_none()
+    );
 
     let mut r = Wallet::restore(r.get_wallet_data()).await.unwrap();
     let r_on = r.go_online(go_online_options(false)).await.unwrap();

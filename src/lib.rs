@@ -199,6 +199,7 @@ use rgbstd::{RevealedData, RevealedValue, VoidState, assignments::AssignVec};
 use rgbstd::{
     containers::{CheckedClaimResolver, PendingConsignment},
     contract::{LinkError, LinkableSchemaWrapper, SchemaWrapper},
+    daggy::NodeIndex,
     validation::{OpsDag, Validity, Warning},
 };
 #[cfg(feature = "esplora")]
