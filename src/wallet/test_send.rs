@@ -12,7 +12,7 @@ use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
     AssetFilter, Balance, Online, Outpoint, ReceiveData, Recipient, RefreshFilter,
-    RefreshTransferStatus, RgbAllocation, Transfer, Unspent, Wallet, WalletData,
+    RefreshTransferStatus, RgbAllocation, Transfer, TransferScope, Unspent, Wallet, WalletData,
 };
 use crate::{
     AssetSchema, Assignment, Attachment, Bytes32, Encryption, Error, MediaType, RgbTransfer,
@@ -174,7 +174,7 @@ async fn send_to(
 
 fn sent(wallet: &Wallet, txid: &str) -> Transfer {
     wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.kind == TransferKind::Send && t.txid.as_deref() == Some(txid))
@@ -1338,7 +1338,7 @@ async fn spv_proofs() {
         wait_for_esplora_sync().await;
     }
     let received: Vec<Transfer> = c
-        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
         .unwrap()
         .into_iter()
         .filter(|t| t.kind == TransferKind::ReceiveBlind)

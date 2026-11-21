@@ -6,7 +6,7 @@ use super::test_burn::*;
 use crate::database::enums::RecipientTypeFull;
 use crate::wallet::offline::MOCK_IFA_LINK_RIGHT;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
-use crate::wallet::{AssetFilter, Invoice, Online, Recipient, Wallet};
+use crate::wallet::{AssetFilter, Invoice, Online, Recipient, TransferScope, Wallet};
 use crate::{
     AssetSchema, Assignment, Error, FileContent, OS_LINK, RgbTransfer, TS_LINK, TransferKind,
     TransferStatus,
@@ -49,7 +49,7 @@ fn metadata_links(wallet: &Wallet, asset_id: &str) -> (Option<String>, Option<St
 
 fn receive_assignments(wallet: &Wallet, asset_id: &str, kind: TransferKind) -> Vec<Assignment> {
     wallet
-        .list_transfers(AssetFilter::Id(asset_id.to_string()), None)
+        .list_transfers(AssetFilter::Id(asset_id.to_string()), TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.kind == kind)

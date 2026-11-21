@@ -16,7 +16,7 @@ use crate::wallet::online::{
 use crate::wallet::rust_only::validate_consignment_offchain;
 use crate::wallet::{
     AssetFilter, Balance, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData,
-    ReceivedMint, Recipient, Wallet,
+    ReceivedMint, Recipient, TransferScope, Wallet,
 };
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, FileContent, OS_ASSET, OS_MINT,
@@ -422,7 +422,9 @@ async fn bfa_mint_settles_and_is_spendable() {
     assert!(!validated.valid);
     assert_eq!(validated.error.as_deref(), Some("external_anchors"));
 
-    let transfers = a.list_transfers(AssetFilter::Any, None).unwrap();
+    let transfers = a
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+        .unwrap();
     let transfer = transfers.last().unwrap();
     assert_eq!(transfer.kind, TransferKind::Mint);
     assert_eq!(transfer.status, TransferStatus::Settled);
@@ -836,7 +838,7 @@ fn edit_batch_transfer(wallet: &mut Wallet, idx: i32, field: &str, value: i64) {
 
 fn transfer_status(wallet: &mut Wallet, recipient_id: &str) -> TransferStatus {
     wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.recipient_id.as_deref() == Some(recipient_id))
@@ -2312,7 +2314,7 @@ async fn bfa_send_mint_right() {
     );
     let send_transfers = |wallet: &Wallet| -> Vec<crate::wallet::Transfer> {
         wallet
-            .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+            .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
             .unwrap()
             .into_iter()
             .filter(|t| t.kind == TransferKind::Send && t.txid.as_ref() == Some(&txid))
@@ -2345,7 +2347,7 @@ async fn bfa_send_mint_right() {
         assert!(t.assignments.is_empty());
     }
     let received: Vec<crate::wallet::Transfer> = b
-        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
         .unwrap()
         .into_iter()
         .filter(|t| t.kind == TransferKind::ReceiveBlind)

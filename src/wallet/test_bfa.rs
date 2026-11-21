@@ -6,7 +6,9 @@ wasm_bindgen_test_configure!(run_in_browser);
 #[path = "../../tests/utils/mod.rs"]
 pub(super) mod utils;
 
-use crate::wallet::{AssetFilter, EvmChain, Online, OnlineOptions, Recipient, Wallet, WalletData};
+use crate::wallet::{
+    AssetFilter, EvmChain, Online, OnlineOptions, Recipient, TransferScope, Wallet, WalletData,
+};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferStatus, generate_keys,
 };
@@ -751,7 +753,9 @@ async fn bfa_receive_refuses_malicious_reject_list() {
         matches!(refreshed.failure, Some(Error::Network { ref details }) if details.contains("no contract at the reject list address")),
         "{refreshed:?}"
     );
-    let transfers = b.list_transfers(AssetFilter::Any, None).unwrap();
+    let transfers = b
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+        .unwrap();
     assert_eq!(
         transfers.last().unwrap().status,
         TransferStatus::WaitingCounterparty
@@ -927,7 +931,9 @@ async fn bfa_reject_list_rpc_config() {
     let signed = a.sign_psbt(begin.psbt, None).unwrap();
     a.send_end(a_online.clone(), signed, false).await.unwrap();
     b.refresh(b_no_evm, None, vec![], false).await.unwrap();
-    let transfers = b.list_transfers(AssetFilter::Any, None).unwrap();
+    let transfers = b
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+        .unwrap();
     assert_eq!(
         transfers.last().unwrap().status,
         TransferStatus::WaitingCounterparty

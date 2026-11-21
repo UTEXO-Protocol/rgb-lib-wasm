@@ -427,6 +427,13 @@ async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsVa
 #[wasm_bindgen_test]
 async fn issue_bfa_returns_known_circulating_supply() {
     let (wallet, _online) = funded_wallet(vec![AssetSchema::Nia, AssetSchema::Bfa]).await;
+    let unspents: js_sys::Array = wallet.list_unspents(false).unwrap().dyn_into().unwrap();
+    assert!(unspents.length() > 0);
+    assert!(unspents.iter().all(|u| {
+        prop(&prop(&u, "utxo"), "derivationIndex")
+            .as_f64()
+            .is_some()
+    }));
     let asset = wallet
         .issue_asset_bfa(
             "BFA",
@@ -483,10 +490,40 @@ async fn inflate_begin_returns_result_object() {
         .unwrap();
     assert!(prop(&res, "batchTransferIdx").as_f64().is_some());
 
+    // the batch transfer scope lists the inflation with its unsigned PSBT
+    let scope = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &scope,
+        &"BatchTransfer".into(),
+        &prop(&res, "batchTransferIdx"),
+    )
+    .unwrap();
+    let scoped: js_sys::Array = wallet
+        .list_transfers(JsValue::from_str("AnyOrNone"), scope.into())
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    assert!(scoped.length() > 0);
+    let begin_psbt = prop(&res, "psbt")
+        .as_string()
+        .unwrap()
+        .parse::<rgb_lib_wasm::bitcoin::Psbt>()
+        .unwrap()
+        .serialize();
+    for t in scoped.iter() {
+        assert_eq!(
+            prop(&t, "batchTransferIdx").as_f64(),
+            prop(&res, "batchTransferIdx").as_f64()
+        );
+        assert_eq!(prop(&t, "kind").as_string().as_deref(), Some("Inflation"));
+        let psbt: Vec<u8> = serde_wasm_bindgen::from_value(prop(&t, "psbt")).unwrap();
+        assert_eq!(psbt, begin_psbt);
+    }
+
     // the change of the inflation right is listed in an array
     let filter = serde_wasm_bindgen::to_value(&AssetFilter::Id(asset_id.clone())).unwrap();
     let transfers: js_sys::Array = wallet
-        .list_transfers(filter, None)
+        .list_transfers(filter, JsValue::from_str("All"))
         .unwrap()
         .dyn_into()
         .unwrap();

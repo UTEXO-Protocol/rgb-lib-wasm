@@ -18,7 +18,7 @@ mod utils;
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::idb_store::{load_snapshot, save_snapshot};
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, Recipient, Wallet, WalletData, WitnessData,
+    AssetFilter, DatabaseType, Online, Recipient, TransferScope, Wallet, WalletData, WitnessData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferStatus, generate_keys,
@@ -627,7 +627,7 @@ async fn test_persistence_across_reload() {
 
     // Verify restore worked in memory
     let transfers_after_restore = fresh_wallet
-        .list_transfers(AssetFilter::NoAsset, None)
+        .list_transfers(AssetFilter::None, TransferScope::All)
         .unwrap();
     assert!(
         !transfers_after_restore.is_empty(),
@@ -640,7 +640,9 @@ async fn test_persistence_across_reload() {
     let mut reloaded = Wallet::restore(wd_restored.clone()).await.unwrap();
     reloaded.go_online(go_online_options(true)).await.unwrap();
 
-    let transfers_after_reload = reloaded.list_transfers(AssetFilter::NoAsset, None).unwrap();
+    let transfers_after_reload = reloaded
+        .list_transfers(AssetFilter::None, TransferScope::All)
+        .unwrap();
     assert!(
         !transfers_after_reload.is_empty(),
         "Transfers should survive reload after backup restore"

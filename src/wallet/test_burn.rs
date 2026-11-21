@@ -8,7 +8,9 @@ use super::test_send::{
 };
 use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
-use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
+use crate::wallet::{
+    AssetFilter, Online, Outpoint, Recipient, Transfer, TransferScope, Wallet, WalletData,
+};
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbTransfer, TS_BURN,
     TransferKind, TransferStatus, wallet::rust_only::validate_consignment_offchain,
@@ -45,7 +47,7 @@ fn balance(wallet: &Wallet, asset_id: &str) -> (u64, u64, u64) {
 
 pub(super) fn transfer(wallet: &Wallet, asset_id: &str, batch_transfer_idx: i32) -> Transfer {
     wallet
-        .list_transfers(AssetFilter::Id(asset_id.to_string()), None)
+        .list_transfers(AssetFilter::Id(asset_id.to_string()), TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.batch_transfer_idx == batch_transfer_idx)
@@ -54,7 +56,7 @@ pub(super) fn transfer(wallet: &Wallet, asset_id: &str, batch_transfer_idx: i32)
 
 fn burns(wallet: &Wallet, asset_id: &str) -> Vec<(TransferKind, Option<String>)> {
     wallet
-        .list_transfers(AssetFilter::Id(asset_id.to_string()), None)
+        .list_transfers(AssetFilter::Id(asset_id.to_string()), TransferScope::All)
         .unwrap()
         .into_iter()
         .filter(|t| t.kind == TransferKind::Burn)
@@ -165,6 +167,15 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(burned.assignments, vec![Assignment::Fungible(250)]);
     assert_eq!(burned.recipient_id, None);
     assert_eq!(burned.change_utxos.len(), 1);
+    // the stored PSBT is the unsigned PSBT of this burn
+    let unsigned = Psbt::deserialize(burned.psbt.as_ref().unwrap()).unwrap();
+    assert_eq!(unsigned.unsigned_tx.compute_txid().to_string(), res.txid);
+    assert!(
+        unsigned
+            .inputs
+            .iter()
+            .all(|i| i.final_script_witness.is_none())
+    );
     let held = assignments(&mut wallet, &asset_id);
     assert!(held.contains(&Assignment::Fungible(600)) && held.contains(&Assignment::Fungible(250)));
     serve_reject_list(&url, "");
@@ -811,7 +822,7 @@ async fn inflate_begin_end() {
     };
     let transfers = |wallet: &Wallet| {
         wallet
-            .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+            .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
             .unwrap()
             .len()
     };
@@ -866,7 +877,7 @@ async fn inflate_begin_end() {
         TransferStatus::WaitingConfirmations
     );
     let inflations: Vec<Transfer> = wallet
-        .list_transfers(AssetFilter::Id(asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
         .unwrap()
         .into_iter()
         .filter(|t| t.kind == TransferKind::Inflation)

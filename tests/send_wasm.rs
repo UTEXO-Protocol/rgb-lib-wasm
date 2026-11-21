@@ -9,8 +9,8 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, Outpoint, Recipient, SendBeginResult, Transfer, Wallet,
-    WalletData,
+    AssetFilter, DatabaseType, Online, Outpoint, Recipient, SendBeginResult, Transfer,
+    TransferScope, Wallet, WalletData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
@@ -194,7 +194,7 @@ async fn end(wallet: &mut Wallet, online: &Online, signed: &str) -> Result<(Stri
 
 fn sends(wallet: &Wallet, txid: &str) -> Vec<Transfer> {
     wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .filter(|t| t.kind == TransferKind::Send && t.txid.as_deref() == Some(txid))
@@ -480,7 +480,9 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
     if let Some(begin_idx) = res.batch_transfer_idx {
         assert_eq!(idx, begin_idx);
     }
-    let transfers = wallet.list_transfers(AssetFilter::Any, None).unwrap();
+    let transfers = wallet
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+        .unwrap();
     assert_eq!(transfers.len(), 5);
     let count = |k: TransferKind| transfers.iter().filter(|t| t.kind == k).count();
     assert_eq!(count(TransferKind::Issuance), 1);
@@ -491,6 +493,12 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
         sends(&wallet, &txid)
             .iter()
             .all(|t| t.status == TransferStatus::WaitingCounterparty)
+    );
+    let begin_psbt = Psbt::from_str(&res.psbt).unwrap().serialize();
+    assert!(
+        sends(&wallet, &txid)
+            .iter()
+            .all(|t| t.psbt.as_ref() == Some(&begin_psbt))
     );
     let r1_transfer = transfers
         .iter()
@@ -538,7 +546,7 @@ async fn send_extra_allocations_no_dry_run_impl(donation: bool) {
     assert_eq!(saved[0].status, TransferStatus::Initiated);
     assert!(
         wallet
-            .list_transfers(AssetFilter::Id(asset_b.clone()), None)
+            .list_transfers(AssetFilter::Id(asset_b.clone()), TransferScope::All)
             .unwrap()
             .iter()
             .all(|t| t.kind != TransferKind::Send)

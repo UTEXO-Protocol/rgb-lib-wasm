@@ -11,7 +11,8 @@ use rgb_lib_wasm::wallet::vss::{
     WasmVssClient, decrypt_data,
 };
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, IndexerConfig, Invoice, OnlineOptions, Wallet, WalletData,
+    AssetFilter, DatabaseType, IndexerConfig, Invoice, OnlineOptions, TransferScope, Wallet,
+    WalletData,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
 use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, run_js, transport_endpoint, within};
@@ -121,7 +122,9 @@ fn test_wallet_queries_fresh() {
     assert!(txs.is_empty());
 
     // list_transfers: empty on fresh wallet
-    let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
+    let transfers = wallet
+        .list_transfers(AssetFilter::None, TransferScope::All)
+        .unwrap();
     assert!(transfers.is_empty());
 
     // list_unspents: empty on fresh wallet
@@ -177,7 +180,9 @@ async fn test_receive_and_transfers() {
     assert_eq!(recv.expiration_timestamp, expiration);
 
     // list_transfers: should have a pending transfer from witness_receive
-    let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
+    let transfers = wallet
+        .list_transfers(AssetFilter::None, TransferScope::All)
+        .unwrap();
     assert!(
         !transfers.is_empty(),
         "Should have transfers after witness_receive"
@@ -368,7 +373,9 @@ async fn test_errors_and_backup() {
     wallet.restore_backup(&backup_bytes, password).unwrap();
 
     // State survives: transfer still exists
-    let transfers = wallet.list_transfers(AssetFilter::NoAsset, None).unwrap();
+    let transfers = wallet
+        .list_transfers(AssetFilter::None, TransferScope::All)
+        .unwrap();
     assert!(
         !transfers.is_empty(),
         "Transfers should survive backup/restore"
@@ -720,7 +727,7 @@ async fn witness_receive_on(wallet: &mut Wallet) -> String {
 
 fn has_transfer(wallet: &Wallet, recipient_id: &str) -> bool {
     wallet
-        .list_transfers(AssetFilter::NoAsset, None)
+        .list_transfers(AssetFilter::None, TransferScope::All)
         .unwrap()
         .iter()
         .any(|t| t.recipient_id.as_deref() == Some(recipient_id))
