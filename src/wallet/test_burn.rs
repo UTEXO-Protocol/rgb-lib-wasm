@@ -6,6 +6,7 @@ use super::test_bfa::*;
 use super::test_send::{
     ResetMocks, consignment as saved_consignment, proven, witness_ord, witness_ords,
 };
+use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
 use crate::{
@@ -617,12 +618,27 @@ async fn ifa_send_moves_inflation_rights() {
     let r20 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(20)).concat();
     assert_eq!(r20.len(), 1);
     serve_reject_list(&url, &r20[0].to_string());
+    forget_reject_list_url(&a, &asset_id);
+    forget_reject_list_url(&b, &asset_id);
     let fetches = reject_list_fetches(&url);
     let right = Assignment::InflationRight(10);
     send(&mut b, &b_online, &mut a, &a_online, &asset_id, right).await;
     assert_eq!(reject_list_fetches(&url) - fetches, 1);
     settle_both(&mut b, &b_online, &mut a, &a_online).await;
+    // The recipient also reads the list from the genesis.
+    assert_eq!(reject_list_fetches(&url) - fetches, 2);
     assert_eq!(inflation_rights(&mut b, &asset_id), vec![20, 20]);
+}
+
+// Erase the reject list URL from the DB. Only the genesis has it.
+fn forget_reject_list_url(wallet: &Wallet, asset_id: &str) {
+    let mut asset: DbAssetActMod = wallet
+        .database
+        .check_asset_exists(asset_id.to_string())
+        .unwrap()
+        .into();
+    asset.reject_list_url = ActiveValue::Set(None);
+    wallet.database.update_asset(&mut asset).unwrap();
 }
 
 fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
