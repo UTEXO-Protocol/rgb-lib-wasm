@@ -1,8 +1,9 @@
 use wasm_bindgen_test::*;
 
-use super::offline::MOCK_MAX_UTXO_ASSET_ALLOCATIONS;
+use super::offline::{MOCK_ISSUE_MEDIA, MOCK_MAX_UTXO_ASSET_ALLOCATIONS};
 use super::online::{
-    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS, MOCK_SPAM_HIDDEN_SPENDS, MOCK_SPAM_RECIPIENT_ASSIGNMENTS,
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS, MOCK_ACK_PENDING, MOCK_SPAM_HIDDEN_SPENDS,
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS, RECEIVED_CONSIGNMENT_VALIDATIONS,
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
@@ -14,8 +15,10 @@ use crate::wallet::{
     RefreshTransferStatus, RgbAllocation, Transfer, Unspent, Wallet, WalletData,
 };
 use crate::{
-    AssetSchema, Assignment, Encryption, Error, RgbTransfer, TransferKind, TransferStatus,
+    AssetSchema, Assignment, Attachment, Bytes32, Encryption, Error, MediaType, RgbTransfer,
+    TransferKind, TransferStatus, sha256_digest,
 };
+use amplify::ByteArray;
 use amplify::confinement::Confined;
 use bdk_wallet::bitcoin::psbt::Psbt;
 use bdk_wallet::bitcoin::psbt::raw::ProprietaryKey;
@@ -44,7 +47,31 @@ impl Drop for ResetMocks {
         MOCK_SPAM_HIDDEN_SPENDS.set(None);
         MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(None);
         MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(false);
+        MOCK_ACK_PENDING.set(false);
+        MOCK_ISSUE_MEDIA.set(None);
     }
+}
+
+pub(super) fn validations() -> usize {
+    RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow(|n| *n)
+}
+
+/// A text attachment whose content is `media`.
+pub(super) fn test_media() -> Attachment {
+    Attachment {
+        ty: MediaType::with("text/plain"),
+        digest: Bytes32::from_byte_array(sha256_digest(b"media")),
+    }
+}
+
+/// Make the proxy answer every `media.get` with the base64 of `content`.
+pub(super) fn serve_media(content: &str) {
+    clear_rpc_hooks();
+    rpc_hook(
+        PROXY_URL,
+        "media.get",
+        &format!("return {{ jsonrpc: '2.0', id: res.id, result: btoa('{content}') }};"),
+    );
 }
 
 async fn nia_wallet(utxos: u8) -> (Wallet, Online) {
@@ -432,7 +459,10 @@ async fn receive_multiple_allocations_refused() {
 
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(50), &[PROXY_URL]).await;
     MOCK_SPAM_RECIPIENT_ASSIGNMENTS.set(Some((1, 1)));
+    let v = validations();
     send_refused(&mut a, &a_on, &mut r, &r_on, &asset_id, &rid, 50).await;
+    // the consignment is validated before its payment is checked
+    assert_eq!(validations(), v + 1);
     assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.with_borrow(|m| m.is_none()));
 
     assert_eq!(balance(&a, &asset_id).spendable, 900);
@@ -440,6 +470,135 @@ async fn receive_multiple_allocations_refused() {
     assert_eq!(colored_allocations(&mut r).len(), 1);
     send_and_settle(&mut r, &r_on, &mut r2, &r2_on, &asset_id, 100).await;
     assert_eq!(balance(&r2, &asset_id).settled, 100);
+}
+
+// a consignment processed again replaces the colorings of the first processing
+#[wasm_bindgen_test]
+async fn receive_processed_again_counted_once() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(5).await;
+    let (mut r, r_on) = nia_wallet(1).await;
+    r.wallet_data.max_allocations_per_utxo = 2;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    send_and_settle(&mut a, &a_on, &mut r, &r_on, &asset_id, 100).await;
+
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
+    MOCK_ACK_PENDING.set(true);
+    let res = r.refresh(r_on.clone(), None, vec![], false).await.unwrap();
+    assert!(res.values().all(|t| t.failure.is_none()), "{res:?}");
+    assert!(!MOCK_ACK_PENDING.take());
+    assert_eq!(
+        transfer_of(&r, &rid).status,
+        TransferStatus::WaitingCounterparty
+    );
+
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(transfer_of(&r, &rid).status, TransferStatus::Settled);
+    assert_eq!(colored_allocations(&mut r).len(), 2);
+    assert_eq!(balance(&r, &asset_id).settled, 200);
+}
+
+// a media that does not match the contract fails the refresh and a later refresh tries again
+#[wasm_bindgen_test]
+async fn receive_media_mismatch_retried() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(5).await;
+    let (mut r, r_on) = nia_wallet(1).await;
+    MOCK_ISSUE_MEDIA.set(Some(test_media()));
+    let asset_id = issue(&a, vec![AMOUNT]);
+    assert!(MOCK_ISSUE_MEDIA.with_borrow(|m| m.is_none()));
+    let rcv = blind_rcv_enc(
+        &mut r,
+        &r_on,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+        Some(Encryption::Optional),
+    )
+    .await
+    .unwrap();
+    send_to(
+        &mut a,
+        &a_on,
+        &asset_id,
+        &rcv.recipient_id,
+        100,
+        PROXY_URL,
+        false,
+    )
+    .await;
+
+    for _ in 0..2 {
+        serve_media("other");
+        let res = r.refresh(r_on.clone(), None, vec![], false).await.unwrap();
+        assert!(
+            matches!(
+                res[&rcv.batch_transfer_idx].failure,
+                Some(Error::HashMismatch)
+            ),
+            "{res:?}"
+        );
+        assert_eq!(
+            transfer_of(&r, &rcv.recipient_id).status,
+            TransferStatus::WaitingCounterparty
+        );
+        assert!(r.database.check_asset_exists(asset_id.clone()).is_err());
+        assert!(
+            r.list_unspents(None, false, true)
+                .unwrap()
+                .iter()
+                .all(|u| u.rgb_allocations.is_empty())
+        );
+    }
+
+    serve_media("media");
+    let res = r.refresh(r_on.clone(), None, vec![], false).await.unwrap();
+    clear_rpc_hooks();
+    let refreshed = &res[&rcv.batch_transfer_idx];
+    assert!(refreshed.failure.is_none(), "{res:?}");
+    assert_eq!(
+        refreshed.updated_status,
+        Some(TransferStatus::WaitingConfirmations)
+    );
+    assert!(
+        r.database
+            .check_asset_exists(asset_id.clone())
+            .unwrap()
+            .media_idx
+            .is_some()
+    );
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(
+        transfer_of(&r, &rcv.recipient_id).status,
+        TransferStatus::Settled
+    );
+    assert_eq!(balance(&r, &asset_id).settled, 100);
+}
+
+// with no validated copy in memory, settlement validates the consignment again
+#[wasm_bindgen_test]
+async fn receive_settles_after_reload() {
+    let (mut a, a_on) = nia_wallet(5).await;
+    let (mut r, r_on) = nia_wallet(1).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
+    refresh(&mut r, &r_on).await;
+    assert_eq!(
+        transfer_of(&r, &rid).status,
+        TransferStatus::WaitingConfirmations
+    );
+
+    let mut r = Wallet::restore(r.get_wallet_data()).await.unwrap();
+    let r_on = r.go_online(go_online_options(false)).await.unwrap();
+    let v = validations();
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(transfer_of(&r, &rid).status, TransferStatus::Settled);
+    assert_eq!(balance(&r, &asset_id).settled, 100);
+    // with no copy in memory, settlement validates once
+    assert_eq!(validations(), v + 1);
 }
 
 // extra allocations listed as spent by a transition the consignment does not carry are refused

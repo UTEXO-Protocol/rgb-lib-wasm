@@ -3,11 +3,12 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
-use super::test_send::witness_ord;
+use super::test_send::{ResetMocks, serve_media, test_media, validations, witness_ord};
 use crate::no_wallet::{
     BundleFilter, Invoice, RgbBridgeLocationInfo, RgbEvmContractInfo, TransitionGlobal,
     TransitionMetadata, inspect_consignment,
 };
+use crate::wallet::offline::MOCK_ISSUE_MEDIA;
 use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, state};
 use crate::wallet::online::{
     MOCK_MINT_KEPT_AMOUNT, RECEIVED_CONSIGNMENT_VALIDATIONS, paying_mint_opid, unsupported_claims,
@@ -18,8 +19,9 @@ use crate::wallet::{
     ReceivedMint, Recipient, Wallet,
 };
 use crate::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, FileContent, OS_ASSET, OS_MINT, RgbTransfer,
-    TransferKind, TransferStatus, TypeOfTransition, ValidationConfig, script_buf_from_recipient_id,
+    AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, FileContent, OS_ASSET, OS_MINT,
+    RgbTransfer, TransferKind, TransferStatus, TypeOfTransition, ValidationConfig,
+    script_buf_from_recipient_id,
 };
 use amplify::ByteArray;
 use bdk_wallet::KeychainKind;
@@ -493,6 +495,40 @@ async fn bfa_mint_settles_and_is_spendable() {
         .unwrap();
     lock_mint(&bridge, &res, MINT_AMOUNT).await;
     mint_end(&mut a, &a_online, &res).await.unwrap();
+    for _ in 0..3 {
+        b.sync(b_online.clone()).await.unwrap();
+        refresh(&mut b, &b_online).await;
+        if transfer_status(&mut b, &receive.recipient_id) == TransferStatus::WaitingConfirmations {
+            break;
+        }
+    }
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingConfirmations
+    );
+
+    // after a reload, settlement checks the lock again: with no EVM RPC URL it waits
+    let mut b = Wallet::restore(b.get_wallet_data()).await.unwrap();
+    let no_evm = b.go_online(go_online_options(false)).await.unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    b.sync(no_evm.clone()).await.unwrap();
+    let refreshed = b.refresh(no_evm, None, vec![], false).await.unwrap();
+    assert!(
+        refreshed.values().all(|t| t.failure.is_none()),
+        "{refreshed:?}"
+    );
+    assert_eq!(
+        transfer_status(&mut b, &receive.recipient_id),
+        TransferStatus::WaitingConfirmations
+    );
+    let b_online = b
+        .go_online(OnlineOptions {
+            evm_chains: evm_chains(2, 1_000_000),
+            ..go_online_options(false)
+        })
+        .await
+        .unwrap();
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
     assert_eq!(
@@ -877,9 +913,10 @@ async fn bfa_mint_receiver_checks() {
     assert_eq!(rpc_count("ack.post"), 0);
     clear_rpc_hooks();
 
-    // with no EVM RPC URL for the chain, the receiver waits and checks the mint later
+    // with no EVM RPC URL for the chain, the receiver waits, fetches no witness and checks the
+    // mint later
     let rcv = mint_rcv(&mut b, &b_online).await;
-    mint_begin(
+    let res = mint_begin(
         &mut a,
         &a_online,
         &asset_id,
@@ -887,7 +924,37 @@ async fn bfa_mint_receiver_checks() {
     )
     .await
     .unwrap();
-    b.refresh(no_evm, None, vec![], false).await.unwrap();
+    let txid = Psbt::from_str(&res.psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    run_js(&format!(
+        "const g = globalThis;
+        g.__witnessFetch = g.fetch;
+        g.__witnessFetches = 0;
+        const fetch = g.fetch;
+        g.fetch = function (input, init) {{
+            const url = input instanceof Request ? input.url : String(input);
+            if (url.includes('/tx/{txid}')) {{
+                g.__witnessFetches += 1;
+                return Promise.reject(new TypeError('injected failure'));
+            }}
+            return fetch.call(this, input, init);
+        }};"
+    ));
+    let r = b.refresh(no_evm, None, vec![], false).await;
+    let fetches = run_js(
+        "const g = globalThis;
+        g.fetch = g.__witnessFetch;
+        delete g.__witnessFetch;
+        return g.__witnessFetches;",
+    )
+    .as_f64()
+    .unwrap();
+    let r = r.unwrap();
+    assert!(r[&rcv.batch_transfer_idx].failure.is_none(), "{r:?}");
+    assert_eq!(fetches, 0.0);
     assert_eq!(
         transfer_status(&mut b, &rcv.recipient_id),
         TransferStatus::WaitingCounterparty
@@ -1753,7 +1820,6 @@ async fn bfa_mint_is_atomic() {
 async fn bfa_mint_retry_looks_up_lock() {
     let (mut a, a_online, mut b, b_online, bridge, asset_id) =
         minter_and_receiver(2, 1, None).await;
-    let validations = || RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow(|n| *n);
     let rcv = mint_rcv(&mut b, &b_online).await;
     let res = mint_begin(
         &mut a,
@@ -1829,8 +1895,130 @@ async fn bfa_mint_retry_looks_up_lock() {
         TransferStatus::WaitingBroadcast
     );
     mint_end(&mut a, &a_online, &res).await.unwrap();
-    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    for _ in 0..3 {
+        b.sync(b_online.clone()).await.unwrap();
+        refresh(&mut b, &b_online).await;
+        if transfer_status(&mut b, &rcv.recipient_id) == TransferStatus::WaitingConfirmations {
+            break;
+        }
+    }
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingConfirmations
+    );
+
+    // settlement uses the validated copy: it validates nothing and needs no EVM RPC URL
+    assert!(
+        b.received_valid_consignments
+            .contains_key(&rcv.recipient_id)
+    );
+    let no_evm = b.go_online(go_online_options(false)).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &no_evm).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+    assert_eq!(b.get_asset_balance(asset_id).unwrap().settled, MINT_AMOUNT);
+    assert_eq!(validations(), v0 + 3);
+}
+
+// the recipient of a send of minted units reads the supply from the bridge before settlement
+#[wasm_bindgen_test]
+async fn bfa_send_reads_bridge_supply() {
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(2, 3, None).await;
+    let (mut c, c_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
+    // the test bridge gives the word of a zero lock ID and amount as its circulating supply
+    record_lock(&bridge, &LockId::from([0u8; 32]), 0, MINT_AMOUNT - 1).await;
+    mint(
+        &mut a,
+        &a_online,
+        &mut b,
+        &b_online,
+        &asset_id,
+        &bridge,
+        MINT_AMOUNT,
+    )
+    .await;
+
+    send(
+        &mut b,
+        &b_online,
+        &mut c,
+        &c_online,
+        &asset_id,
+        Assignment::Fungible(30),
+    )
+    .await;
+    let res = c.refresh(c_online, None, vec![], false).await.unwrap();
+    let refreshed = res.values().next().unwrap();
+    assert!(refreshed.failure.is_none(), "{:?}", refreshed.failure);
+    assert_eq!(
+        refreshed.updated_status,
+        Some(TransferStatus::WaitingConfirmations)
+    );
+    let metadata = c.get_asset_metadata(asset_id).unwrap();
+    assert_eq!(metadata.known_circulating_supply, MINT_AMOUNT);
+}
+
+// a mint whose media does not match the contract is not imported, also on the next refresh
+#[wasm_bindgen_test]
+async fn bfa_mint_media_mismatch_not_imported() {
+    let _reset = ResetMocks;
+    MOCK_ISSUE_MEDIA.set(Some(test_media()));
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(2, 1, None).await;
+    assert!(MOCK_ISSUE_MEDIA.with_borrow(|m| m.is_none()));
+    let rcv = blind_rcv_enc(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Fungible(MINT_AMOUNT),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+        Some(Encryption::Optional),
+    )
+    .await
+    .unwrap();
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&rcv, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    lock_mint(&bridge, &res, MINT_AMOUNT).await;
+
+    for _ in 0..2 {
+        serve_media("other");
+        let r = b
+            .refresh(b_online.clone(), None, vec![], false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                r[&rcv.batch_transfer_idx].failure,
+                Some(Error::HashMismatch)
+            ),
+            "{r:?}"
+        );
+        assert_eq!(
+            transfer_status(&mut b, &rcv.recipient_id),
+            TransferStatus::WaitingCounterparty
+        );
+        assert!(b.database.check_asset_exists(asset_id.clone()).is_err());
+        assert!(!b.received_mints.contains_key(&rcv.recipient_id));
+    }
+
+    serve_media("media");
+    let r = b
+        .refresh(b_online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    clear_rpc_hooks();
+    assert!(r[&rcv.batch_transfer_idx].failure.is_none(), "{r:?}");
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingBroadcast
+    );
 }
 
 #[wasm_bindgen_test]
