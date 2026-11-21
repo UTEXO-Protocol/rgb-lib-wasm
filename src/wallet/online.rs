@@ -10273,6 +10273,10 @@ impl Wallet {
     /// [`Error::MintLockNotFound`] is returned, or [`Error::MintLockExpired`] if there never will
     /// be one. An expired mint is failed, which releases its inputs, before the error is returned.
     ///
+    /// Once the lock is confirmed, the known circulating supply of the asset (see
+    /// [`AssetBFA::known_circulating_supply`](crate::wallet::AssetBFA::known_circulating_supply))
+    /// is updated to the one accounted by the bridge contract, if it can be read.
+    ///
     /// This doesn't require the wallet to have private keys.
     pub async fn mint_end(
         &mut self,
@@ -14591,7 +14595,8 @@ mod bfa_tests {
             .set_asset(DbAssetActMod {
                 id: ActiveValue::Set(asset_id.clone()),
                 schema: ActiveValue::Set(AssetSchema::Bfa),
-                known_circulating_supply: ActiveValue::Set(Some(s!("42"))),
+                ticker: ActiveValue::Set(Some(s!("BFA"))),
+                known_circulating_supply: ActiveValue::Set(None),
                 ..Default::default()
             })
             .unwrap();
@@ -14622,7 +14627,23 @@ mod bfa_tests {
                 .unwrap()
                 .known_circulating_supply
         };
+        let listed = || {
+            wallet
+                .list_assets(vec![AssetSchema::Bfa])
+                .unwrap()
+                .bfa
+                .unwrap()[0]
+                .known_circulating_supply
+        };
 
+        // never read
+        assert_eq!(listed(), 0);
+        // a supply read sets it
+        assert_eq!(
+            update(Some(&format!(r#""result":"0x{:064x}""#, 42))),
+            Some(s!("42"))
+        );
+        assert_eq!(listed(), 42);
         // the bridge does not count the supply
         assert_eq!(
             update(Some(r#""error":{"code":3,"message":"execution reverted"}"#)),
@@ -14630,11 +14651,12 @@ mod bfa_tests {
         );
         // the node fails
         assert_eq!(update(None), Some(s!("42")));
-        // a supply read replaces it
+        // a lower supply read replaces it
         assert_eq!(
             update(Some(&format!(r#""result":"0x{:064x}""#, 7))),
             Some(s!("7"))
         );
+        assert_eq!(listed(), 7);
     }
 
     #[test]

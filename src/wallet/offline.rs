@@ -405,6 +405,9 @@ pub struct AssetBFA {
     pub details: Option<String>,
     /// Precision, also known as divisibility, of the asset
     pub precision: u8,
+    /// Amount locked on the bridge contract, as read at the last mint end or asset receive.
+    /// It is 0 if the wallet never read it. It counts incomplete mints, so it is an upper bound
+    pub known_circulating_supply: u64,
     /// Timestamp of asset genesis
     pub timestamp: i64,
     /// Timestamp of asset import
@@ -447,12 +450,17 @@ impl AssetBFA {
             colorings,
             txos,
         )?;
+        let known_circulating_supply = asset
+            .known_circulating_supply
+            .as_ref()
+            .map_or(0, |s| s.parse::<u64>().unwrap());
         Ok(AssetBFA {
             asset_id: asset.id.clone(),
             ticker: asset.ticker.clone().unwrap(),
             name: asset.name.clone(),
             details: asset.details.clone(),
             precision: asset.precision,
+            known_circulating_supply,
             timestamp: asset.timestamp,
             added_at: asset.added_at,
             balance,
