@@ -581,6 +581,8 @@ pub(crate) struct InfoBatchTransfer {
     operation_secret_key: Option<Vec<u8>>,
     /// the sender's own proxy endpoint, where the recipients post their ACK
     sender_transport_endpoint: Option<String>,
+    /// BIP-174 bytes of the unsigned PSBT the _begin step returns
+    unsigned_psbt: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for InfoBatchTransfer {
@@ -2625,6 +2627,7 @@ impl Wallet {
         expiration_timestamp: Option<i64>,
         operation_secret_key: Option<Vec<u8>>,
         sender_transport_endpoint: Option<String>,
+        unsigned_psbt: Option<Vec<u8>>,
         consignment_hashes: &HashMap<String, String>,
     ) -> Result<i32, Error> {
         let created_at = now().unix_timestamp();
@@ -2636,6 +2639,7 @@ impl Wallet {
             created_at: ActiveValue::Set(created_at),
             min_confirmations: ActiveValue::Set(min_confirmations),
             operation_secret_key: ActiveValue::Set(operation_secret_key.clone()),
+            unsigned_psbt: ActiveValue::Set(unsigned_psbt),
             ..Default::default()
         };
         let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
@@ -2900,6 +2904,7 @@ impl Wallet {
                 info.expiration_timestamp,
                 info.operation_secret_key.clone(),
                 info.sender_transport_endpoint.clone(),
+                info.unsigned_psbt.clone(),
                 consignment_hashes,
             );
         };
@@ -4221,6 +4226,7 @@ impl Wallet {
             entropy,
             operation_secret_key: None,
             sender_transport_endpoint: None,
+            unsigned_psbt: None,
         };
         self.transfer_artifacts
             .entry(txid_key.to_string())
@@ -4312,6 +4318,7 @@ impl Wallet {
             .expect("set by _prepare_rgb_psbt_wasm");
         batch_info.operation_secret_key = operation_secret_key;
         batch_info.sender_transport_endpoint = sender_transport_endpoint;
+        batch_info.unsigned_psbt = Some(psbt.serialize());
         let info = batch_info.clone();
         // reserve all inputs, also the ones with no allocations, until the operation ends, fails or
         // expires
@@ -4343,6 +4350,7 @@ impl Wallet {
                 expiration_timestamp,
                 info.operation_secret_key,
                 info.sender_transport_endpoint,
+                info.unsigned_psbt,
                 &HashMap::new(),
             )?)
         };
@@ -9610,6 +9618,7 @@ impl Wallet {
                 None,
                 None,
                 None,
+                info_contents.unsigned_psbt,
                 &HashMap::new(),
             )?,
         };
@@ -11014,6 +11023,7 @@ mod send_end_tests {
             entropy: 0,
             operation_secret_key: Some(OPERATION_SEED.to_vec()),
             sender_transport_endpoint: None,
+            unsigned_psbt: None,
         };
         let db = DbBatchTransfer {
             idx: 1,
@@ -11026,6 +11036,7 @@ mod send_end_tests {
             operation_secret_key: Some(OPERATION_SEED.to_vec()),
             broadcast_deadline: None,
             retention_deadline: None,
+            unsigned_psbt: None,
         };
         let act = DbBatchTransferActMod {
             operation_secret_key: ActiveValue::Set(Some(OPERATION_SEED.to_vec())),
@@ -11118,6 +11129,7 @@ mod send_end_tests {
             entropy: 0,
             operation_secret_key: Some(OPERATION_SEED.to_vec()),
             sender_transport_endpoint: Some(s!("rpc://127.0.0.1:1")),
+            unsigned_psbt: None,
         }
     }
 
@@ -11951,6 +11963,7 @@ mod send_end_tests {
                 None,
                 TransferStatus::Initiated,
                 1,
+                None,
                 None,
                 None,
                 None,
@@ -13778,7 +13791,7 @@ mod send_end_tests {
 
         // the listing tells the two apart
         let listed = wallet
-            .list_transfers(AssetFilter::Any, None)
+            .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
             .unwrap()
             .into_iter()
             .find(|t| t.batch_transfer_idx == idx)
@@ -14578,6 +14591,238 @@ mod send_end_tests {
         let res = block_on(wallet.fail_transfers(online, Some(batch.idx), false, true));
         assert_eq!(res, Ok(true));
         assert_eq!(status(&wallet, batch.idx), TransferStatus::Failed);
+    }
+
+    // The listing of every scope is the full listing filtered by that scope.
+    fn check_scopes_match_all(wallet: &Wallet, filters: &[AssetFilter]) {
+        let all = wallet
+            .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+            .unwrap();
+        let mut batch_idxs: Vec<i32> = all.iter().map(|t| t.batch_transfer_idx).collect();
+        batch_idxs.dedup();
+        let mut txids: Vec<String> = all.iter().filter_map(|t| t.txid.clone()).collect();
+        txids.dedup();
+        for filter in filters {
+            let all = wallet
+                .list_transfers(filter.clone(), TransferScope::All)
+                .unwrap();
+            for idx in &batch_idxs {
+                let scoped = wallet
+                    .list_transfers(filter.clone(), TransferScope::BatchTransfer(*idx))
+                    .unwrap();
+                let expected: Vec<&Transfer> = all
+                    .iter()
+                    .filter(|t| t.batch_transfer_idx == *idx)
+                    .collect();
+                assert_eq!(format!("{scoped:?}"), format!("{expected:?}"));
+            }
+            for txid in &txids {
+                let scoped = wallet
+                    .list_transfers(filter.clone(), TransferScope::Txid(txid.clone()))
+                    .unwrap();
+                let expected: Vec<&Transfer> = all
+                    .iter()
+                    .filter(|t| t.txid.as_ref() == Some(txid))
+                    .collect();
+                assert_eq!(format!("{scoped:?}"), format!("{expected:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn list_transfers_scopes() {
+        let (mut wallet, _) = setup();
+        let send = seed_batch(&wallet, "t", TransferStatus::Initiated, false, None);
+        // an extra allocation moved along by the send is not user driven
+        let extra = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(false),
+                batch_transfer_idx: ActiveValue::Set(send),
+                asset_id: ActiveValue::Set(Some(s!("other"))),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(extra),
+                incoming: ActiveValue::Set(false),
+                ..Default::default()
+            })
+            .unwrap();
+        let script = new_script(&mut wallet);
+        let status = TransferStatus::WaitingConfirmations;
+        let rcv_a = seed_witness_receive(&wallet, "t", status, Some(0), &script);
+        let rcv_b = seed_witness_receive(&wallet, "t", status, Some(1), &script);
+        let status = TransferStatus::WaitingCounterparty;
+        let pending = seed_witness_receive(&wallet, "p", status, Some(0), &script);
+        let mut asset_transfer = DbAssetTransferActMod {
+            idx: ActiveValue::Set(batch_transfer_row(&wallet, pending).asset_transfer_idx),
+            asset_id: ActiveValue::Set(None),
+            ..Default::default()
+        };
+        wallet
+            .database
+            .update_asset_transfer(&mut asset_transfer)
+            .unwrap();
+
+        let list = |filter: AssetFilter, scope: TransferScope| {
+            wallet
+                .list_transfers(filter, scope)
+                .map(|ts| ts.iter().map(|t| t.batch_transfer_idx).collect::<Vec<_>>())
+        };
+        let unknown_txid = "0".repeat(64);
+        let any = || AssetFilter::AnyOrNone;
+        assert_eq!(list(any(), TransferScope::All).unwrap().len(), 4);
+        assert_eq!(
+            list(any(), TransferScope::Txid(s!("t"))).unwrap(),
+            vec![send, rcv_a, rcv_b]
+        );
+        assert_eq!(
+            list(any(), TransferScope::BatchTransfer(send)).unwrap(),
+            vec![send]
+        );
+        assert_eq!(
+            list(any(), TransferScope::BatchTransfer(rcv_b)).unwrap(),
+            vec![rcv_b]
+        );
+        assert_eq!(
+            list(AssetFilter::None, TransferScope::All).unwrap(),
+            vec![pending]
+        );
+        assert!(
+            list(AssetFilter::None, TransferScope::BatchTransfer(send))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            list(any(), TransferScope::Txid(unknown_txid.clone()))
+                .unwrap()
+                .is_empty()
+        );
+        for filter in [any(), AssetFilter::None] {
+            assert!(matches!(
+                list(filter, TransferScope::BatchTransfer(999)),
+                Err(Error::BatchTransferNotFound { idx: 999 })
+            ));
+        }
+        let inexistent = || AssetFilter::Id(s!("rgb:inexistent"));
+        for scope in [
+            TransferScope::BatchTransfer(999),
+            TransferScope::Txid(unknown_txid),
+        ] {
+            assert!(matches!(
+                list(inexistent(), scope),
+                Err(Error::AssetNotFound { .. })
+            ));
+        }
+        check_scopes_match_all(&wallet, &[any(), AssetFilter::None]);
+    }
+
+    #[test]
+    fn saved_transfer_keeps_unsigned_psbt() {
+        use crate::keys::generate_keys;
+        use crate::utils::MemStock;
+        use crate::wallet::idb_store::WalletSnapshot;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+
+        let keys = generate_keys(BitcoinNetwork::Regtest);
+        let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
+        wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
+        *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
+        let input_idx = seed_txo(&wallet, "i", 0);
+        let map = BTreeMap::from([(
+            s!("asset"),
+            info_asset(
+                TypeOfTransition::Transfer,
+                vec![recipient("r1", false, true)],
+                HashMap::from([(input_idx, vec![Assignment::Fungible(10)])]),
+            ),
+        )]);
+        // no outgoing batch exists yet, as after a dry-run begin
+        let info = InfoBatchTransfer {
+            unsigned_psbt: Some(vec![1, 2, 3]),
+            ..batch_info(HashMap::new())
+        };
+        let send = wallet
+            ._update_or_save_transfers(
+                s!("t"),
+                &map,
+                &info,
+                TransferStatus::WaitingCounterparty,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let script = new_script(&mut wallet);
+        let status = TransferStatus::WaitingConfirmations;
+        let receive = seed_witness_receive(&wallet, "t", status, Some(0), &script);
+
+        let check = |wallet: &Wallet| {
+            let sent = wallet
+                .list_transfers(AssetFilter::AnyOrNone, TransferScope::BatchTransfer(send))
+                .unwrap();
+            assert!(!sent.is_empty());
+            assert!(sent.iter().all(|t| t.kind == TransferKind::Send));
+            assert!(sent.iter().all(|t| t.psbt == Some(vec![1, 2, 3])));
+        };
+        check(&wallet);
+        let received = wallet
+            .list_transfers(AssetFilter::AnyOrNone, TransferScope::Txid(s!("t")))
+            .unwrap()
+            .into_iter()
+            .find(|t| t.batch_transfer_idx == receive)
+            .unwrap();
+        assert_eq!(received.psbt, None);
+
+        let json = serde_json::to_string(&wallet.snapshot().unwrap()).unwrap();
+        let snapshot: WalletSnapshot = serde_json::from_str(&json).unwrap();
+        let mut restored = make_test_wallet_with_keys(keys, false);
+        restored.restore_from_snapshot(snapshot).unwrap();
+        check(&restored);
+    }
+
+    #[test]
+    fn list_unspents_sets_derivation_index() {
+        let (mut wallet, _) = setup();
+        let e0 = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External);
+        let e1 = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External);
+        let i0 = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::Internal);
+        let txid = apply_tx_paying(
+            &mut wallet,
+            &[
+                e0.address.script_pubkey(),
+                e1.address.script_pubkey(),
+                i0.address.script_pubkey(),
+            ],
+        );
+        seed_txo(&wallet, &txid, 0);
+        seed_txo(&wallet, &txid, 1);
+        let unknown_txid = "3".repeat(64);
+        seed_txo(&wallet, &unknown_txid, 0);
+
+        let unspents = wallet.list_unspents(None, false, true).unwrap();
+        let index = |txid: &str, vout: u32, colorable: bool| {
+            let unspent = unspents
+                .iter()
+                .find(|u| {
+                    u.utxo.outpoint.txid == txid
+                        && u.utxo.outpoint.vout == vout
+                        && u.utxo.colorable == colorable
+                })
+                .unwrap();
+            unspent.utxo.derivation_index
+        };
+        assert_eq!(index(&txid, 0, true), Some(e0.index));
+        assert_eq!(index(&txid, 1, true), Some(e1.index));
+        assert_eq!(index(&unknown_txid, 0, true), None);
+        assert_eq!(index(&txid, 2, false), Some(i0.index));
     }
 }
 
