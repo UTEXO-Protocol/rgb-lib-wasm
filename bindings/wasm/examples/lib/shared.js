@@ -311,6 +311,7 @@ export function fillWalletKeys(keys) {
     accountXpubVanilla: keys.accountXpubVanilla,
     accountXpubColored: keys.accountXpubColored,
     masterFingerprint: keys.masterFingerprint,
+    witnessVersion: keys.witnessVersion,
     mnemonic: keys.mnemonic,
     vanillaKeychain: null,
   };

@@ -14,7 +14,7 @@ use rgb_lib_wasm::wallet::{
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
-    generate_keys,
+    WitnessVersion, generate_keys,
 };
 use utils::*;
 
@@ -22,8 +22,11 @@ use utils::*;
 const MAX_EXPIRATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 const DOWN: &str = "rpc://127.0.0.1:1/json-rpc";
 
-fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+fn test_wallet_data(
+    schemas: Vec<AssetSchema>,
+    witness_version: WitnessVersion,
+) -> (WalletData, SinglesigKeys) {
+    let keys = generate_keys(BitcoinNetwork::Regtest, witness_version);
     (
         WalletData {
             data_dir: "/tmp/rgb_send".to_string(),
@@ -70,14 +73,22 @@ async fn create_utxos(
 }
 
 async fn new_wallet() -> (Wallet, Online) {
-    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    new_wallet_as(WitnessVersion::Taproot).await
+}
+
+async fn new_wallet_as(witness_version: WitnessVersion) -> (Wallet, Online) {
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia], witness_version);
     let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     (wallet, online)
 }
 
 async fn sender() -> (Wallet, Online) {
-    let (mut wallet, online) = new_wallet().await;
+    sender_as(WitnessVersion::Taproot).await
+}
+
+async fn sender_as(witness_version: WitnessVersion) -> (Wallet, Online) {
+    let (mut wallet, online) = new_wallet_as(witness_version).await;
     fund_and_sync(&mut wallet, &online, "1.0").await;
     create_utxos(&mut wallet, &online, true, Some(10), None).await;
     (wallet, online)
@@ -1263,7 +1274,7 @@ async fn invoice_not_reserved_fail() {
 
 #[wasm_bindgen_test]
 async fn proxy_auth() {
-    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia]);
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia], WitnessVersion::Taproot);
     let mut wallet = Wallet::new(wd, keys).unwrap();
     let endpoint = transport_endpoint(PROXY_AUTH_URL);
     let mut options = go_online_options(false);
@@ -1466,4 +1477,71 @@ async fn proxy_draining() {
     let res = end(&mut wallet, &online, &signed).await;
     clear_rpc_hooks();
     assert!(matches!(res, Err(Error::ProxyDraining)));
+}
+
+#[wasm_bindgen_test]
+async fn p2wpkh_send_receive_nia() {
+    let (mut wallet, online) = sender_as(WitnessVersion::SegWitV0).await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender_as(WitnessVersion::SegWitV0).await;
+    let b = blind(&mut rcv, &rcv_online, 40, PROXY_URL).await;
+    let w = witness_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(26),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+    let map = HashMap::from([(
+        asset_id.clone(),
+        vec![
+            recipient(&b, 40, None, PROXY_URL),
+            recipient(&w, 26, Some(1000), PROXY_URL),
+        ],
+    )]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+
+    refresh(&mut rcv, &rcv_online).await;
+    refresh(&mut wallet, &online).await;
+    let ids = [b, w];
+    settle(&mut rcv, &rcv_online, &ids).await;
+    settle(&mut wallet, &online, &ids).await;
+    assert_eq!(balance(&rcv, &asset_id), 66);
+    assert_eq!(balance(&wallet, &asset_id), 934);
+}
+
+#[wasm_bindgen_test]
+async fn cross_type_p2tr_to_p2wpkh() {
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender_as(WitnessVersion::SegWitV0).await;
+
+    // P2TR to P2WPKH
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+    refresh(&mut rcv, &rcv_online).await;
+    refresh(&mut wallet, &online).await;
+    settle(&mut rcv, &rcv_online, &[rid.clone()]).await;
+    settle(&mut wallet, &online, &[rid]).await;
+    assert_eq!(balance(&wallet, &asset_id), 934);
+    assert_eq!(balance(&rcv, &asset_id), 66);
+
+    // P2WPKH back to P2TR
+    let rid = blind(&mut wallet, &online, 10, PROXY_URL).await;
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 10, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut rcv, &rcv_online, map, false, false).await;
+    end(&mut rcv, &rcv_online, &signed).await.unwrap();
+    refresh(&mut wallet, &online).await;
+    refresh(&mut rcv, &rcv_online).await;
+    settle(&mut wallet, &online, &[rid.clone()]).await;
+    settle(&mut rcv, &rcv_online, &[rid]).await;
+    assert_eq!(balance(&wallet, &asset_id), 944);
+    assert_eq!(balance(&rcv, &asset_id), 56);
 }

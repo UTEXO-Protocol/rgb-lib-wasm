@@ -10779,7 +10779,7 @@ mod separate_signer_tests {
     use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
 
     fn funded_wallet_and_signer() -> (Wallet, Wallet, OutPoint) {
-        let keys = generate_keys(BitcoinNetwork::Regtest);
+        let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
         let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
         let signer = make_test_wallet_with_keys(keys, false);
 
@@ -14727,7 +14727,7 @@ mod send_end_tests {
         use crate::wallet::idb_store::WalletSnapshot;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
 
-        let keys = generate_keys(BitcoinNetwork::Regtest);
+        let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
         let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
         wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
         *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());

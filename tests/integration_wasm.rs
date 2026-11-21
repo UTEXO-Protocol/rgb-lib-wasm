@@ -12,12 +12,12 @@ use rgb_lib_wasm::wallet::{
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
-    bitcoin::Psbt, generate_keys,
+    WitnessVersion, bitcoin::Psbt, generate_keys,
 };
 use utils::*;
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     (
         WalletData {
             data_dir: "/tmp/rgb_integration".to_string(),

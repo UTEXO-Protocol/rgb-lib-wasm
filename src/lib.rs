@@ -70,7 +70,7 @@ pub use crate::{
         TypeOfTransition, WalletTransactionType,
     },
     error::Error,
-    keys::{generate_keys, restore_keys},
+    keys::{WitnessVersion, generate_keys, restore_keys},
     utils::BitcoinNetwork,
     wallet::{RecipientType, TransactionType, TransferKind, Wallet},
 };

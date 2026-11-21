@@ -11,7 +11,6 @@ const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::
 pub(crate) const RGB_RUNTIME_DIR: &str = "rgb";
 pub(crate) const LOG_FILE: &str = "log";
 
-pub(crate) const PURPOSE: u8 = 86;
 pub(crate) const COIN_RGB_MAINNET: u32 = 827166;
 pub(crate) const COIN_RGB_TESTNET: u32 = 827167;
 pub(crate) const ACCOUNT: u8 = 0;
@@ -275,9 +274,12 @@ pub(crate) fn get_coin_type(bitcoin_network: &BitcoinNetwork, rgb: bool) -> u32 
     }
 }
 
-pub(crate) fn get_account_derivation_children(coin_type: u32) -> Vec<ChildNumber> {
+pub(crate) fn get_account_derivation_children(
+    witness_version: WitnessVersion,
+    coin_type: u32,
+) -> Vec<ChildNumber> {
     vec![
-        ChildNumber::from_hardened_idx(PURPOSE as u32).unwrap(),
+        ChildNumber::from_hardened_idx(witness_version.purpose()).unwrap(),
         ChildNumber::from_hardened_idx(coin_type).unwrap(),
         ChildNumber::from_hardened_idx(ACCOUNT as u32).unwrap(),
     ]
@@ -287,9 +289,10 @@ fn derive_account_xprv_from_mnemonic(
     bitcoin_network: BitcoinNetwork,
     mnemonic: &str,
     rgb: bool,
+    witness_version: WitnessVersion,
 ) -> Result<(Xpriv, Fingerprint), Error> {
     let coin_type = get_coin_type(&bitcoin_network, rgb);
-    let account_derivation_children = get_account_derivation_children(coin_type);
+    let account_derivation_children = get_account_derivation_children(witness_version, coin_type);
     let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.to_string())?;
     let master_xprv = Xpriv::new_master(bitcoin_network, &mnemonic.to_seed("")).unwrap();
     let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
@@ -302,15 +305,16 @@ fn get_xpub_from_xprv(xprv: &Xpriv) -> Xpub {
     Xpub::from_priv(&Secp256k1::new(), xprv)
 }
 
-/// Get the account-level xPriv and xPub for the given mnemonic and Bitcoin network based on the
-/// requested wallet side (colored or vanilla)
+/// Get the account-level xPriv and xPub for the given mnemonic, Bitcoin network and witness
+/// version, based on the requested wallet side (colored or vanilla).
 pub fn get_account_data(
     bitcoin_network: BitcoinNetwork,
     mnemonic: &str,
     rgb: bool,
+    witness_version: WitnessVersion,
 ) -> Result<(Xpriv, Xpub, Fingerprint), Error> {
     let (account_xprv, master_fingerprint) =
-        derive_account_xprv_from_mnemonic(bitcoin_network, mnemonic, rgb)?;
+        derive_account_xprv_from_mnemonic(bitcoin_network, mnemonic, rgb, witness_version)?;
     let account_xpub = get_xpub_from_xprv(&account_xprv);
     Ok((account_xprv, account_xpub, master_fingerprint))
 }
@@ -318,9 +322,12 @@ pub fn get_account_data(
 pub(crate) fn get_account_xpubs(
     bitcoin_network: BitcoinNetwork,
     mnemonic: &str,
+    witness_version: WitnessVersion,
 ) -> Result<(Xpub, Xpub), Error> {
-    let (_, account_xpub_vanilla, _) = get_account_data(bitcoin_network, mnemonic, false)?;
-    let (_, account_xpub_colored, _) = get_account_data(bitcoin_network, mnemonic, true)?;
+    let (_, account_xpub_vanilla, _) =
+        get_account_data(bitcoin_network, mnemonic, false, witness_version)?;
+    let (_, account_xpub_colored, _) =
+        get_account_data(bitcoin_network, mnemonic, true, witness_version)?;
     Ok((account_xpub_vanilla, account_xpub_colored))
 }
 
@@ -330,14 +337,21 @@ fn derive_descriptor(
     rgb: bool,
     keychain: u8,
     expected_xpub: Xpub,
+    witness_version: WitnessVersion,
 ) -> Result<String, Error> {
     let (account_xprv, account_xpub, master_fingerprint) =
-        get_account_data(bitcoin_network, mnemonic, rgb)?;
+        get_account_data(bitcoin_network, mnemonic, rgb, witness_version)?;
     if account_xpub != expected_xpub {
         return Err(Error::InvalidBitcoinKeys);
     }
     let coin_type = get_coin_type(&bitcoin_network, rgb);
-    calculate_descriptor_from_xprv(&master_fingerprint, coin_type, account_xprv, keychain)
+    calculate_descriptor_from_xprv(
+        &master_fingerprint,
+        coin_type,
+        account_xprv,
+        keychain,
+        witness_version,
+    )
 }
 
 pub(crate) fn get_descriptors(
@@ -346,6 +360,7 @@ pub(crate) fn get_descriptors(
     vanilla_keychain: Option<u8>,
     expected_xpub_btc: Xpub,
     expected_xpub_rgb: Xpub,
+    witness_version: WitnessVersion,
 ) -> Result<(String, String), Error> {
     let descriptor_colored = derive_descriptor(
         bitcoin_network,
@@ -353,6 +368,7 @@ pub(crate) fn get_descriptors(
         true,
         KEYCHAIN_RGB,
         expected_xpub_rgb,
+        witness_version,
     )?;
     let descriptor_vanilla = derive_descriptor(
         bitcoin_network,
@@ -360,6 +376,7 @@ pub(crate) fn get_descriptors(
         false,
         vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
         expected_xpub_btc,
+        witness_version,
     )?;
     Ok((descriptor_colored, descriptor_vanilla))
 }
@@ -370,6 +387,7 @@ pub(crate) fn get_descriptors_from_xpubs(
     xpub_rgb: Xpub,
     xpub_btc: Xpub,
     vanilla_keychain: Option<u8>,
+    witness_version: WitnessVersion,
 ) -> Result<(String, String), Error> {
     let master_fingerprint =
         Fingerprint::from_str(master_fingerprint).map_err(|_| Error::InvalidFingerprint)?;
@@ -378,12 +396,14 @@ pub(crate) fn get_descriptors_from_xpubs(
         get_coin_type(&bitcoin_network, true),
         xpub_rgb,
         KEYCHAIN_RGB,
+        witness_version,
     )?;
     let descriptor_vanilla = calculate_descriptor_from_xpub(
         &master_fingerprint,
         get_coin_type(&bitcoin_network, false),
         xpub_btc,
         vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
+        witness_version,
     )?;
     Ok((descriptor_colored, descriptor_vanilla))
 }
@@ -421,12 +441,13 @@ pub(crate) fn calculate_descriptor_from_xprv(
     coin_type: u32,
     xprv: Xpriv,
     keychain: u8,
+    witness_version: WitnessVersion,
 ) -> Result<String, Error> {
     let path = get_derivation_path(keychain);
     let der_xprv = &xprv
         .derive_priv(&Secp256k1::new(), &path)
         .expect("provided path should be derivable in an xprv");
-    let account_derivation_children = get_account_derivation_children(coin_type);
+    let account_derivation_children = get_account_derivation_children(witness_version, coin_type);
     let full_path = get_extended_derivation_path(account_derivation_children, keychain);
     let origin_prv: KeySource = (*master_fingerprint, full_path.clone());
     let der_xprv_desc_key: DescriptorKey<Segwitv0> = der_xprv
@@ -437,7 +458,7 @@ pub(crate) fn calculate_descriptor_from_xprv(
     } else {
         return Err(InternalError::Unexpected)?;
     };
-    Ok(format!("tr({key})"))
+    Ok(format!("{}({key})", witness_version.descriptor_fn()))
 }
 
 pub(crate) fn calculate_descriptor_from_xpub(
@@ -445,12 +466,13 @@ pub(crate) fn calculate_descriptor_from_xpub(
     coin_type: u32,
     xpub: Xpub,
     keychain: u8,
+    witness_version: WitnessVersion,
 ) -> Result<String, Error> {
     let path = get_derivation_path(keychain);
     let der_xpub = &xpub
         .derive_pub(&Secp256k1::new(), &path)
         .expect("provided path should be derivable in an xpub");
-    let account_derivation_children = get_account_derivation_children(coin_type);
+    let account_derivation_children = get_account_derivation_children(witness_version, coin_type);
     let full_path = get_extended_derivation_path(account_derivation_children, keychain);
     let origin_pub: KeySource = (*master_fingerprint, full_path);
     let der_xpub_desc_key: DescriptorKey<Segwitv0> = der_xpub
@@ -461,7 +483,7 @@ pub(crate) fn calculate_descriptor_from_xpub(
     } else {
         return Err(InternalError::Unexpected)?;
     };
-    Ok(format!("tr({key})"))
+    Ok(format!("{}({key})", witness_version.descriptor_fn()))
 }
 
 /// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
@@ -1075,7 +1097,7 @@ mod tests {
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn fresh_keys() -> crate::keys::Keys {
-        crate::keys::generate_keys(BitcoinNetwork::Regtest)
+        crate::keys::generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot)
     }
 
     #[test]
@@ -1273,9 +1295,13 @@ mod tests {
 
     #[test]
     fn derive_account_xprv_produces_valid_key() {
-        let (xprv, fingerprint) =
-            derive_account_xprv_from_mnemonic(BitcoinNetwork::Regtest, TEST_MNEMONIC, true)
-                .expect("derivation should succeed");
+        let (xprv, fingerprint) = derive_account_xprv_from_mnemonic(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            true,
+            WitnessVersion::Taproot,
+        )
+        .expect("derivation should succeed");
         // The xprv should be a valid extended private key
         let xpub = get_xpub_from_xprv(&xprv);
         assert_ne!(xpub.to_string(), "");
@@ -1285,9 +1311,13 @@ mod tests {
 
     #[test]
     fn get_xpub_from_xprv_produces_valid_xpub() {
-        let (xprv, _) =
-            derive_account_xprv_from_mnemonic(BitcoinNetwork::Regtest, TEST_MNEMONIC, true)
-                .unwrap();
+        let (xprv, _) = derive_account_xprv_from_mnemonic(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            true,
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         let xpub = get_xpub_from_xprv(&xprv);
         // xpub string should start with "xpub" or "tpub" depending on network
         let xpub_str = xpub.to_string();
@@ -1299,7 +1329,12 @@ mod tests {
 
     #[test]
     fn get_account_xpubs_returns_two_different_keys() {
-        let (vanilla, colored) = get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC).unwrap();
+        let (vanilla, colored) = get_account_xpubs(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         // The vanilla and colored xpubs must differ (different derivation paths)
         assert_ne!(vanilla, colored);
         // Both should be valid xpub strings
@@ -1309,64 +1344,81 @@ mod tests {
 
     #[test]
     fn get_descriptors_produce_valid_strings() {
-        let (vanilla_xpub, colored_xpub) =
-            get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC).unwrap();
-        let (desc_colored, desc_vanilla) = get_descriptors(
-            BitcoinNetwork::Regtest,
-            TEST_MNEMONIC,
-            None,
-            vanilla_xpub,
-            colored_xpub,
-        )
-        .unwrap();
-        // Both descriptors should start with "tr(" (taproot)
-        assert!(
-            desc_colored.starts_with("tr("),
-            "colored descriptor: {desc_colored}"
-        );
-        assert!(
-            desc_vanilla.starts_with("tr("),
-            "vanilla descriptor: {desc_vanilla}"
-        );
-        // They should contain different xpub material since they derive from different coin types
-        assert_ne!(desc_colored, desc_vanilla);
+        for (wv, prefix) in [
+            (WitnessVersion::Taproot, "tr("),
+            (WitnessVersion::SegWitV0, "wpkh("),
+        ] {
+            let (vanilla_xpub, colored_xpub) =
+                get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC, wv).unwrap();
+            let (desc_colored, desc_vanilla) = get_descriptors(
+                BitcoinNetwork::Regtest,
+                TEST_MNEMONIC,
+                None,
+                vanilla_xpub,
+                colored_xpub,
+                wv,
+            )
+            .unwrap();
+            assert!(
+                desc_colored.starts_with(prefix),
+                "colored descriptor: {desc_colored}"
+            );
+            assert!(
+                desc_vanilla.starts_with(prefix),
+                "vanilla descriptor: {desc_vanilla}"
+            );
+            // They should contain different xpub material since they derive from different coin types
+            assert_ne!(desc_colored, desc_vanilla);
+        }
     }
 
     #[test]
     fn get_descriptors_from_xpubs_produces_valid_descriptors() {
-        let keys =
-            crate::keys::restore_keys(BitcoinNetwork::Regtest, TEST_MNEMONIC.to_string()).unwrap();
-        let vanilla_xpub = Xpub::from_str(&keys.account_xpub_vanilla).unwrap();
-        let colored_xpub = Xpub::from_str(&keys.account_xpub_colored).unwrap();
+        for (wv, prefix) in [
+            (WitnessVersion::Taproot, "tr("),
+            (WitnessVersion::SegWitV0, "wpkh("),
+        ] {
+            let keys =
+                crate::keys::restore_keys(BitcoinNetwork::Regtest, TEST_MNEMONIC.to_string(), wv)
+                    .unwrap();
+            let vanilla_xpub = Xpub::from_str(&keys.account_xpub_vanilla).unwrap();
+            let colored_xpub = Xpub::from_str(&keys.account_xpub_colored).unwrap();
 
-        let (desc_colored, desc_vanilla) = get_descriptors_from_xpubs(
-            BitcoinNetwork::Regtest,
-            &keys.master_fingerprint,
-            colored_xpub,
-            vanilla_xpub,
-            None,
-        )
-        .unwrap();
-        assert!(
-            desc_colored.starts_with("tr("),
-            "colored descriptor: {desc_colored}"
-        );
-        assert!(
-            desc_vanilla.starts_with("tr("),
-            "vanilla descriptor: {desc_vanilla}"
-        );
+            let (desc_colored, desc_vanilla) = get_descriptors_from_xpubs(
+                BitcoinNetwork::Regtest,
+                &keys.master_fingerprint,
+                colored_xpub,
+                vanilla_xpub,
+                None,
+                wv,
+            )
+            .unwrap();
+            assert!(
+                desc_colored.starts_with(prefix),
+                "colored descriptor: {desc_colored}"
+            );
+            assert!(
+                desc_vanilla.starts_with(prefix),
+                "vanilla descriptor: {desc_vanilla}"
+            );
+        }
     }
 
     /// Helper: derive a valid regtest address from the test mnemonic's descriptor
     fn regtest_address() -> BdkAddress {
-        let (vanilla_xpub, colored_xpub) =
-            get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC).unwrap();
+        let (vanilla_xpub, colored_xpub) = get_account_xpubs(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         let (_, desc_vanilla) = get_descriptors(
             BitcoinNetwork::Regtest,
             TEST_MNEMONIC,
             None,
             vanilla_xpub,
             colored_xpub,
+            WitnessVersion::Taproot,
         )
         .unwrap();
         // Use BDK to derive address 0 from the vanilla descriptor
@@ -1476,20 +1528,28 @@ mod tests {
 
     #[test]
     fn get_account_derivation_children_has_three_levels() {
-        let children = get_account_derivation_children(COIN_RGB_TESTNET);
-        assert_eq!(children.len(), 3);
-        // First child is PURPOSE (86')
-        assert_eq!(
-            children[0],
-            ChildNumber::from_hardened_idx(PURPOSE as u32).unwrap()
-        );
+        for (wv, purpose) in [
+            (WitnessVersion::SegWitV0, 84),
+            (WitnessVersion::Taproot, 86),
+        ] {
+            let children = get_account_derivation_children(wv, COIN_RGB_TESTNET);
+            assert_eq!(children.len(), 3);
+            assert_eq!(
+                children[0],
+                ChildNumber::from_hardened_idx(purpose).unwrap()
+            );
+        }
     }
 
     #[test]
     fn generate_and_restore_keys_round_trip() {
         let keys = fresh_keys();
-        let restored =
-            crate::keys::restore_keys(BitcoinNetwork::Regtest, keys.mnemonic.to_string()).unwrap();
+        let restored = crate::keys::restore_keys(
+            BitcoinNetwork::Regtest,
+            keys.mnemonic.to_string(),
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         assert_eq!(keys.xpub, restored.xpub);
         assert_eq!(keys.account_xpub_vanilla, restored.account_xpub_vanilla);
         assert_eq!(keys.account_xpub_colored, restored.account_xpub_colored);

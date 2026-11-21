@@ -125,7 +125,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       <label for="wallet-data">WalletData JSON</label>
       <textarea id="wallet-data" rows="6" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
       <label for="wallet-keys">SinglesigKeys JSON (auto-filled from generated keys)</label>
-      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", ...}'></textarea>
+      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", "witnessVersion": "Taproot", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-create-wallet" disabled>Create Wallet</button>
@@ -343,7 +343,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-auto-setup').addEventListener('click', async () => {
       try {
         log('Auto-setup: generating keys...', 'log-info');
-        const keys = generateKeys('regtest');
+        const keys = generateKeys('regtest', 'Taproot');
         const wd = fillWalletData('regtest');
         const sk = fillWalletKeys(keys);
         log('Auto-setup: creating wallet...', 'log-info');
@@ -364,7 +364,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-generate').addEventListener('click', () => {
       const network = document.getElementById('gen-network').value;
       try {
-        const keys = generateKeys(network);
+        const keys = generateKeys(network, 'Taproot');
         fillWalletData(network);
         fillWalletKeys(keys);
         showResult('setup-output', 'setup-result',
@@ -627,7 +627,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
       // Test 1: invalid network in generateKeys
       try {
-        generateKeys('invalid_network');
+        generateKeys('invalid_network', 'Taproot');
         record(false, 'generateKeys("invalid_network")', 'expected error but succeeded');
       } catch (e) {
         record(true, 'generateKeys("invalid_network")', 'rejected: ' + e);
@@ -635,7 +635,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
       // Test 2: bad mnemonic in restoreKeys
       try {
-        restoreKeys('regtest', 'not a valid mnemonic phrase at all');
+        restoreKeys('regtest', 'not a valid mnemonic phrase at all', 'Taproot');
         record(false, 'restoreKeys(bad mnemonic)', 'expected error but succeeded');
       } catch (e) {
         record(true, 'restoreKeys(bad mnemonic)', 'rejected: ' + e);
@@ -643,7 +643,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
       // Test 3: empty mnemonic in restoreKeys
       try {
-        restoreKeys('regtest', '');
+        restoreKeys('regtest', '', 'Taproot');
         record(false, 'restoreKeys(empty mnemonic)', 'expected error but succeeded');
       } catch (e) {
         record(true, 'restoreKeys(empty mnemonic)', 'rejected: ' + e);
@@ -653,8 +653,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const networks = ['regtest', 'testnet', 'signet', 'mainnet'];
       for (const net of networks) {
         try {
-          const generated = generateKeys(net);
-          const restored = restoreKeys(net, generated.mnemonic);
+          const generated = generateKeys(net, 'Taproot');
+          const restored = restoreKeys(net, generated.mnemonic, 'Taproot');
           const fields = Object.keys(generated);
           let allMatch = true;
           for (const field of fields) {

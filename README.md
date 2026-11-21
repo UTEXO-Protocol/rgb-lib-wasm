@@ -72,10 +72,10 @@ await init();
 ### Key generation
 
 ```javascript
-const keys = generateKeys('Regtest');
-// keys: { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint }
+const keys = generateKeys('Regtest', 'Taproot');
+// keys: { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint, witnessVersion }
 
-const restored = restoreKeys('Regtest', keys.mnemonic);
+const restored = restoreKeys('Regtest', keys.mnemonic, 'Taproot');
 ```
 
 ### Creating a wallet
@@ -93,6 +93,7 @@ const walletKeys = {
   accountXpubVanilla: keys.accountXpubVanilla,
   accountXpubColored: keys.accountXpubColored,
   masterFingerprint: keys.masterFingerprint,
+  witnessVersion: keys.witnessVersion,
   mnemonic: keys.mnemonic,
   vanillaKeychain: null,
 };
@@ -367,9 +368,9 @@ To protect a wallet:
 
 | Function | Description |
 |----------|-------------|
-| `generateKeys(network)` | Generate a new BIP39 mnemonic and derive xpubs |
+| `generateKeys(network, witnessVersion)` | Generate a new BIP39 mnemonic and derive xpubs; `witnessVersion` is `'Taproot'` (BIP86, P2TR) or `'SegWitV0'` (BIP84, P2WPKH) |
 | `maxExpirationSecs()` | Maximum seconds in the future an expiration can be |
-| `restoreKeys(network, mnemonic)` | Restore xpubs from a mnemonic |
+| `restoreKeys(network, mnemonic, witnessVersion)` | Restore xpubs from a mnemonic |
 | `checkProxyUrl(url)` | Validate an RGB proxy server URL |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
 | `inspectConsignment(bytes, bundleFilter)` | Inspect an RGB consignment without a wallet |

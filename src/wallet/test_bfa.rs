@@ -11,7 +11,8 @@ use crate::wallet::{
     WalletData,
 };
 use crate::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferStatus, generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferStatus, WitnessVersion,
+    generate_keys,
 };
 use amplify::{ByteArray, Wrapper};
 use bdk_wallet::bitcoin::OutPoint;
@@ -26,7 +27,7 @@ pub(super) const CHAIN_ID: u64 = 31337;
 pub(super) const BRIDGE: &str = "0x00000000000000000000000000000000000000b1";
 
 pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     (
         WalletData {
             data_dir: "/tmp/rgb_bfa".to_string(),

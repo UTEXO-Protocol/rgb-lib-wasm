@@ -14,11 +14,13 @@ use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, IndexerConfig, Invoice, OnlineOptions, SinglesigKeys, TransferScope,
     Wallet, WalletData,
 };
-use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, generate_keys};
+use rgb_lib_wasm::{
+    AssetSchema, Assignment, BitcoinNetwork, Error, TransferStatus, WitnessVersion, generate_keys,
+};
 use utils::{PROXY_URL, VSS_SERVER_URL, go_online_options, run_js, transport_endpoint, within};
 
 fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     (
         WalletData {
             data_dir: "/tmp/rgb_test".to_string(),
@@ -41,7 +43,7 @@ fn test_wallet_new_signing() {
 
 #[wasm_bindgen_test]
 fn test_wallet_new_watch_only() {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wd = WalletData {
         data_dir: "/tmp/rgb_test_wo".to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
@@ -57,7 +59,7 @@ fn test_wallet_new_watch_only() {
 
 #[wasm_bindgen_test]
 fn test_wallet_new_fingerprint_mismatch() {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     let wd = WalletData {
         data_dir: "/tmp/rgb_test_fp".to_string(),
         bitcoin_network: BitcoinNetwork::Regtest,
@@ -477,7 +479,7 @@ async fn test_create_and_restore_request_persistent_storage() {
 // ---------------------------------------------------------------------------
 
 fn test_wallet_data_reuse(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
     (
         WalletData {
             data_dir: "/tmp/rgb_test_reuse".to_string(),
@@ -756,7 +758,7 @@ async fn test_vss_restore_refuses_unencrypted_data() {
 #[wasm_bindgen_test]
 async fn test_vss_restore_refuses_other_fingerprint() {
     let (mut wallet, store) = wallet_with_vss_backup().await;
-    let other = generate_keys(BitcoinNetwork::Regtest).master_fingerprint;
+    let other = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot).master_fingerprint;
     store.put("backup/fingerprint", other.into_bytes()).await;
     let err = wallet.vss_restore_backup().await.unwrap_err();
     assert!(matches!(err, Error::FingerprintMismatch), "{err:?}");
@@ -950,7 +952,7 @@ fn assert_mismatch(err: Error, expected: &str) {
 
 #[wasm_bindgen_test]
 async fn config_load_success() {
-    let keys = generate_keys(Signet);
+    let keys = generate_keys(Signet, WitnessVersion::SegWitV0);
     let wd = WalletData {
         max_allocations_per_utxo: 1,
         supported_schemas: vec![Nia, Ifa],
@@ -981,7 +983,7 @@ async fn config_load_success() {
 
 #[wasm_bindgen_test]
 async fn config_restore_updates_saved_settings() {
-    let keys = generate_keys(Regtest);
+    let keys = generate_keys(Regtest, WitnessVersion::Taproot);
     let wd = WalletData {
         max_allocations_per_utxo: 1,
         ..config_data("update", Regtest)
@@ -1014,7 +1016,7 @@ async fn config_restore_updates_saved_settings() {
 
 #[wasm_bindgen_test]
 async fn config_restore_refuses_fixed_settings() {
-    let keys = generate_keys(Regtest);
+    let keys = generate_keys(Regtest, WitnessVersion::Taproot);
     let wd = config_data("fixed", Regtest);
     saved(&wd, SinglesigKeys::from_keys(&keys, None)).await;
 
@@ -1027,7 +1029,7 @@ async fn config_restore_refuses_fixed_settings() {
 
 #[wasm_bindgen_test]
 async fn config_watch_only_toggle_success() {
-    let keys = generate_keys(Regtest);
+    let keys = generate_keys(Regtest, WitnessVersion::Taproot);
     let fp = &keys.master_fingerprint;
     let wd = config_data("toggle", Regtest);
     saved(&wd, SinglesigKeys::from_keys(&keys, None)).await;
@@ -1054,7 +1056,7 @@ async fn config_watch_only_toggle_success() {
 
 #[wasm_bindgen_test]
 async fn config_load_inexistent_manifest_fail() {
-    let keys = generate_keys(Regtest);
+    let keys = generate_keys(Regtest, WitnessVersion::Taproot);
     let wd = config_data("inexistent", Regtest);
     let wallet = Wallet::new(wd.clone(), SinglesigKeys::from_keys(&keys, None)).unwrap();
     let load = || Wallet::load(&wd.data_dir, Regtest, &keys.master_fingerprint, None);
@@ -1070,7 +1072,10 @@ async fn config_load_inexistent_manifest_fail() {
 #[wasm_bindgen_test]
 async fn config_load_fingerprint_mismatch_fail() {
     let wd = config_data("fingerprint", Regtest);
-    let (keys_1, keys_2) = (generate_keys(Regtest), generate_keys(Regtest));
+    let (keys_1, keys_2) = (
+        generate_keys(Regtest, WitnessVersion::Taproot),
+        generate_keys(Regtest, WitnessVersion::Taproot),
+    );
     let wallet_1 = Wallet::new(wd.clone(), SinglesigKeys::from_keys(&keys_1, None)).unwrap();
     wallet_1.flush().await.unwrap();
     let wallet_2 = Wallet::new(wd.clone(), SinglesigKeys::from_keys(&keys_2, None)).unwrap();
@@ -1088,10 +1093,10 @@ async fn config_load_fingerprint_mismatch_fail() {
 
 #[wasm_bindgen_test]
 async fn config_load_wrong_mnemonic_fail() {
-    let keys = generate_keys(Regtest);
+    let keys = generate_keys(Regtest, WitnessVersion::Taproot);
     let wd = config_data("wrong-mnemonic", Regtest);
     saved(&wd, SinglesigKeys::from_keys(&keys, None)).await;
-    let other = generate_keys(Regtest);
+    let other = generate_keys(Regtest, WitnessVersion::Taproot);
     let err = Wallet::load(
         &wd.data_dir,
         Regtest,
@@ -1106,7 +1111,7 @@ async fn config_load_wrong_mnemonic_fail() {
 
 #[wasm_bindgen_test]
 async fn config_load_after_backup_restore_success() {
-    let keys = generate_keys(Regtest);
+    let keys = generate_keys(Regtest, WitnessVersion::Taproot);
     let wd_a = WalletData {
         max_allocations_per_utxo: 1,
         ..config_data("backup-a", Regtest)

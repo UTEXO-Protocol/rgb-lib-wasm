@@ -165,7 +165,7 @@ impl super::Wallet {
     }
 
     /// Restore wallet state from an encrypted backup.
-    /// The wallet must be created first with the same keys and vanilla keychain; other keys give `WalletSettingMismatch`. The wallet keeps its own mutable settings.
+    /// The wallet must be created first with the same keys, witness version and vanilla keychain; other keys give `WalletSettingMismatch`. The wallet keeps its own mutable settings.
     /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()` or `Wallet::load()`, or its data directory holds no snapshot.
     /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
@@ -619,8 +619,13 @@ mod tests {
 
         let burn = "4".repeat(64);
         let link = "6".repeat(64);
-        let mut wallet =
-            make_test_wallet_with_keys(generate_keys(crate::BitcoinNetwork::Regtest), false);
+        let mut wallet = make_test_wallet_with_keys(
+            generate_keys(
+                crate::BitcoinNetwork::Regtest,
+                crate::WitnessVersion::Taproot,
+            ),
+            false,
+        );
         seed_ended_without_recipient(
             &mut wallet,
             &burn,
@@ -668,7 +673,10 @@ mod tests {
         let txid = "1".repeat(64);
         let indexer_url = "http://127.0.0.1:1";
         let password = "pw";
-        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+        let keys = generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
 
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
@@ -899,7 +907,10 @@ mod tests {
         use crate::wallet::online::TransferArtifacts;
 
         let txid = "2".repeat(64);
-        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+        let keys = generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
 
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
@@ -1028,7 +1039,10 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn failed_restore_with_bad_rgb_store_keeps_wallet() {
-        let keys = crate::keys::generate_keys(crate::BitcoinNetwork::Regtest);
+        let keys = crate::keys::generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
         let mut wallet = wallet_with_transfer(keys.clone());
         let mut payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(&keys, None));
         payload.rgb_store = s!("not base64!");
@@ -1041,9 +1055,15 @@ mod tests {
     fn failed_restore_of_other_wallet_keeps_wallet() {
         use crate::keys::generate_keys;
 
-        let mut wallet = wallet_with_transfer(generate_keys(crate::BitcoinNetwork::Regtest));
+        let mut wallet = wallet_with_transfer(generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        ));
         let mut payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(
-            &generate_keys(crate::BitcoinNetwork::Regtest),
+            &generate_keys(
+                crate::BitcoinNetwork::Regtest,
+                crate::WitnessVersion::Taproot,
+            ),
             None,
         ));
         assert!(payload.bdk_changeset.is_some());
@@ -1057,7 +1077,10 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn restore_backup_refuses_changed_settings() {
-        let keys = crate::keys::generate_keys(crate::BitcoinNetwork::Regtest);
+        let keys = crate::keys::generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
         let mut wallet = wallet_with_transfer(keys.clone());
         let payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(&keys, Some(1)));
 
