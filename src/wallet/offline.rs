@@ -116,6 +116,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: std::cell::RefCell<Option<usize>> =
         const { std::cell::RefCell::new(None) };
+    /// Media of the next asset issued, if set.
+    pub(crate) static MOCK_ISSUE_MEDIA: std::cell::RefCell<Option<Attachment>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The ID of the contract a contract `link` (e.g. [`LinkableSchemaWrapper::link_from`]) points
@@ -1065,6 +1068,9 @@ pub struct Wallet {
     /// Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
+    /// Validated copy of each received consignment, kept for settlement. Key: recipient_id
+    #[cfg(feature = "esplora")]
+    pub(crate) received_valid_consignments: HashMap<String, ValidTransfer>,
     /// Proxy data of each received consignment. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
@@ -1245,6 +1251,8 @@ impl Wallet {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            received_valid_consignments: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignment_meta: HashMap::new(),
             #[cfg(feature = "esplora")]
@@ -1729,6 +1737,8 @@ impl Wallet {
         text: RicardianContract,
         media: Option<Attachment>,
     ) -> ContractTerms {
+        #[cfg(test)]
+        let media = media.or_else(|| MOCK_ISSUE_MEDIA.take());
         ContractTerms { text, media }
     }
 
@@ -4397,6 +4407,8 @@ pub(crate) mod address_reuse_tests {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            received_valid_consignments: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignment_meta: HashMap::new(),
             #[cfg(feature = "esplora")]
