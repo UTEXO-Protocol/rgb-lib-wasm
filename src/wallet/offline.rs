@@ -2792,14 +2792,15 @@ impl Wallet {
     }
 
     /// Return the [`BtcBalance`] of the internal Bitcoin wallets.
-    pub fn get_btc_balance(
+    pub async fn get_btc_balance(
         &mut self,
         online: Option<Online>,
         skip_sync: bool,
     ) -> Result<BtcBalance, Error> {
         info!(self.logger, "Getting BTC balance...");
 
-        self.sync_if_requested(online, skip_sync)?;
+        self.sync_if_requested(online, skip_sync, "get_btc_balance")
+            .await?;
 
         let mut vanilla = self._get_btc_balance(KeychainKind::Internal)?;
         let reserved = self.get_reserved_vanilla_outpoints()?;
@@ -2910,10 +2911,11 @@ impl Wallet {
         Ok(Assets { nia, ifa, bfa })
     }
 
-    pub(crate) fn sync_if_requested(
+    pub(crate) async fn sync_if_requested(
         &mut self,
         #[cfg_attr(not(feature = "esplora"), allow(unused_variables))] online: Option<Online>,
         skip_sync: bool,
+        #[cfg_attr(not(feature = "esplora"), allow(unused_variables))] op: &'static str,
     ) -> Result<(), Error> {
         if !skip_sync {
             #[cfg(not(feature = "esplora"))]
@@ -2925,21 +2927,28 @@ impl Wallet {
                 } else {
                     return Err(Error::OnlineNeeded);
                 }
-                return Err(Error::Offline);
+                let cp = self.checkpoint(op);
+                let res = async {
+                    self.fast_sync(true).await?;
+                    self.fast_sync(false).await
+                }
+                .await;
+                self.commit(cp, res, |_| false).await?;
             }
         }
         Ok(())
     }
 
     /// List the Bitcoin [`Transaction`]s known to the wallet.
-    pub fn list_transactions(
+    pub async fn list_transactions(
         &mut self,
         online: Option<Online>,
         skip_sync: bool,
     ) -> Result<Vec<Transaction>, Error> {
         info!(self.logger, "Listing transactions...");
 
-        self.sync_if_requested(online, skip_sync)?;
+        self.sync_if_requested(online, skip_sync, "list_transactions")
+            .await?;
 
         let mut create_utxos_txids = vec![];
         let mut drain_txids = vec![];
@@ -3282,7 +3291,7 @@ impl Wallet {
     ///
     /// If `settled` is true only show settled RGB allocations, if false also show pending RGB
     /// allocations.
-    pub fn list_unspents(
+    pub async fn list_unspents(
         &mut self,
         online: Option<Online>,
         settled_only: bool,
@@ -3290,7 +3299,8 @@ impl Wallet {
     ) -> Result<Vec<Unspent>, Error> {
         info!(self.logger, "Listing unspents...");
 
-        self.sync_if_requested(online, skip_sync)?;
+        self.sync_if_requested(online, skip_sync, "list_unspents")
+            .await?;
 
         let db_data = self.database.get_db_data(false)?;
 
