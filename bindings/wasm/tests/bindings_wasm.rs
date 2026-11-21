@@ -398,9 +398,8 @@ fn prop(v: &JsValue, key: &str) -> JsValue {
     js_sys::Reflect::get(v, &key.into()).unwrap()
 }
 
-#[wasm_bindgen_test]
-async fn inflate_begin_returns_result_object() {
-    let wallet = wallet_with_schemas(vec![AssetSchema::Nia, AssetSchema::Ifa]);
+async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsValue) {
+    let wallet = wallet_with_schemas(supported_schemas);
     let online = online(&wallet).await;
     let address = wallet.get_address().unwrap();
     helper_post(
@@ -422,6 +421,34 @@ async fn inflate_begin_returns_result_object() {
     helper_post("mine", r#"{"blocks":1}"#).await;
     esplora_synced().await;
     wallet.sync(online.clone()).await.unwrap();
+    (wallet, online)
+}
+
+#[wasm_bindgen_test]
+async fn issue_bfa_returns_known_circulating_supply() {
+    let (wallet, _online) = funded_wallet(vec![AssetSchema::Nia, AssetSchema::Bfa]).await;
+    let asset = wallet
+        .issue_asset_bfa(
+            "BFA",
+            "Bridged",
+            0,
+            1,
+            31337,
+            "0x00000000000000000000000000000000000000b1",
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+    let supply = prop(&asset, "knownCirculatingSupply");
+    assert!(supply.is_bigint());
+    assert!(supply.loose_eq(&JsValue::from(0u64)));
+}
+
+#[wasm_bindgen_test]
+async fn inflate_begin_returns_result_object() {
+    let (wallet, online) = funded_wallet(vec![AssetSchema::Nia, AssetSchema::Ifa]).await;
     let asset = wallet
         .issue_asset_ifa(
             "IFA",
