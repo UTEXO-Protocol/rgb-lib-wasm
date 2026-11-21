@@ -39,6 +39,8 @@ pub struct WalletSnapshot {
     pub received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints keyed by recipient_id.
     pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
+    pub(crate) pending_mint_locks: HashMap<String, super::PendingMintLocks>,
     /// Encoded RGB store (base64).
     pub rgb_store: String,
     /// Pinned derivation index per keychain for address reuse.
@@ -324,6 +326,7 @@ mod tests {
             .insert("asset-id".to_owned(), vec![1, 2, 3, 4]);
         transfer_artifact.signed_tx = Some(vec![9]);
         transfer_artifact.fascia = Some(vec![7, 8]);
+        let pml = crate::wallet::offline::address_reuse_tests::pending_mint_locks();
         let snapshot = WalletSnapshot {
             writer: 1,
             sequence: 1,
@@ -354,6 +357,7 @@ mod tests {
                     bridge_contract: "bridge".to_owned(),
                 },
             )]),
+            pending_mint_locks: HashMap::from([("rid".to_owned(), pml)]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
         };
@@ -386,6 +390,10 @@ mod tests {
             snapshot.received_signed_txs
         );
         assert_eq!(restored_snapshot.received_mints, snapshot.received_mints);
+        assert_eq!(
+            restored_snapshot.pending_mint_locks,
+            snapshot.pending_mint_locks
+        );
 
         let restored = deserialize_stock(&restored_snapshot.rgb_store).expect("deserialize stock");
 

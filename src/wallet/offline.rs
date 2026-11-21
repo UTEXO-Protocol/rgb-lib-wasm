@@ -624,6 +624,20 @@ pub struct ReceivedMint {
     pub bridge_contract: String,
 }
 
+/// The mint locks a received consignment waits for, saved once it is validated as far as it can
+/// be without them.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub(crate) struct PendingMintLocks {
+    /// SHA-256 digest (hex) of the consignment waiting for the locks
+    pub(crate) consignment_digest: String,
+    /// EIP-155 chain ID of the EVM chain the bridge contract lives on
+    pub(crate) evm_chain_id: u64,
+    /// Address of the bridge contract that records the locks
+    pub(crate) bridge_contract: EvmAddress,
+    /// The claims of the mints whose locks are not finalized yet
+    pub(crate) claims: Vec<Claim>,
+}
+
 /// The information needed to receive RGB assets in witness mode.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -1057,6 +1071,8 @@ pub struct Wallet {
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
+    /// Mint locks a received consignment waits for, keyed by recipient_id
+    pub(crate) pending_mint_locks: HashMap<String, PendingMintLocks>,
     /// TXs this wallet broadcast in the running operation. A failed operation keeps them in BDK.
     #[cfg(feature = "esplora")]
     pub(crate) broadcast_txs: Vec<BdkTransaction>,
@@ -1232,6 +1248,7 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            pending_mint_locks: HashMap::new(),
             #[cfg(feature = "esplora")]
             broadcast_txs: Vec::new(),
             idb_queue: Default::default(),
@@ -3928,6 +3945,7 @@ pub(crate) struct Checkpoint {
     #[cfg(feature = "esplora")]
     received_signed_txs: HashMap<String, Vec<u8>>,
     received_mints: HashMap<String, ReceivedMint>,
+    pending_mint_locks: HashMap<String, PendingMintLocks>,
     reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
@@ -4037,6 +4055,7 @@ impl Wallet {
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
+            pending_mint_locks: self.pending_mint_locks.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
         })
@@ -4087,6 +4106,7 @@ impl Wallet {
         self.received_consignment_meta = snapshot.received_consignment_meta;
         self.received_signed_txs = snapshot.received_signed_txs;
         self.received_mints = snapshot.received_mints;
+        self.pending_mint_locks = snapshot.pending_mint_locks;
 
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
@@ -4188,6 +4208,7 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
+            pending_mint_locks: self.pending_mint_locks.clone(),
             reuse_address_index: self.reuse_address_index.clone(),
         }
     }
@@ -4208,6 +4229,7 @@ impl Wallet {
             self.received_signed_txs = cp.received_signed_txs;
         }
         self.received_mints = cp.received_mints;
+        self.pending_mint_locks = cp.pending_mint_locks;
         self.reuse_address_index = cp.reuse_address_index;
         #[cfg(feature = "esplora")]
         if !self.broadcast_txs.is_empty() {
@@ -4288,6 +4310,22 @@ pub(crate) mod address_reuse_tests {
     use crate::keys::generate_keys;
     use crate::utils::{get_descriptors, str_to_xpub};
 
+    pub(crate) fn pending_mint_locks() -> PendingMintLocks {
+        PendingMintLocks {
+            consignment_digest: "digest".to_owned(),
+            evm_chain_id: 3,
+            bridge_contract: "0x1111111111111111111111111111111111111111"
+                .parse::<EvmAddress>()
+                .unwrap(),
+            claims: vec![Claim::Lock {
+                opid: OpId::from([1u8; 32]),
+                witness_id: "22".repeat(32).parse::<RgbTxid>().unwrap(),
+                amount: 1,
+                before_block: 2,
+            }],
+        }
+    }
+
     /// Helper: build a minimal Wallet for native tests.
     ///
     /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
@@ -4362,6 +4400,7 @@ pub(crate) mod address_reuse_tests {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            pending_mint_locks: HashMap::new(),
             #[cfg(feature = "esplora")]
             broadcast_txs: Vec::new(),
             idb_queue: Default::default(),
@@ -4389,6 +4428,7 @@ pub(crate) mod address_reuse_tests {
             "received_consignment_meta": wallet.received_consignment_meta,
             "received_signed_txs": wallet.received_signed_txs,
             "received_mints": wallet.received_mints,
+            "pending_mint_locks": wallet.pending_mint_locks,
             "reuse_address_index": wallet.reuse_address_index,
         })
     }

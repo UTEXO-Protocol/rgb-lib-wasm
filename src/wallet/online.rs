@@ -35,6 +35,9 @@ thread_local! {
         const { std::cell::RefCell::new(false) };
     pub(crate) static MOCK_MINT_KEPT_AMOUNT: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
+    // test counter: received consignments validated
+    pub(crate) static RECEIVED_CONSIGNMENT_VALIDATIONS: std::cell::RefCell<usize> =
+        const { std::cell::RefCell::new(0) };
 }
 
 // test mock: move part of the recipient amount to `num` extra assignments of `amount` to the
@@ -1204,6 +1207,20 @@ impl Indexer {
                     Some(0)
                 }
             }
+        })
+    }
+
+    /// Whether a confirmed TX spends the output at `outpoint`.
+    pub(crate) async fn output_spent_on_chain(
+        &self,
+        outpoint: &BdkOutPoint,
+    ) -> Result<bool, Error> {
+        Ok(match self {
+            Indexer::EsploraAsync(client) => client
+                .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+                .await
+                .map_err(IndexerError::from)?
+                .is_some_and(|s| s.spent && s.status.is_some_and(|ts| ts.confirmed)),
         })
     }
 
@@ -4338,6 +4355,55 @@ impl Wallet {
         })
     }
 
+    /// Whether the received consignment is still waiting for the mint locks saved for it: none
+    /// of them expired and some not finalized yet. Anything else is left to the processing of the
+    /// consignment.
+    async fn _waiting_for_mint_locks(
+        &self,
+        recipient_id: &str,
+        consignment_bytes: &[u8],
+    ) -> Result<bool, Error> {
+        let Some(entry) = self.pending_mint_locks.get(recipient_id) else {
+            return Ok(false);
+        };
+        if hex::encode(sha256_digest(consignment_bytes)) != entry.consignment_digest {
+            return Ok(false);
+        }
+        let chain_id = entry.evm_chain_id;
+        let Some(evm_client) = self._evm_client(chain_id) else {
+            return Ok(false);
+        };
+        let location = BridgeLocation::Evm(EvmContract {
+            chain_id,
+            address: entry.bridge_contract,
+        });
+        let resolver = MintClaimResolver::fetch(&evm_client, &location, &entry.claims).await?;
+        let checked = match CheckedClaimResolver::with(&resolver, location) {
+            Ok(checked) => checked,
+            Err(ClaimResolverError::WrongChainId { .. }) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let mut unconfirmed = 0;
+        for claim in &entry.claims {
+            if !checked.is_confirmed(claim)? {
+                let Claim::Lock { opid, .. } = claim;
+                if resolver.is_expired(opid) {
+                    return Ok(false);
+                }
+                unconfirmed += 1;
+            }
+        }
+        if unconfirmed == 0 {
+            return Ok(false);
+        }
+        info!(
+            self.logger,
+            "{unconfirmed} mint lock(s) not found or not confirmed on the external chain yet, \
+             will retry"
+        );
+        Ok(true)
+    }
+
     async fn _get_reject_list_async(
         &self,
         source: &RejectListSource,
@@ -4551,6 +4617,7 @@ impl Wallet {
         self.received_consignments.remove(recipient_id);
         self.received_consignment_meta.remove(recipient_id);
         self.received_signed_txs.remove(recipient_id);
+        self.pending_mint_locks.remove(recipient_id);
     }
 
     async fn _refuse_consignment_async(
@@ -5317,6 +5384,14 @@ impl Wallet {
             })?
             .clone();
 
+        // a consignment waiting for mint locks is validated as far as it can be without them
+        if self
+            ._waiting_for_mint_locks(&recipient_id, &consignment_bytes)
+            .await?
+        {
+            return Ok(None);
+        }
+
         // a mint already checked, or found below, gets no NACK when refused
         let checked_mint = self.received_mints.contains_key(&recipient_id);
         let mut mint_known = checked_mint;
@@ -5566,6 +5641,8 @@ impl Wallet {
             build_ops_dag: true,
             ..Default::default()
         };
+        #[cfg(test)]
+        RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow_mut(|n| *n += 1);
         let mut pending = match consignment
             .clone()
             .validate_deterministic(&schema_rules, &validation_config)
@@ -5716,6 +5793,15 @@ impl Wallet {
                 if !unconfirmed.is_empty() {
                     let others_unconfirmed =
                         unconfirmed.iter().any(|opid| Some(*opid) != paying_opid);
+                    // an unchecked mint waits for the other locks first: look up only those
+                    let mut waiting_for = unconfirmed.clone();
+                    if received_mint.is_some() && !checked_mint && others_unconfirmed {
+                        info!(
+                            self.logger,
+                            "Mint not checked yet, waiting for the other mints it relies on"
+                        );
+                        waiting_for.retain(|opid| Some(*opid) != paying_opid);
+                    }
                     // check the mint once before the lock, so the user knows what to lock
                     if let Some(mint) = &received_mint
                         && let Some(claim) = &paying_claim
@@ -5818,10 +5904,26 @@ impl Wallet {
                                 )
                                 .await;
                         }
-                        self.received_mints.insert(recipient_id, mint.clone());
+                        self.received_mints
+                            .insert(recipient_id.clone(), mint.clone());
                         // a backup made before the check does not have it: mark one as required
                         self.update_backup_info(false)?;
                     }
+                    let claims: Vec<Claim> = pending
+                        .pending()
+                        .unresolved_claims()
+                        .filter(|Claim::Lock { opid, .. }| waiting_for.contains(opid))
+                        .cloned()
+                        .collect();
+                    self.pending_mint_locks.insert(
+                        recipient_id.clone(),
+                        PendingMintLocks {
+                            consignment_digest: hex::encode(sha256_digest(&consignment_bytes)),
+                            evm_chain_id: chain_id,
+                            bridge_contract: address,
+                            claims,
+                        },
+                    );
                     info!(
                         self.logger,
                         "{} mint lock(s) not found or not confirmed on the external chain yet, \
@@ -5989,12 +6091,12 @@ impl Wallet {
         // release the stock before awaiting the proxy
         drop(runtime);
 
-        // a mint has no operation on the sender proxy and its lock is final: wait for its TX
+        // a mint has no operation on the sender proxy: wait for the minter to broadcast its TX
         if is_mint {
             let mut updated_transfer: DbTransferActMod = transfer.clone().into();
             updated_transfer.ack = ActiveValue::Set(Some(true));
             self.database.update_transfer(&mut updated_transfer)?;
-            updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+            updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingBroadcast);
             return Ok(Some(
                 self.database
                     .update_batch_transfer(updated_batch_transfer)?,
@@ -6637,6 +6739,45 @@ impl Wallet {
         }
     }
 
+    /// Whether another confirmed TX spends an input of the TX of the mint that the given transfer
+    /// receives, so that the TX can never confirm.
+    async fn _received_mint_tx_inputs_spent_elsewhere(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+        recipient_id: &str,
+    ) -> Result<bool, Error> {
+        let txid = batch_transfer
+            .txid
+            .as_deref()
+            .expect("an accepted receive has a TXID");
+        let Some(bytes) = self.received_consignments.get(recipient_id) else {
+            return Ok(false);
+        };
+        let consignment = RgbTransfer::load(&bytes[..]).map_err(InternalError::from)?;
+        let Some(witness_bundle) = consignment
+            .bundles
+            .iter()
+            .find(|wb| wb.witness_id().to_string() == txid)
+        else {
+            return Ok(false);
+        };
+        for input in &witness_bundle.tx.input {
+            if self
+                .indexer()
+                .output_spent_on_chain(&input.previous_output)
+                .await?
+            {
+                // the mint TX itself spends it if it is confirmed meanwhile
+                return Ok(self
+                    .indexer()
+                    .get_tx_confirmations(txid)
+                    .await?
+                    .is_none_or(|c| c == 0));
+            }
+        }
+        Ok(false)
+    }
+
     /// A proxy recipient that has ACKed polls the sender proxy until the signed TX is released,
     /// then decrypts and broadcasts it.
     async fn _wait_broadcast_async(
@@ -6649,6 +6790,26 @@ impl Wallet {
         let batch_transfer_data =
             batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
         let (_, transfer) = self.database.get_incoming_transfer(&batch_transfer_data)?;
+
+        if self._is_mint(batch_transfer, db_data)? {
+            let recipient_id = transfer
+                .recipient_id
+                .as_deref()
+                .expect("transfer should have a recipient ID");
+            if self
+                ._received_mint_tx_inputs_spent_elsewhere(batch_transfer, recipient_id)
+                .await?
+            {
+                info!(
+                    self.logger,
+                    "An input of the mint TX has been spent by another confirmed transaction, \
+                     failing the transfer"
+                );
+                return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
+            }
+            debug!(self.logger, "Waiting for the minter to broadcast");
+            return Ok(None);
+        }
 
         // sender proxy endpoint (where the signed TX is released); without one there is nothing
         // to ask for the TX, the sender broadcasts it and wait_confirmations detects it on-chain
@@ -10452,7 +10613,9 @@ mod separate_signer_tests {
 mod send_end_tests {
     use super::*;
     use crate::no_wallet::recipient_id_from_script_buf;
-    use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, make_test_wallet};
+    use crate::wallet::offline::address_reuse_tests::{
+        assert_no_partial_change, make_test_wallet, pending_mint_locks,
+    };
     use strict_encoding::StrictDumb;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
@@ -11773,6 +11936,38 @@ mod send_end_tests {
                 details: s!("indexer reported a transaction height greater than the chain tip")
             })
         );
+    }
+
+    #[test]
+    fn output_spent_on_chain_needs_a_confirmed_spend() {
+        let txid = "22".repeat(32);
+        let spent_on_chain = |body: &'static str| {
+            let path = format!("/tx/{txid}/outspend/1");
+            let url = fake_esplora(move |p: &str| {
+                if p == path {
+                    ("200 OK", body.as_bytes().to_vec())
+                } else {
+                    ("404 Not Found", vec![])
+                }
+            });
+            let outpoint = BdkOutPoint {
+                txid: Txid::from_str(&txid).unwrap(),
+                vout: 1,
+            };
+            block_on(
+                crate::utils::build_indexer(&url)
+                    .unwrap()
+                    .output_spent_on_chain(&outpoint),
+            )
+            .unwrap()
+        };
+        assert!(spent_on_chain(
+            r#"{"spent":true,"txid":"2222222222222222222222222222222222222222222222222222222222222222","vin":0,"status":{"confirmed":true,"block_height":95,"block_hash":"0000000000000000000000000000000000000000000000000000000000000000","block_time":1600000000}}"#
+        ));
+        assert!(!spent_on_chain(
+            r#"{"spent":true,"txid":"2222222222222222222222222222222222222222222222222222222222222222","vin":0,"status":{"confirmed":false}}"#
+        ));
+        assert!(!spent_on_chain(r#"{"spent":false}"#));
     }
 
     #[test]
@@ -13625,6 +13820,9 @@ mod send_end_tests {
         wallet
             .received_signed_txs
             .insert(rid.clone(), raw_tx(&dummy_psbt().0));
+        wallet
+            .pending_mint_locks
+            .insert(rid.clone(), pending_mint_locks());
         let txid = apply_tx_paying(&mut wallet, &[script]);
         let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
         let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
@@ -13633,6 +13831,7 @@ mod send_end_tests {
                 w.received_consignments.contains_key(&rid),
                 w.received_consignment_meta.contains_key(&rid),
                 w.received_signed_txs.contains_key(&rid),
+                w.pending_mint_locks.contains_key(&rid),
             ]
         };
 
@@ -13643,11 +13842,11 @@ mod send_end_tests {
             0,
             async |w| w.refresh(online.clone(), None, vec![], true).await,
         ));
-        assert_eq!(kept(&wallet), [true; 3]);
+        assert_eq!(kept(&wallet), [true; 4]);
         let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
 
         assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
-        assert_eq!(kept(&wallet), [false; 3]);
+        assert_eq!(kept(&wallet), [false; 4]);
         assert!(!pending_witness(&wallet, paid_txo));
         assert!(pending_witness(&wallet, unrelated_txo));
     }

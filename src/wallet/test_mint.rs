@@ -9,7 +9,9 @@ use crate::no_wallet::{
     TransitionMetadata, inspect_consignment,
 };
 use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, state};
-use crate::wallet::online::{MOCK_MINT_KEPT_AMOUNT, paying_mint_opid, unsupported_claims};
+use crate::wallet::online::{
+    MOCK_MINT_KEPT_AMOUNT, RECEIVED_CONSIGNMENT_VALIDATIONS, paying_mint_opid, unsupported_claims,
+};
 use crate::wallet::rust_only::validate_consignment_offchain;
 use crate::wallet::{
     AssetFilter, Balance, MintBeginResult, Online, OnlineOptions, OperationResult, ReceiveData,
@@ -20,7 +22,8 @@ use crate::{
     TransferKind, TransferStatus, TypeOfTransition, ValidationConfig, script_buf_from_recipient_id,
 };
 use amplify::ByteArray;
-use bdk_wallet::bitcoin::Psbt;
+use bdk_wallet::KeychainKind;
+use bdk_wallet::bitcoin::{FeeRate, Psbt};
 use rgbstd::containers::LockId;
 use rgbstd::{OpId, Opout, Txid as RgbTxid};
 use serde_json::json;
@@ -1744,6 +1747,153 @@ async fn bfa_mint_is_atomic() {
         mint_end(w, &a_online, &res).await
     })
     .await;
+}
+
+#[wasm_bindgen_test]
+async fn bfa_mint_retry_looks_up_lock() {
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(2, 1, None).await;
+    let validations = || RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow(|n| *n);
+    let rcv = mint_rcv(&mut b, &b_online).await;
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&rcv, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+
+    // checking the mint validates its consignment and saves the locks it waits for
+    let v0 = validations();
+    refresh(&mut b, &b_online).await;
+    assert!(
+        b.get_received_mint(rcv.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+    assert_eq!(validations(), v0 + 1);
+    assert!(
+        Wallet::restore(b.get_wallet_data())
+            .await
+            .unwrap()
+            .pending_mint_locks
+            .contains_key(&rcv.recipient_id)
+    );
+
+    // a saved entry for other consignment bytes is not used: the consignment is validated again
+    let digest = b.pending_mint_locks[&rcv.recipient_id]
+        .consignment_digest
+        .clone();
+    b.pending_mint_locks
+        .get_mut(&rcv.recipient_id)
+        .unwrap()
+        .consignment_digest = "00".repeat(32);
+    refresh(&mut b, &b_online).await;
+    assert_eq!(validations(), v0 + 2);
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+    assert_eq!(
+        b.pending_mint_locks[&rcv.recipient_id].consignment_digest,
+        digest
+    );
+
+    // until its lock is finalized, a refresh only looks the lock up
+    refresh(&mut b, &b_online).await;
+    record_lock(
+        &bridge,
+        &mint_lock_id(&res),
+        MINT_AMOUNT,
+        evm_block_number().await,
+    )
+    .await;
+    refresh(&mut b, &b_online).await;
+    assert_eq!(validations(), v0 + 2);
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingCounterparty
+    );
+
+    // once it is, the consignment is validated again and accepted
+    finalize_evm().await;
+    refresh(&mut b, &b_online).await;
+    assert_eq!(validations(), v0 + 3);
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingBroadcast
+    );
+    mint_end(&mut a, &a_online, &res).await.unwrap();
+    let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+}
+
+#[wasm_bindgen_test]
+async fn bfa_mint_tx_inputs_spent() {
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(2, 1, None).await;
+    let rcv = mint_rcv(&mut b, &b_online).await;
+    let res = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&rcv, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    refresh(&mut b, &b_online).await;
+    lock_mint(&bridge, &res, MINT_AMOUNT).await;
+    refresh(&mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingBroadcast
+    );
+
+    // while the mint TX can still be broadcast, the receive waits for it
+    refresh(&mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::WaitingBroadcast
+    );
+    let result = b
+        .fail_transfers(b_online.clone(), Some(rcv.batch_transfer_idx), false, false)
+        .await;
+    assert!(
+        matches!(result, Err(Error::CannotFailBatchTransfer)),
+        "{result:?}"
+    );
+
+    // the minter spends an input of the mint TX elsewhere
+    let outpoint = Psbt::from_str(&res.psbt).unwrap().unsigned_tx.input[0].previous_output;
+    let script = a
+        .bdk_wallet
+        .peek_address(KeychainKind::External, 0)
+        .script_pubkey();
+    let mut builder = a.bdk_wallet.build_tx();
+    builder
+        .add_utxo(outpoint)
+        .unwrap()
+        .manually_selected_only()
+        .drain_to(script)
+        .fee_rate(FeeRate::from_sat_per_vb_u32(1));
+    let psbt = builder.finish().unwrap();
+    let signed = a.sign_psbt(psbt.to_string(), None).unwrap();
+    let tx = Psbt::from_str(&signed).unwrap().extract_tx().unwrap();
+    a.indexer().broadcast(&tx).await.unwrap();
+
+    // a confirmed spend fails it
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    refresh(&mut b, &b_online).await;
+    assert_eq!(
+        transfer_status(&mut b, &rcv.recipient_id),
+        TransferStatus::Failed
+    );
 }
 
 #[wasm_bindgen_test]
