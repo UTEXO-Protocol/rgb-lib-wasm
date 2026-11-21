@@ -474,7 +474,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: skip, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {} });
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: skip, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         showResult('online-output', 'online-result',
           'Online! Stored for subsequent operations.\n\n' + json(state.online));
         enableBtns(onlineBtns);
@@ -489,7 +489,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       if (!requireOnline('online-output', 'online-result')) return;
       try {
         log('Syncing...', 'log-warn');
-        await state.wallet.sync(state.online);
+        await state.wallet.sync(state.online, { keychain: 'Colored', strategy: 'FastSync' });
+        await state.wallet.sync(state.online, { keychain: { Vanilla: { lookback: 20 } }, strategy: 'FastSync' });
         showResult('online-output', 'online-result', 'Sync completed successfully.');
         log('Sync complete', 'log-ok');
       } catch (e) {
@@ -518,9 +519,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         log('Mined to height ' + mineResult.height, 'log-info');
 
         log('Syncing wallet...', 'log-warn');
-        await state.wallet.sync(state.online);
+        await state.wallet.sync(state.online, { keychain: 'Colored', strategy: 'FastSync' });
+        await state.wallet.sync(state.online, { keychain: { Vanilla: { lookback: 20 } }, strategy: 'FastSync' });
 
-        const balance = state.wallet.getBtcBalance();
+        const balance = await state.wallet.getBtcBalance(state.online, false);
         showResult('utxo-output', 'utxo-result',
           'Funded ' + address + ' with ' + amount + ' BTC\n' +
           'Mine height: ' + mineResult.height + '\n\n' +
@@ -636,10 +638,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     // 5. Wallet State
     // =================================================================
 
-    document.getElementById('btn-btc-balance').addEventListener('click', () => {
+    document.getElementById('btn-btc-balance').addEventListener('click', async () => {
       if (!requireWallet('state-output', 'state-result')) return;
       try {
-        const balance = state.wallet.getBtcBalance();
+        const balance = await state.wallet.getBtcBalance(state.online, !state.online);
         showJson('state-output', 'state-result', balance);
         log('BTC balance: ' + json(balance), 'log-ok');
       } catch (e) {
@@ -672,10 +674,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       }
     });
 
-    document.getElementById('btn-list-unspents').addEventListener('click', () => {
+    document.getElementById('btn-list-unspents').addEventListener('click', async () => {
       if (!requireWallet('state-output', 'state-result')) return;
       try {
-        const unspents = state.wallet.listUnspents(false);
+        const unspents = await state.wallet.listUnspents(state.online, false, !state.online);
         showJson('state-output', 'state-result', unspents);
         log('listUnspents OK', 'log-ok');
       } catch (e) {
@@ -684,10 +686,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       }
     });
 
-    document.getElementById('btn-list-transactions').addEventListener('click', () => {
+    document.getElementById('btn-list-transactions').addEventListener('click', async () => {
       if (!requireWallet('state-output', 'state-result')) return;
       try {
-        const txs = state.wallet.listTransactions(false);
+        const txs = await state.wallet.listTransactions(state.online, !state.online);
         showJson('state-output', 'state-result', txs);
         log('listTransactions OK', 'log-ok');
       } catch (e) {

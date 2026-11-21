@@ -518,14 +518,15 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
 // Esplora sends `cache-control: max-age`, so the browser can serve stale chain data.
 // The client cannot set the fetch cache mode or a timeout on wasm32.
 // This wrapper sets `no-store` and a timeout on indexer requests. It compares normalized URLs.
+// If other code replaces fetch, the next call wraps fetch again, so the wrapper stays outermost.
 #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 export function no_store_fetch(base, timeout_ms) {
     const g = globalThis;
-    if (!g.__rgbLibNoStoreUrls) {
-        g.__rgbLibNoStoreUrls = new Map();
+    if (!g.__rgbLibNoStoreUrls) g.__rgbLibNoStoreUrls = new Map();
+    if (g.fetch !== g.__rgbLibNoStoreFetch) {
         const fetch = g.fetch;
-        g.fetch = function (input, init) {
+        g.fetch = g.__rgbLibNoStoreFetch = function (input, init) {
             const m = input instanceof Request && [...g.__rgbLibNoStoreUrls].find(([p]) => input.url.startsWith(p));
             if (m) {
                 const signal = AbortSignal.any([input.signal, AbortSignal.timeout(m[1])]);

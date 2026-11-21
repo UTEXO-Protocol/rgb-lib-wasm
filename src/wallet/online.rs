@@ -1391,6 +1391,41 @@ impl Indexer {
     }
 }
 
+/// Which keychain contributes SPKs to the sync request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncKeychain {
+    /// Sync the colored keychain
+    Colored,
+    /// Sync the vanilla keychain
+    Vanilla {
+        /// Number of addresses preceding the lookback anchor (last used or, if none, last
+        /// revealed) to scan
+        lookback: u32,
+    },
+}
+
+/// Strategy used to build the indexer sync request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncStrategy {
+    /// BIP44 stop-gap full scan
+    FullScan,
+    /// Sync all revealed SPKs
+    FullSync,
+    /// Sync only SPKs we strictly need to observe:
+    /// - colored: SPKs used in pending transfers or unconfirmed transactions
+    /// - vanilla: a tail of recently revealed SPKs
+    FastSync,
+}
+
+/// Options driving a single sync invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOptions {
+    /// Which keychain to sync
+    pub keychain: SyncKeychain,
+    /// Sync strategy
+    pub strategy: SyncStrategy,
+}
+
 /// Options for the [`Wallet::go_online`] method.
 #[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -1425,6 +1460,9 @@ pub struct OnlineOptions {
     /// Only used when the wallet supports the [`AssetSchema::Bfa`] schema.
     #[serde(default, deserialize_with = "deserialize_evm_chains")]
     pub evm_chains: HashMap<u64, EvmChain>,
+    /// Number of addresses before the last used (or last revealed if none) address to sync when
+    /// doing an automatic FastSync for the vanilla keychain
+    pub vanilla_sync_lookback: u32,
 }
 
 impl std::fmt::Debug for OnlineOptions {
@@ -1438,6 +1476,7 @@ impl std::fmt::Debug for OnlineOptions {
             )
             .field("proxy_auth_keys", &self.proxy_auth_keys.keys())
             .field("evm_chains", &self.evm_chains)
+            .field("vanilla_sync_lookback", &self.vanilla_sync_lookback)
             .finish()
     }
 }
@@ -1528,6 +1567,7 @@ pub(crate) struct OnlineData {
     pub(crate) failed_witness_receive_grace_secs: u32,
     // EVM chains by chain ID, checked when going online
     evm_chains: HashMap<u64, EvmChain>,
+    pub(crate) vanilla_sync_lookback: u32,
 }
 
 impl OnlineData {
@@ -1554,6 +1594,7 @@ impl OnlineData {
             proxy_auth_keys: HashMap::new(),
             failed_witness_receive_grace_secs: 604_800,
             evm_chains: HashMap::new(),
+            vanilla_sync_lookback: 20,
         }
     }
 }
@@ -1619,6 +1660,10 @@ impl TryFrom<TransferStatus> for RefreshTransferStatus {
 }
 
 impl Wallet {
+    pub(crate) fn vanilla_sync_lookback(&self) -> u32 {
+        self.online_data.as_ref().unwrap().vanilla_sync_lookback
+    }
+
     pub(crate) fn indexer(&self) -> &Indexer {
         &self.online_data.as_ref().unwrap().indexer
     }
@@ -3051,6 +3096,7 @@ impl Wallet {
             proxy_auth_keys,
             failed_witness_receive_grace_secs: online_options.failed_witness_receive_grace_secs,
             evm_chains: HashMap::new(),
+            vanilla_sync_lookback: online_options.vanilla_sync_lookback,
         };
         Ok((online, online_data))
     }
@@ -3115,11 +3161,13 @@ impl Wallet {
                     failed_witness_receive_grace_secs,
                     proxy_auth_keys,
                     evm_chains: _, // set below
+                    vanilla_sync_lookback,
                 } = &online_options;
                 let proxy_auth_keys = parse_proxy_auth_keys(proxy_auth_keys)?;
                 let online_data = self.online_data.as_mut().unwrap();
                 online_data.proxy_auth_keys = proxy_auth_keys;
                 online_data.failed_witness_receive_grace_secs = *failed_witness_receive_grace_secs;
+                online_data.vanilla_sync_lookback = *vanilla_sync_lookback;
                 online
             }
         } else {
@@ -3156,7 +3204,24 @@ impl Wallet {
             });
         }
         // unspent DB TXOs must be in BDK's unspent list after a full scan
-        self.sync_db_txos(true).await?;
+        self.sync_wallet(
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FullScan,
+            },
+            false,
+        )
+        .await?;
+        self.sync_wallet(
+            SyncOptions {
+                keychain: SyncKeychain::Vanilla {
+                    lookback: self.vanilla_sync_lookback(),
+                },
+                strategy: SyncStrategy::FullScan,
+            },
+            false,
+        )
+        .await?;
         let bdk_utxos: HashSet<String> = self
             .bdk_wallet
             .list_unspent()
@@ -3223,18 +3288,110 @@ impl Wallet {
         Ok(())
     }
 
-    pub(crate) async fn sync_db_txos(&mut self, full_scan: bool) -> Result<(), Error> {
-        debug!(self.logger, "Syncing TXOs...");
+    fn fast_sync_vanilla_spks(&self, lookback: u32) -> HashSet<ScriptBuf> {
+        let spk_index = self.bdk_wallet.spk_index();
+        let Some(last_revealed) = spk_index.last_revealed_index(KeychainKind::Internal) else {
+            return HashSet::new();
+        };
+        let lookback_anchor = spk_index
+            .last_used_index(KeychainKind::Internal)
+            .unwrap_or(last_revealed);
+        let start = lookback_anchor.saturating_sub(lookback);
+        spk_index
+            .revealed_keychain_spks(KeychainKind::Internal)
+            .filter(|(i, _)| *i >= start && *i <= last_revealed)
+            .map(|(_, spk)| spk)
+            .collect()
+    }
 
-        // Use js_sys::Date::now() for WASM-compatible timestamp
-        // (std::time::UNIX_EPOCH.elapsed() panics on wasm32-unknown-unknown)
-        let start_time = (js_sys::Date::now() / 1000.0) as u64;
-        let update: Update = if full_scan {
-            let request = self.bdk_wallet.start_full_scan_at(start_time);
-            self.indexer().full_scan(request).await?.into()
+    fn unconfirmed_colored_spks(&self) -> HashSet<ScriptBuf> {
+        let spk_index = self.bdk_wallet.spk_index();
+        let mut spks: HashSet<ScriptBuf> = HashSet::new();
+        for tx in self
+            .bdk_wallet
+            .transactions()
+            .filter(|tx| matches!(tx.chain_position, ChainPosition::Unconfirmed { .. }))
+        {
+            // one input is enough for the indexer to return the TX info
+            for input in tx.tx_node.tx.input.iter() {
+                if let Some(((kc, _), txout)) = spk_index.txout(input.previous_output)
+                    && kc == KeychainKind::External
+                {
+                    spks.insert(txout.script_pubkey.clone());
+                    break;
+                }
+            }
+        }
+        spks
+    }
+
+    /// FastSync one keychain: the colored one if `colored`, else the vanilla one.
+    pub(crate) async fn fast_sync(&mut self, colored: bool) -> Result<(), Error> {
+        let keychain = if colored {
+            SyncKeychain::Colored
         } else {
-            let request = self.bdk_wallet.start_sync_with_revealed_spks_at(start_time);
-            self.indexer().sync(request).await?.into()
+            SyncKeychain::Vanilla {
+                lookback: self.vanilla_sync_lookback(),
+            }
+        };
+        let strategy = SyncStrategy::FastSync;
+        self.sync_wallet(SyncOptions { keychain, strategy }, false)
+            .await
+    }
+
+    pub(crate) async fn sync_wallet(
+        &mut self,
+        options: SyncOptions,
+        include_spent: bool,
+    ) -> Result<(), Error> {
+        debug!(self.logger, "Syncing {:?}...", options);
+
+        let pending_witness_scripts = match options.keychain {
+            SyncKeychain::Colored => self._reconcile_pending_witness()?,
+            SyncKeychain::Vanilla { .. } => HashMap::new(),
+        };
+        let kc = match options.keychain {
+            SyncKeychain::Colored => KeychainKind::External,
+            SyncKeychain::Vanilla { .. } => KeychainKind::Internal,
+        };
+        // the request builders without a time read std::time, which panics on wasm32
+        let start_time = now().unix_timestamp() as u64;
+        let latest_checkpoint = self.bdk_wallet.latest_checkpoint();
+        let update: Update = match options.strategy {
+            SyncStrategy::FullScan => {
+                let mut iters = self.bdk_wallet.spk_index().all_unbounded_spk_iters();
+                let iter = iters.remove(&kc).expect("keychain must exist");
+                let request = FullScanRequest::builder_at(start_time)
+                    .chain_tip(latest_checkpoint)
+                    .spks_for_keychain(kc, iter);
+                self.indexer().full_scan(request).await?.into()
+            }
+            SyncStrategy::FullSync => {
+                let spks: Vec<ScriptBuf> = self
+                    .bdk_wallet
+                    .spk_index()
+                    .revealed_keychain_spks(kc)
+                    .map(|(_, spk)| spk)
+                    .collect();
+                let request = SyncRequest::builder_at(start_time)
+                    .chain_tip(latest_checkpoint)
+                    .spks(spks);
+                self.indexer().sync(request).await?.into()
+            }
+            SyncStrategy::FastSync => {
+                let spks: HashSet<ScriptBuf> = match options.keychain {
+                    SyncKeychain::Colored => pending_witness_scripts
+                        .keys()
+                        .map(|s| ScriptBuf::from_hex(s).expect("valid script"))
+                        .chain(self.unconfirmed_colored_spks())
+                        .collect(),
+                    SyncKeychain::Vanilla { lookback } => self.fast_sync_vanilla_spks(lookback),
+                };
+                let request = SyncRequest::builder_at(start_time)
+                    .chain_tip(latest_checkpoint)
+                    .spks(spks);
+                self.indexer().sync(request).await?.into()
+            }
         };
         self.bdk_wallet
             .apply_update(update)
@@ -3243,27 +3400,31 @@ impl Wallet {
             })?;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
 
-        let pending_witness_scripts = self._reconcile_pending_witness()?;
-        self._update_db_colored_txos_from_bdk(&pending_witness_scripts)?;
+        if matches!(options.keychain, SyncKeychain::Colored) {
+            self.update_db_colored_txos_from_bdk(include_spent, &pending_witness_scripts)?;
+        }
 
-        debug!(self.logger, "Synced TXOs");
-
+        debug!(self.logger, "Synced");
         Ok(())
     }
 
-    fn _update_db_colored_txos_from_bdk(
+    fn update_db_colored_txos_from_bdk(
         &self,
+        include_spent: bool,
         pending_witness_scripts: &HashMap<String, bool>,
     ) -> Result<(), Error> {
         let db_txos = self.database.iter_txos()?;
 
         let db_outpoints: HashSet<String> = db_txos
-            .clone()
             .into_iter()
-            .filter(|t| !t.spent && t.exists)
+            .filter(|t| t.exists && (include_spent || !t.spent))
             .map(|u| u.outpoint().to_string())
             .collect();
-        let bdk_utxos = self.bdk_wallet.list_unspent();
+        let bdk_utxos: Box<dyn Iterator<Item = LocalOutput>> = if include_spent {
+            Box::new(self.bdk_wallet.list_output())
+        } else {
+            Box::new(self.bdk_wallet.list_unspent())
+        };
         let external_bdk_utxos: Vec<LocalOutput> = bdk_utxos
             .filter(|u| u.keychain == KeychainKind::External)
             .collect();
@@ -3287,39 +3448,40 @@ impl Wallet {
         Ok(())
     }
 
-    /// Incrementally sync the wallet and save new RGB UTXOs to the DB (wasm32 async).
-    ///
-    /// Re-queries only already-revealed SPKs. To rediscover UTXOs for unrevealed SPKs (e.g. a thin
-    /// restored state) use [`Wallet::full_scan`].
-    pub async fn sync(&mut self, online: Online) -> Result<(), Error> {
+    /// Sync one keychain with the given [`SyncOptions`] and save new colored UTXOs to the DB.
+    /// Call it once per keychain to sync both.
+    pub async fn sync(&mut self, online: Online, options: SyncOptions) -> Result<(), Error> {
         let cp = self.checkpoint("sync");
-        let res = self._sync(online).await;
+        let res = self._sync(online, options).await;
         self.commit(cp, res, |_| false).await
     }
 
-    async fn _sync(&mut self, online: Online) -> Result<(), Error> {
+    /// Sync all revealed scripts of both keychains.
+    #[cfg(test)]
+    pub(crate) async fn full_sync(&mut self, online: Online) -> Result<(), Error> {
+        self.sync(
+            online.clone(),
+            SyncOptions {
+                keychain: SyncKeychain::Colored,
+                strategy: SyncStrategy::FullSync,
+            },
+        )
+        .await?;
+        self.sync(
+            online,
+            SyncOptions {
+                keychain: SyncKeychain::Vanilla { lookback: 20 },
+                strategy: SyncStrategy::FullSync,
+            },
+        )
+        .await
+    }
+
+    async fn _sync(&mut self, online: Online, options: SyncOptions) -> Result<(), Error> {
         info!(self.logger, "Syncing...");
         self.check_online(online)?;
-        self.sync_db_txos(false).await?;
+        self.sync_wallet(options, false).await?;
         info!(self.logger, "Sync completed");
-        Ok(())
-    }
-
-    /// Run a BIP44 stop-gap full scan and save new RGB UTXOs to the DB (wasm32 async).
-    ///
-    /// Derives and queries SPKs up to the indexer stop-gap, rebuilding a thin BDK state (no
-    /// revealed SPKs) from the indexer when an incremental [`Wallet::sync`] cannot.
-    pub async fn full_scan(&mut self, online: Online) -> Result<(), Error> {
-        let cp = self.checkpoint("full_scan");
-        let res = self._full_scan(online).await;
-        self.commit(cp, res, |_| false).await
-    }
-
-    async fn _full_scan(&mut self, online: Online) -> Result<(), Error> {
-        info!(self.logger, "Full scanning...");
-        self.check_online(online)?;
-        self.sync_db_txos(true).await?;
-        info!(self.logger, "Full scan completed");
         Ok(())
     }
 
@@ -3351,20 +3513,12 @@ impl Wallet {
         }
     }
 
-    async fn _broadcast_psbt(
-        &mut self,
-        signed_psbt: Psbt,
-        skip_sync: bool,
-    ) -> Result<BdkTransaction, Error> {
+    async fn _broadcast_psbt(&mut self, signed_psbt: Psbt) -> Result<BdkTransaction, Error> {
         let tx = signed_psbt.extract_tx().map_err(InternalError::from)?;
-        self._broadcast_signed_tx(tx, skip_sync).await
+        self._broadcast_signed_tx(tx).await
     }
 
-    async fn _broadcast_signed_tx(
-        &mut self,
-        tx: BdkTransaction,
-        skip_sync: bool,
-    ) -> Result<BdkTransaction, Error> {
+    async fn _broadcast_signed_tx(&mut self, tx: BdkTransaction) -> Result<BdkTransaction, Error> {
         let tx = self._broadcast_tx(tx).await?;
         self.broadcast_txs.push(tx.clone());
         fault_point("after_broadcast")?;
@@ -3392,14 +3546,7 @@ impl Wallet {
             self.database.update_txo(db_txo)?;
         }
 
-        if !skip_sync {
-            self.sync_db_txos(false).await?;
-        }
-
-        // Keep the transaction in BDK's graph after the optional sync. Esplora may not have
-        // indexed a freshly broadcast transaction yet and can mark it evicted during that sync,
-        // leaving rgb-lib's TXO database aware of its outputs while BDK cannot later use them
-        // as PSBT inputs.
+        // Apply the broadcast TX to BDK so its outputs are visible without a sync.
         // Esplora's sync uses second-resolution timestamps for evictions. Advance the local
         // observation by one second so a same-second "not indexed yet" eviction cannot make the
         // transaction non-canonical.
@@ -3407,6 +3554,10 @@ impl Wallet {
         self.bdk_wallet
             .apply_unconfirmed_txs([(tx.clone(), last_seen)]);
         self.bdk_wallet.persist(&mut self.bdk_database)?;
+
+        // Register the new colored outputs (e.g. the change) in the DB.
+        let pending_witness_scripts = self._reconcile_pending_witness()?;
+        self.update_db_colored_txos_from_bdk(false, &pending_witness_scripts)?;
 
         Ok(tx)
     }
@@ -3459,9 +3610,7 @@ impl Wallet {
     ) -> Result<BdkTransaction, Error> {
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
         self._check_vanilla_end(&signed_psbt, r#type)?;
-        let tx = self._broadcast_psbt(signed_psbt, true).await?;
-        let pending_witness_scripts = self._reconcile_pending_witness()?;
-        self._update_db_colored_txos_from_bdk(&pending_witness_scripts)?;
+        let tx = self._broadcast_psbt(signed_psbt).await?;
         let txid = tx.compute_txid().to_string();
         if let Some(existing) = self.database.get_wallet_transaction_by_txid(&txid)? {
             self.database
@@ -3547,7 +3696,7 @@ impl Wallet {
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
         if !skip_sync {
-            self.sync_db_txos(false).await?;
+            self.fast_sync(false).await?;
         }
 
         let unspent_txos = self.database.get_unspent_txos(vec![])?;
@@ -6358,7 +6507,6 @@ impl Wallet {
         &mut self,
         batch_transfer: &DbBatchTransfer,
         db_data: &mut DbData,
-        skip_sync: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger, "Waiting ACK...");
 
@@ -6425,7 +6573,6 @@ impl Wallet {
                     batch_transfer,
                     "the sender proxy no longer knows the operation",
                     Error::OperationNotFound,
-                    skip_sync,
                 )
                 .await
                 .map(Some);
@@ -6492,7 +6639,6 @@ impl Wallet {
                             batch_transfer,
                             "the sender proxy serves an invalid ACK signature",
                             Error::InvalidContentSignature,
-                            skip_sync,
                         )
                         .await
                         .map(Some);
@@ -6512,7 +6658,7 @@ impl Wallet {
             .asset_transfers_data
             .iter()
             .for_each(|atd| batch_transfer_transfers.extend(atd.transfers.clone()));
-        self.try_complete_batch(batch_transfer, &batch_transfer_transfers, skip_sync)
+        self.try_complete_batch(batch_transfer, &batch_transfer_transfers)
             .await
     }
 
@@ -6520,7 +6666,6 @@ impl Wallet {
         &mut self,
         batch_transfer: &DbBatchTransfer,
         transfers: &[DbTransfer],
-        skip_sync: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         if transfers.iter().any(|t| t.ack == Some(false)) {
             return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
@@ -6547,10 +6692,7 @@ impl Wallet {
             return Ok(Some(self._fail_batch_transfer(batch_transfer)?));
         }
         if released && Self::any_invoice_expired(transfers, now) {
-            if let Some(updated) = self
-                .complete_batch_if_tx_on_chain(batch_transfer, skip_sync)
-                .await?
-            {
+            if let Some(updated) = self.complete_batch_if_tx_on_chain(batch_transfer).await? {
                 return Ok(Some(updated));
             }
             // the TX can never confirm once one of its inputs has been spent by another confirmed
@@ -6568,7 +6710,7 @@ impl Wallet {
             );
             return Ok(None);
         }
-        Ok(Some(self.broadcast_batch(batch_transfer, skip_sync).await?))
+        Ok(Some(self.broadcast_batch(batch_transfer).await?))
     }
 
     /// Whether the invoice expiration of any recipient has passed, accounting for the clock skew
@@ -6614,7 +6756,6 @@ impl Wallet {
     async fn broadcast_batch(
         &mut self,
         batch_transfer: &DbBatchTransfer,
-        skip_sync: bool,
     ) -> Result<DbBatchTransfer, Error> {
         let txid = batch_transfer
             .txid
@@ -6634,7 +6775,7 @@ impl Wallet {
         let signed_tx = decode_signed_tx(signed_tx)?;
         let fascia = self.transfer_artifacts[txid].fascia()?;
         let mut runtime = self.rgb_runtime()?;
-        self._broadcast_signed_tx(signed_tx, skip_sync).await?;
+        self._broadcast_signed_tx(signed_tx).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
         self.transfer_artifacts.remove(txid);
@@ -6658,12 +6799,8 @@ impl Wallet {
         batch_transfer: &DbBatchTransfer,
         reason: &str,
         waiting_error: Error,
-        skip_sync: bool,
     ) -> Result<DbBatchTransfer, Error> {
-        if let Some(updated) = self
-            .complete_batch_if_tx_on_chain(batch_transfer, skip_sync)
-            .await?
-        {
+        if let Some(updated) = self.complete_batch_if_tx_on_chain(batch_transfer).await? {
             return Ok(updated);
         }
         if !broadcast_deadline_passed_beyond_skew_margin(batch_transfer) {
@@ -6682,7 +6819,6 @@ impl Wallet {
     async fn complete_batch_if_tx_on_chain(
         &mut self,
         batch_transfer: &DbBatchTransfer,
-        skip_sync: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         let Some(txid) = &batch_transfer.txid else {
             return Ok(None);
@@ -6694,7 +6830,7 @@ impl Wallet {
             self.logger,
             "TX of a transfer waiting for the counterparty found on-chain"
         );
-        Ok(Some(self.broadcast_batch(batch_transfer, skip_sync).await?))
+        Ok(Some(self.broadcast_batch(batch_transfer).await?))
     }
 
     async fn _wait_confirmations_async(
@@ -6775,7 +6911,7 @@ impl Wallet {
 
             if let Some(RecipientTypeFull::Witness { vout }) = transfer.recipient_type {
                 if !skip_sync {
-                    self.sync_db_txos(false).await?;
+                    self.fast_sync(true).await?;
                 }
                 let outpoint = Outpoint {
                     txid: txid.clone(),
@@ -6880,12 +7016,11 @@ impl Wallet {
         transfer: &DbBatchTransfer,
         db_data: &mut DbData,
         incoming: bool,
-        skip_sync: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         if incoming {
             self._wait_consignment_async(transfer, db_data).await
         } else {
-            self._wait_ack_async(transfer, db_data, skip_sync).await
+            self._wait_ack_async(transfer, db_data).await
         }
     }
 
@@ -7197,7 +7332,7 @@ impl Wallet {
         }
         match transfer.status {
             TransferStatus::WaitingCounterparty => {
-                self._wait_counterparty_async(transfer, db_data, incoming, skip_sync)
+                self._wait_counterparty_async(transfer, db_data, incoming)
                     .await
             }
             TransferStatus::WaitingSafeHeight => {
@@ -7607,7 +7742,7 @@ impl Wallet {
         if !incoming
             && batch_transfer.status == TransferStatus::WaitingCounterparty
             && self
-                .complete_batch_if_tx_on_chain(batch_transfer, true)
+                .complete_batch_if_tx_on_chain(batch_transfer)
                 .await?
                 .is_some()
         {
@@ -7729,7 +7864,7 @@ impl Wallet {
         skip_sync: bool,
     ) -> Result<bool, Error> {
         if !skip_sync {
-            self.sync_db_txos(false).await?;
+            self.fast_sync(true).await?;
         }
 
         let mut db_data = self.database.get_db_data(false)?;
@@ -8505,17 +8640,18 @@ impl Wallet {
     /// Complete the send operation (wasm32 async).
     ///
     /// See native [`send_end`](Wallet::send_end) for full documentation.
+    ///
+    /// The wallet does not sync: it applies the broadcast TX locally.
     pub async fn send_end(
         &mut self,
         online: Online,
         signed_psbt: String,
-        skip_sync: bool,
     ) -> Result<OperationResult, Error> {
         let cp = self.checkpoint("send_end");
         let txid = Psbt::from_str(&signed_psbt)
             .map(|psbt| psbt.unsigned_tx.compute_txid().to_string())
             .ok();
-        let res = self._send_end(online, signed_psbt, skip_sync).await;
+        let res = self._send_end(online, signed_psbt).await;
         // keep the consignments and used flags. A retry posts the same bytes and skips used endpoints.
         let kept = match (&res, txid) {
             (Err(_), Some(txid)) => self
@@ -8539,7 +8675,6 @@ impl Wallet {
         &mut self,
         online: Online,
         signed_psbt: String,
-        skip_sync: bool,
     ) -> Result<OperationResult, Error> {
         info!(self.logger, "Sending (end)...");
         self.check_online(online)?;
@@ -8729,7 +8864,7 @@ impl Wallet {
         let batch_transfer_idx = if info_contents.donation {
             // Broadcast immediately for donations
             let mut runtime = self.rgb_runtime()?;
-            self._broadcast_psbt(psbt, skip_sync).await?;
+            self._broadcast_psbt(psbt).await?;
             Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
             let idx = self._update_or_save_transfers(
                 txid.clone(),
@@ -8808,7 +8943,7 @@ impl Wallet {
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
         if !skip_sync {
-            self.sync_db_txos(false).await?;
+            self.fast_sync(false).await?;
         }
 
         let script_pubkey = self.get_script_pubkey(&address)?;
@@ -8939,7 +9074,8 @@ impl Wallet {
         self.check_online(online)?;
         let fee_rate_checked = self._check_fee_rate(fee_rate)?;
 
-        self.sync_db_txos(false).await?;
+        self.fast_sync(true).await?;
+        self.fast_sync(false).await?;
 
         let script_pubkey = self.get_script_pubkey(&address)?;
 
@@ -9227,7 +9363,7 @@ impl Wallet {
 
         // the artifacts stay until the stock has the fascia, so a failed sync can be retried
         let mut runtime = self.rgb_runtime()?;
-        let tx = self._broadcast_psbt(psbt, false).await?;
+        let tx = self._broadcast_psbt(psbt).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         // Drop runtime so Stock returns to RefCell before auto-save
         drop(runtime);
@@ -9596,7 +9732,7 @@ impl Wallet {
             consignment_bytes.insert(asset_id.clone(), bytes);
         }
 
-        let tx = self._broadcast_psbt(psbt, false).await?;
+        let tx = self._broadcast_psbt(psbt).await?;
         runtime.consume_fascia(fascia, None)?;
         runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
         // Drop runtime so Stock returns to RefCell before auto-save
@@ -10371,7 +10507,7 @@ impl Wallet {
         };
 
         let mut runtime = self.rgb_runtime()?;
-        let tx = self._broadcast_psbt(psbt, false).await?;
+        let tx = self._broadcast_psbt(psbt).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
 
@@ -10503,7 +10639,7 @@ impl Wallet {
 
         if !skip_sync {
             let cp = self.checkpoint("list_unspents_vanilla");
-            let res = self.sync_db_txos(false).await;
+            let res = self.fast_sync(false).await;
             self.commit(cp, res, |_| false).await?;
         }
 
@@ -10582,6 +10718,7 @@ mod go_online_tests {
                 .map(|(e, k)| (e.to_string(), k.to_string()))
                 .collect(),
             evm_chains: HashMap::new(),
+            vanilla_sync_lookback: 20,
         }
     }
 
@@ -10647,12 +10784,14 @@ mod go_online_tests {
             &mut wallet,
             OnlineOptions {
                 failed_witness_receive_grace_secs: 0,
+                vanilla_sync_lookback: 7,
                 ..options(INDEXER_URL, &[])
             },
         );
         assert_eq!(res, Ok(online));
         assert!(stored_keys(&wallet).is_empty());
         assert_eq!(stored_grace(&wallet), 0);
+        assert_eq!(wallet.vanilla_sync_lookback(), 7);
     }
 
     #[test]
@@ -11152,7 +11291,7 @@ mod send_end_tests {
     }
 
     fn send_end_err(wallet: &mut Wallet, online: &Online, psbt: &str) -> Error {
-        block_on(wallet.send_end(online.clone(), psbt.to_string(), true)).unwrap_err()
+        block_on(wallet.send_end(online.clone(), psbt.to_string())).unwrap_err()
     }
 
     fn inflate_end_err(wallet: &mut Wallet, online: &Online, psbt: &str) -> Error {
@@ -11689,8 +11828,17 @@ mod send_end_tests {
                 .reveal_next_address(KeychainKind::External)
                 .script_pubkey();
             let (psbt, txid) = dummy_psbt_to(spk);
-            // the broadcast succeeds and every sync request fails
-            let url = fake_esplora(esplora_route(Some(raw_tx(&psbt))));
+            // the broadcast succeeds and every other request fails
+            let paths = Arc::new(std::sync::Mutex::new(vec![]));
+            let seen = paths.clone();
+            let url = fake_esplora(move |path| {
+                seen.lock().unwrap().push(path.to_string());
+                if path == "/tx" {
+                    ("200 OK", vec![])
+                } else {
+                    ("404 Not Found", vec![])
+                }
+            });
             wallet.online_data = Some(OnlineData::for_test(&url));
             let online = Online {
                 id: 1,
@@ -11711,10 +11859,12 @@ mod send_end_tests {
                 _ => txid.clone(),
             };
             assert_eq!(res, Ok(expected));
+            assert_eq!(*paths.lock().unwrap(), vec![s!("/tx")]);
 
             let txos = wallet.database.iter_txos().unwrap();
             let output = txos.iter().find(|t| t.txid == txid && t.vout == 0);
-            assert!(!output.unwrap().spent);
+            let output = output.unwrap();
+            assert!(output.exists && !output.spent);
             let input = txos.iter().find(|t| t.txid == input_txid && t.vout == 0);
             assert!(input.unwrap().spent);
             let row = wallet.database.get_wallet_transaction_by_txid(&txid);
@@ -13137,7 +13287,7 @@ mod send_end_tests {
             .endpoint = endpoint;
 
         let signed_tx = raw_tx(&psbt);
-        block_on(wallet.send_end(online, psbt, true)).unwrap();
+        block_on(wallet.send_end(online, psbt)).unwrap();
         assert_eq!(wallet.transfer_artifacts[&txid].signed_tx, Some(signed_tx));
         let batch = wallet
             .database
@@ -14161,6 +14311,170 @@ mod send_end_tests {
             .collect()
     }
 
+    // The tip list of an esplora that has only the regtest genesis block.
+    const REGTEST_GENESIS_INFO: &[u8] = br#"[{"id":"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206","height":0,"version":1,"timestamp":1296688602,"tx_count":1,"size":285,"weight":1140,"merkle_root":"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b","previousblockhash":null,"mediantime":1296688602,"nonce":2,"bits":545259519,"difficulty":0}]"#;
+
+    #[test]
+    fn colored_fast_sync_requests_pending_witness_and_unconfirmed_input_scripts() {
+        let paths = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = paths.clone();
+        let url = fake_esplora(move |path| {
+            seen.lock().unwrap().push(path.to_string());
+            match path {
+                "/blocks" => ("200 OK", REGTEST_GENESIS_INFO.to_vec()),
+                p if p.starts_with("/scripthash/") => ("200 OK", b"[]".to_vec()),
+                _ => ("404 Not Found", vec![]),
+            }
+        });
+        let (mut wallet, _) = setup_at(&url);
+        let pending = new_script(&mut wallet);
+        let funded = new_script(&mut wallet);
+        let unrelated = new_script(&mut wallet);
+        seed_witness_receive(
+            &wallet,
+            "",
+            TransferStatus::WaitingCounterparty,
+            None,
+            &pending,
+        );
+        set_pending_witness_scripts(&wallet, &[&pending]);
+        let _ = wallet
+            .bdk_wallet
+            .reveal_addresses_to(KeychainKind::Internal, 3)
+            .count();
+        let vanilla = wallet
+            .bdk_wallet
+            .peek_address(KeychainKind::Internal, 0)
+            .script_pubkey();
+        let tx = |prev: OutPoint, output: Vec<TxOut>| BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: prev,
+                ..Default::default()
+            }],
+            output,
+        };
+        let funding_txid = apply_tx_paying(&mut wallet, &[funded.clone()]);
+        let vanilla_funding = tx(
+            OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            vec![TxOut {
+                value: BdkAmount::from_sat(1000),
+                script_pubkey: vanilla.clone(),
+            }],
+        );
+        let vanilla_txid = vanilla_funding.compute_txid();
+        // unconfirmed TXs: one spends a colored output, one a vanilla output
+        wallet.bdk_wallet.apply_unconfirmed_txs([
+            (vanilla_funding, 0),
+            (
+                tx(
+                    OutPoint::new(Txid::from_str(&funding_txid).unwrap(), 0),
+                    vec![],
+                ),
+                0,
+            ),
+            (tx(OutPoint::new(vanilla_txid, 0), vec![]), 0),
+        ]);
+
+        let _ = block_on(wallet.fast_sync(true));
+
+        let requested = |script: &ScriptBuf| {
+            let hash = <sha256::Hash as Sha256Hash>::hash(script.as_bytes());
+            paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.starts_with(&format!("/scripthash/{hash:x}/txs")))
+        };
+        assert!(requested(&pending));
+        assert!(requested(&funded));
+        assert!(!requested(&unrelated));
+        assert!(!requested(&vanilla));
+        let scripthash_requests = paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with("/scripthash/"))
+            .count();
+        assert_eq!(scripthash_requests, 2);
+    }
+
+    #[test]
+    fn listing_syncs_only_when_asked() {
+        let paths = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = paths.clone();
+        let url = fake_esplora(move |path| {
+            seen.lock().unwrap().push(path.to_string());
+            match path {
+                "/blocks" => ("200 OK", REGTEST_GENESIS_INFO.to_vec()),
+                p if p.starts_with("/scripthash/") => ("200 OK", b"[]".to_vec()),
+                _ => ("404 Not Found", vec![]),
+            }
+        });
+        let (mut wallet, online) = setup_at(&url);
+        wallet.online_data.as_mut().unwrap().vanilla_sync_lookback = 3;
+        let pending = new_script(&mut wallet);
+        seed_witness_receive(
+            &wallet,
+            "",
+            TransferStatus::WaitingCounterparty,
+            None,
+            &pending,
+        );
+        set_pending_witness_scripts(&wallet, &[&pending]);
+        let _ = wallet
+            .bdk_wallet
+            .reveal_addresses_to(KeychainKind::Internal, 9)
+            .count();
+        // the pending colored script and the last 4 vanilla scripts
+        let expected: HashSet<String> = (6..=9)
+            .map(|i| {
+                wallet
+                    .bdk_wallet
+                    .peek_address(KeychainKind::Internal, i)
+                    .script_pubkey()
+            })
+            .chain([pending])
+            .map(|script| {
+                let hash = <sha256::Hash as Sha256Hash>::hash(script.as_bytes());
+                format!("/scripthash/{hash:x}/txs")
+            })
+            .collect();
+        let requested = || -> HashSet<String> {
+            paths
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with("/scripthash/"))
+                .cloned()
+                .collect()
+        };
+        for op in 0..3 {
+            let mut call = |online: Option<Online>, skip_sync: bool| {
+                block_on(async {
+                    match op {
+                        0 => wallet.get_btc_balance(online, skip_sync).await.map(|_| ()),
+                        1 => wallet
+                            .list_transactions(online, skip_sync)
+                            .await
+                            .map(|_| ()),
+                        _ => wallet
+                            .list_unspents(online, false, skip_sync)
+                            .await
+                            .map(|_| ()),
+                    }
+                })
+            };
+            assert_eq!(call(Some(online.clone()), true), Ok(()));
+            assert!(paths.lock().unwrap().is_empty());
+            assert_eq!(call(Some(online.clone()), false), Ok(()));
+            assert_eq!(requested(), expected);
+            assert_eq!(call(None, false), Err(Error::OnlineNeeded));
+            paths.lock().unwrap().clear();
+        }
+    }
+
     #[test]
     fn reconcile_keeps_failed_witness_receive_scripts_for_the_grace_time() {
         let (mut wallet, _) = setup();
@@ -14213,7 +14527,9 @@ mod send_end_tests {
 
         let txid = apply_tx_paying(&mut wallet, &[pending, recent]);
         let kept = wallet._reconcile_pending_witness().unwrap();
-        wallet._update_db_colored_txos_from_bdk(&kept).unwrap();
+        wallet
+            .update_db_colored_txos_from_bdk(false, &kept)
+            .unwrap();
 
         let txo = |vout: u32| {
             wallet
@@ -14807,7 +15123,7 @@ mod send_end_tests {
         let unknown_txid = "3".repeat(64);
         seed_txo(&wallet, &unknown_txid, 0);
 
-        let unspents = wallet.list_unspents(None, false, true).unwrap();
+        let unspents = block_on(wallet.list_unspents(None, false, true)).unwrap();
         let index = |txid: &str, vout: u32, colorable: bool| {
             let unspent = unspents
                 .iter()
@@ -15624,6 +15940,7 @@ mod bfa_tests {
                     max_mint_lock_blocks: 10,
                 },
             )]),
+            vanilla_sync_lookback: 20,
         }));
         assert!(
             matches!(result, Err(Error::InvalidEvmRpcUrl { ref details })
@@ -15664,7 +15981,7 @@ mod bfa_tests {
         let options = |urls: &str| {
             serde_json::from_str::<OnlineOptions>(&format!(
                 r#"{{"indexer_config":{{"Esplora":{{"url":"u"}}}},"skip_consistency_check":true,
-                "failed_witness_receive_grace_secs":604800,"proxy_auth_keys":{{}}{urls}}}"#
+                "failed_witness_receive_grace_secs":604800,"proxy_auth_keys":{{}},"vanilla_sync_lookback":20{urls}}}"#
             ))
         };
         let chain =
@@ -15826,5 +16143,104 @@ mod recipient_checks_tests {
             matches!(result, Err(Error::InvalidRecipientNetwork)),
             "{result:?}"
         );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sync_options_tests {
+    use super::*;
+    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+    // Make the wallet know an unconfirmed TX that spends `prev` and pays `spk`.
+    fn pay(wallet: &mut Wallet, spk: ScriptBuf, prev: OutPoint) -> Txid {
+        let tx = BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: prev,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(10_000),
+                script_pubkey: spk,
+            }],
+        };
+        let txid = tx.compute_txid();
+        wallet.bdk_wallet.apply_unconfirmed_txs([(tx, 1)]);
+        txid
+    }
+
+    fn spk(wallet: &Wallet, keychain: KeychainKind, index: u32) -> ScriptBuf {
+        wallet
+            .bdk_wallet
+            .peek_address(keychain, index)
+            .address
+            .script_pubkey()
+    }
+
+    fn foreign_outpoint() -> OutPoint {
+        OutPoint::new(Txid::from_str(&"11".repeat(32)).unwrap(), 0)
+    }
+
+    #[test]
+    fn fast_sync_vanilla_spks_takes_lookback_tail() {
+        let mut wallet = make_test_wallet(false);
+        let _ = wallet
+            .bdk_wallet
+            .reveal_addresses_to(KeychainKind::Internal, 9)
+            .count();
+        let range = |wallet: &Wallet, from: u32| -> HashSet<ScriptBuf> {
+            (from..=9)
+                .map(|i| spk(wallet, KeychainKind::Internal, i))
+                .collect()
+        };
+        assert_eq!(wallet.fast_sync_vanilla_spks(3), range(&wallet, 6));
+        assert_eq!(wallet.fast_sync_vanilla_spks(0), range(&wallet, 9));
+        assert_eq!(wallet.fast_sync_vanilla_spks(20), range(&wallet, 0));
+
+        let used = spk(&wallet, KeychainKind::Internal, 4);
+        pay(&mut wallet, used, foreign_outpoint());
+        assert_eq!(wallet.fast_sync_vanilla_spks(2), range(&wallet, 2));
+    }
+
+    // A pays colored script 0 and B spends it. C pays vanilla script 0 and D spends it.
+    fn spend_colored_and_vanilla(wallet: &mut Wallet) -> Txid {
+        let colored = spk(wallet, KeychainKind::External, 0);
+        let vanilla = spk(wallet, KeychainKind::Internal, 0);
+        let a = pay(wallet, colored, foreign_outpoint());
+        pay(wallet, ScriptBuf::new(), OutPoint::new(a, 0));
+        let c = pay(
+            wallet,
+            vanilla,
+            OutPoint::new(Txid::from_str(&"22".repeat(32)).unwrap(), 0),
+        );
+        pay(wallet, ScriptBuf::new(), OutPoint::new(c, 0));
+        a
+    }
+
+    #[test]
+    fn include_spent_registers_spent_colored_outputs() {
+        let mut wallet = make_test_wallet(false);
+        let _ = wallet
+            .bdk_wallet
+            .reveal_addresses_to(KeychainKind::External, 0)
+            .count();
+        let _ = wallet
+            .bdk_wallet
+            .reveal_addresses_to(KeychainKind::Internal, 0)
+            .count();
+        let a = spend_colored_and_vanilla(&mut wallet);
+        let outpoint = Outpoint {
+            txid: a.to_string(),
+            vout: 0,
+        };
+        wallet
+            .update_db_colored_txos_from_bdk(false, &HashMap::new())
+            .unwrap();
+        assert!(wallet.database.get_txo(&outpoint).unwrap().is_none());
+        wallet
+            .update_db_colored_txos_from_bdk(true, &HashMap::new())
+            .unwrap();
+        assert!(wallet.database.get_txo(&outpoint).unwrap().is_some());
     }
 }
