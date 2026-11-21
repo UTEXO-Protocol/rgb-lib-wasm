@@ -7,7 +7,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 mod utils;
 
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Outpoint, Recipient, Wallet, WalletData, WitnessData,
+    AssetFilter, DatabaseType, Outpoint, Recipient, TransferScope, Wallet, WalletData, WitnessData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
@@ -286,7 +286,10 @@ async fn test_no_receive_on_pending_send_input() {
 
     // a failed send cannot be ended and frees its inputs, also after it is deleted
     let transfers = wallet
-        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid.clone()))
+        .list_transfers(
+            AssetFilter::Id(asset.asset_id.clone()),
+            TransferScope::Txid(txid.clone()),
+        )
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].status, TransferStatus::Initiated);
@@ -362,7 +365,10 @@ async fn test_no_receive_on_pending_send_input() {
     js_sys::eval("Date.now = realDateNow").unwrap();
     assert!(result.unwrap());
     let transfers = wallet
-        .list_transfers(AssetFilter::Id(asset.asset_id.clone()), Some(txid))
+        .list_transfers(
+            AssetFilter::Id(asset.asset_id.clone()),
+            TransferScope::Txid(txid),
+        )
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].status, TransferStatus::Failed);
@@ -503,7 +509,7 @@ async fn test_no_inflate_end_after_fail() {
         result.map(|r| r.txid)
     );
     let status = wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.batch_transfer_idx == idx)
@@ -513,7 +519,7 @@ async fn test_no_inflate_end_after_fail() {
 
     // the received allocation is intact
     let receive = wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.recipient_id.as_ref() == Some(&receive_data.recipient_id))
@@ -657,17 +663,19 @@ async fn test_full_wallet_flow() {
         .await
         .unwrap()
         .psbt;
-    let begin_txid = unsigned_psbt
-        .parse::<Psbt>()
-        .unwrap()
-        .unsigned_tx
-        .compute_txid()
-        .to_string();
+    let begin_psbt = unsigned_psbt.parse::<Psbt>().unwrap();
+    let begin_txid = begin_psbt.unsigned_tx.compute_txid().to_string();
+    let unsigned_psbt_bytes = begin_psbt.serialize();
     let begun = wallet
-        .list_transfers(AssetFilter::Any, Some(begin_txid))
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::Txid(begin_txid))
         .unwrap();
     assert!(!begun.is_empty());
     assert!(begun.iter().all(|t| t.status == TransferStatus::Initiated));
+    assert!(
+        begun
+            .iter()
+            .all(|t| t.psbt.as_ref() == Some(&unsigned_psbt_bytes))
+    );
     // A signer that never synced has no chain data
     let signer = Wallet::new(wd.clone()).unwrap();
     let signed_psbt = signer.sign_psbt(unsigned_psbt, None).unwrap();
@@ -688,14 +696,17 @@ async fn test_full_wallet_flow() {
     let sent = wallet
         .list_transfers(
             AssetFilter::Id(nia.asset_id.clone()),
-            Some(send_result.txid.clone()),
+            TransferScope::Txid(send_result.txid.clone()),
         )
         .unwrap();
     let sent = sent.iter().find(|t| t.kind == TransferKind::Send).unwrap();
     assert_eq!(sent.expiration_timestamp, Some(send_exp));
     // send_end updates the begun records and adds none
     let ended = wallet
-        .list_transfers(AssetFilter::Any, Some(send_result.txid.clone()))
+        .list_transfers(
+            AssetFilter::AnyOrNone,
+            TransferScope::Txid(send_result.txid.clone()),
+        )
         .unwrap();
     assert_eq!(
         ended.iter().map(|t| t.idx).collect::<Vec<_>>(),
@@ -776,7 +787,7 @@ async fn test_full_wallet_flow() {
 
     // list_transfers: verify NIA send created transfer records
     let a_transfers = wallet
-        .list_transfers(AssetFilter::Id(nia.asset_id.clone()), None)
+        .list_transfers(AssetFilter::Id(nia.asset_id.clone()), TransferScope::All)
         .unwrap();
     assert!(
         !a_transfers.is_empty(),
@@ -785,7 +796,10 @@ async fn test_full_wallet_flow() {
 
     // txid filter: the send tx's transfers
     let by_txid = wallet
-        .list_transfers(AssetFilter::Any, Some(send_result.txid.clone()))
+        .list_transfers(
+            AssetFilter::AnyOrNone,
+            TransferScope::Txid(send_result.txid.clone()),
+        )
         .unwrap();
     assert!(!by_txid.is_empty(), "Send txid should resolve to transfers");
     assert!(
@@ -793,12 +807,27 @@ async fn test_full_wallet_flow() {
             .iter()
             .all(|t| t.txid == Some(send_result.txid.clone()))
     );
+    // the unsigned PSBT outlives the broadcast
+    assert!(
+        by_txid
+            .iter()
+            .filter(|t| t.kind == TransferKind::Send)
+            .all(|t| t.psbt.as_ref() == Some(&unsigned_psbt_bytes))
+    );
+    let received = wallet_b
+        .list_transfers(
+            AssetFilter::AnyOrNone,
+            TransferScope::Txid(send_result.txid.clone()),
+        )
+        .unwrap();
+    assert!(!received.is_empty());
+    assert!(received.iter().all(|t| t.psbt.is_none()));
 
     // asset + txid intersection
     let nia_by_txid = wallet
         .list_transfers(
             AssetFilter::Id(nia.asset_id.clone()),
-            Some(send_result.txid.clone()),
+            TransferScope::Txid(send_result.txid.clone()),
         )
         .unwrap();
     assert!(!nia_by_txid.is_empty(), "NIA + send txid should intersect");
@@ -807,7 +836,10 @@ async fn test_full_wallet_flow() {
     let unknown = "0000000000000000000000000000000000000000000000000000000000000000";
     assert!(
         wallet
-            .list_transfers(AssetFilter::Any, Some(unknown.to_string()))
+            .list_transfers(
+                AssetFilter::AnyOrNone,
+                TransferScope::Txid(unknown.to_string())
+            )
             .unwrap()
             .is_empty()
     );
@@ -965,7 +997,7 @@ async fn test_full_wallet_flow() {
     let inflation = wallet
         .list_transfers(
             AssetFilter::Id(ifa.asset_id.clone()),
-            Some(inflate_result.txid.clone()),
+            TransferScope::Txid(inflate_result.txid.clone()),
         )
         .unwrap();
     let inflation = inflation
@@ -1082,7 +1114,7 @@ async fn test_full_wallet_flow() {
     let ifa_transfers = wallet
         .list_transfers(
             AssetFilter::Id(ifa.asset_id.clone()),
-            Some(ifa_send.txid.clone()),
+            TransferScope::Txid(ifa_send.txid.clone()),
         )
         .unwrap();
     assert!(!ifa_transfers.is_empty(), "Sender should have IFA transfer");
@@ -1586,7 +1618,7 @@ async fn test_restored_wallet_inflates_after_inflation() {
         .unwrap();
 
     let states = |w: &Wallet| -> Vec<(TransferKind, TransferStatus)> {
-        w.list_transfers(AssetFilter::Id(ifa.asset_id.clone()), None)
+        w.list_transfers(AssetFilter::Id(ifa.asset_id.clone()), TransferScope::All)
             .unwrap()
             .into_iter()
             .map(|t| (t.kind, t.status))

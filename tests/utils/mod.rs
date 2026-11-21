@@ -1,6 +1,6 @@
 use rgb_lib_wasm::wallet::{
-    AssetFilter, IndexerConfig, Online, OnlineOptions, ReceiveData, Recipient, Transfer, Wallet,
-    WitnessData,
+    AssetFilter, IndexerConfig, Online, OnlineOptions, ReceiveData, Recipient, Transfer,
+    TransferScope, Wallet, WitnessData,
 };
 use rgb_lib_wasm::{Assignment, Encryption, Error, TransferStatus};
 use serde::{Deserialize, Serialize};
@@ -567,7 +567,7 @@ pub fn recipient(id: &str, amount: u64, sat: Option<u64>, url: &str) -> Recipien
 #[allow(dead_code)]
 pub fn transfer_of(wallet: &Wallet, recipient_id: &str) -> Transfer {
     wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.recipient_id.as_deref() == Some(recipient_id))

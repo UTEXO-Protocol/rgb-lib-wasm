@@ -162,6 +162,7 @@ pub struct DbBatchTransfer {
     pub operation_secret_key: Option<Vec<u8>>,
     pub broadcast_deadline: Option<i64>,
     pub retention_deadline: Option<i64>,
+    pub unsigned_psbt: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for DbBatchTransfer {
@@ -196,6 +197,7 @@ pub struct DbBatchTransferActMod {
     pub operation_secret_key: ActiveValue<Option<Vec<u8>>>,
     pub broadcast_deadline: ActiveValue<Option<i64>>,
     pub retention_deadline: ActiveValue<Option<i64>>,
+    pub unsigned_psbt: ActiveValue<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for DbBatchTransferActMod {
@@ -461,6 +463,7 @@ impl From<DbBatchTransfer> for DbBatchTransferActMod {
             operation_secret_key: ActiveValue::Unchanged(m.operation_secret_key),
             broadcast_deadline: ActiveValue::Unchanged(m.broadcast_deadline),
             retention_deadline: ActiveValue::Unchanged(m.retention_deadline),
+            unsigned_psbt: ActiveValue::Unchanged(m.unsigned_psbt),
         }
     }
 }
@@ -750,6 +753,7 @@ impl InMemoryDb {
             operation_secret_key: av(b.operation_secret_key),
             broadcast_deadline: av(b.broadcast_deadline),
             retention_deadline: av(b.retention_deadline),
+            unsigned_psbt: av(b.unsigned_psbt),
         };
         self.batch_transfers.borrow_mut().push(row);
         Ok(idx)

@@ -694,7 +694,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-list-transfers').addEventListener('click', () => {
       if (!requireWallet('state-output', 'state-result')) return;
       try {
-        const transfers = state.wallet.listTransfers(null);
+        const transfers = state.wallet.listTransfers("AnyOrNone", "All");
         showJson('state-output', 'state-result', transfers);
         log('listTransfers OK', 'log-ok');
       } catch (e) {

@@ -741,16 +741,26 @@ pub struct PendingVanillaTx {
     pub r#type: WalletTransactionType,
 }
 
-/// An asset filter for listing transfers.
+/// An asset filter.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub enum AssetFilter {
-    /// Match transfers of any asset, including those not connected to one
-    Any,
-    /// Match only transfers not connected to a specific asset
-    NoAsset,
-    /// Match only transfers of the asset with the given ID
+    /// Match any or no asset
+    AnyOrNone,
+    /// Match no asset
+    None,
+    /// Match the asset with the given ID
     Id(String),
+}
+
+/// Which transfers to list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TransferScope {
+    /// All transfers
+    All,
+    /// Transfers committed by the on-chain transaction with the given TXID
+    Txid(String),
+    /// Transfers belonging to the batch transfer with the given index
+    BatchTransfer(i32),
 }
 
 /// Proxy data of a received consignment, saved until the transfer ends.
@@ -804,6 +814,8 @@ pub struct Transfer {
     pub invoice_string: Option<String>,
     /// Consignment path
     pub consignment_path: Option<String>,
+    /// Unsigned PSBT (BIP-174 bytes) produced by the `_begin` step, when available
+    pub psbt: Option<Vec<u8>>,
     /// Hex-encoded 32-byte reason of a burn transfer, if any
     pub burn_reason: Option<String>,
 }
@@ -833,6 +845,7 @@ impl Transfer {
             sender_transport_endpoint,
             invoice_string: x.invoice_string.clone(),
             consignment_path: td.consignment_path,
+            psbt: td.psbt,
             burn_reason: x.burn_reason.clone(),
         }
     }
@@ -932,6 +945,10 @@ pub struct Utxo {
     pub colorable: bool,
     /// Defines if the UTXO already exists (TX that creates it has been broadcasted)
     pub exists: bool,
+    /// Derivation index of the UTXO's script pubkey. `None` if the transaction creating the UTXO
+    /// is not known to the underlying BDK wallet, which is the case while the UTXO does not yet
+    /// exist on-chain and for outputs that do not belong to this wallet.
+    pub derivation_index: Option<u32>,
 }
 
 impl From<DbTxo> for Utxo {
@@ -944,6 +961,7 @@ impl From<DbTxo> for Utxo {
                 .expect("DB should contain a valid u64 value"),
             colorable: true,
             exists: x.exists,
+            derivation_index: None,
         }
     }
 }
@@ -955,6 +973,7 @@ impl From<LocalOutput> for Utxo {
             btc_amount: x.txout.value.to_sat(),
             colorable: false,
             exists: true,
+            derivation_index: Some(x.derivation_index),
         }
     }
 }
@@ -2730,8 +2749,10 @@ impl Wallet {
     /// that TXID.
     pub fn get_burn_consignment(&self, asset_id: String, txid: String) -> Result<Vec<u8>, Error> {
         info!(self.logger, "Getting burn consignment...");
-        let transfers =
-            self.list_transfers(AssetFilter::Id(asset_id.clone()), Some(txid.clone()))?;
+        let transfers = self.list_transfers(
+            AssetFilter::Id(asset_id.clone()),
+            TransferScope::Txid(txid.clone()),
+        )?;
         if !transfers.iter().any(|t| t.kind == TransferKind::Burn) {
             return Err(Error::UnknownTransfer { txid });
         }
@@ -3186,6 +3207,8 @@ impl Wallet {
         }
         .map(|p| p.to_string_lossy().to_string());
 
+        let psbt = batch_transfer.unsigned_psbt.clone();
+
         Ok(TransferData {
             kind,
             status: batch_transfer.status,
@@ -3198,47 +3221,56 @@ impl Wallet {
             updated_at: batch_transfer.updated_at,
             expiration: batch_transfer.expiration,
             consignment_path,
+            psbt,
         })
     }
 
-    /// List the RGB [`Transfer`]s known to the wallet.
+    /// List the RGB [`Transfer`]s known to the wallet, filtered by `asset_filter` and `scope`.
     ///
-    /// `filter` selects transfers by asset. When a `txid` is provided, restrict the result to the
-    /// transfers committed by the on-chain transaction with that ID; an unknown `txid` yields an
-    /// empty list.
+    /// An unknown TXID yields an empty list, while an unknown batch transfer index returns
+    /// [`Error::BatchTransferNotFound`].
     pub fn list_transfers(
         &self,
-        filter: AssetFilter,
-        txid: Option<String>,
+        asset_filter: AssetFilter,
+        scope: TransferScope,
     ) -> Result<Vec<Transfer>, Error> {
         info!(
             self.logger,
-            "Listing transfers for filter '{:?}' and txid '{:?}'...", filter, txid
+            "Listing transfers for filter '{:?}' and scope '{:?}'...", asset_filter, scope
         );
-        if let AssetFilter::Id(asset_id) = &filter {
+        if let AssetFilter::Id(asset_id) = &asset_filter {
             self.database.check_asset_exists(asset_id.clone())?;
         }
         let db_data = self.database.get_db_data(false)?;
-        let batch_transfer_idx = match &txid {
-            Some(txid) => match db_data
-                .batch_transfers
-                .iter()
-                .find(|b| b.txid.as_deref() == Some(txid))
-            {
-                Some(batch_transfer) => Some(batch_transfer.idx),
-                None => return Ok(vec![]),
-            },
-            None => None,
+        let batch_transfer_idxs: Option<Vec<i32>> = match &scope {
+            TransferScope::All => None,
+            TransferScope::Txid(txid) => Some(
+                db_data
+                    .batch_transfers
+                    .iter()
+                    .filter(|b| b.txid.as_deref() == Some(txid))
+                    .map(|b| b.idx)
+                    .collect(),
+            ),
+            TransferScope::BatchTransfer(idx) => {
+                self.database
+                    .get_batch_transfer_or_fail(*idx, &db_data.batch_transfers)?;
+                Some(vec![*idx])
+            }
         };
         let asset_transfer_ids: Vec<i32> = db_data
             .asset_transfers
             .iter()
-            .filter(|t| match &filter {
-                AssetFilter::Any => true,
-                AssetFilter::NoAsset => t.asset_id.is_none(),
+            .filter(|t| match &asset_filter {
+                AssetFilter::AnyOrNone => true,
+                AssetFilter::None => t.asset_id.is_none(),
                 AssetFilter::Id(asset_id) => t.asset_id.as_ref() == Some(asset_id),
             })
-            .filter(|t| batch_transfer_idx.is_none_or(|idx| t.batch_transfer_idx == idx))
+            .filter(|t| {
+                batch_transfer_idxs
+                    .as_ref()
+                    .is_none_or(|idxs| idxs.contains(&t.batch_transfer_idx))
+            })
             .filter(|t| t.user_driven)
             .map(|t| t.idx)
             .collect();
@@ -3355,6 +3387,14 @@ impl Wallet {
                 .for_each(|u| u.rgb_allocations.retain(|a| a.settled));
         }
 
+        let spk_index = self.bdk_wallet.spk_index();
+        for unspent in unspents.iter_mut() {
+            if let Some(((KeychainKind::External, derivation_index), _)) =
+                spk_index.txout(BdkOutPoint::from(unspent.utxo.outpoint.clone()))
+            {
+                unspent.utxo.derivation_index = Some(derivation_index);
+            }
+        }
         let mut internal_unspents: Vec<Unspent> =
             self.internal_unspents().map(Unspent::from).collect();
 

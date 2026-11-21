@@ -230,7 +230,7 @@ const assetBalance = wallet.getAssetBalance(assetId);
 const metadata = wallet.getAssetMetadata(assetId);
 // metadata: { assetSchema, name, ticker, precision, initialSupply, maxSupply, knownCirculatingSupply, timestamp, ... }
 const assets = wallet.listAssets([]);              // all schemas
-const transfers = wallet.listTransfers(null);       // all assets
+const transfers = wallet.listTransfers("AnyOrNone", "All"); // all transfers
 const unspents = wallet.listUnspents(false);
 const transactions = wallet.listTransactions();
 const address = wallet.getAddress();
@@ -387,7 +387,7 @@ To protect a wallet:
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
 | `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
 | `listAssets(schemas)` | no | List known RGB assets |
-| `listTransfers(assetId?)` | no | List RGB transfers |
+| `listTransfers(assetFilter, scope)` | no | List RGB transfers by asset filter and scope |
 | `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
 | `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
 | `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |

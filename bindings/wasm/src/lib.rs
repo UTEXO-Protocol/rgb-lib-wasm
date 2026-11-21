@@ -374,21 +374,24 @@ impl WasmWallet {
         to_js(&assets)
     }
 
-    /// List RGB transfers matching an asset filter ("Any", "NoAsset" or {"Id": "<asset_id>"}),
-    /// optionally restricted to the transfers of an on-chain txid.
+    /// List RGB transfers matching an asset filter ("AnyOrNone", "None" or {"Id": "<asset_id>"})
+    /// and a scope ("All", {"Txid": "<txid>"} or {"BatchTransfer": <idx>}).
     #[wasm_bindgen(js_name = "listTransfers")]
     pub fn list_transfers(
         &self,
-        filter_js: JsValue,
-        txid: Option<String>,
+        asset_filter_js: JsValue,
+        scope_js: JsValue,
     ) -> Result<JsValue, JsValue> {
-        let filter: rgb_lib_wasm::wallet::AssetFilter =
-            serde_wasm_bindgen::from_value(filter_js)
-                .map_err(|e| JsValue::from_str(&format!("Invalid filter: {e}")))?;
+        let asset_filter: rgb_lib_wasm::wallet::AssetFilter =
+            serde_wasm_bindgen::from_value(asset_filter_js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid asset filter: {e}")))?;
+        let scope: rgb_lib_wasm::wallet::TransferScope =
+            serde_wasm_bindgen::from_value(scope_js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid scope: {e}")))?;
         let transfers = self
             .inner
             .borrow()
-            .list_transfers(filter, txid)
+            .list_transfers(asset_filter, scope)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&transfers)
     }

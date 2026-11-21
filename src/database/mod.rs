@@ -287,6 +287,7 @@ pub(crate) struct TransferData {
     pub(crate) updated_at: i64,
     pub(crate) expiration: Option<i64>,
     pub(crate) consignment_path: Option<String>,
+    pub(crate) psbt: Option<Vec<u8>>,
 }
 
 pub(crate) mod enums;
