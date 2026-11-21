@@ -38,6 +38,9 @@ thread_local! {
     // test counter: received consignments validated
     pub(crate) static RECEIVED_CONSIGNMENT_VALIDATIONS: std::cell::RefCell<usize> =
         const { std::cell::RefCell::new(0) };
+    // test mock: keep a processed receive in WaitingCounterparty with no ACK
+    pub(crate) static MOCK_ACK_PENDING: std::cell::RefCell<bool> =
+        const { std::cell::RefCell::new(false) };
 }
 
 // test mock: move part of the recipient amount to `num` extra assignments of `amount` to the
@@ -4635,6 +4638,7 @@ impl Wallet {
     /// Forget the data kept for a received consignment.
     fn clear_received_data(&mut self, recipient_id: &str) {
         self.received_consignments.remove(recipient_id);
+        self.received_valid_consignments.remove(recipient_id);
         self.received_consignment_meta.remove(recipient_id);
         self.received_signed_txs.remove(recipient_id);
         self.pending_mint_locks.remove(recipient_id);
@@ -4995,6 +4999,10 @@ impl Wallet {
                     .update_batch_transfer(updated_batch_transfer)?,
             ));
         }
+        #[cfg(test)]
+        if MOCK_ACK_PENDING.take() {
+            return Ok(None);
+        }
 
         // the sender proxy retention grace is how long after the operation expiration a released
         // signed TX can still be retrieved: a non-donation transfer whose sender proxy grants
@@ -5037,7 +5045,7 @@ impl Wallet {
     }
 
     /// Fetch the media of a contract from the proxy and check it against the contract. Return
-    /// `false` if it is missing or does not match.
+    /// `false` if it is missing and an error if it does not match.
     #[allow(clippy::too_many_arguments)]
     async fn _contract_media_verified(
         &self,
@@ -5089,37 +5097,78 @@ impl Wallet {
                 );
                 return Ok(false);
             };
-            // also checks the plaintext against the digest in the contract
-            if Self::decrypt_payload_with_shared_key(
+            // also checks the plaintext against the digest in the contract. A mismatch is an
+            // error: the transfer stays pending and the next refresh tries again.
+            Self::decrypt_payload_with_shared_key(
                 &media_b64,
                 data.recipient_encryption,
                 recipient_seed,
                 &data.sender_pubkey,
                 &digest,
             )
-            .is_err()
-            {
-                error!(
+            .inspect_err(|e| {
+                warn!(
                     self.logger,
-                    "Attached file has a different hash than the one in the contract"
-                );
-                return Ok(false);
-            }
+                    "Attached file does not match the contract: {e}"
+                )
+            })?;
         }
         Ok(true)
     }
 
-    /// Validate what a consignment pays and its history. `None` means refuse the consignment.
-    /// The history is checked against the reject list only when `check_reject_list` is true.
+    fn validation_error(e: ValidationError) -> Error {
+        match e {
+            ValidationError::ResolverError(e) => Error::Network {
+                details: e.to_string(),
+            },
+            e => Error::Internal {
+                details: format!("unexpected consignment validation error: {e}"),
+            },
+        }
+    }
+
+    /// Resolve the witnesses, then check what a consignment pays and its history. `None` means
+    /// refuse the consignment. The history is checked against the reject list only when
+    /// `check_reject_list` is true.
+    #[allow(clippy::too_many_arguments)]
     async fn _check_received_consignment(
         &self,
         runtime: &RgbRuntime,
-        pending: PendingConsignment<true>,
+        mut pending: PendingConsignment<true>,
+        consignment: &RgbTransfer,
+        witness_id: RgbTxid,
         receiving: &HashMap<Opout, Assignment>,
         asset_schema: AssetSchema,
         asset_id: &str,
         check_reject_list: bool,
-    ) -> Result<Option<(ValidConsignment<true>, HashMap<Opout, Assignment>)>, Error> {
+    ) -> Result<
+        Option<(
+            ValidConsignment<true>,
+            HashMap<Opout, Assignment>,
+            PreFetchResolver,
+        )>,
+        Error,
+    > {
+        let chain_resolver = self
+            .prefetch_consignment_witnesses(consignment)
+            .await
+            .map_err(|e| Error::Network {
+                details: e.to_string(),
+            })?;
+        let resolver = OffchainResolverWasm {
+            witness_id,
+            consignment,
+            fallback: &chain_resolver,
+        };
+        if let Err(e) = pending.pending().resolve_all(&resolver) {
+            match e {
+                ValidationError::InvalidConsignment(e) => {
+                    error!(self.logger, "Consignment is invalid: {e}");
+                    return Ok(None);
+                }
+                e => return Err(Self::validation_error(e)),
+            }
+        }
         let valid_consignment = pending.finalize();
         let validation_status = valid_consignment.validation_status();
         let validity = validation_status.validity();
@@ -5170,7 +5219,7 @@ impl Wallet {
             }
         }
 
-        Ok(Some((valid_consignment, received)))
+        Ok(Some((valid_consignment, received, chain_resolver)))
     }
 
     /// Prepare the PSBT of an operation on one asset (an inflation, a burn or a mint).
@@ -5556,6 +5605,49 @@ impl Wallet {
         };
         let blinding = derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding;
         let matcher = transfer.receive_matcher(blinding)?;
+
+        debug!(self.logger, "Validating consignment...");
+        let schema_rules = asset_schema.schema_rules();
+        let safe_height =
+            NonZeroU32::new(self.safe_height(batch_transfer.min_confirmations).await?);
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            build_ops_dag: true,
+            safe_height,
+        };
+        #[cfg(test)]
+        RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow_mut(|n| *n += 1);
+        let mut pending = match consignment
+            .clone()
+            .validate_deterministic(&schema_rules, &validation_config)
+        {
+            Ok(pending) => pending,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(self.logger, "Consignment is invalid: {}", e);
+                return self
+                    ._refuse_consignment_async(
+                        data,
+                        &recipient_id,
+                        recipient_seed,
+                        updated_batch_transfer,
+                        mint_known,
+                    )
+                    .await;
+            }
+            Err(e) => return Err(Self::validation_error(e)),
+        };
+        if unsupported_claims(asset_schema, &mut pending) {
+            error!(self.logger, "{asset_schema} schema does not support claims");
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    &recipient_id,
+                    recipient_seed,
+                    updated_batch_transfer,
+                    mint_known,
+                )
+                .await;
+        }
         let spent = Self::known_spent_opouts(&consignment);
         let mut payments: Vec<_> = self.find_payments(&consignment, &matcher, &spent).collect();
         if payments.len() != 1 {
@@ -5707,71 +5799,6 @@ impl Wallet {
 
         let donation_tx = Self::donation_signed_tx(&paying_bundle.tx);
 
-        let chain_resolver = self
-            .prefetch_consignment_witnesses(&consignment)
-            .await
-            .map_err(|e| Error::Network {
-                details: e.to_string(),
-            })?;
-        let resolver = OffchainResolverWasm {
-            witness_id,
-            consignment: &consignment,
-            fallback: &chain_resolver,
-        };
-
-        debug!(self.logger, "Validating consignment...");
-        let schema_rules = asset_schema.schema_rules();
-        let safe_height =
-            NonZeroU32::new(self.safe_height(batch_transfer.min_confirmations).await?);
-        let validation_config = ValidationConfig {
-            chain_net: self.chain_net(),
-            build_ops_dag: true,
-            safe_height,
-        };
-        #[cfg(test)]
-        RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow_mut(|n| *n += 1);
-        let mut pending = match consignment
-            .clone()
-            .validate_deterministic(&schema_rules, &validation_config)
-            .and_then(|mut p| p.pending().resolve_all(&resolver).map(|_| p))
-        {
-            Ok(pending) => pending,
-            Err(ValidationError::InvalidConsignment(e)) => {
-                error!(self.logger, "Consignment is invalid: {}", e);
-                return self
-                    ._refuse_consignment_async(
-                        data,
-                        &recipient_id,
-                        recipient_seed,
-                        updated_batch_transfer,
-                        mint_known,
-                    )
-                    .await;
-            }
-            Err(ValidationError::ResolverError(e)) => {
-                warn!(self.logger, "Network error during consignment validation");
-                return Err(Error::Network {
-                    details: e.to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(Error::Internal {
-                    details: format!("unexpected consignment validation error: {e}"),
-                });
-            }
-        };
-        if unsupported_claims(asset_schema, &mut pending) {
-            error!(self.logger, "{asset_schema} schema does not support claims");
-            return self
-                ._refuse_consignment_async(
-                    data,
-                    &recipient_id,
-                    recipient_seed,
-                    updated_batch_transfer,
-                    mint_known,
-                )
-                .await;
-        }
         // the mint paying this recipient, as opposed to those in its history. Its lock must match
         // the whole amount received, all of it from this mint, and the invoice.
         let mut paying_claim = None;
@@ -5848,6 +5875,7 @@ impl Wallet {
         // a mint whose lock may be made completes whatever the wallet does: the reject list is
         // not checked again for a mint already checked, nor for one whose lock is recorded
         let mut committed_mint = checked_mint;
+        let mut bridge = None;
         match self._resolve_claims(&mut pending).await {
             Err(e @ Error::MintLockExpired { .. }) => {
                 error!(self.logger, "{e}");
@@ -5949,13 +5977,15 @@ impl Wallet {
                             ._check_received_consignment(
                                 &runtime,
                                 assumed,
+                                &consignment,
+                                witness_id,
                                 &receiving,
                                 asset_schema,
                                 &asset_id,
                                 !committed_mint,
                             )
                             .await?;
-                        let Some((valid_consignment, _)) = checked else {
+                        let Some((valid_consignment, ..)) = checked else {
                             return self
                                 ._refuse_consignment_async(
                                     data,
@@ -6019,12 +6049,16 @@ impl Wallet {
                     );
                     return Ok(None);
                 }
+                // the bridge accounts all the confirmed mints
+                bridge = Some((evm_client, address));
             }
         }
-        let Some((valid_consignment, received)) = self
+        let Some((valid_consignment, received, chain_resolver)) = self
             ._check_received_consignment(
                 &runtime,
                 pending,
+                &consignment,
+                witness_id,
                 &receiving,
                 asset_schema,
                 &asset_id,
@@ -6055,9 +6089,6 @@ impl Wallet {
             .filter(|t| *t != txid)
             .collect();
         let is_mint = received_mint.is_some();
-        if let Some(mint) = received_mint {
-            self.received_mints.insert(recipient_id.clone(), mint);
-        }
 
         // add asset info to transfer if missing
         if asset_transfer.asset_id.is_none() {
@@ -6101,7 +6132,7 @@ impl Wallet {
                     contract_id,
                     asset_schema,
                     valid_contract,
-                    valid_consignment,
+                    valid_consignment.clone(),
                 )?;
             }
 
@@ -6110,6 +6141,16 @@ impl Wallet {
             self.database
                 .update_asset_transfer(&mut updated_asset_transfer)?;
         }
+        if let Some((evm_client, address)) = &bridge {
+            self._update_bfa_known_circulating_supply(evm_client, address, asset_id.clone())
+                .await?;
+        }
+        if let Some(mint) = received_mint {
+            self.received_mints.insert(recipient_id.clone(), mint);
+        }
+        // keep the validated consignment for settlement
+        self.received_valid_consignments
+            .insert(recipient_id.clone(), valid_consignment);
 
         debug!(
             self.logger,
@@ -6152,6 +6193,8 @@ impl Wallet {
             }
             _ => return Err(InternalError::Unexpected.into()),
         };
+        // a consignment can be processed again after its colorings are saved: replace them
+        self.database.del_coloring(asset_transfer.idx)?;
         for assignment in received.into_values() {
             let db_coloring = DbColoringActMod {
                 txo_idx: ActiveValue::Set(utxo_idx),
@@ -6689,17 +6732,6 @@ impl Wallet {
                 .expect("transfer should have a recipient ID");
             debug!(self.logger, "Recipient ID: {recipient_id}");
 
-            // load consignment from in-memory storage
-            let consignment_bytes = self
-                .received_consignments
-                .get(&recipient_id)
-                .ok_or_else(|| Error::Internal {
-                    details: s!("consignment not found in memory"),
-                })?
-                .clone();
-            let consignment =
-                RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
-
             if let Some(RecipientTypeFull::Witness { vout }) = transfer.recipient_type {
                 if !skip_sync {
                     self.sync_db_txos(false).await?;
@@ -6714,30 +6746,50 @@ impl Wallet {
                 self.database.update_txo(txo)?;
             }
 
-            let wasm_resolver = self.prefetch_consignment_witnesses(&consignment).await?;
-            let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-            let validation_config = ValidationConfig {
-                chain_net: self.chain_net(),
-                ..Default::default()
-            };
-            let mut pending = consignment
-                .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
-                .and_then(|mut p| p.pending().resolve_all(&wasm_resolver).map(|_| p))
-                .map_err(|_| InternalError::Unexpected)?;
-            let bridge = match self._resolve_claims(&mut pending).await? {
-                ClaimsResolution::NoClaims => None,
-                ClaimsResolution::Resolved {
-                    evm_client,
-                    address,
-                    unconfirmed,
-                    ..
-                } if unconfirmed.is_empty() => Some((evm_client, address)),
-                _ => {
-                    warn!(self.logger, "Mint locks not confirmed yet, will retry");
-                    return Ok(None);
+            let valid_consignment = match self.received_valid_consignments.get(&recipient_id) {
+                Some(v) => v.clone(),
+                None => {
+                    // the validated copy is gone (e.g. after a reload): validate again
+                    let consignment_bytes = self
+                        .received_consignments
+                        .get(&recipient_id)
+                        .ok_or_else(|| Error::Internal {
+                            details: s!("consignment not found in memory"),
+                        })?;
+                    let consignment =
+                        RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
+                    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+                    let validation_config = ValidationConfig {
+                        chain_net: self.chain_net(),
+                        ..Default::default()
+                    };
+                    #[cfg(test)]
+                    RECEIVED_CONSIGNMENT_VALIDATIONS.with_borrow_mut(|n| *n += 1);
+                    let mut pending = consignment
+                        .clone()
+                        .validate_deterministic(&asset_schema.schema_rules(), &validation_config)
+                        .map_err(|_| InternalError::Unexpected)?;
+                    match self._resolve_claims(&mut pending).await? {
+                        ClaimsResolution::NoClaims => {}
+                        ClaimsResolution::Resolved { unconfirmed, .. }
+                            if unconfirmed.is_empty() => {}
+                        _ => {
+                            warn!(self.logger, "Mint locks not confirmed yet, will retry");
+                            return Ok(None);
+                        }
+                    }
+                    let wasm_resolver = self.prefetch_consignment_witnesses(&consignment).await?;
+                    pending
+                        .pending()
+                        .resolve_all(&wasm_resolver)
+                        .map_err(|_| InternalError::Unexpected)?;
+                    pending.finalize()
                 }
             };
-            let valid_consignment = pending.finalize();
+            let asset_schema: AssetSchema = valid_consignment.schema_id().try_into()?;
+            let wasm_resolver = self
+                .prefetch_consignment_witnesses(&valid_consignment)
+                .await?;
             let mut runtime = self.rgb_runtime()?;
             runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
             if asset_schema == AssetSchema::Ifa {
@@ -6759,14 +6811,6 @@ impl Wallet {
                         ActiveValue::Set(Some(known_circulating_supply.to_string()));
                     self.database.update_asset(&mut updated_asset)?;
                 }
-            }
-            if let Some((evm_client, address)) = &bridge {
-                self._update_bfa_known_circulating_supply(
-                    evm_client,
-                    address,
-                    asset_transfer.asset_id.clone().unwrap(),
-                )
-                .await?;
             }
         }
 
