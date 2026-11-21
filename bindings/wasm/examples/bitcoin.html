@@ -122,7 +122,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       <label for="wallet-data">WalletData JSON (auto-filled from generated keys)</label>
       <textarea id="wallet-data" rows="6" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
       <label for="wallet-keys">SinglesigKeys JSON (auto-filled from generated keys)</label>
-      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", ...}'></textarea>
+      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", "witnessVersion": "Taproot", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-create-wallet" disabled>Create Wallet</button>
@@ -307,7 +307,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Auto setup: generating keys...', 'log-warn');
         const network = document.getElementById('gen-network').value;
-        const keys = generateKeys(network);
+        const keys = generateKeys(network, 'Taproot');
         const wd = fillWalletData(network);
         const sk = fillWalletKeys(keys);
         log('Auto setup: keys generated', 'log-ok');
@@ -337,7 +337,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-generate').addEventListener('click', () => {
       const network = document.getElementById('gen-network').value;
       try {
-        const keys = generateKeys(network);
+        const keys = generateKeys(network, 'Taproot');
         fillWalletData(network);
         fillWalletKeys(keys);
         showResult('setup-output', 'setup-result',

@@ -146,20 +146,30 @@ pub fn max_expiration_secs() -> u32 {
 }
 
 #[wasm_bindgen(js_name = "generateKeys")]
-pub fn generate_keys(network: &str) -> Result<JsValue, JsValue> {
+pub fn generate_keys(network: &str, witness_version: &str) -> Result<JsValue, JsValue> {
     let bitcoin_network = network
         .parse::<rgb_lib_wasm::BitcoinNetwork>()
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let keys = rgb_lib_wasm::generate_keys(bitcoin_network);
+    let witness_version = witness_version
+        .parse::<rgb_lib_wasm::keys::WitnessVersion>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let keys = rgb_lib_wasm::generate_keys(bitcoin_network, witness_version);
     to_js(&keys)
 }
 
 #[wasm_bindgen(js_name = "restoreKeys")]
-pub fn restore_keys(network: &str, mnemonic: &str) -> Result<JsValue, JsValue> {
+pub fn restore_keys(
+    network: &str,
+    mnemonic: &str,
+    witness_version: &str,
+) -> Result<JsValue, JsValue> {
     let bitcoin_network = network
         .parse::<rgb_lib_wasm::BitcoinNetwork>()
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let keys = rgb_lib_wasm::restore_keys(bitcoin_network, mnemonic.to_string())
+    let witness_version = witness_version
+        .parse::<rgb_lib_wasm::keys::WitnessVersion>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let keys = rgb_lib_wasm::restore_keys(bitcoin_network, mnemonic.to_string(), witness_version)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     to_js(&keys)
 }

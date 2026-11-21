@@ -1018,6 +1018,8 @@ pub struct SinglesigKeys {
     pub vanilla_keychain: Option<u8>,
     /// Wallet master fingerprint
     pub master_fingerprint: String,
+    /// Witness version these keys were derived with
+    pub witness_version: WitnessVersion,
     /// Wallet mnemonic phrase
     pub mnemonic: Option<Zeroizing<String>>,
 }
@@ -1029,6 +1031,7 @@ impl std::fmt::Debug for SinglesigKeys {
             .field("account_xpub_colored", &self.account_xpub_colored)
             .field("vanilla_keychain", &self.vanilla_keychain)
             .field("master_fingerprint", &self.master_fingerprint)
+            .field("witness_version", &self.witness_version)
             .field("mnemonic", &self.mnemonic.as_ref().map(|_| crate::REDACTED))
             .finish()
     }
@@ -1049,6 +1052,7 @@ impl SinglesigKeys {
                 self.vanilla_keychain,
                 xpub_btc,
                 xpub_rgb,
+                self.witness_version,
             )?;
             // check master fingerprint derived from mnemonic matches provided one
             let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.as_str())?;
@@ -1068,6 +1072,7 @@ impl SinglesigKeys {
                 xpub_rgb,
                 xpub_btc,
                 self.vanilla_keychain,
+                self.witness_version,
             )?;
             (descs, true)
         };
@@ -1089,6 +1094,7 @@ impl SinglesigKeys {
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain,
             master_fingerprint: keys.master_fingerprint.clone(),
+            witness_version: keys.witness_version,
             mnemonic: None,
         }
     }
@@ -1118,6 +1124,7 @@ pub(crate) struct WalletManifest {
     pub(crate) account_xpub_colored: String,
     pub(crate) vanilla_keychain: u8,
     pub(crate) master_fingerprint: String,
+    pub(crate) witness_version: WitnessVersion,
 }
 
 impl WalletManifest {
@@ -1133,6 +1140,7 @@ impl WalletManifest {
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain: keys.vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
             master_fingerprint: keys.master_fingerprint.clone(),
+            witness_version: keys.witness_version,
         }
     }
 
@@ -1160,8 +1168,10 @@ impl WalletManifest {
             };
         }
 
+        // The witness version comes before the xPubs it derives.
         check!(
             master_fingerprint,
+            witness_version,
             vanilla_keychain,
             account_xpub_colored,
             account_xpub_vanilla,
@@ -1189,6 +1199,7 @@ impl WalletManifest {
                 account_xpub_colored: self.account_xpub_colored,
                 vanilla_keychain: Some(self.vanilla_keychain),
                 master_fingerprint: self.master_fingerprint,
+                witness_version: self.witness_version,
                 mnemonic,
             },
         )
@@ -1290,7 +1301,7 @@ impl Wallet {
     ///
     /// The returned wallet is ready for use only after the IndexedDB read and snapshot
     /// restoration complete. IndexedDB and snapshot decoding failures are returned to the caller.
-    /// A snapshot saved with another fingerprint, vanilla keychain or account xPub gives
+    /// A snapshot saved with another fingerprint, witness version, vanilla keychain or account xPub gives
     /// [`Error::WalletSettingMismatch`]. Other settings come from `wallet_data` and are saved
     /// with the next save.
     /// It asks the browser to keep the storage. A refusal does not fail the call.
@@ -4564,7 +4575,10 @@ pub(crate) mod address_reuse_tests {
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
     pub(crate) fn make_test_wallet(reuse: bool) -> Wallet {
-        make_test_wallet_with_keys(generate_keys(BitcoinNetwork::Regtest), reuse)
+        make_test_wallet_with_keys(
+            generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot),
+            reuse,
+        )
     }
 
     pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys, reuse: bool) -> Wallet {
@@ -4795,7 +4809,7 @@ mod mainnet_schema_tests {
         schemas: Vec<AssetSchema>,
         reckless: bool,
     ) -> (WalletData, SinglesigKeys) {
-        let keys = generate_keys(network);
+        let keys = generate_keys(network, WitnessVersion::Taproot);
         let wd = WalletData {
             data_dir: s!(":memory:"),
             bitcoin_network: network,
@@ -4844,7 +4858,7 @@ mod mainnet_schema_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod keys_and_settings_tests {
     use super::*;
-    use crate::keys::generate_keys;
+    use crate::keys::{Keys, WitnessVersion, generate_keys, restore_keys};
 
     const NET: BitcoinNetwork = BitcoinNetwork::Regtest;
 
@@ -4878,7 +4892,7 @@ mod keys_and_settings_tests {
 
     #[test]
     fn get_descriptors_success() {
-        let keys = generate_keys(NET);
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
         let signing = SinglesigKeys::from_keys(&keys, None);
         let wallet = Wallet::new(wallet_data(), signing.clone()).unwrap();
         let descs = wallet.get_descriptors();
@@ -4896,9 +4910,60 @@ mod keys_and_settings_tests {
     }
 
     #[test]
+    fn keys_need_witness_version() {
+        let field = if cfg!(feature = "camel_case") {
+            "witnessVersion"
+        } else {
+            "witness_version"
+        };
+        let missing = format!("missing field `{field}`");
+        let keys = generate_keys(NET, WitnessVersion::SegWitV0);
+
+        let mut v = serde_json::to_value(&keys).unwrap();
+        v.as_object_mut().unwrap().remove(field).unwrap();
+        let err = serde_json::from_value::<Keys>(v).unwrap_err();
+        assert_eq!(err.to_string(), missing);
+
+        let mut v = serde_json::to_value(SinglesigKeys::from_keys(&keys, None)).unwrap();
+        v.as_object_mut().unwrap().remove(field).unwrap();
+        let err = serde_json::from_value::<SinglesigKeys>(v).unwrap_err();
+        assert_eq!(err.to_string(), missing);
+    }
+
+    #[test]
+    fn segwit_v0_wallet_success() {
+        let keys = generate_keys(NET, WitnessVersion::SegWitV0);
+        let mut addresses = vec![];
+        for sk in [
+            SinglesigKeys::from_keys(&keys, None),
+            SinglesigKeys::from_keys_no_mnemonic(&keys, None),
+        ] {
+            let mut wallet = Wallet::new(wallet_data(), sk).unwrap();
+            for (keychain, path) in [
+                (KeychainKind::External, "m/84'/827167'/0'/0"),
+                (KeychainKind::Internal, "m/84'/1'/0'/0"),
+            ] {
+                let bdk_wallet::miniscript::Descriptor::Wpkh(w) =
+                    wallet.bdk_wallet.public_descriptor(keychain)
+                else {
+                    panic!("expected a wpkh descriptor");
+                };
+                assert_eq!(
+                    w.as_inner().full_derivation_path().unwrap(),
+                    DerivationPath::from_str(path).unwrap()
+                );
+            }
+            addresses.push(wallet.get_address().unwrap());
+        }
+        assert_eq!(addresses[0], addresses[1]);
+        let address = BdkAddress::from_str(&addresses[0]).unwrap();
+        assert!(address.assume_checked().script_pubkey().is_p2wpkh());
+    }
+
+    #[test]
     fn new_fail() {
-        let keys = generate_keys(NET);
-        let other = generate_keys(NET);
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
+        let other = generate_keys(NET, WitnessVersion::Taproot);
         let signing = SinglesigKeys::from_keys(&keys, None);
 
         // invalid colored xPub
@@ -4920,6 +4985,13 @@ mod keys_and_settings_tests {
         // xPub not derived from the mnemonic
         let err = new_err(SinglesigKeys {
             account_xpub_colored: other.xpub.clone(),
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
+
+        // Taproot xPubs with the SegWitV0 witness version
+        let err = new_err(SinglesigKeys {
+            witness_version: WitnessVersion::SegWitV0,
             ..signing.clone()
         });
         assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
@@ -4954,7 +5026,7 @@ mod keys_and_settings_tests {
     #[test]
     fn settings_check_refuses_fixed_settings() {
         let wd = wallet_data();
-        let keys = generate_keys(NET);
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
         let sk = SinglesigKeys::from_keys(&keys, None);
         let manifest = WalletManifest::new(&wd, &sk);
         let check = |wd: &WalletData, sk: &SinglesigKeys| manifest.check_settings_unchanged(wd, sk);
@@ -4969,8 +5041,22 @@ mod keys_and_settings_tests {
         ));
 
         // all keys change: the fingerprint is reported first
-        let other = SinglesigKeys::from_keys_no_mnemonic(&generate_keys(NET), None);
+        let other = SinglesigKeys::from_keys_no_mnemonic(
+            &generate_keys(NET, WitnessVersion::Taproot),
+            None,
+        );
         mismatch(check(&wd, &other), "master_fingerprint");
+
+        // other witness version: it is reported before the xPubs
+        let segwit = SinglesigKeys::from_keys(
+            &restore_keys(NET, keys.mnemonic.to_string(), WitnessVersion::SegWitV0).unwrap(),
+            None,
+        );
+        let (expected, provided) = mismatch(check(&wd, &segwit), "witness_version");
+        assert_eq!(
+            (expected.as_str(), provided.as_str()),
+            ("Taproot", "SegWitV0")
+        );
 
         let keychain = SinglesigKeys::from_keys(&keys, Some(2));
         let (expected, provided) = mismatch(check(&wd, &keychain), "vanilla_keychain");
@@ -4992,7 +5078,7 @@ mod keys_and_settings_tests {
     #[test]
     fn settings_check_allows_mutable_settings() {
         let wd = wallet_data();
-        let keys = generate_keys(NET);
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
         let manifest = WalletManifest::new(&wd, &SinglesigKeys::from_keys(&keys, None));
 
         manifest
@@ -5016,7 +5102,7 @@ mod keys_and_settings_tests {
 
     #[test]
     fn manifest_round_trip() {
-        let keys = generate_keys(NET);
+        let keys = generate_keys(NET, WitnessVersion::SegWitV0);
         let wd = WalletData {
             max_allocations_per_utxo: 1,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],

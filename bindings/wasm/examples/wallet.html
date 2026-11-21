@@ -137,7 +137,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       <label for="wallet-data">WalletData JSON (auto-filled from generated keys)</label>
       <textarea id="wallet-data" rows="8" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
       <label for="wallet-keys">SinglesigKeys JSON (auto-filled from generated keys)</label>
-      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", ...}'></textarea>
+      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", "witnessVersion": "Taproot", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-create-wallet" disabled>Create Wallet</button>
@@ -358,7 +358,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-generate').addEventListener('click', () => {
       const network = document.getElementById('gen-network').value;
       try {
-        const keys = generateKeys(network);
+        const keys = generateKeys(network, 'Taproot');
         showJson('keys-output', 'keys-result', keys);
         document.getElementById('rt-status').innerHTML = '';
         if (keys.mnemonic) {
@@ -383,7 +383,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         return;
       }
       try {
-        const keys = restoreKeys(network, mnemonic);
+        const keys = restoreKeys(network, mnemonic, 'Taproot');
         showJson('keys-output', 'keys-result', keys);
         document.getElementById('rt-status').innerHTML = '';
         log('restoreKeys(' + network + ') OK', 'log-ok');
@@ -398,8 +398,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const network = document.getElementById('gen-network').value;
       const statusDiv = document.getElementById('rt-status');
       try {
-        const generated = generateKeys(network);
-        const restored = restoreKeys(network, generated.mnemonic);
+        const generated = generateKeys(network, 'Taproot');
+        const restored = restoreKeys(network, generated.mnemonic, 'Taproot');
         const fields = Object.keys(generated);
         let allMatch = true;
         const lines = [];
