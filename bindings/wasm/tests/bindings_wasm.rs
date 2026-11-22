@@ -8,7 +8,9 @@ use rgb_lib_wasm::wallet::{
     AssetFilter, DatabaseType, ReceiveData, SinglesigKeys, WalletData, WalletDescriptors,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
-use rgb_lib_wasm_bindings::{WasmInvoice, WasmWallet, inspect_consignment, max_expiration_secs};
+use rgb_lib_wasm_bindings::{
+    WasmInvoice, WasmWallet, check_indexer_url, inspect_consignment, max_expiration_secs,
+};
 
 fn wallet() -> WasmWallet {
     wallet_with_schemas(vec![AssetSchema::Nia])
@@ -689,4 +691,18 @@ async fn listing_sync_and_send_end_take_js_values() {
         .await
         .unwrap_err());
     assert!(e.starts_with("Invalid PSBT"), "{e}");
+}
+
+#[wasm_bindgen_test]
+async fn check_indexer_url_reads_arguments() {
+    const URL: &str = "http://127.0.0.1:8094/regtest/api";
+    assert!(!err(check_indexer_url(URL, "Nope").await.unwrap_err()).is_empty());
+    let e = err(check_indexer_url("http://127.0.0.1:1", "Regtest")
+        .await
+        .unwrap_err());
+    assert!(e.contains("not a valid electrum nor esplora server"), "{e}");
+    assert_eq!(
+        check_indexer_url(URL, "Regtest").await.unwrap().as_string(),
+        Some("Esplora".into())
+    );
 }
