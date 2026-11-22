@@ -5,7 +5,7 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, ReceiveData, SinglesigKeys, WalletData, WalletDescriptors,
+    AssetFilter, DatabaseType, Online, ReceiveData, SinglesigKeys, WalletData, WalletDescriptors,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{
@@ -728,4 +728,104 @@ async fn check_indexer_url_reads_arguments() {
         check_indexer_url(URL, "Regtest").await.unwrap().as_string(),
         Some("Esplora".into())
     );
+}
+
+#[wasm_bindgen_test]
+async fn one_step_calls_need_online() {
+    let wallet = wallet();
+    let online = || {
+        serde_wasm_bindgen::to_value(&Online {
+            id: 1,
+            indexer_url: "http://127.0.0.1:1".to_string(),
+        })
+        .unwrap()
+    };
+    let map = || js_sys::Object::new().into();
+    let e = err(wallet
+        .send(
+            online(),
+            map(),
+            false,
+            1,
+            1,
+            JsValue::from(now_secs() + 3600),
+            None,
+        )
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("Wallet is offline"), "{e}");
+    let e = err(wallet
+        .send(
+            online(),
+            map(),
+            false,
+            1,
+            1,
+            JsValue::from_str("soon"),
+            None,
+        )
+        .await
+        .unwrap_err());
+    assert!(e.starts_with("Invalid expiration timestamp:"), "{e}");
+}
+
+#[wasm_bindgen_test]
+async fn one_step_calls_return_results() {
+    let (wallet, online) = funded_wallet(vec![AssetSchema::Nia, AssetSchema::Ifa]).await;
+    let created = wallet
+        .create_utxos(online.clone(), false, Some(1), None, 1, true)
+        .await
+        .unwrap();
+    assert_eq!(created, 1);
+    let txid = wallet
+        .send_btc(
+            online.clone(),
+            &wallet.get_address().unwrap(),
+            1000,
+            1,
+            true,
+        )
+        .await
+        .unwrap();
+    txid.parse::<rgb_lib_wasm::bitcoin::Txid>().unwrap();
+
+    let asset = wallet
+        .issue_asset_ifa(
+            "IFA",
+            "Inflatable",
+            0,
+            serde_wasm_bindgen::to_value(&vec![600u64, 400]).unwrap(),
+            serde_wasm_bindgen::to_value(&vec![100u64]).unwrap(),
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+    let asset_id = prop(&asset, "assetId").as_string().unwrap();
+    let res = wallet
+        .inflate(
+            online.clone(),
+            &asset_id,
+            serde_wasm_bindgen::to_value(&vec![50u64]).unwrap(),
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(prop(&res, "txid").is_string());
+    assert!(prop(&res, "batchTransferIdx").as_f64().is_some());
+    assert!(prop(&res, "entropy").is_bigint());
+
+    let txid = wallet
+        .drain_to(
+            online.clone(),
+            &wallet_with_schemas(vec![AssetSchema::Nia])
+                .get_address()
+                .unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    txid.parse::<rgb_lib_wasm::bitcoin::Txid>().unwrap();
 }
