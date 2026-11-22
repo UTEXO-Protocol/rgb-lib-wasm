@@ -1356,14 +1356,20 @@ impl Indexer {
         })
     }
 
-    pub(crate) async fn get_spv_proof(&self, txid: &Txid) -> Result<Option<SpvProof>, Error> {
+    pub(crate) async fn get_merkle_proof(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<esplora_client::MerkleProof>, IndexerError> {
         Ok(match self {
-            Indexer::EsploraAsync(client) => client
-                .get_merkle_proof(txid)
-                .await
-                .map_err(IndexerError::from)?
-                .and_then(spv_proof_from_esplora),
+            Indexer::EsploraAsync(client) => client.get_merkle_proof(txid).await?,
         })
+    }
+
+    pub(crate) async fn get_spv_proof(&self, txid: &Txid) -> Result<Option<SpvProof>, Error> {
+        Ok(self
+            .get_merkle_proof(txid)
+            .await?
+            .and_then(spv_proof_from_esplora))
     }
 
     pub(crate) fn populate_tx_cache(
@@ -1553,7 +1559,7 @@ impl fmt::Display for IndexerProtocol {
     }
 }
 
-async fn connect_indexer(
+pub(crate) async fn connect_indexer(
     indexer: Option<Indexer>,
     bitcoin_network: BitcoinNetwork,
     invalid: &str,
@@ -11064,7 +11070,9 @@ const REGTEST_GENESIS_INFO: &[u8] = br#"[{"id":"0f9188f13cb7b2c71f2a335e3a4fc328
 
 // Serve an esplora: `route` maps a request path to a status line and a body.
 #[cfg(test)]
-fn fake_esplora(route: impl Fn(&str) -> (&'static str, Vec<u8>) + Send + 'static) -> String {
+pub(crate) fn fake_esplora(
+    route: impl Fn(&str) -> (&'static str, Vec<u8>) + Send + 'static,
+) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {

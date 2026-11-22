@@ -1544,6 +1544,22 @@ pub async fn check_indexer_url(indexer_url: &str, network: &str) -> Result<JsVal
     to_js(&protocol)
 }
 
+/// Fill in the SPV proofs a transfer consignment misses, from an esplora indexer.
+/// Returns { withoutProof: [{ txid, details }], rewritten, consignment: Uint8Array | null }.
+#[wasm_bindgen(js_name = "fillSpvProofs")]
+pub async fn fill_spv_proofs(
+    consignment_bytes: &[u8],
+    indexer_url: &str,
+) -> Result<JsValue, JsValue> {
+    let (fill, bytes) = rgb_lib_wasm::no_wallet::fill_spv_proofs(consignment_bytes, indexer_url)
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let obj = to_js(&fill)?;
+    let consignment = bytes.map_or(JsValue::NULL, |b| js_sys::Uint8Array::from(&b[..]).into());
+    js_sys::Reflect::set(&obj, &"consignment".into(), &consignment)?;
+    Ok(obj)
+}
+
 /// Validate an RGB consignment using witness data bundled in the consignment (offchain).
 ///
 /// Works before the witness transaction is broadcast. Takes the raw consignment
