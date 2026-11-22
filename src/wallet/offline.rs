@@ -105,6 +105,7 @@ pub(crate) struct LocalAssetData {
     pub(crate) initial_supply: u64,
     pub(crate) max_supply: Option<u64>,
     pub(crate) known_circulating_supply: Option<u64>,
+    pub(crate) bridge_location: Option<RgbBridgeLocationInfo>,
     pub(crate) reject_list: Option<RgbRejectListInfo>,
     pub(crate) linked_from_contract: Option<String>,
 }
@@ -222,6 +223,8 @@ pub struct Metadata {
     pub ticker: Option<String>,
     /// Asset details
     pub details: Option<String>,
+    /// Where the bridge contract backing the asset is deployed, which only a BFA asset has
+    pub bridge_location: Option<RgbBridgeLocationInfo>,
     /// Where the reject list the asset commits to is published, if any
     pub reject_list: Option<RgbRejectListInfo>,
     /// ID of the contract the asset is linked from (e.g. the one it replaces), if any
@@ -416,6 +419,8 @@ pub struct AssetBFA {
     pub balance: Balance,
     /// Asset media attachment
     pub media: Option<Media>,
+    /// Where the bridge contract backing the asset is deployed
+    pub bridge_location: RgbBridgeLocationInfo,
     /// Where the reject list the asset commits to is published, if any
     pub reject_list: Option<RgbRejectListInfo>,
 }
@@ -465,6 +470,10 @@ impl AssetBFA {
             added_at: asset.added_at,
             balance,
             media,
+            bridge_location: asset
+                .bridge_location
+                .clone()
+                .expect("a BFA asset has a bridge location"),
             reject_list: asset.reject_list.clone(),
         })
     }
@@ -2029,6 +2038,7 @@ impl Wallet {
             precision: ActiveValue::Set(asset_data.precision),
             ticker: ActiveValue::Set(asset_data.ticker),
             timestamp: ActiveValue::Set(timestamp),
+            bridge_location: ActiveValue::Set(asset_data.bridge_location),
             reject_list: ActiveValue::Set(asset_data.reject_list),
             linked_from_contract: ActiveValue::Set(asset_data.linked_from_contract),
             linked_to_contract: ActiveValue::Set(None),
@@ -2169,6 +2179,7 @@ impl Wallet {
             initial_supply: settled,
             max_supply: None,
             known_circulating_supply: None,
+            bridge_location: None,
             reject_list: None,
             linked_from_contract: None,
         };
@@ -2432,6 +2443,7 @@ impl Wallet {
             initial_supply: settled,
             max_supply: Some(max_supply),
             known_circulating_supply: Some(settled),
+            bridge_location: None,
             reject_list: reject_list_url.map(RgbRejectListInfo::Url),
             linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
@@ -2615,6 +2627,11 @@ impl Wallet {
         let bfa_name = self._check_name(name.clone())?;
         let bfa_precision = self._check_precision(precision)?;
 
+        let bridge_location = BridgeLocation::Evm(EvmContract {
+            chain_id,
+            address: self._check_contract_address(contract_address)?,
+        });
+
         let mut builder = ContractBuilder::with(
             Identity::default(),
             BridgedFungibleAsset::schema_rules(),
@@ -2628,13 +2645,7 @@ impl Wallet {
         .expect("invalid precision")
         .add_global_state("terms", terms)
         .expect("invalid terms")
-        .add_global_state(
-            RGB_GLOBAL_BRIDGE_LOCATION,
-            BridgeLocation::Evm(EvmContract {
-                chain_id,
-                address: self._check_contract_address(contract_address)?,
-            }),
-        )
+        .add_global_state(RGB_GLOBAL_BRIDGE_LOCATION, bridge_location.clone())
         .expect("invalid bridgeLocation");
         let reject_list = reject_list_address
             .map(|address| {
@@ -2694,6 +2705,7 @@ impl Wallet {
             initial_supply: 0,
             max_supply: None,
             known_circulating_supply: None,
+            bridge_location: Some(bridge_location.into()),
             reject_list: reject_list.map(RgbRejectListInfo::from),
             linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
@@ -3005,6 +3017,7 @@ impl Wallet {
             precision: asset.precision,
             ticker: asset.ticker,
             details: asset.details,
+            bridge_location: asset.bridge_location,
             reject_list: asset.reject_list,
             linked_from_contract: asset.linked_from_contract,
             linked_to_contract: asset.linked_to_contract,
