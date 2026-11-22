@@ -1279,6 +1279,8 @@ pub struct Wallet {
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
+    /// Media bytes keyed by hex digest (replaces the media directory on wasm32).
+    pub(crate) media: HashMap<String, Vec<u8>>,
     /// Mint locks a received consignment waits for, keyed by recipient_id
     pub(crate) pending_mint_locks: HashMap<String, PendingMintLocks>,
     /// TXs this wallet broadcast in the running operation. A failed operation keeps them in BDK.
@@ -1465,6 +1467,7 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            media: HashMap::new(),
             pending_mint_locks: HashMap::new(),
             #[cfg(feature = "esplora")]
             broadcast_txs: Vec::new(),
@@ -1987,6 +1990,18 @@ impl Wallet {
                 ..Default::default()
             })?,
         })
+    }
+
+    pub(crate) fn get_asset_medias(&self, media_idx: Option<i32>) -> Result<HashSet<Media>, Error> {
+        let mut asset_medias = HashSet::new();
+        if let Some(media_idx) = media_idx {
+            let db_media = self
+                .database
+                .get_media(media_idx)?
+                .expect("asset media row exists");
+            asset_medias.insert(Media::from_db_media(&db_media, self.get_media_dir()));
+        }
+        Ok(asset_medias)
     }
 
     pub(crate) fn add_asset_to_db(
@@ -4208,6 +4223,7 @@ pub(crate) struct Checkpoint {
     #[cfg(feature = "esplora")]
     received_signed_txs: HashMap<String, Vec<u8>>,
     received_mints: HashMap<String, ReceivedMint>,
+    media: HashMap<String, Vec<u8>>,
     pending_mint_locks: HashMap<String, PendingMintLocks>,
     reuse_address_index: HashMap<KeychainKind, u32>,
 }
@@ -4322,6 +4338,7 @@ impl Wallet {
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
+            media: self.media.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
@@ -4378,6 +4395,7 @@ impl Wallet {
         self.received_consignment_meta = snapshot.received_consignment_meta;
         self.received_signed_txs = snapshot.received_signed_txs;
         self.received_mints = snapshot.received_mints;
+        self.media = snapshot.media;
         self.pending_mint_locks = snapshot.pending_mint_locks;
 
         // Restore address reuse pinned indices
@@ -4462,6 +4480,7 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
+            media: self.media.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
             reuse_address_index: self.reuse_address_index.clone(),
         }
@@ -4483,6 +4502,7 @@ impl Wallet {
             self.received_signed_txs = cp.received_signed_txs;
         }
         self.received_mints = cp.received_mints;
+        self.media = cp.media;
         self.pending_mint_locks = cp.pending_mint_locks;
         self.reuse_address_index = cp.reuse_address_index;
         #[cfg(feature = "esplora")]
@@ -4652,6 +4672,7 @@ pub(crate) mod address_reuse_tests {
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            media: HashMap::new(),
             pending_mint_locks: HashMap::new(),
             #[cfg(feature = "esplora")]
             broadcast_txs: Vec::new(),
@@ -4680,6 +4701,7 @@ pub(crate) mod address_reuse_tests {
             "received_consignment_meta": wallet.received_consignment_meta,
             "received_signed_txs": wallet.received_signed_txs,
             "received_mints": wallet.received_mints,
+            "media": wallet.media,
             "pending_mint_locks": wallet.pending_mint_locks,
             "reuse_address_index": wallet.reuse_address_index,
         })

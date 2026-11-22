@@ -3285,6 +3285,16 @@ impl Wallet {
                 details: format!("spent bitcoins with another wallet: {spent:?}"),
             });
         }
+        if self
+            .database
+            .iter_media()?
+            .iter()
+            .any(|m| !self.media.contains_key(&m.digest))
+        {
+            return Err(Error::Inconsistency {
+                details: s!("DB media do not match with the ones stored in media directory"),
+            });
+        }
         Ok(())
     }
 
@@ -5254,7 +5264,7 @@ impl Wallet {
     /// `false` if it is missing and an error if it does not match.
     #[allow(clippy::too_many_arguments)]
     async fn _contract_media_verified(
-        &self,
+        &mut self,
         runtime: &RgbRuntime,
         valid_contract: &ValidContract,
         asset_schema: AssetSchema,
@@ -5289,8 +5299,9 @@ impl Wallet {
         };
         for attachment in attachments {
             let digest = hex::encode(attachment.digest);
-            // on wasm32, skip media file storage (no filesystem): the media is fetched
-            // and checked against the digest in the contract
+            if self.media.contains_key(&digest) {
+                continue;
+            }
             let derived = derive_shared(&ed25519_from_seed(seed), sender_vk)?;
             let media_id = derived.media_id(&digest);
             let media_res = ProxyClient::new(&data.proxy_url)?
@@ -5305,7 +5316,7 @@ impl Wallet {
             };
             // also checks the plaintext against the digest in the contract. A mismatch is an
             // error: the transfer stays pending and the next refresh tries again.
-            Self::decrypt_payload_with_shared_key(
+            let plaintext = Self::decrypt_payload_with_shared_key(
                 &media_b64,
                 data.recipient_encryption,
                 recipient_seed,
@@ -5318,6 +5329,7 @@ impl Wallet {
                     "Attached file does not match the contract: {e}"
                 )
             })?;
+            self.media.insert(digest, plaintext);
         }
         Ok(true)
     }
@@ -8534,28 +8546,42 @@ impl Wallet {
         }))
     }
 
-    /// Post the consignment of an asset to each recipient, on the first of its transport
-    /// endpoints that accepts it, marking the endpoint as used.
+    /// Post the consignment and the media of an asset to each recipient, on the first of its
+    /// transport endpoints that accepts them, marking the endpoint as used.
     #[allow(clippy::too_many_arguments)]
     async fn post_transfer_data(
         &self,
         recipients: &mut [LocalRecipient],
         consignment: &[u8],
+        asset_id: &str,
         sender_sk: &SigningKey,
         sender_pubkey_hex: &str,
         sender_transport_endpoint: &str,
         consignment_hash: &str,
         batch: bool,
     ) -> Result<(), Error> {
+        let asset = self.database.check_asset_exists(asset_id.to_string())?;
+        let medias = self
+            .get_asset_medias(asset.media_idx)?
+            .into_iter()
+            .map(|m| match self.media.get(&m.digest) {
+                Some(bytes) => Ok((m.digest, bytes.clone())),
+                None => Err(Error::IO {
+                    details: format!("media {} not found", m.digest),
+                }),
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let media_count = medias.len();
         for recipient in recipients {
             let recipient_id = &recipient.recipient_id;
             let recipient_vk = verifying_key_from_bytes(&recipient.public_key)?;
             let derived = derive_shared(sender_sk, &recipient_vk)?;
+            let encrypt = recipient.encryption != Encryption::Unsupported;
             let (invoice_id, transfer_id) = recipient.proxy_ids(sender_pubkey_hex);
 
             // the (optionally encrypted) consignment, signed along with the hash of the uploaded
             // bytes, is the same for every transport endpoint
-            let posted = if recipient.encryption != Encryption::Unsupported {
+            let posted = if encrypt {
                 encrypt_blob(
                     consignment,
                     &derived.sym_key,
@@ -8580,6 +8606,26 @@ impl Wallet {
                     ),
                 )),
             };
+            let media_posts = medias
+                .iter()
+                .map(|(digest, bytes)| {
+                    let media_id = derived.media_id(digest);
+                    let payload = if encrypt {
+                        encrypt_blob(bytes, &derived.sym_key, &decode_hash_hex(digest)?)?
+                    } else {
+                        bytes.clone()
+                    };
+                    let media_blob_hash = hex::encode(sha256_digest(&payload));
+                    let signature = hex::encode(sign_ed25519(
+                        sender_sk,
+                        &sha256_digest(
+                            post_media_message(&transfer_id, &media_id, &media_blob_hash)
+                                .as_bytes(),
+                        ),
+                    ));
+                    Ok((media_id, payload, signature))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
 
             let mut found_valid = false;
             // the error of the last endpoint that refused to create the transfer, if any
@@ -8605,6 +8651,30 @@ impl Wallet {
                 );
                 let proxy_client = ProxyClient::new(&proxy_url)?;
 
+                // skip a proxy that would refuse some of the media after the consignment is posted,
+                // or that doesn't tell how many it accepts
+                if media_count > 0 {
+                    let max_media = proxy_client
+                        .get_info()
+                        .await
+                        .ok()
+                        .and_then(|res| res.result)
+                        .as_ref()
+                        .and_then(proxy_max_media);
+                    let Some(max_media) = max_media else {
+                        debug!(self.logger, "Proxy {proxy_url} doesn't report max media");
+                        continue;
+                    };
+                    if media_count > max_media {
+                        debug!(
+                            self.logger,
+                            "Proxy {proxy_url} accepts {max_media} media, {media_count} needed"
+                        );
+                        refusal = Some(Error::ProxyTooManyMedia);
+                        continue;
+                    }
+                }
+
                 match self
                     .post_consignment_with_pow(&proxy_client, &consignment_data, &posted)
                     .await?
@@ -8623,6 +8693,16 @@ impl Wallet {
                     }
                     Err(e @ Error::ProxyCannotChange { .. }) => return Err(e),
                     Err(_) => continue,
+                }
+
+                for (media_id, payload, signature) in &media_posts {
+                    let media_res = proxy_client
+                        .post_media(&transfer_id, media_id, payload, signature)
+                        .await?;
+                    debug!(self.logger, "Attachment POST response: {:?}", media_res);
+                    if let Some(err) = media_res.error {
+                        return Err(map_proxy_error(err));
+                    }
                 }
 
                 transport_endpoint.used = true;
@@ -8831,6 +8911,7 @@ impl Wallet {
                     .post_transfer_data(
                         &mut info_contents_asset.recipients,
                         &consignment_bytes[asset_id],
+                        asset_id,
                         &sender_sk,
                         &sender_pubkey_hex,
                         &sender_transport_endpoint,
@@ -10397,6 +10478,7 @@ impl Wallet {
                     .expect("saved by _prepare_transfer_psbt_wasm")
                     .recipients,
                 &consignment,
+                &asset_id,
                 &operation_sk,
                 &sender_pubkey_hex,
                 &sender_transport_endpoint,
@@ -10676,6 +10758,10 @@ fn add_inflation(known_circulating_supply: &str, inflation: u64) -> u64 {
         .expect("known circulating supply plus inflation cannot exceed u64::MAX")
 }
 
+// The tip list of an esplora that has only the regtest genesis block.
+#[cfg(test)]
+const REGTEST_GENESIS_INFO: &[u8] = br#"[{"id":"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206","height":0,"version":1,"timestamp":1296688602,"tx_count":1,"size":285,"weight":1140,"merkle_root":"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b","previousblockhash":null,"mediantime":1296688602,"nonce":2,"bits":545259519,"difficulty":0}]"#;
+
 // Serve an esplora: `route` maps a request path to a status line and a body.
 #[cfg(test)]
 fn fake_esplora(route: impl Fn(&str) -> (&'static str, Vec<u8>) + Send + 'static) -> String {
@@ -10824,6 +10910,44 @@ mod go_online_tests {
         assert_eq!(go_online(&mut wallet, checked.clone()), Err(err.clone()));
         assert_eq!(go_online(&mut wallet, checked), Err(err));
         assert!(go_online(&mut wallet, options(&url, &[])).is_ok());
+    }
+
+    #[test]
+    fn go_online_detects_missing_media() {
+        use crate::database::memory_db::{ActiveValue, DbMediaActMod};
+
+        let mut wallet = make_test_wallet(false);
+        let digest = hex::encode(sha256_digest(b"media"));
+        wallet
+            .database
+            .set_media(DbMediaActMod {
+                digest: ActiveValue::Set(digest.clone()),
+                mime: ActiveValue::Set(s!("text/plain")),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet.media.insert(digest, b"media".to_vec());
+        let url = fake_esplora(|path: &str| match path {
+            "/blocks" => ("200 OK", REGTEST_GENESIS_INFO.to_vec()),
+            p if p.starts_with("/scripthash/") => ("200 OK", b"[]".to_vec()),
+            _ => (
+                "200 OK",
+                b"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206".to_vec(),
+            ),
+        });
+        let checked = OnlineOptions {
+            skip_consistency_check: false,
+            ..options(&url, &[])
+        };
+        let res = go_online(&mut wallet, checked.clone());
+        assert!(res.is_ok(), "{res:?}");
+
+        wallet.media.clear();
+        let err = Error::Inconsistency {
+            details: s!("DB media do not match with the ones stored in media directory"),
+        };
+        assert_eq!(go_online(&mut wallet, checked.clone()), Err(err.clone()));
+        assert_eq!(go_online(&mut wallet, checked), Err(err));
     }
 
     #[test]
@@ -11292,6 +11416,31 @@ mod send_end_tests {
 
     fn send_end_err(wallet: &mut Wallet, online: &Online, psbt: &str) -> Error {
         block_on(wallet.send_end(online.clone(), psbt.to_string())).unwrap_err()
+    }
+
+    /// Save the asset "asset", with `media` as its media bytes when given.
+    fn seed_asset(wallet: &mut Wallet, media: Option<&[u8]>) {
+        let media_idx = media.map(|bytes| {
+            let digest = hex::encode(sha256_digest(bytes));
+            wallet.media.insert(digest.clone(), bytes.to_vec());
+            wallet
+                .database
+                .set_media(DbMediaActMod {
+                    digest: ActiveValue::Set(digest),
+                    mime: ActiveValue::Set(s!("text/plain")),
+                    ..Default::default()
+                })
+                .unwrap()
+        });
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(s!("asset")),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                media_idx: ActiveValue::Set(media_idx),
+                ..Default::default()
+            })
+            .unwrap();
     }
 
     fn inflate_end_err(wallet: &mut Wallet, online: &Online, psbt: &str) -> Error {
@@ -12044,6 +12193,7 @@ mod send_end_tests {
     fn send_end_keeps_artifacts_when_a_post_fails() {
         let (psbt, txid) = dummy_psbt();
         let (mut wallet, online) = setup();
+        seed_asset(&mut wallet, None);
         let mut server = mockito::Server::new();
         let _info = rpc_mock(&mut server, "server.info", INFO_BODY);
         let _prepare = rpc_mock(&mut server, "ack.prepare", TRUE_BODY);
@@ -12073,6 +12223,25 @@ mod send_end_tests {
         let kept = &wallet.transfer_artifacts[&txid];
         assert!(kept.batch_info.is_some());
         assert!(kept.asset_infos["asset"].recipients[0].transport_endpoints[0].used);
+        assert!(kept.signed_tx.is_none());
+
+        // the proxy takes the consignment but refuses the media
+        let sender = sender_proxy();
+        let mut proxy = mockito::Server::new();
+        let info = INFO_BODY.replace(r#""uptime":1"#, r#""uptime":1,"max_media":"1""#);
+        let _info = rpc_mock(&mut proxy, "server.info", &info);
+        let _post = rpc_mock(&mut proxy, "consignment.post", TRUE_BODY);
+        let _media = rpc_mock(
+            &mut proxy,
+            "media.post",
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-503,"message":"signature"}}"#,
+        );
+        let (mut wallet, online, psbt, txid) = media_send(&sender, vec![proxy.url()]);
+        let res = send_end_err(&mut wallet, &online, &psbt);
+        assert_eq!(res, Error::InvalidContentSignature);
+        let kept = &wallet.transfer_artifacts[&txid];
+        assert!(kept.batch_info.is_some());
+        assert!(!kept.asset_infos["asset"].recipients[0].transport_endpoints[0].used);
         assert!(kept.signed_tx.is_none());
     }
 
@@ -13256,10 +13425,153 @@ mod send_end_tests {
         );
     }
 
+    // a recipient proxy that expects `posts` consignment and media posts
+    fn recipient_proxy(
+        max: Option<&str>,
+        posts: usize,
+    ) -> (mockito::ServerGuard, Vec<mockito::Mock>) {
+        let mut server = mockito::Server::new();
+        let mut mocks = vec![rpc_mock(
+            &mut server,
+            "server.info",
+            &max.map_or(INFO_BODY.to_string(), |m| {
+                INFO_BODY.replace(r#""uptime":1"#, &format!(r#""uptime":1,"max_media":"{m}""#))
+            }),
+        )];
+        for method in ["consignment.post", "media.post"] {
+            mocks.push(
+                server
+                    .mock("POST", "/")
+                    .match_body(mockito::Matcher::Regex(method.to_string()))
+                    .with_header("content-type", "application/json")
+                    .with_body(TRUE_BODY)
+                    .expect(posts)
+                    .create(),
+            );
+        }
+        (server, mocks)
+    }
+
+    // a send of an asset with media to one recipient with the given endpoints
+    fn media_send(
+        sender: &mockito::ServerGuard,
+        endpoints: Vec<String>,
+    ) -> (Wallet, Online, String, String) {
+        let (psbt, txid) = dummy_psbt();
+        let (mut wallet, online) = setup();
+        seed_asset(&mut wallet, Some(b"media"));
+        let mut r1 = recipient("r1", false, true);
+        r1.transport_endpoints = endpoints
+            .into_iter()
+            .map(|endpoint| LocalTransportEndpoint {
+                transport_type: TransportType::JsonRpc,
+                endpoint,
+                used: false,
+                usable: true,
+            })
+            .collect();
+        let mut transfer_artifacts = artifacts(BTreeMap::from([(
+            s!("asset"),
+            info_asset(TypeOfTransition::Transfer, vec![r1], HashMap::new()),
+        )]));
+        let info = transfer_artifacts.batch_info.as_mut().unwrap();
+        info.expiration_timestamp = Some(now().unix_timestamp() + 1000);
+        info.sender_transport_endpoint = Some(format!("rpc://{}", sender.host_with_port()));
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), transfer_artifacts);
+        (wallet, online, psbt, txid)
+    }
+
+    fn sender_proxy() -> mockito::ServerGuard {
+        let mut server = mockito::Server::new();
+        rpc_mock(&mut server, "server.info", INFO_BODY);
+        rpc_mock(&mut server, "ack.prepare", TRUE_BODY);
+        server
+    }
+
+    #[test]
+    fn send_end_checks_proxy_max_media() {
+        // a proxy with a too low, a missing or an invalid max media is skipped
+        for (max, expected) in [
+            (Some("0"), Error::ProxyTooManyMedia),
+            (None, Error::NoValidTransportEndpoint),
+            (Some("x"), Error::NoValidTransportEndpoint),
+        ] {
+            let sender = sender_proxy();
+            let (proxy, mocks) = recipient_proxy(max, 0);
+            let (mut wallet, online, psbt, _) = media_send(&sender, vec![proxy.url()]);
+            assert_eq!(send_end_err(&mut wallet, &online, &psbt), expected);
+            mocks.iter().skip(1).for_each(|m| m.assert());
+        }
+
+        // the send falls back to a proxy that accepts the media
+        let sender = sender_proxy();
+        let (a, a_mocks) = recipient_proxy(Some("0"), 0);
+        let (b, b_mocks) = recipient_proxy(Some("1"), 1);
+        let (mut wallet, online, psbt, txid) = media_send(&sender, vec![a.url(), b.url()]);
+        block_on(wallet.send_end(online, psbt)).unwrap();
+        let used: Vec<bool> = wallet.transfer_artifacts[&txid].asset_infos["asset"].recipients[0]
+            .transport_endpoints
+            .iter()
+            .map(|e| e.used)
+            .collect();
+        assert_eq!(used, vec![false, true]);
+        a_mocks
+            .iter()
+            .chain(&b_mocks)
+            .skip(1)
+            .for_each(|m| m.assert());
+
+        // a recipient that takes no encryption gets the media bytes as they are
+        let sender = sender_proxy();
+        let mut proxy = mockito::Server::new();
+        let info = INFO_BODY.replace(r#""uptime":1"#, r#""uptime":1,"max_media":"1""#);
+        let _info = rpc_mock(&mut proxy, "server.info", &info);
+        let _post = rpc_mock(&mut proxy, "consignment.post", TRUE_BODY);
+        let plain = proxy
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(s!("media.post")),
+                mockito::Matcher::Regex(s!("\r\n\r\nmedia\r\n--")),
+            ]))
+            .with_header("content-type", "application/json")
+            .with_body(TRUE_BODY)
+            .expect(1)
+            .create();
+        let (mut wallet, online, psbt, txid) = media_send(&sender, vec![proxy.url()]);
+        wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .asset_infos
+            .get_mut("asset")
+            .unwrap()
+            .recipients[0]
+            .encryption = Encryption::Unsupported;
+        block_on(wallet.send_end(online, psbt)).unwrap();
+        plain.assert();
+    }
+
+    #[test]
+    fn send_end_needs_media_bytes() {
+        let sender = sender_proxy();
+        let (proxy, mocks) = recipient_proxy(Some("1"), 0);
+        let (mut wallet, online, psbt, txid) = media_send(&sender, vec![proxy.url()]);
+        wallet.media.clear();
+        assert!(matches!(
+            send_end_err(&mut wallet, &online, &psbt),
+            Error::IO { .. }
+        ));
+        mocks.iter().skip(1).for_each(|m| m.assert());
+        assert!(wallet.transfer_artifacts.contains_key(&txid));
+    }
+
     #[test]
     fn send_end_sets_broadcast_deadline() {
         let (psbt, txid) = dummy_psbt();
         let (mut wallet, online) = setup();
+        seed_asset(&mut wallet, None);
         let mut server = mockito::Server::new();
         let _info = rpc_mock(&mut server, "server.info", INFO_BODY);
         let _prepare = rpc_mock(&mut server, "ack.prepare", TRUE_BODY);
@@ -14310,9 +14622,6 @@ mod send_end_tests {
             .map(|s| s.script)
             .collect()
     }
-
-    // The tip list of an esplora that has only the regtest genesis block.
-    const REGTEST_GENESIS_INFO: &[u8] = br#"[{"id":"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206","height":0,"version":1,"timestamp":1296688602,"tx_count":1,"size":285,"weight":1140,"merkle_root":"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b","previousblockhash":null,"mediantime":1296688602,"nonce":2,"bits":545259519,"difficulty":0}]"#;
 
     #[test]
     fn colored_fast_sync_requests_pending_witness_and_unconfirmed_input_scripts() {

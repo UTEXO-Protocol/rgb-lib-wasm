@@ -265,7 +265,7 @@ use crate::{
         verifying_key_from_bytes,
     },
     error::IndexerError,
-    utils::INDEXER_STOP_GAP,
+    utils::{INDEXER_STOP_GAP, proxy_max_media},
     wallet::{AssignmentsCollection, Indexer},
 };
 use crate::{

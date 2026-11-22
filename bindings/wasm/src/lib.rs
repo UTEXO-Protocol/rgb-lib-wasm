@@ -404,6 +404,17 @@ impl WasmWallet {
         to_js(&metadata)
     }
 
+    /// List the media of an RGB asset.
+    #[wasm_bindgen(js_name = "listAssetMedia")]
+    pub fn list_asset_media(&self, asset_id: &str) -> Result<JsValue, JsValue> {
+        let medias = self
+            .inner
+            .borrow()
+            .list_asset_media(asset_id.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&medias)
+    }
+
     /// Return the balance for a specific asset.
     #[wasm_bindgen(js_name = "getAssetBalance")]
     pub fn get_asset_balance(&self, asset_id: &str) -> Result<JsValue, JsValue> {
