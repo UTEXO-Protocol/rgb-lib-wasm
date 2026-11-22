@@ -3,6 +3,8 @@
 use super::*;
 
 pub(crate) mod inspection;
+#[cfg(feature = "esplora")]
+pub(crate) mod spv;
 
 pub use inspection::{
     BundleFilter, ConsignmentInspection, Opout, RgbBridgeLocationInfo, RgbEvmContractInfo,
@@ -10,6 +12,8 @@ pub use inspection::{
     RgbRejectListInfo, RgbTransitionInfo, TransitionGlobal, TransitionMetadata,
     inspect_consignment,
 };
+#[cfg(feature = "esplora")]
+pub use spv::{SpvProofFill, WitnessWithoutProof, fill_spv_proofs};
 
 /// Bitcoin transaction outpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]

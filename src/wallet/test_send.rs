@@ -7,6 +7,7 @@ use super::online::{
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
+use crate::no_wallet::{SpvProofFill, WitnessWithoutProof, fill_spv_proofs};
 use crate::utils::{INDEXER_SYNCS, TRANSITION_BUILDERS_LOADED};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
@@ -17,7 +18,7 @@ use crate::wallet::{
 };
 use crate::{
     AssetSchema, Assignment, Attachment, Bytes32, Encryption, Error, MediaType, RgbTransfer,
-    TransferKind, TransferStatus, sha256_digest,
+    SpvProof, TransferKind, TransferStatus, WitnessBundle, sha256_digest,
 };
 use amplify::ByteArray;
 use amplify::confinement::Confined;
@@ -1402,7 +1403,8 @@ impl Drop for AllowTxLookups {
 }
 
 // a consignment carries the SPV proof of each mined history witness, and the receiver checks it
-// without fetching the witness
+// without fetching the witness; the wallet-less fill sets the proofs a consignment misses and keeps
+// the ones it has
 #[wasm_bindgen_test]
 async fn spv_proofs() {
     let _allow = AllowTxLookups;
@@ -1437,6 +1439,30 @@ async fn spv_proofs() {
     assert!(proofs[&txid_1]);
     assert!(!proofs[&txid_2]);
     assert!(stored_proof(&a, &txid_1));
+
+    let bytes = a.transfer_artifacts[&txid_2].consignment_bytes[&asset_id].clone();
+    let empty = SpvProofFill {
+        without_proof: vec![],
+        rewritten: false,
+    };
+
+    // the wallet-less fill reports the unmined witness and does not look up the proven one
+    refuse_tx_lookups(&[&txid_1]);
+    assert_eq!(
+        fill_spv_proofs(&bytes, ESPLORA_URL).await.unwrap(),
+        (
+            SpvProofFill {
+                without_proof: vec![WitnessWithoutProof {
+                    txid: txid_2.clone(),
+                    details: s("TX is unknown or not mined"),
+                }],
+                rewritten: false,
+            },
+            None
+        )
+    );
+    assert_eq!(refused_tx_lookups(), 0);
+    refuse_tx_lookups(&[]);
 
     // C settles the transfer with the lookups of txid_1 refused
     for _ in 0..3 {
@@ -1512,6 +1538,76 @@ async fn spv_proofs() {
         resolver.resolve_witness(witness_1),
         Ok(WitnessStatus::Resolved(_, WitnessOrd::Mined(_)))
     ));
+
+    // once mined, the missing proof is set
+    let proof_1 = proof_of(&bytes, &txid_1).unwrap();
+    let (fill, filled) = fill_spv_proofs(&bytes, ESPLORA_URL).await.unwrap();
+    assert_eq!(
+        fill,
+        SpvProofFill {
+            without_proof: vec![],
+            rewritten: true,
+        }
+    );
+    let filled = filled.unwrap();
+    assert_eq!(proof_of(&filled, &txid_1), Some(proof_1));
+    let proof_2 = proof_of(&filled, &txid_2).unwrap();
+
+    // the set proof replaces the lookup of its witness
+    refuse_tx_lookups(&[&txid_2]);
+    let resolver = c
+        .prefetch_consignment_witnesses(&RgbTransfer::load(&filled[..]).unwrap())
+        .await
+        .unwrap();
+    refuse_tx_lookups(&[]);
+    assert!(
+        resolver
+            .resolve_witness(RgbTxid::from_str(&txid_2).unwrap())
+            .is_err()
+    );
+    assert!(resolver.get_block_header(proof_2.block_height).is_ok());
+
+    // a second fill looks up nothing and returns no bytes
+    refuse_tx_lookups(&[&txid_1, &txid_2]);
+    assert_eq!(
+        fill_spv_proofs(&filled, ESPLORA_URL).await.unwrap(),
+        (empty.clone(), None)
+    );
+    assert_eq!(refused_tx_lookups(), 0);
+    refuse_tx_lookups(&[]);
+
+    // an existing proof is kept, even a stale one
+    let witness_2 = RgbTxid::from_str(&txid_2).unwrap();
+    let edited = |f: fn(&mut WitnessBundle)| {
+        let mut consignment = RgbTransfer::load(&filled[..]).unwrap();
+        assert!(consignment.modify_bundle(witness_2, f));
+        let mut bytes = vec![];
+        consignment.save(&mut bytes).unwrap();
+        bytes
+    };
+    let stale = edited(|bw| bw.spv_proof.as_mut().unwrap().pos += 1);
+    assert_eq!(
+        fill_spv_proofs(&stale, ESPLORA_URL).await.unwrap(),
+        (empty, None)
+    );
+
+    // a dropped proof is set again
+    let dropped = edited(|bw| bw.spv_proof = None);
+    let (fill, refilled) = fill_spv_proofs(&dropped, ESPLORA_URL).await.unwrap();
+    assert!(fill.rewritten);
+    assert_eq!(proof_of(&refilled.unwrap(), &txid_2), Some(proof_2));
+}
+
+fn proof_of(bytes: &[u8], txid: &str) -> Option<SpvProof> {
+    let witness_id = RgbTxid::from_str(txid).unwrap();
+    RgbTransfer::load(bytes)
+        .unwrap()
+        .bundles
+        .iter()
+        .find(|bw| bw.witness_id() == witness_id)
+        .unwrap()
+        .spv_proof
+        .clone()
 }
 
 #[wasm_bindgen_test]

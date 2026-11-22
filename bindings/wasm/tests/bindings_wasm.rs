@@ -9,7 +9,8 @@ use rgb_lib_wasm::wallet::{
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{
-    WasmInvoice, WasmWallet, check_indexer_url, inspect_consignment, max_expiration_secs,
+    WasmInvoice, WasmWallet, check_indexer_url, fill_spv_proofs, inspect_consignment,
+    max_expiration_secs,
 };
 
 fn wallet() -> WasmWallet {
@@ -728,6 +729,63 @@ async fn check_indexer_url_reads_arguments() {
         check_indexer_url(URL, "Regtest").await.unwrap().as_string(),
         Some("Esplora".into())
     );
+}
+
+#[wasm_bindgen_test]
+async fn fill_spv_proofs_reads_arguments() {
+    use rgb_lib_wasm::{FileContent, RgbTransfer};
+    const URL: &str = "http://127.0.0.1:8094/regtest/api";
+    let get = |v: &JsValue, key: &str| js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap();
+    let e = err(fill_spv_proofs(&[0], URL).await.unwrap_err());
+    assert!(e.contains("Invalid consignment"), "{e}");
+
+    // the fixture witnesses are unknown to the indexer
+    let mut consignment = RgbTransfer::load(
+        &include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/inspection/send.rgbc"
+        ))[..],
+    )
+    .unwrap();
+    for bw in consignment.bundles.iter_mut() {
+        bw.spv_proof = None;
+    }
+    let mut bytes = vec![];
+    consignment.save(&mut bytes).unwrap();
+    let fill = fill_spv_proofs(&bytes, URL).await.unwrap();
+    let without: js_sys::Array = get(&fill, "withoutProof").dyn_into().unwrap();
+    assert_eq!(without.length(), consignment.bundles.len() as u32);
+    for w in without.iter() {
+        assert_eq!(
+            get(&w, "details"),
+            JsValue::from_str("TX is unknown or not mined")
+        );
+    }
+    assert_eq!(get(&fill, "rewritten"), JsValue::FALSE);
+    assert!(get(&fill, "consignment").is_null());
+
+    // an indexer that proves every witness
+    js_sys::eval(
+        r#"globalThis.__origFetch = globalThis.fetch;
+        globalThis.fetch = function (input, init) {
+            const u = input instanceof Request ? input.url : String(input);
+            if (u.includes('/merkle-proof')) {
+                const resp = new Response('{"block_height":1,"merkle":[],"pos":0}', {status: 200});
+                return Promise.resolve(Object.defineProperty(resp, 'url', {value: u}));
+            }
+            return globalThis.__origFetch(input, init);
+        };"#,
+    )
+    .unwrap();
+    let fill = fill_spv_proofs(&bytes, URL).await;
+    js_sys::eval("globalThis.fetch = globalThis.__origFetch;").unwrap();
+    let fill = fill.unwrap();
+    assert_eq!(get(&fill, "rewritten"), JsValue::TRUE);
+    let filled: js_sys::Uint8Array = get(&fill, "consignment").dyn_into().unwrap();
+    let filled = RgbTransfer::load(&filled.to_vec()[..]).unwrap();
+    for bw in filled.bundles.iter() {
+        assert_eq!(bw.spv_proof.as_ref().unwrap().block_height.get(), 1);
+    }
 }
 
 #[wasm_bindgen_test]
