@@ -18,8 +18,8 @@ mod utils;
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::idb_store::{load_snapshot, save_snapshot};
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, Recipient, SinglesigKeys, TransferScope, Wallet, WalletData,
-    WitnessData,
+    AssetFilter, DatabaseType, Online, Recipient, SinglesigKeys, SyncKeychain, SyncOptions,
+    SyncStrategy, TransferScope, Wallet, WalletData, WitnessData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferStatus, WitnessVersion,
@@ -52,7 +52,7 @@ async fn fund_and_sync(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Onlin
     let addr = wallet.get_address().unwrap();
     fund_address(&addr, amount).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, num: u8) {
@@ -67,7 +67,7 @@ async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 /// Simulate a browser page reload through the production restore API.
@@ -359,7 +359,7 @@ async fn test_address_reuse_persists_across_backup_restore() {
 }
 
 /// A wallet restored with a thin BDK state (no revealed SPKs) cannot recover its BTC balance
-/// through an incremental `sync`; `full_scan` rebuilds it from the indexer.
+/// through a `FullSync`; a vanilla `FullScan` rebuilds it from the indexer.
 #[wasm_bindgen_test]
 async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     let unique = js_sys::Date::now().to_string();
@@ -377,8 +377,8 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     fund_address(&addr, "1.0").await;
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    funded.sync(funded_online.clone()).await.unwrap();
-    let funded_balance = funded.get_btc_balance(None, true).unwrap();
+    full_sync(&mut funded, &funded_online).await;
+    let funded_balance = funded.get_btc_balance(None, true).await.unwrap();
     assert!(funded_balance.vanilla.settled > 0);
 
     // Same keys, fresh BDK store (distinct data_dir): a thin state with no revealed SPKs.
@@ -391,26 +391,35 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     // no scan: keep the thin state
     let online = thin.go_online(go_online_options(true)).await.unwrap();
 
-    thin.sync(online.clone()).await.unwrap();
-    let after_incremental = thin.get_btc_balance(None, true).unwrap();
+    full_sync(&mut thin, &online).await;
+    let after_incremental = thin.get_btc_balance(None, true).await.unwrap();
     assert_eq!(
         after_incremental.vanilla.settled, 0,
         "incremental sync cannot recover a thin BDK state"
     );
 
-    thin.full_scan(online.clone()).await.unwrap();
-    let after_full_scan = thin.get_btc_balance(None, true).unwrap();
+    let options = SyncOptions {
+        keychain: SyncKeychain::Vanilla {
+            lookback: INDEXER_SYNC_LOOKBACK,
+        },
+        strategy: SyncStrategy::FullScan,
+    };
+    thin.sync(online.clone(), options).await.unwrap();
+    let after_full_scan = thin.get_btc_balance(None, true).await.unwrap();
     assert_eq!(
         after_full_scan.vanilla.settled, funded_balance.vanilla.settled,
         "full_scan recovers the BTC balance"
     );
     // full_scan saves the balance with no flush
     let (mut saved, _) = saved_wallet(&thin).await;
-    assert_eq!(saved.get_btc_balance(None, true).unwrap(), after_full_scan);
+    assert_eq!(
+        saved.get_btc_balance(None, true).await.unwrap(),
+        after_full_scan
+    );
 
     // go_online with the check on scans both keychains of a thin state
     create_utxos(&mut funded, &funded_online, 1).await;
-    let funded_balance = funded.get_btc_balance(None, true).unwrap();
+    let funded_balance = funded.get_btc_balance(None, true).await.unwrap();
     assert!(funded_balance.vanilla.settled > 0 && funded_balance.colored.settled > 0);
     let (wd3, sk3) = test_wallet_data(
         &keys,
@@ -419,7 +428,10 @@ async fn test_btc_balance_recovers_via_full_scan_after_thin_restore() {
     );
     let mut checked = Wallet::new(wd3, sk3).unwrap();
     checked.go_online(go_online_options(false)).await.unwrap();
-    assert_eq!(checked.get_btc_balance(None, true).unwrap(), funded_balance);
+    assert_eq!(
+        checked.get_btc_balance(None, true).await.unwrap(),
+        funded_balance
+    );
 }
 
 /// Test: BDK wallet state (BTC balance) survives page reload.
@@ -450,14 +462,17 @@ async fn test_persistence_across_reload() {
         .unwrap();
     assert_eq!(nia.balance.settled, 1000);
     let asset_id = nia.asset_id.clone();
-    let btc_balance = wallet.get_btc_balance(None, true).unwrap();
+    let btc_balance = wallet.get_btc_balance(None, true).await.unwrap();
 
     // Reload
     let mut wallet = simulate_reload(wallet, &wd_a).await;
     // No sync yet, so the balance comes from the BDK changeset only
-    assert_eq!(wallet.get_btc_balance(None, true).unwrap(), btc_balance);
+    assert_eq!(
+        wallet.get_btc_balance(None, true).await.unwrap(),
+        btc_balance
+    );
     let online = wallet.go_online(go_online_options(true)).await.unwrap();
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     // list_assets: asset should exist
     let assets = wallet.list_assets(vec![AssetSchema::Nia]).unwrap();
@@ -533,10 +548,7 @@ async fn test_persistence_across_reload() {
 
     // Complete the send
     let signed_psbt = wallet.sign_psbt(unsigned_psbt, None).unwrap();
-    let send_result = wallet
-        .send_end(online.clone(), signed_psbt, false)
-        .await
-        .unwrap();
+    let send_result = wallet.send_end(online.clone(), signed_psbt).await.unwrap();
     assert!(!send_result.txid.is_empty());
 
     // === Section 3: Signed PSBT survives reload during send ===
@@ -544,12 +556,12 @@ async fn test_persistence_across_reload() {
     drop(wallet);
     let mut wallet = Wallet::restore(wd_a.clone(), sk_a.clone()).await.unwrap();
     let online = wallet.go_online(go_online_options(true)).await.unwrap();
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
-    wallet_b.sync(online_b.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
+    full_sync(&mut wallet_b, &online_b).await;
 
     // Receiver refreshes: picks up consignment, ACKs
     let recv_refresh = wallet_b
@@ -566,7 +578,7 @@ async fn test_persistence_across_reload() {
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(&mut wallet, &online).await;
 
     // Sender (reloaded) refreshes: sees ACK, broadcasts — needs signed PSBT from IDB
     let send_refresh = wallet
@@ -595,7 +607,7 @@ async fn test_persistence_across_reload() {
     .unwrap();
 
     // Backup
-    let btc_balance = wallet.get_btc_balance(None, true).unwrap();
+    let btc_balance = wallet.get_btc_balance(None, true).await.unwrap();
     let password = "persist_test_pw";
     let backup_bytes = wallet.backup(password).unwrap();
     assert!(!backup_bytes.is_empty());
@@ -613,7 +625,7 @@ async fn test_persistence_across_reload() {
         .unwrap();
     // No sync yet, so the balance comes from the BDK changeset only
     assert_eq!(
-        fresh_wallet.get_btc_balance(None, true).unwrap(),
+        fresh_wallet.get_btc_balance(None, true).await.unwrap(),
         btc_balance
     );
 
@@ -714,7 +726,7 @@ async fn test_received_contract_survives_reload() {
         .unwrap()
         .psbt;
     let signed = wallet_a.sign_psbt(unsigned, None).unwrap();
-    wallet_a.send_end(online_a, signed, false).await.unwrap();
+    wallet_a.send_end(online_a, signed).await.unwrap();
 
     // the ACK post fails after the download
     rpc_fail(PROXY_URL, "ack.post");
@@ -817,7 +829,7 @@ async fn test_initiated_send_completes_after_reload() {
     let mut wallet_a = simulate_reload(wallet_a, &wd_a).await;
     let restored_online = wallet_a.go_online(go_online_options(true)).await.unwrap();
     let completed = wallet_a
-        .send_end(restored_online.clone(), signed, false)
+        .send_end(restored_online.clone(), signed)
         .await
         .unwrap();
     assert_eq!(completed.txid, txid);
@@ -898,7 +910,7 @@ async fn incoming_nia(case: &str) -> (Wallet, Online, String, String) {
         .unwrap()
         .psbt;
     let signed = a.sign_psbt(unsigned, None).unwrap();
-    a.send_end(online_a, signed, false).await.unwrap();
+    a.send_end(online_a, signed).await.unwrap();
     (b, online_b, rid, asset.asset_id)
 }
 
@@ -951,10 +963,10 @@ async fn test_synced_balance_is_saved() {
     let mut wallet = Wallet::new(wd, sk).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     fund_and_sync(&mut wallet, &online, "1.0").await;
-    let live = wallet.get_btc_balance(None, true).unwrap();
+    let live = wallet.get_btc_balance(None, true).await.unwrap();
     assert!(live.vanilla.future > 0);
     let (mut saved, _) = saved_wallet(&wallet).await;
-    let stored = saved.get_btc_balance(None, true).unwrap();
+    let stored = saved.get_btc_balance(None, true).await.unwrap();
     assert_eq!(stored, live, "saved balance {stored:?}, live {live:?}");
 }
 

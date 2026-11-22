@@ -115,7 +115,7 @@ async fn import_contract_then_receive() {
     );
 
     // a witness invoice for the asset needs no BTC
-    assert!(b.list_unspents(None, false, true).unwrap().is_empty());
+    assert!(b.list_unspents(None, false, true).await.unwrap().is_empty());
     let receive = witness_rcv(
         &mut b,
         &b_on,
@@ -149,7 +149,7 @@ async fn import_contract_then_receive() {
         .await
         .unwrap();
     let signed = a.sign_psbt(begin.psbt, None).unwrap();
-    a.send_end(a_on.clone(), signed, false).await.unwrap();
+    a.send_end(a_on.clone(), signed).await.unwrap();
     settle_both(&mut a, &a_on, &mut b, &b_on).await;
 
     assert_eq!(transfer_of(&b, &rid).status, TransferStatus::Settled);

@@ -133,7 +133,7 @@ Other settings changed in `create` are stored with the next save.
 
 Every call that changes the wallet saves it. Saves are written in order, and
 none is dropped. An async call returns after its save commits, and returns a
-persistence error if the save fails. `sync`, `full_scan`, `refresh`,
+persistence error if the save fails. `sync`, the listing calls that sync, `refresh`,
 `fail_transfers` and the begins that sync first also save when they keep a
 change and then fail. `backup` and `vss_backup` save the backup time. A sync call
 (`issue_asset_*`, `get_address`, `rotate_address`, `delete_transfers`,
@@ -150,8 +150,9 @@ await this durable commit before returning success.
 ### Going online
 
 ```javascript
-const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {} });
-await wallet.sync(online);
+const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
+await wallet.sync(online, { keychain: 'Colored', strategy: 'FastSync' });
+await wallet.sync(online, { keychain: { Vanilla: { lookback: 20 } }, strategy: 'FastSync' });
 ```
 
 ### Creating UTXOs
@@ -196,7 +197,7 @@ const senderEndpoint = 'rpc://localhost:3000/json-rpc';
 const begin = await wallet.sendBegin(online, recipientMap, false, 1n, 1, Math.floor(Date.now() / 1000) + 3600, senderEndpoint, null, false);
 // begin: { psbt, batchTransferIdx, details }; dryRun = true saves nothing and gives batchTransferIdx null
 const signed = wallet.signPsbt(begin.psbt);
-const result = await wallet.sendEnd(online, signed, false);
+const result = await wallet.sendEnd(online, signed);
 // result: { txid, batchTransferIdx }
 ```
 
@@ -234,14 +235,14 @@ const str = invoice.invoiceString(); // original string
 ### Querying wallet state
 
 ```javascript
-const btcBalance = wallet.getBtcBalance();
+const btcBalance = await wallet.getBtcBalance(online, false);
 const assetBalance = wallet.getAssetBalance(assetId);
 const metadata = wallet.getAssetMetadata(assetId);
 // metadata: { assetSchema, name, ticker, precision, initialSupply, maxSupply, knownCirculatingSupply, timestamp, ... }
 const assets = wallet.listAssets([]);              // all schemas
 const transfers = wallet.listTransfers("AnyOrNone", "All"); // all transfers
-const unspents = wallet.listUnspents(false);
-const transactions = wallet.listTransactions();
+const unspents = await wallet.listUnspents(online, false, false);
+const transactions = await wallet.listTransactions(online, false);
 const address = wallet.getAddress();
 ```
 
@@ -395,17 +396,17 @@ To protect a wallet:
 | `getKeys()` | no | Return SinglesigKeys; `mnemonic` is null |
 | `getDescriptors()` | no | Return `{colored, vanilla}`; a signing wallet's descriptors hold its account private keys |
 | `getAddress()` | no | Get a new Bitcoin address |
-| `getBtcBalance()` | no | Get BTC balance |
+| `getBtcBalance(online?, skipSync)` | yes | Get BTC balance, after a sync unless `skipSync` |
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
 | `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
 | `listAssets(schemas)` | no | List known RGB assets |
 | `listTransfers(assetFilter, scope)` | no | List RGB transfers by asset filter and scope |
-| `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
-| `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
+| `listUnspents(online?, settledOnly, skipSync)` | yes | List unspent outputs with RGB allocations, after a sync unless `skipSync` |
+| `listTransactions(online?, skipSync)` | yes | List Bitcoin transactions, and begun vanilla operations with `pending: true`, after a sync unless `skipSync` |
 | `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
 | `abortPendingVanillaTx(txid)` | no | Abort a begun vanilla operation: delete it and release its inputs |
-| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. |
-| `sync(online)` | yes | Sync wallet with indexer |
+| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. `vanillaSyncLookback` is how many vanilla addresses before the last used one a `FastSync` checks. |
+| `sync(online, {keychain, strategy})` | yes | Sync one keychain (`"Colored"` or `{Vanilla: {lookback}}`) with the indexer, by `"FullScan"`, `"FullSync"` or `"FastSync"` |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
 | `createUtxosEnd(online, psbt)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
@@ -414,7 +415,7 @@ To protect a wallet:
 | `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
 | `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
 | `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
-| `sendEnd(online, psbt, skipSync)` | yes | Broadcast RGB send PSBT |
+| `sendEnd(online, psbt)` | yes | Broadcast RGB send PSBT |
 | `sendBtcBegin(...)` | yes | Prepare BTC send PSBT, reserve its inputs unless dryRun |
 | `sendBtcEnd(online, psbt)` | yes | Broadcast BTC send PSBT |
 | `getFeeEstimation(online, blocks)` | yes | Estimate fee rate for target blocks |

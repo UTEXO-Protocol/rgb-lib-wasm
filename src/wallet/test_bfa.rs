@@ -76,7 +76,7 @@ pub(super) async fn funded_wallet_with(
         .unwrap();
     fund_address(&wallet.get_address().unwrap(), "1.0").await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    wallet.full_sync(online.clone()).await.unwrap();
     let unsigned = wallet
         .create_utxos_begin(online.clone(), true, Some(utxos), size, 1, true, false)
         .await
@@ -88,7 +88,7 @@ pub(super) async fn funded_wallet_with(
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    wallet.full_sync(online.clone()).await.unwrap();
     (wallet, online)
 }
 
@@ -105,12 +105,13 @@ pub(super) async fn add_utxos(wallet: &mut Wallet, online: &Online, num: u8, siz
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    wallet.full_sync(online.clone()).await.unwrap();
 }
 
-pub(super) fn mint_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
+pub(super) async fn mint_rights(wallet: &mut Wallet, asset_id: &str) -> usize {
     wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .iter()
         .flat_map(|u| &u.rgb_allocations)
@@ -175,7 +176,7 @@ pub(super) async fn send_recipients(
         .unwrap();
     let signed = sender.sign_psbt(begin.psbt, None).unwrap();
     sender
-        .send_end(sender_online.clone(), signed, false)
+        .send_end(sender_online.clone(), signed)
         .await
         .unwrap()
         .txid
@@ -197,7 +198,7 @@ pub(super) async fn settle_both(
         .into_iter()
         .enumerate()
         {
-            wallet.sync(online.clone()).await.unwrap();
+            wallet.full_sync(online.clone()).await.unwrap();
             for (idx, refreshed) in wallet
                 .refresh(online.clone(), None, vec![], false)
                 .await
@@ -240,12 +241,12 @@ pub(super) async fn send_and_settle(
 }
 
 /// The opouts of `asset_id`, by UTXO, of the UTXOs that hold `assignment`.
-pub(super) fn opouts_holding(
+pub(super) async fn opouts_holding(
     wallet: &mut Wallet,
     asset_id: &str,
     assignment: &Assignment,
 ) -> Vec<Vec<Opout>> {
-    let unspents = wallet.list_unspents(None, false, true).unwrap();
+    let unspents = wallet.list_unspents(None, false, true).await.unwrap();
     let contract_id = ContractId::from_str(asset_id).unwrap();
     let runtime = wallet.rgb_runtime().unwrap();
     unspents
@@ -333,7 +334,7 @@ async fn bfa_issue_list_and_backup() {
             .asset_schema,
         AssetSchema::Bfa
     );
-    assert_eq!(mint_rights(&mut wallet, &bfa.asset_id), 2);
+    assert_eq!(mint_rights(&mut wallet, &bfa.asset_id).await, 2);
 
     let backup = wallet.backup("password").unwrap();
     let mut restored = Wallet::new(wd, keys).unwrap();
@@ -346,7 +347,7 @@ async fn bfa_issue_list_and_backup() {
     assert_eq!(restored_bfa.len(), 1);
     assert_eq!(restored_bfa[0].asset_id, bfa.asset_id);
     assert_eq!(restored_bfa[0].ticker, ticker);
-    assert_eq!(mint_rights(&mut restored, &bfa.asset_id), 2);
+    assert_eq!(mint_rights(&mut restored, &bfa.asset_id).await, 2);
 }
 
 #[wasm_bindgen_test]
@@ -432,7 +433,7 @@ async fn bfa_mint_right_moves_with_another_asset() {
         a.get_asset_balance(nia.asset_id.clone()).unwrap().settled,
         50
     );
-    let unspents = a.list_unspents(None, false, true).unwrap();
+    let unspents = a.list_unspents(None, false, true).await.unwrap();
     assert!(unspents.iter().any(|u| {
         let holds = |id: &str| {
             u.rgb_allocations
@@ -449,7 +450,7 @@ async fn bfa_mint_right_moves_with_another_asset() {
         30
     );
     assert_eq!(b.get_asset_balance(nia.asset_id).unwrap().settled, 70);
-    assert_eq!(mint_rights(&mut a, &bfa.asset_id), 2);
+    assert_eq!(mint_rights(&mut a, &bfa.asset_id).await, 2);
 }
 
 /// The unlocked first account of anvil.
@@ -590,7 +591,7 @@ pub(super) async fn bfa_with_units(
     for _ in 0..3 {
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
-        wallet.sync(online.clone()).await.unwrap();
+        wallet.full_sync(online.clone()).await.unwrap();
         wallet
             .refresh(online.clone(), None, vec![], false)
             .await
@@ -598,7 +599,7 @@ pub(super) async fn bfa_with_units(
     }
     let balance = wallet.get_asset_balance(bfa.asset_id.clone()).unwrap();
     assert_eq!((balance.settled, balance.spendable), (100, 100));
-    assert_eq!(mint_rights(wallet, &bfa.asset_id), 1);
+    assert_eq!(mint_rights(wallet, &bfa.asset_id).await, 1);
     (bfa.asset_id, opid, lock_id)
 }
 
@@ -674,7 +675,7 @@ async fn bfa_send_receive_waits_for_mint_lock() {
         .await
         .unwrap();
     let signed = a.sign_psbt(begin.psbt, None).unwrap();
-    a.send_end(a_online.clone(), signed, false).await.unwrap();
+    a.send_end(a_online.clone(), signed).await.unwrap();
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
     let a_balance = a.get_asset_balance(asset_id.clone()).unwrap();
@@ -931,7 +932,7 @@ async fn bfa_reject_list_rpc_config() {
         .await
         .unwrap();
     let signed = a.sign_psbt(begin.psbt, None).unwrap();
-    a.send_end(a_online.clone(), signed, false).await.unwrap();
+    a.send_end(a_online.clone(), signed).await.unwrap();
     b.refresh(b_no_evm, None, vec![], false).await.unwrap();
     let transfers = b
         .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)

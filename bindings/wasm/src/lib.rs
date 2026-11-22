@@ -9,7 +9,7 @@ use wasm_bindgen::prelude::*;
 
 use rgb_lib_wasm::Wallet;
 use rgb_lib_wasm::wallet::{
-    Online, OnlineOptions, Recipient, RefreshFilter, SinglesigKeys, WalletData,
+    Online, OnlineOptions, Recipient, RefreshFilter, SinglesigKeys, SyncOptions, WalletData,
 };
 
 /// Serialize to JsValue using BigInt for u64/i64 values that exceed Number.MAX_SAFE_INTEGER.
@@ -376,13 +376,19 @@ impl WasmWallet {
         to_js(&asset)
     }
 
-    /// Return the BTC balance. Always skips sync on wasm32.
+    /// Return the BTC balance. Syncs first unless `skipSync` is true.
     #[wasm_bindgen(js_name = "getBtcBalance")]
-    pub fn get_btc_balance(&self) -> Result<JsValue, JsValue> {
+    pub async fn get_btc_balance(
+        &self,
+        online_js: JsValue,
+        skip_sync: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online = js_to_online_opt(online_js)?;
         let balance = self
             .inner
             .borrow_mut()
-            .get_btc_balance(None, true)
+            .get_btc_balance(online, skip_sync)
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&balance)
     }
@@ -445,24 +451,37 @@ impl WasmWallet {
         to_js(&transfers)
     }
 
-    /// List unspent outputs. Always skips sync on wasm32.
+    /// List unspent outputs. Syncs first unless `skipSync` is true.
     #[wasm_bindgen(js_name = "listUnspents")]
-    pub fn list_unspents(&self, settled_only: bool) -> Result<JsValue, JsValue> {
+    pub async fn list_unspents(
+        &self,
+        online_js: JsValue,
+        settled_only: bool,
+        skip_sync: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online = js_to_online_opt(online_js)?;
         let unspents = self
             .inner
             .borrow_mut()
-            .list_unspents(None, settled_only, true)
+            .list_unspents(online, settled_only, skip_sync)
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&unspents)
     }
 
-    /// List Bitcoin transactions. Always skips sync on wasm32.
+    /// List Bitcoin transactions. Syncs first unless `skipSync` is true.
     #[wasm_bindgen(js_name = "listTransactions")]
-    pub fn list_transactions(&self) -> Result<JsValue, JsValue> {
+    pub async fn list_transactions(
+        &self,
+        online_js: JsValue,
+        skip_sync: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online = js_to_online_opt(online_js)?;
         let txs = self
             .inner
             .borrow_mut()
-            .list_transactions(None, true)
+            .list_transactions(online, skip_sync)
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&txs)
     }
@@ -652,31 +671,16 @@ impl WasmWallet {
         to_js(&online)
     }
 
-    /// Sync the wallet with the indexer.
-    ///
-    /// Incremental: re-queries only already-revealed SPKs. Use `fullScan` to recover a thin
-    /// restored state.
-    pub async fn sync(&self, online_js: JsValue) -> Result<(), JsValue> {
+    /// Sync one keychain (`{keychain: "Colored" | {Vanilla: {lookback}}, strategy: "FullScan" |
+    /// "FullSync" | "FastSync"}`). Call once per keychain to sync both.
+    pub async fn sync(&self, online_js: JsValue, options_js: JsValue) -> Result<(), JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let options: SyncOptions = serde_wasm_bindgen::from_value(options_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid sync options: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .sync(online)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-
-    /// Run a BIP44 stop-gap full scan against the indexer.
-    ///
-    /// Rebuilds a thin BDK state (no revealed SPKs) after a restore, recovering the BTC balance
-    /// when an incremental `sync` cannot.
-    #[wasm_bindgen(js_name = "fullScan")]
-    pub async fn full_scan(&self, online_js: JsValue) -> Result<(), JsValue> {
-        let online: Online = serde_wasm_bindgen::from_value(online_js)
-            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
-        let mut wallet = self.inner.borrow_mut();
-        wallet
-            .full_scan(online)
+            .sync(online, options)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -774,13 +778,12 @@ impl WasmWallet {
         &self,
         online_js: JsValue,
         signed_psbt: &str,
-        skip_sync: bool,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
-            .send_end(online, signed_psbt.to_string(), skip_sync)
+            .send_end(online, signed_psbt.to_string())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)

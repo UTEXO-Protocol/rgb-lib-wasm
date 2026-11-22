@@ -6,7 +6,10 @@ use crate::database::DbWalletTransaction;
 use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::vss::VssBackupConfig;
-use crate::wallet::{Online, Outpoint, PendingVanillaTx, TransactionType, Wallet};
+use crate::wallet::{
+    Online, Outpoint, PendingVanillaTx, SyncKeychain, SyncOptions, SyncStrategy, TransactionType,
+    Wallet,
+};
 use crate::{AssetSchema, Error, TransferStatus, WalletTransactionType};
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::OutPoint;
@@ -25,7 +28,7 @@ async fn vanilla_wallet(utxos: u8) -> (Wallet, Online) {
     if utxos > 1 {
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
-        w.sync(online.clone()).await.unwrap();
+        w.full_sync(online.clone()).await.unwrap();
     }
     (w, online)
 }
@@ -84,8 +87,12 @@ fn reserved(w: &Wallet) -> Vec<OutPoint> {
     w.get_reserved_vanilla_outpoints().unwrap()
 }
 
-fn spendable(w: &mut Wallet) -> u64 {
-    w.get_btc_balance(None, true).unwrap().vanilla.spendable
+async fn spendable(w: &mut Wallet) -> u64 {
+    w.get_btc_balance(None, true)
+        .await
+        .unwrap()
+        .vanilla
+        .spendable
 }
 
 async fn send_begin(w: &mut Wallet, online: &Online) -> Result<String, Error> {
@@ -177,7 +184,7 @@ async fn abort_pending_vanilla_tx_fail() {
 #[wasm_bindgen_test]
 async fn send_btc_begin_reservation_interactions() {
     let (mut w, online) = vanilla_wallet(5).await;
-    let before = spendable(&mut w);
+    let before = spendable(&mut w).await;
     let psbt = send_begin(&mut w, &online).await.unwrap();
     let txid = txid_of(&psbt);
 
@@ -188,20 +195,21 @@ async fn send_btc_begin_reservation_interactions() {
     assert_eq!(r.inputs, inputs);
     let reserved_inputs: Vec<Outpoint> = reserved(&w).into_iter().map(Outpoint::from).collect();
     assert_eq!(reserved_inputs, inputs);
-    let while_reserved = spendable(&mut w);
+    let while_reserved = spendable(&mut w).await;
     assert!(while_reserved < before);
 
     send_end(&mut w, &online, psbt).await.unwrap();
     assert!(reserved(&w).is_empty());
     assert!(pending(&w).is_empty());
-    assert!(spendable(&mut w) > while_reserved);
+    assert!(spendable(&mut w).await > while_reserved);
     row(&w, &txid);
 
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    w.sync(online.clone()).await.unwrap();
+    w.full_sync(online.clone()).await.unwrap();
     let tx = w
         .list_transactions(None, true)
+        .await
         .unwrap()
         .into_iter()
         .find(|t| t.txid == txid)
@@ -309,6 +317,7 @@ async fn begun_vanilla_listed_in_transactions() {
         let txid = txid_of(&psbt);
         let tx = w
             .list_transactions(None, true)
+            .await
             .unwrap()
             .into_iter()
             .find(|t| t.txid == txid)
@@ -323,7 +332,7 @@ async fn begun_vanilla_listed_in_transactions() {
     for txid in txids {
         w.abort_pending_vanilla_tx(txid).unwrap();
     }
-    let txs = w.list_transactions(None, true).unwrap();
+    let txs = w.list_transactions(None, true).await.unwrap();
     assert!(txs.iter().all(|t| !t.pending));
 }
 
@@ -405,17 +414,24 @@ async fn vanilla_operations_are_atomic() {
     let (mut w, online) = vanilla_wallet(3).await;
     // a failed sync drops the UTXOs it found, and a new sync finds them
     let txid = unsynced_utxos(&mut w).await;
-    assert_no_partial_change(&mut w, "sync", 0, async |w| w.sync(online.clone()).await).await;
-    assert!(!has_txo(&w, &txid));
-    w.sync(online.clone()).await.unwrap();
-    assert!(has_txo(&w, &txid));
-    let txid = unsynced_utxos(&mut w).await;
-    assert_no_partial_change(&mut w, "full_scan", 0, async |w| {
-        w.full_scan(online.clone()).await
+    assert_no_partial_change(&mut w, "sync", 0, async |w| {
+        w.full_sync(online.clone()).await
     })
     .await;
     assert!(!has_txo(&w, &txid));
-    w.full_scan(online.clone()).await.unwrap();
+    w.full_sync(online.clone()).await.unwrap();
+    assert!(has_txo(&w, &txid));
+    let txid = unsynced_utxos(&mut w).await;
+    let full_scan = SyncOptions {
+        keychain: SyncKeychain::Colored,
+        strategy: SyncStrategy::FullScan,
+    };
+    assert_no_partial_change(&mut w, "sync", 0, async |w| {
+        w.sync(online.clone(), full_scan).await
+    })
+    .await;
+    assert!(!has_txo(&w, &txid));
+    w.sync(online.clone(), full_scan).await.unwrap();
     assert!(has_txo(&w, &txid));
     let txid = unsynced_utxos(&mut w).await;
     assert_no_partial_change(&mut w, "list_unspents_vanilla", 0, async |w| {

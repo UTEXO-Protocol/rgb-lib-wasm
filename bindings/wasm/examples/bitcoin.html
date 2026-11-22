@@ -319,7 +319,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
 
         log('Auto setup: going online...', 'log-warn');
         const url = document.getElementById('indexer-url').value.trim();
-        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {} });
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         enableBtns(onlineBtns);
         log('Auto setup: online at ' + url, 'log-ok');
 
@@ -376,7 +376,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {} });
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         showResult('setup-output', 'setup-result',
           'Online! Connected to ' + url + '\n\n' + json(state.online));
         enableBtns(onlineBtns);
@@ -391,7 +391,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       if (!requireOnline('setup-output', 'setup-result')) return;
       try {
         log('Syncing...', 'log-warn');
-        await state.wallet.sync(state.online);
+        await state.wallet.sync(state.online, { keychain: 'Colored', strategy: 'FastSync' });
+        await state.wallet.sync(state.online, { keychain: { Vanilla: { lookback: 20 } }, strategy: 'FastSync' });
         showResult('setup-output', 'setup-result', 'Sync completed successfully.');
         log('Sync complete', 'log-ok');
       } catch (e) {

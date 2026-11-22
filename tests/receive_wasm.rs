@@ -45,7 +45,7 @@ async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8) {
         .unwrap();
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 async fn new_wallet() -> (Wallet, Online) {
@@ -98,7 +98,7 @@ async fn begin_end(
         .compute_txid()
         .to_string();
     wallet
-        .send_end(online.clone(), signed.clone(), false)
+        .send_end(online.clone(), signed.clone())
         .await
         .unwrap();
     (signed, txid)
@@ -374,10 +374,7 @@ async fn receive_refuses_history_witness_not_on_chain() {
     wallet_b
         .set_send_consignment_bytes(&w2, &asset_id, save(&consignment))
         .unwrap();
-    wallet_b
-        .send_end(online_b.clone(), signed, false)
-        .await
-        .unwrap();
+    wallet_b.send_end(online_b.clone(), signed).await.unwrap();
 
     refresh(&mut wallet_c, &online_c).await;
     assert_eq!(
@@ -440,6 +437,7 @@ async fn ack_failure_no_duplicate_colorings() {
     ));
     assert!(
         rcv.list_unspents(None, false, true)
+            .await
             .unwrap()
             .iter()
             .all(|u| u.rgb_allocations.is_empty())
@@ -485,7 +483,7 @@ async fn ack_failure_no_duplicate_colorings() {
     assert_eq!(transfer.status, TransferStatus::Failed);
     assert!(transfer.assignments.is_empty());
     assert!(rcv.rgb_contract_ids().unwrap().is_empty());
-    assert_only_btc_received(&mut rcv, &txid);
+    assert_only_btc_received(&mut rcv, &txid).await;
 }
 
 // A sender with an asset and a recipient that has a witness receive and no colorable UTXO.
@@ -525,8 +523,8 @@ async fn donate_to(
     let (_, txid) = begin_end(wallet, online, map, true).await;
     // esplora indexes the mempool with a delay
     for _ in 0..60 {
-        rcv.sync(rcv_online.clone()).await.unwrap();
-        let unspents = rcv.list_unspents(None, false, true).unwrap();
+        full_sync(rcv, &rcv_online).await;
+        let unspents = rcv.list_unspents(None, false, true).await.unwrap();
         if unspents.iter().any(|u| u.utxo.outpoint.txid == txid) {
             return txid;
         }
@@ -535,8 +533,8 @@ async fn donate_to(
     panic!("the wallet did not see the donation");
 }
 
-fn assert_only_btc_received(rcv: &mut Wallet, txid: &str) {
-    let unspents = rcv.list_unspents(None, false, true).unwrap();
+async fn assert_only_btc_received(rcv: &mut Wallet, txid: &str) {
+    let unspents = rcv.list_unspents(None, false, true).await.unwrap();
     let unspent = unspents
         .iter()
         .find(|u| u.utxo.outpoint.txid == txid)
@@ -578,7 +576,7 @@ async fn witness_receive_cleanup_payment_after_fail() {
 
     let txid = donate_to(&mut wallet, &online, &asset_id, &mut rcv, &rcv_online, &rid).await;
 
-    assert_only_btc_received(&mut rcv, &txid);
+    assert_only_btc_received(&mut rcv, &txid).await;
     refresh(&mut rcv, &rcv_online).await;
     assert_eq!(transfer_of(&rcv, &rid).status, TransferStatus::Failed);
     blind_receive_result(&mut rcv, &rcv_online).await.unwrap();
@@ -607,6 +605,6 @@ async fn witness_receive_cleanup_payment_before_refusal() {
     clear_rpc_hooks();
 
     assert_eq!(transfer_of(&rcv, &rid).status, TransferStatus::Failed);
-    assert_only_btc_received(&mut rcv, &txid);
+    assert_only_btc_received(&mut rcv, &txid).await;
     blind_receive_result(&mut rcv, &rcv_online).await.unwrap();
 }
