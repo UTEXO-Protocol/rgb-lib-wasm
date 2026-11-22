@@ -61,7 +61,7 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 
 ```javascript
 import init, {
-  generateKeys, restoreKeys, checkProxyUrl, maxExpirationSecs,
+  generateKeys, restoreKeys, checkProxyUrl, checkIndexerUrl, maxExpirationSecs,
   validateConsignmentOffchain, inspectConsignment,
   WasmWallet, WasmInvoice,
 } from './pkg/rgb_lib_wasm.js';
@@ -338,6 +338,9 @@ const deleted = wallet.deleteTransfers(null, false);
 // Validate an RGB proxy server
 await checkProxyUrl('http://localhost:3000/json-rpc');
 
+// Validate an esplora indexer for the network, return its protocol ('Esplora')
+const protocol = await checkIndexerUrl('http://localhost:8094/regtest/api', 'Regtest');
+
 // Validate an RGB consignment offchain (before TX is broadcast)
 // consignmentBytes is a Uint8Array of the strict-encoded consignment
 const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
@@ -373,6 +376,7 @@ To protect a wallet:
 | `maxExpirationSecs()` | Maximum seconds in the future an expiration can be |
 | `restoreKeys(network, mnemonic, witnessVersion)` | Restore xpubs from a mnemonic |
 | `checkProxyUrl(url)` | Validate an RGB proxy server URL |
+| `checkIndexerUrl(url, network)` | Validate an indexer URL for the network and return its protocol ('Esplora') |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
 | `inspectConsignment(bytes, bundleFilter)` | Inspect an RGB consignment without a wallet |
 
