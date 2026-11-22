@@ -13,6 +13,7 @@ use crate::database::enums::{
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
+use crate::no_wallet::RgbRejectListInfo;
 use crate::utils::now;
 use crate::wallet::{Balance, Outpoint};
 
@@ -93,7 +94,7 @@ pub struct DbAsset {
     pub timestamp: i64,
     pub max_supply: Option<String>,
     pub known_circulating_supply: Option<String>,
-    pub reject_list_url: Option<String>,
+    pub reject_list: Option<RgbRejectListInfo>,
     pub linked_from_contract: Option<String>,
     pub linked_to_contract: Option<String>,
 }
@@ -113,7 +114,7 @@ pub struct DbAssetActMod {
     pub timestamp: ActiveValue<i64>,
     pub max_supply: ActiveValue<Option<String>>,
     pub known_circulating_supply: ActiveValue<Option<String>>,
-    pub reject_list_url: ActiveValue<Option<String>>,
+    pub reject_list: ActiveValue<Option<RgbRejectListInfo>>,
     pub linked_from_contract: ActiveValue<Option<String>>,
     pub linked_to_contract: ActiveValue<Option<String>>,
 }
@@ -443,7 +444,7 @@ impl DbAssetActMod {
             timestamp: av(self.timestamp),
             max_supply: av(self.max_supply),
             known_circulating_supply: av(self.known_circulating_supply),
-            reject_list_url: av(self.reject_list_url),
+            reject_list: av(self.reject_list),
             linked_from_contract: av(self.linked_from_contract),
             linked_to_contract: av(self.linked_to_contract),
         })
@@ -540,7 +541,7 @@ impl From<DbAsset> for DbAssetActMod {
             timestamp: ActiveValue::Unchanged(m.timestamp),
             max_supply: ActiveValue::Unchanged(m.max_supply),
             known_circulating_supply: ActiveValue::Unchanged(m.known_circulating_supply),
-            reject_list_url: ActiveValue::Unchanged(m.reject_list_url),
+            reject_list: ActiveValue::Unchanged(m.reject_list),
             linked_from_contract: ActiveValue::Unchanged(m.linked_from_contract),
             linked_to_contract: ActiveValue::Unchanged(m.linked_to_contract),
         }
@@ -698,7 +699,7 @@ impl InMemoryDb {
             timestamp: av(a.timestamp),
             max_supply: av(a.max_supply),
             known_circulating_supply: av(a.known_circulating_supply),
-            reject_list_url: av(a.reject_list_url),
+            reject_list: av(a.reject_list),
             linked_from_contract: av(a.linked_from_contract),
             linked_to_contract: av(a.linked_to_contract),
         };
@@ -998,8 +999,8 @@ impl InMemoryDb {
         if let ActiveValue::Set(v) = &a.known_circulating_supply {
             row.known_circulating_supply = v.clone();
         }
-        if let ActiveValue::Set(v) = &a.reject_list_url {
-            row.reject_list_url = v.clone();
+        if let ActiveValue::Set(v) = &a.reject_list {
+            row.reject_list = v.clone();
         }
         if let ActiveValue::Set(v) = &a.linked_from_contract {
             row.linked_from_contract = v.clone();

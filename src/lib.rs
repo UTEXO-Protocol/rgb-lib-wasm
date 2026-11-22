@@ -237,7 +237,7 @@ use crate::database::{
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
 use crate::no_wallet::{
-    Outpoint, beneficiary_from_script_buf, recipient_id_from_script_buf,
+    Outpoint, RgbRejectListInfo, beneficiary_from_script_buf, recipient_id_from_script_buf,
     script_buf_from_recipient_id,
 };
 #[cfg(feature = "esplora")]
