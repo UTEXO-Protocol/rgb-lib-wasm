@@ -30,6 +30,8 @@ pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 #[cfg(test)]
 thread_local! {
     pub(crate) static TRANSITION_BUILDERS_LOADED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // test probe: count the indexer syncs
+    pub(crate) static INDEXER_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(feature = "esplora")]

@@ -696,6 +696,26 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Create UTXOs: begin, sign with the wallet keys and end. Returns the number of created UTXOs.
+    #[wasm_bindgen(js_name = "createUtxos")]
+    pub async fn create_utxos(
+        &self,
+        online_js: JsValue,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<u8, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .create_utxos(online, up_to, num, size, fee_rate, skip_sync)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Create UTXOs (begin): prepare a PSBT to create new UTXOs for RGB allocations.
     /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation.
     /// Returns the unsigned PSBT string.
@@ -735,6 +755,44 @@ impl WasmWallet {
             .create_utxos_end(online, signed_psbt.to_string())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Send RGB assets: begin, sign with the wallet keys and end. Returns an OperationResult JS
+    /// object.
+    ///
+    /// The arguments are read as in `sendBegin`.
+    #[wasm_bindgen(js_name = "send")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send(
+        &self,
+        online_js: JsValue,
+        recipient_map_js: JsValue,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp_js: JsValue,
+        sender_transport_endpoint: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let recipient_map: HashMap<String, Vec<Recipient>> =
+            serde_wasm_bindgen::from_value(recipient_map_js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid recipient map: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .send(
+                online,
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                expiration_timestamp,
+                sender_transport_endpoint,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
     }
 
     /// Send RGB assets (begin): prepare a PSBT. Returns a SendBeginResult JS object
@@ -798,6 +856,25 @@ impl WasmWallet {
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)
+    }
+
+    /// Send BTC: begin, sign with the wallet keys and end. Returns the txid string.
+    #[wasm_bindgen(js_name = "sendBtc")]
+    pub async fn send_btc(
+        &self,
+        online_js: JsValue,
+        address: &str,
+        amount: u64,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<String, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .send_btc(online, address.to_string(), amount, fee_rate, skip_sync)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Send BTC (begin): prepare a PSBT. Returns the unsigned PSBT string.
@@ -918,6 +995,24 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Drain all wallet funds: begin, sign with the wallet keys and end. Returns the txid string.
+    /// It spends the colored UTXOs too and destroys their assets.
+    #[wasm_bindgen(js_name = "drainTo")]
+    pub async fn drain_to(
+        &self,
+        online_js: JsValue,
+        address: &str,
+        fee_rate: u64,
+    ) -> Result<String, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .drain_to(online, address.to_string(), fee_rate)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Drain all wallet funds (begin): prepare a PSBT. Returns the unsigned PSBT string.
     /// It spends the colored UTXOs too and destroys their assets.
     /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation.
@@ -952,6 +1047,37 @@ impl WasmWallet {
             .drain_to_end(online, signed_psbt.to_string())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Inflate an IFA asset: begin, sign with the wallet keys and end. Returns an OperationResult
+    /// JS object.
+    ///
+    /// `inflation_amounts_js` is a JS array of u64 values.
+    #[wasm_bindgen(js_name = "inflate")]
+    pub async fn inflate(
+        &self,
+        online_js: JsValue,
+        asset_id: &str,
+        inflation_amounts_js: JsValue,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let inflation_amounts: Vec<u64> = serde_wasm_bindgen::from_value(inflation_amounts_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid inflation_amounts array: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .inflate(
+                online,
+                asset_id.to_string(),
+                inflation_amounts,
+                fee_rate,
+                min_confirmations,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
     }
 
     /// Inflate an IFA asset (begin): prepare a PSBT. Returns an InflateBeginResult JS object

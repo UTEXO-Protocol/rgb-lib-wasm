@@ -3413,6 +3413,8 @@ impl Wallet {
         options: SyncOptions,
         include_spent: bool,
     ) -> Result<(), Error> {
+        #[cfg(test)]
+        crate::utils::INDEXER_SYNCS.set(crate::utils::INDEXER_SYNCS.get() + 1);
         debug!(self.logger, "Syncing {:?}...", options);
 
         let pending_witness_scripts = match options.keychain {
@@ -3720,6 +3722,48 @@ impl Wallet {
             return Err(Error::CannotEndTransfer { txid });
         }
         Ok(())
+    }
+
+    /// Create new UTXOs.
+    ///
+    /// This calls [`create_utxos_begin`](Wallet::create_utxos_begin), signs the resulting PSBT and
+    /// finally calls [`create_utxos_end`](Wallet::create_utxos_end).
+    ///
+    /// A wallet with private keys is required.
+    pub async fn create_utxos(
+        &mut self,
+        online: Online,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<u8, Error> {
+        let cp = self.checkpoint("create_utxos");
+        let res = self
+            ._create_utxos(online, up_to, num, size, fee_rate, skip_sync)
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _create_utxos(
+        &mut self,
+        online: Online,
+        up_to: bool,
+        num: Option<u8>,
+        size: Option<u32>,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<u8, Error> {
+        info!(self.logger, "Creating UTXOs...");
+        self._check_xprv()?;
+        let psbt = self
+            ._create_utxos_begin(online.clone(), up_to, num, size, fee_rate, skip_sync, true)
+            .await?;
+        let signed_psbt = self.sign_psbt(psbt, None)?;
+        let res = self._create_utxos_end(online, signed_psbt).await?;
+        info!(self.logger, "Create UTXOs completed");
+        Ok(res)
     }
 
     /// Prepare a transaction to create new UTXOs for RGB allocations (wasm32 async).
@@ -8231,6 +8275,71 @@ impl Wallet {
         Ok(())
     }
 
+    /// Send RGB assets.
+    ///
+    /// This calls [`send_begin`](Wallet::send_begin), signs the resulting PSBT and finally calls
+    /// [`send_end`](Wallet::send_end).
+    ///
+    /// A wallet with private keys is required.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send(
+        &mut self,
+        online: Online,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp: u64,
+        sender_transport_endpoint: Option<String>,
+    ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("send");
+        let res = self
+            ._send(
+                online,
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                expiration_timestamp,
+                sender_transport_endpoint,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn _send(
+        &mut self,
+        online: Online,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp: u64,
+        sender_transport_endpoint: Option<String>,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Sending to: {:?}...", recipient_map);
+        self._check_xprv()?;
+        self.check_online(online.clone())?;
+        let begin = self
+            ._send_begin(
+                online.clone(),
+                recipient_map,
+                donation,
+                fee_rate,
+                min_confirmations,
+                expiration_timestamp,
+                sender_transport_endpoint,
+                None,
+                true,
+            )
+            .await?;
+        let signed_psbt = self.sign_psbt(begin.psbt, None)?;
+        let res = self._send_end(online, signed_psbt).await?;
+        info!(self.logger, "Send completed");
+        Ok(res)
+    }
+
     /// Prepare the PSBT to send RGB assets (wasm32 async).
     ///
     /// See native [`send_begin`](Wallet::send_begin) for full documentation.
@@ -9047,6 +9156,46 @@ impl Wallet {
         })
     }
 
+    /// Send bitcoins using the vanilla wallet.
+    ///
+    /// This calls [`send_btc_begin`](Wallet::send_btc_begin), signs the resulting PSBT and finally
+    /// calls [`send_btc_end`](Wallet::send_btc_end).
+    ///
+    /// A wallet with private keys and [`Online`] data are required.
+    pub async fn send_btc(
+        &mut self,
+        online: Online,
+        address: String,
+        amount: u64,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<String, Error> {
+        let cp = self.checkpoint("send_btc");
+        let res = self
+            ._send_btc(online, address, amount, fee_rate, skip_sync)
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _send_btc(
+        &mut self,
+        online: Online,
+        address: String,
+        amount: u64,
+        fee_rate: u64,
+        skip_sync: bool,
+    ) -> Result<String, Error> {
+        info!(self.logger, "Sending BTC...");
+        self._check_xprv()?;
+        let psbt = self
+            ._send_btc_begin(online.clone(), address, amount, fee_rate, skip_sync, true)
+            .await?;
+        let signed_psbt = self.sign_psbt(psbt, None)?;
+        let res = self._send_btc_end(online, signed_psbt).await?;
+        info!(self.logger, "Send BTC completed");
+        Ok(res)
+    }
+
     /// Prepare the PSBT to send bitcoins (wasm32 async).
     ///
     /// See native [`send_btc_begin`](Wallet::send_btc_begin) for full documentation.
@@ -9181,6 +9330,44 @@ impl Wallet {
         Ok(estimation)
     }
 
+    /// Send all bitcoin funds to the provided address.
+    ///
+    /// <div class="warning">Warning: draining all funds is a destructive and irreversible
+    /// operation, only do this if you know what you're doing! It spends the colored UTXOs too
+    /// and destroys their assets. After draining the wallet will not be usable anymore.</div>
+    ///
+    /// This calls [`drain_to_begin`](Wallet::drain_to_begin), signs the resulting PSBT and finally
+    /// calls [`drain_to_end`](Wallet::drain_to_end).
+    ///
+    /// A wallet with private keys is required.
+    pub async fn drain_to(
+        &mut self,
+        online: Online,
+        address: String,
+        fee_rate: u64,
+    ) -> Result<String, Error> {
+        let cp = self.checkpoint("drain_to");
+        let res = self._drain_to(online, address, fee_rate).await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _drain_to(
+        &mut self,
+        online: Online,
+        address: String,
+        fee_rate: u64,
+    ) -> Result<String, Error> {
+        info!(self.logger, "Draining to '{}'...", address);
+        self._check_xprv()?;
+        let psbt = self
+            ._drain_to_begin(online.clone(), address, fee_rate, true)
+            .await?;
+        let signed_psbt = self.sign_psbt(psbt, None)?;
+        let res = self._drain_to_end(online, signed_psbt).await?;
+        info!(self.logger, "Drain completed");
+        Ok(res)
+    }
+
     /// Prepare the PSBT to drain all wallet funds.
     ///
     /// <div class="warning">Warning: draining all funds is a destructive and irreversible
@@ -9277,6 +9464,60 @@ impl Wallet {
 
         info!(self.logger, "Drain (end) completed");
         Ok(tx.compute_txid().to_string())
+    }
+
+    /// Inflate RGB assets.
+    ///
+    /// This calls [`inflate_begin`](Wallet::inflate_begin), signs the resulting PSBT and finally
+    /// calls [`inflate_end`](Wallet::inflate_end).
+    ///
+    /// A wallet with private keys is required.
+    pub async fn inflate(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        inflation_amounts: Vec<u64>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
+        let cp = self.checkpoint("inflate");
+        let res = self
+            ._inflate(
+                online,
+                asset_id,
+                inflation_amounts,
+                fee_rate,
+                min_confirmations,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    async fn _inflate(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        inflation_amounts: Vec<u64>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Inflating amounts: {:?}...", inflation_amounts);
+        self._check_xprv()?;
+        self.check_online(online.clone())?;
+        let begin = self
+            ._inflate_begin(
+                online.clone(),
+                asset_id,
+                inflation_amounts,
+                fee_rate,
+                min_confirmations,
+                true,
+            )
+            .await?;
+        let signed_psbt = self.sign_psbt(begin.psbt, None)?;
+        let res = self._inflate_end(online, signed_psbt).await?;
+        info!(self.logger, "Inflate completed");
+        Ok(res)
     }
 
     /// Prepare the PSBT to inflate an IFA asset, one new UTXO per amount in `inflation_amounts`.
@@ -16248,6 +16489,108 @@ mod bfa_tests {
             block_on(wallet.burn(online, s!("rgb:ifa"), 10, None, 1, 1)),
             Err(Error::WatchOnly)
         ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn one_step_calls_refuse_invalid_input() {
+        use crate::api::evm::tests::block_on;
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+
+        // the send and inflate inputs fail before online is checked, if it is checked late
+        fn all(wallet: &mut Wallet, online: &Online, addr: &str) -> Vec<Error> {
+            let exp = now().unix_timestamp() as u64 + 3600;
+            vec![
+                block_on(wallet.create_utxos(online.clone(), true, None, None, 1, true))
+                    .unwrap_err(),
+                block_on(wallet.drain_to(online.clone(), addr.to_string(), 1)).unwrap_err(),
+                block_on(wallet.send(online.clone(), HashMap::new(), false, 1, 1, exp, None))
+                    .unwrap_err(),
+                block_on(wallet.send_btc(online.clone(), addr.to_string(), 1000, 1, true))
+                    .unwrap_err(),
+                block_on(wallet.inflate(online.clone(), s!("rgb:unknown"), vec![1], 1, 1))
+                    .unwrap_err(),
+            ]
+        }
+
+        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Ifa];
+        for (id, schema, supply) in [
+            ("rgb:ifa", AssetSchema::Ifa, Some(s!("1000"))),
+            ("rgb:nia", AssetSchema::Nia, None),
+        ] {
+            wallet
+                .database
+                .set_asset(DbAssetActMod {
+                    id: ActiveValue::Set(id.to_string()),
+                    schema: ActiveValue::Set(schema),
+                    known_circulating_supply: ActiveValue::Set(supply),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let addr = crate::wallet::offline::address_reuse_tests::make_test_wallet(false)
+            .get_address()
+            .unwrap();
+        let url = "http://127.0.0.1:1";
+        let online = Online {
+            id: 1,
+            indexer_url: url.to_string(),
+        };
+
+        assert!(wallet.online_data.is_none());
+        for err in all(&mut wallet, &online, &addr) {
+            assert_eq!(err, Error::Offline);
+        }
+
+        wallet.watch_only = true;
+        for err in all(&mut wallet, &online, &addr) {
+            assert_eq!(err, Error::WatchOnly);
+        }
+        wallet.watch_only = false;
+
+        wallet.online_data = Some(OnlineData::for_test(url));
+        let other = Online {
+            id: 2,
+            indexer_url: url.to_string(),
+        };
+        for err in all(&mut wallet, &other, &addr) {
+            assert_eq!(err, Error::CannotChangeOnline);
+        }
+
+        assert_eq!(
+            block_on(wallet.create_utxos(online.clone(), true, None, None, 1, true)).unwrap_err(),
+            Error::InsufficientBitcoins {
+                needed: UTXO_SIZE as u64 * UTXO_NUM as u64 + 1000,
+                available: 0,
+            }
+        );
+        assert!(matches!(
+            block_on(wallet.send_btc(online.clone(), addr, 1000, 1, true)),
+            Err(Error::InsufficientBitcoins { .. })
+        ));
+        let exp = now().unix_timestamp() as u64 + 3600;
+        assert_eq!(
+            block_on(wallet.send(online.clone(), HashMap::new(), false, 1, 1, exp, None))
+                .unwrap_err(),
+            Error::InvalidRecipientMap
+        );
+        let cases: [(&str, Vec<u64>, fn(&Error) -> bool); 3] = [
+            ("rgb:ifa", vec![], |e| *e == Error::NoInflationAmounts),
+            ("rgb:unknown", vec![1], |e| {
+                matches!(e, Error::AssetNotFound { .. })
+            }),
+            ("rgb:nia", vec![1], |e| {
+                *e == Error::UnsupportedInflation {
+                    asset_schema: AssetSchema::Nia,
+                }
+            }),
+        ];
+        for (id, amounts, expected) in cases {
+            let err = block_on(wallet.inflate(online.clone(), id.to_string(), amounts, 1, 1))
+                .unwrap_err();
+            assert!(expected(&err), "{err:?}");
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
