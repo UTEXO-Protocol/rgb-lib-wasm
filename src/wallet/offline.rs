@@ -105,7 +105,7 @@ pub(crate) struct LocalAssetData {
     pub(crate) initial_supply: u64,
     pub(crate) max_supply: Option<u64>,
     pub(crate) known_circulating_supply: Option<u64>,
-    pub(crate) reject_list_url: Option<String>,
+    pub(crate) reject_list: Option<RgbRejectListInfo>,
     pub(crate) linked_from_contract: Option<String>,
 }
 
@@ -222,8 +222,8 @@ pub struct Metadata {
     pub ticker: Option<String>,
     /// Asset details
     pub details: Option<String>,
-    /// Reject list URL
-    pub reject_list_url: Option<String>,
+    /// Where the reject list the asset commits to is published, if any
+    pub reject_list: Option<RgbRejectListInfo>,
     /// ID of the contract the asset is linked from (e.g. the one it replaces), if any
     pub linked_from_contract: Option<String>,
     /// ID of the contract the asset has been linked to (e.g. the one replacing it), if linked by
@@ -304,7 +304,7 @@ impl AssetNIA {
 }
 
 /// An Inflatable Fungible Asset.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct AssetIFA {
     /// ID of the asset
@@ -331,8 +331,8 @@ pub struct AssetIFA {
     pub balance: Balance,
     /// Asset media attachment
     pub media: Option<Media>,
-    /// Reject list URL
-    pub reject_list_url: Option<String>,
+    /// Where the reject list the asset commits to is published, if any
+    pub reject_list: Option<RgbRejectListInfo>,
 }
 
 impl AssetIFA {
@@ -386,13 +386,13 @@ impl AssetIFA {
             added_at: asset.added_at,
             balance,
             media,
-            reject_list_url: asset.reject_list_url.clone(),
+            reject_list: asset.reject_list.clone(),
         })
     }
 }
 
 /// A Bridged Fungible Asset.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct AssetBFA {
     /// ID of the asset
@@ -416,8 +416,8 @@ pub struct AssetBFA {
     pub balance: Balance,
     /// Asset media attachment
     pub media: Option<Media>,
-    /// Reject list URL
-    pub reject_list_url: Option<String>,
+    /// Where the reject list the asset commits to is published, if any
+    pub reject_list: Option<RgbRejectListInfo>,
 }
 
 impl AssetBFA {
@@ -465,7 +465,7 @@ impl AssetBFA {
             added_at: asset.added_at,
             balance,
             media,
-            reject_list_url: asset.reject_list_url.clone(),
+            reject_list: asset.reject_list.clone(),
         })
     }
 }
@@ -2029,7 +2029,7 @@ impl Wallet {
             precision: ActiveValue::Set(asset_data.precision),
             ticker: ActiveValue::Set(asset_data.ticker),
             timestamp: ActiveValue::Set(timestamp),
-            reject_list_url: ActiveValue::Set(asset_data.reject_list_url),
+            reject_list: ActiveValue::Set(asset_data.reject_list),
             linked_from_contract: ActiveValue::Set(asset_data.linked_from_contract),
             linked_to_contract: ActiveValue::Set(None),
         };
@@ -2169,7 +2169,7 @@ impl Wallet {
             initial_supply: settled,
             max_supply: None,
             known_circulating_supply: None,
-            reject_list_url: None,
+            reject_list: None,
             linked_from_contract: None,
         };
         let asset = self.add_asset_to_db(
@@ -2432,7 +2432,7 @@ impl Wallet {
             initial_supply: settled,
             max_supply: Some(max_supply),
             known_circulating_supply: Some(settled),
-            reject_list_url,
+            reject_list: reject_list_url.map(RgbRejectListInfo::Url),
             linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
         let asset = self.add_asset_to_db(
@@ -2636,15 +2636,17 @@ impl Wallet {
             }),
         )
         .expect("invalid bridgeLocation");
-        if let Some(reject_list_address) = reject_list_address {
+        let reject_list = reject_list_address
+            .map(|address| {
+                Ok::<_, Error>(RejectListLocation::Evm(EvmContract {
+                    chain_id,
+                    address: self._check_contract_address(address)?,
+                }))
+            })
+            .transpose()?;
+        if let Some(reject_list) = reject_list.clone() {
             builder = builder
-                .add_global_state(
-                    RGB_GLOBAL_REJECT_LIST,
-                    RejectListLocation::Evm(EvmContract {
-                        chain_id,
-                        address: self._check_contract_address(reject_list_address)?,
-                    }),
-                )
+                .add_global_state(RGB_GLOBAL_REJECT_LIST, reject_list)
                 .expect("invalid rejectList");
         }
 
@@ -2692,7 +2694,7 @@ impl Wallet {
             initial_supply: 0,
             max_supply: None,
             known_circulating_supply: None,
-            reject_list_url: None,
+            reject_list: reject_list.map(RgbRejectListInfo::from),
             linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
         let asset = self.add_asset_to_db(
@@ -3003,7 +3005,7 @@ impl Wallet {
             precision: asset.precision,
             ticker: asset.ticker,
             details: asset.details,
-            reject_list_url: asset.reject_list_url,
+            reject_list: asset.reject_list,
             linked_from_contract: asset.linked_from_contract,
             linked_to_contract: asset.linked_to_contract,
         })

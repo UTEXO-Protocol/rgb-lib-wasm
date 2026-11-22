@@ -360,7 +360,7 @@ impl Wallet {
                     initial_supply,
                     max_supply: None,
                     known_circulating_supply: None,
-                    reject_list_url: None,
+                    reject_list: None,
                     linked_from_contract: None,
                 }
             }
@@ -385,7 +385,9 @@ impl Wallet {
                     IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
                         .total_issued_supply()
                         .into();
-                let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
+                let reject_list = contract
+                    .reject_list_url()
+                    .map(|u| RgbRejectListInfo::Url(u.to_string()));
                 LocalAssetData {
                     name,
                     precision,
@@ -395,7 +397,7 @@ impl Wallet {
                     initial_supply,
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
-                    reject_list_url,
+                    reject_list,
                     linked_from_contract: contract_link(contract.link_from())?,
                 }
             }
@@ -409,11 +411,7 @@ impl Wallet {
                 } else {
                     None
                 };
-                // the DB keeps only a reject list URL
-                let reject_list_url = match contract.reject_list() {
-                    Some(RejectListLocation::Url(url)) => Some(url.to_string()),
-                    _ => None,
-                };
+                let reject_list = contract.reject_list().map(RgbRejectListInfo::from);
                 LocalAssetData {
                     name: contract.name().to_string(),
                     precision: contract.precision().into(),
@@ -423,7 +421,7 @@ impl Wallet {
                     initial_supply: 0,
                     max_supply: None,
                     known_circulating_supply: None,
-                    reject_list_url,
+                    reject_list,
                     linked_from_contract: contract_link(contract.link_from())?,
                 }
             }
