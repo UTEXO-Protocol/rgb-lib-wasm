@@ -62,7 +62,7 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 ```javascript
 import init, {
   generateKeys, restoreKeys, checkProxyUrl, checkIndexerUrl, maxExpirationSecs,
-  validateConsignmentOffchain, inspectConsignment,
+  validateConsignmentOffchain, inspectConsignment, fillSpvProofs,
   WasmWallet, WasmInvoice,
 } from './pkg/rgb_lib_wasm.js';
 
@@ -351,6 +351,10 @@ const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
 // the filter is 'All', 'Terminals' or { Witness: txid }
 const inspection = inspectConsignment(consignmentBytes, 'Terminals');
 
+// Fill in the SPV proofs a transfer consignment misses, from an esplora indexer
+// consignment is null when no proof was set
+const { withoutProof, rewritten, consignment } = await fillSpvProofs(consignmentBytes, 'http://localhost:8094/regtest/api');
+
 // PSBT signing and finalization (standalone)
 const signed = wallet.signPsbt(unsignedPsbtBase64);
 const finalized = wallet.finalizePsbt(signedPsbtBase64);
@@ -379,6 +383,7 @@ To protect a wallet:
 | `checkIndexerUrl(url, network)` | Validate an indexer URL for the network and return its protocol ('Esplora') |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
 | `inspectConsignment(bytes, bundleFilter)` | Inspect an RGB consignment without a wallet |
+| `fillSpvProofs(bytes, indexerUrl)` | Fill in the SPV proofs a transfer consignment misses, from an esplora indexer |
 
 ### `WasmInvoice`
 
