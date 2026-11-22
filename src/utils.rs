@@ -527,9 +527,14 @@ pub(crate) async fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, E
 
 #[cfg(feature = "esplora")]
 pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
-    use crate::wallet::online::Indexer;
     #[cfg(target_arch = "wasm32")]
     no_store_fetch(indexer_url, u32::from(INDEXER_TIMEOUT) * 1000);
+    esplora_indexer(indexer_url)
+}
+
+#[cfg(feature = "esplora")]
+pub(crate) fn esplora_indexer(indexer_url: &str) -> Option<Indexer> {
+    use crate::wallet::online::Indexer;
     let opts = esplora_client::Builder::new(indexer_url)
         .timeout(INDEXER_TIMEOUT.into())
         .max_retries(INDEXER_RETRIES.into());
@@ -543,7 +548,7 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
 // If other code replaces fetch, the next call wraps fetch again, so the wrapper stays outermost.
 #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-export function no_store_fetch(base, timeout_ms) {
+function urls() {
     const g = globalThis;
     if (!g.__rgbLibNoStoreUrls) g.__rgbLibNoStoreUrls = new Map();
     if (g.fetch !== g.__rgbLibNoStoreFetch) {
@@ -551,19 +556,63 @@ export function no_store_fetch(base, timeout_ms) {
         g.fetch = g.__rgbLibNoStoreFetch = function (input, init) {
             const m = input instanceof Request && [...g.__rgbLibNoStoreUrls].find(([p]) => input.url.startsWith(p));
             if (m) {
-                const signal = AbortSignal.any([input.signal, AbortSignal.timeout(m[1])]);
+                const signal = AbortSignal.any([input.signal, AbortSignal.timeout(m[1].ms)]);
                 input = new Request(input, { cache: 'no-store', signal });
             }
             return fetch.call(this, input, init);
         };
     }
-    let key = base;
-    try { key = new URL(base).href; } catch (e) {}
-    g.__rgbLibNoStoreUrls.set(key, timeout_ms);
+    return g.__rgbLibNoStoreUrls;
+}
+function href(base) {
+    try { return new URL(base).href; } catch (e) { return null; }
+}
+export function no_store_fetch(base, timeout_ms) {
+    const map = urls();
+    const key = href(base) ?? base;
+    map.set(key, { ms: timeout_ms, wallet: true, holds: map.get(key)?.holds ?? 0 });
+}
+// A check holds a URL while it runs. A release keeps a URL that a wallet registered.
+export function no_store_fetch_hold(base, timeout_ms) {
+    const key = href(base);
+    if (key === null) return;
+    const map = urls();
+    const e = map.get(key) ?? { ms: timeout_ms, wallet: false, holds: 0 };
+    e.holds += 1;
+    map.set(key, e);
+}
+export function no_store_fetch_release(base) {
+    const key = href(base);
+    const map = globalThis.__rgbLibNoStoreUrls;
+    const e = key !== null && map?.get(key);
+    if (!e) return;
+    e.holds -= 1;
+    if (!e.wallet && e.holds <= 0) map.delete(key);
 }
 "#)]
 extern "C" {
     fn no_store_fetch(base: &str, timeout_ms: u32);
+    fn no_store_fetch_hold(base: &str, timeout_ms: u32);
+    fn no_store_fetch_release(base: &str);
+}
+
+/// Bypass the cache and time out requests to the URL while the guard lives.
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+pub(crate) struct NoStoreHold(String);
+
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+impl NoStoreHold {
+    pub(crate) fn new(url: &str) -> Self {
+        no_store_fetch_hold(url, u32::from(INDEXER_TIMEOUT) * 1000);
+        Self(url.to_string())
+    }
+}
+
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+impl Drop for NoStoreHold {
+    fn drop(&mut self) {
+        no_store_fetch_release(&self.0);
+    }
 }
 
 #[cfg(feature = "esplora")]
@@ -1655,8 +1704,124 @@ mod tests {
 
     #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
     mod no_store_fetch_browser {
-        use super::super::no_store_fetch;
+        use super::super::{
+            build_indexer, no_store_fetch, no_store_fetch_hold, no_store_fetch_release,
+        };
+        use crate::wallet::{IndexerProtocol, check_indexer_url};
+        use crate::{BitcoinNetwork, Error};
+        use wasm_bindgen::JsValue;
         use wasm_bindgen_test::*;
+
+        const SAVE: &str = "const g = globalThis; g.__realUrls = g.__rgbLibNoStoreUrls; \
+            delete g.__rgbLibNoStoreUrls; g.__realFetch = g.fetch; g.__seen = []; \
+            const res = (input, body, status) => Object.defineProperty( \
+              new Response(body, { status }), 'url', { value: input.url });";
+        const RESTORE: &str = "g.fetch = g.__realFetch; g.__rgbLibNoStoreUrls = g.__realUrls;";
+        const BAD_INDEXER: &str = "not a valid electrum nor esplora server";
+
+        async fn js(src: &str) -> JsValue {
+            let v = js_sys::Function::new_no_args(src)
+                .call0(&JsValue::NULL)
+                .unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&v))
+                .await
+                .unwrap()
+        }
+
+        async fn has(url: &str) -> bool {
+            js(&format!(
+                "return globalThis.__rgbLibNoStoreUrls?.has(new URL('{url}').href) ?? false"
+            ))
+            .await
+            .as_bool()
+            .unwrap()
+        }
+
+        fn bad_indexer() -> Result<IndexerProtocol, Error> {
+            Err(Error::InvalidIndexer {
+                details: BAD_INDEXER.to_string(),
+            })
+        }
+
+        // A wallet registers the URL while a failing check waits for its response.
+        #[wasm_bindgen_test]
+        async fn failed_check_keeps_wallet_registration() {
+            const U: &str = "http://127.0.0.1:1/race";
+            js(&format!(
+                "{SAVE} g.fetch = (input) => {{ g.__seen.push(input.cache); \
+                 if (g.__seen.length > 1) return Promise.resolve(res(input, '', 200)); \
+                 return new Promise(r => {{ g.__answer = () => r(res(input, '', 404)); }}); }};"
+            ))
+            .await;
+            wasm_bindgen_futures::spawn_local(async {
+                let mut ticks = 0;
+                while js("return globalThis.__seen.length").await.as_f64() == Some(0.0) {
+                    ticks += 1;
+                    assert!(ticks < 1000, "check sent no request");
+                    js("return new Promise(r => setTimeout(r, 0))").await;
+                }
+                build_indexer(U);
+                js("globalThis.__answer()").await;
+            });
+            assert_eq!(
+                check_indexer_url(U, BitcoinNetwork::Regtest).await,
+                bad_indexer()
+            );
+            let registered = has(U).await;
+            let out = js(&format!(
+                "const g = globalThis; return g.fetch(new Request('{U}/blocks/tip/height')).then(() => {{ \
+                 const out = g.__seen.join(); {RESTORE} return out; }});"
+            ))
+            .await;
+            assert_eq!(
+                format!("{},{registered}", out.as_string().unwrap()),
+                "no-store,no-store,true"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        async fn check_releases_only_its_own_holds() {
+            const OK: &str = "http://127.0.0.1:1/ok/";
+            const BAD: &str = "http://127.0.0.1:1/bad/";
+            const W: &str = "http://127.0.0.1:1/wallet/";
+            const H: &str = "http://127.0.0.1:1/hold/";
+            js(&format!(
+                "{SAVE} g.fetch = (input) => {{ g.__seen.push(input.cache); \
+                 return Promise.resolve(input.url.includes('/ok/') \
+                   ? res(input, '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206', 200) \
+                   : res(input, '', 404)); }};"
+            ))
+            .await;
+            let regtest = BitcoinNetwork::Regtest;
+            assert_eq!(
+                check_indexer_url(OK, regtest).await,
+                Ok(IndexerProtocol::Esplora)
+            );
+            assert!(!has(OK).await);
+            assert_eq!(check_indexer_url(BAD, regtest).await, bad_indexer());
+            assert!(!has(BAD).await);
+            build_indexer(W);
+            assert!(check_indexer_url(W, regtest).await.is_err());
+            assert!(has(W).await);
+            assert!(check_indexer_url("", regtest).await.is_err());
+            assert_eq!(
+                js("return globalThis.__rgbLibNoStoreUrls.size")
+                    .await
+                    .as_f64(),
+                Some(1.0)
+            );
+            no_store_fetch_hold(H, 10_000);
+            no_store_fetch_hold(H, 10_000);
+            no_store_fetch_release(H);
+            assert!(has(H).await);
+            no_store_fetch_release(H);
+            assert!(!has(H).await);
+            let out = js(&format!(
+                "const g = globalThis; const out = g.__seen.join(); {RESTORE} return out;"
+            ))
+            .await;
+            assert_eq!(out.as_string().unwrap(), "no-store,no-store,no-store");
+        }
 
         // Stub fetch, register indexers, and record what reaches the stub.
         #[wasm_bindgen_test]

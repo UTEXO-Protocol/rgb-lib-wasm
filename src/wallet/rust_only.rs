@@ -27,19 +27,6 @@ pub struct ColoringInfo {
 /// Map of contract ID and list of its beneficiaries
 pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>>>;
 
-/// Indexer protocol
-#[derive(Clone, Debug)]
-pub enum IndexerProtocol {
-    /// An indexer implementing the esplora protocol
-    Esplora,
-}
-
-impl fmt::Display for IndexerProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
 /// Result of consignment validation (offchain or indexer-based).
 #[cfg(feature = "esplora")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,7 +320,7 @@ impl Wallet {
     pub fn get_online(&self) -> Option<Online> {
         self.online_data.as_ref().map(|od| Online {
             id: od.id,
-            indexer_url: od.indexer_url.clone(),
+            indexer_url: od.indexer_config.url().to_string(),
         })
     }
 

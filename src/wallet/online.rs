@@ -1531,6 +1531,67 @@ impl IndexerConfig {
             Self::Esplora { url } => url,
         }
     }
+
+    /// Protocol the indexer speaks.
+    pub fn protocol(&self) -> IndexerProtocol {
+        match self {
+            Self::Esplora { .. } => IndexerProtocol::Esplora,
+        }
+    }
+}
+
+/// Indexer protocol
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum IndexerProtocol {
+    /// An indexer implementing the esplora protocol
+    Esplora,
+}
+
+impl fmt::Display for IndexerProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+async fn connect_indexer(
+    indexer: Option<Indexer>,
+    bitcoin_network: BitcoinNetwork,
+    invalid: &str,
+) -> Result<Indexer, Error> {
+    let indexer = indexer.ok_or_else(|| Error::InvalidIndexer {
+        details: s!("failed to build esplora async client"),
+    })?;
+    let genesis_hash = indexer
+        .block_hash(0)
+        .await
+        .map_err(|_| Error::InvalidIndexer {
+            details: invalid.to_string(),
+        })?;
+    crate::utils::check_indexer_network(bitcoin_network, &genesis_hash)?;
+    Ok(indexer)
+}
+
+/// Return the indexer protocol for the provided URL.
+/// An error is raised if the provided indexer URL is invalid or if the service is for the wrong
+/// network or doesn't have the required functionality.
+///
+/// The URL is checked as an esplora server.
+pub async fn check_indexer_url(
+    indexer_url: &str,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<IndexerProtocol, Error> {
+    let indexer_config = IndexerConfig::Esplora {
+        url: indexer_url.to_string(),
+    };
+    #[cfg(target_arch = "wasm32")]
+    let _hold = crate::utils::NoStoreHold::new(indexer_url);
+    connect_indexer(
+        crate::utils::esplora_indexer(indexer_url),
+        bitcoin_network,
+        "not a valid electrum nor esplora server",
+    )
+    .await?;
+    Ok(indexer_config.protocol())
 }
 
 /// Parse and validate the [`OnlineOptions::proxy_auth_keys`], keying them by proxy URL.
@@ -1561,7 +1622,7 @@ fn parse_proxy_auth_keys(
 
 pub(crate) struct OnlineData {
     pub(crate) id: u64,
-    pub(crate) indexer_url: String,
+    pub(crate) indexer_config: IndexerConfig,
     indexer: Indexer,
     pub(crate) proxy_auth_keys: HashMap<String, [u8; 32]>,
     pub(crate) failed_witness_receive_grace_secs: u32,
@@ -1589,7 +1650,9 @@ impl OnlineData {
     pub(crate) fn for_test(indexer_url: &str) -> Self {
         Self {
             id: 1,
-            indexer_url: indexer_url.to_string(),
+            indexer_config: IndexerConfig::Esplora {
+                url: indexer_url.to_string(),
+            },
             indexer: crate::utils::build_indexer(indexer_url).unwrap(),
             proxy_auth_keys: HashMap::new(),
             failed_witness_receive_grace_secs: 604_800,
@@ -1795,7 +1858,8 @@ impl Wallet {
 
     pub(crate) fn check_online(&self, online: Online) -> Result<(), Error> {
         if let Some(online_data) = &self.online_data {
-            if online_data.id != online.id || online_data.indexer_url != online.indexer_url {
+            if online_data.id != online.id || online_data.indexer_config.url() != online.indexer_url
+            {
                 error!(self.logger, "Cannot change online object");
                 return Err(Error::CannotChangeOnline);
             }
@@ -3077,21 +3141,16 @@ impl Wallet {
             id: online_id,
             indexer_url: indexer_url.clone(),
         };
-        let indexer =
-            crate::utils::build_indexer(&indexer_url).ok_or_else(|| Error::InvalidIndexer {
-                details: s!("failed to build esplora async client"),
-            })?;
-        let genesis_hash = indexer
-            .block_hash(0)
-            .await
-            .map_err(|_| Error::InvalidIndexer {
-                details: s!("not a valid esplora server"),
-            })?;
-        crate::utils::check_indexer_network(self.bitcoin_network(), &genesis_hash)?;
+        let indexer = connect_indexer(
+            crate::utils::build_indexer(&indexer_url),
+            self.bitcoin_network(),
+            "not a valid esplora server",
+        )
+        .await?;
         indexer.populate_tx_cache(&self.bdk_wallet);
         let online_data = OnlineData {
             id: online.id,
-            indexer_url,
+            indexer_config: online_options.indexer_config.clone(),
             indexer,
             proxy_auth_keys,
             failed_witness_receive_grace_secs: online_options.failed_witness_receive_grace_secs,
@@ -3147,7 +3206,7 @@ impl Wallet {
                 id: online_data.id,
                 indexer_url: online_options.indexer_config.url().to_string(),
             };
-            if online_data.indexer_url != online.indexer_url {
+            if online_data.indexer_config != online_options.indexer_config {
                 let (online, online_data) = self._go_online_wasm(&online_options).await?;
                 self.online_data = Some(online_data);
                 info!(self.logger, "Went online with new indexer");
@@ -11027,9 +11086,49 @@ mod go_online_tests {
             assert!(matches!(res, Err(Error::InvalidProxyAuthKey { .. })));
             let online_data = wallet.online_data.as_ref().unwrap();
             assert_eq!(online_data.id, 1);
-            assert_eq!(online_data.indexer_url, INDEXER_URL);
+            assert_eq!(online_data.indexer_config.url(), INDEXER_URL);
             assert_eq!(online_data.proxy_auth_keys, keys);
         }
+    }
+
+    fn regtest_esplora() -> String {
+        fake_esplora(|_| {
+            (
+                "200 OK",
+                b"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206".to_vec(),
+            )
+        })
+    }
+
+    #[test]
+    fn check_indexer_url_success() {
+        let url = regtest_esplora();
+        assert_eq!(
+            crate::block_on(check_indexer_url(&url, BitcoinNetwork::Regtest)),
+            Ok(IndexerProtocol::Esplora)
+        );
+        assert_eq!(
+            IndexerConfig::Esplora { url }.protocol(),
+            IndexerProtocol::Esplora
+        );
+    }
+
+    #[test]
+    fn check_indexer_url_fail() {
+        let url = regtest_esplora();
+        assert_eq!(
+            crate::block_on(check_indexer_url(&url, BitcoinNetwork::Testnet)),
+            Err(Error::InvalidIndexer {
+                details: s!("resolver is for another chain-network pair")
+            })
+        );
+        let url = fake_esplora(|_| ("404 Not Found", vec![]));
+        assert_eq!(
+            crate::block_on(check_indexer_url(&url, BitcoinNetwork::Regtest)),
+            Err(Error::InvalidIndexer {
+                details: s!("not a valid electrum nor esplora server")
+            })
+        );
     }
 }
 
