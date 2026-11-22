@@ -230,13 +230,15 @@ async fn import_contract_reject_list() {
     assert_eq!(issued.reject_list, expected);
     let ifa = |w: &Wallet| w.list_assets(vec![AssetSchema::Ifa]).unwrap().ifa.unwrap();
     let reported = |w: &Wallet| {
+        let metadata = w.get_asset_metadata(asset_id.clone()).unwrap();
         (
             ifa(w)[0].reject_list.clone(),
-            w.get_asset_metadata(asset_id.clone()).unwrap().reject_list,
+            metadata.reject_list,
+            metadata.bridge_location,
         )
     };
     let (bytes, txid) = sent_consignment(&mut a, &a_on, &asset_id, &mut c, &c_on).await;
-    assert_eq!(reported(&a), (expected.clone(), expected.clone()));
+    assert_eq!(reported(&a), (expected.clone(), expected.clone(), None));
 
     let terminal = RgbTransfer::load(&bytes[..]).unwrap().terminal_ops();
     assert_eq!(terminal.len(), 1);
@@ -257,5 +259,5 @@ async fn import_contract_reject_list() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].asset_id, asset_id);
     assert_eq!(listed[0].balance, zero());
-    assert_eq!(reported(&d), (expected.clone(), expected));
+    assert_eq!(reported(&d), (expected.clone(), expected, None));
 }
