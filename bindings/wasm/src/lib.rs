@@ -1406,6 +1406,18 @@ pub async fn check_proxy_url(proxy_url: &str) -> Result<(), JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Check that the URL points to a valid indexer for the network. Return its protocol.
+#[wasm_bindgen(js_name = "checkIndexerUrl")]
+pub async fn check_indexer_url(indexer_url: &str, network: &str) -> Result<JsValue, JsValue> {
+    let bitcoin_network = network
+        .parse::<rgb_lib_wasm::BitcoinNetwork>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let protocol = rgb_lib_wasm::wallet::check_indexer_url(indexer_url, bitcoin_network)
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&protocol)
+}
+
 /// Validate an RGB consignment using witness data bundled in the consignment (offchain).
 ///
 /// Works before the witness transaction is broadcast. Takes the raw consignment
