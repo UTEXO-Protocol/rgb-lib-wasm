@@ -7,6 +7,7 @@ use super::test_send::{
     ResetMocks, consignment as saved_consignment, proven, witness_ord, witness_ords,
 };
 use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+use crate::utils::INDEXER_SYNCS;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{
     AssetFilter, Online, Outpoint, Recipient, SinglesigKeys, Transfer, TransferScope, Wallet,
@@ -936,6 +937,67 @@ async fn inflate_dry_run_end_saves_transfer() {
     let saved = transfer(&wallet, &asset_id, res.batch_transfer_idx);
     assert_eq!(saved.status, TransferStatus::WaitingConfirmations);
     assert_eq!(saved.kind, TransferKind::Inflation);
+}
+
+#[wasm_bindgen_test]
+async fn inflate_one_step() {
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let last_operation = |wallet: &Wallet| {
+        wallet
+            .database
+            .get_backup_info()
+            .unwrap()
+            .map(|b| b.last_operation_timestamp)
+    };
+    let inflations = |wallet: &Wallet| -> Vec<Transfer> {
+        wallet
+            .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind == TransferKind::Inflation)
+            .collect()
+    };
+
+    let before = last_operation(&wallet);
+    INDEXER_SYNCS.set(0);
+    let res = wallet
+        .inflate(online.clone(), asset_id.clone(), vec![30, 20], 1, 1)
+        .await
+        .unwrap();
+    // the broadcast is applied locally, with no sync
+    assert_eq!(INDEXER_SYNCS.get(), 0);
+    assert!(
+        wallet
+            .database
+            .iter_txos()
+            .unwrap()
+            .iter()
+            .any(|t| t.txid == res.txid && t.exists && !t.spent)
+    );
+    assert_ne!(last_operation(&wallet), before);
+    let saved = inflations(&wallet);
+    assert_eq!(saved.len(), 2);
+    for t in &saved {
+        assert_eq!(t.batch_transfer_idx, res.batch_transfer_idx);
+        assert_eq!(t.txid.as_ref(), Some(&res.txid));
+        assert_eq!(t.status, TransferStatus::WaitingConfirmations);
+    }
+    assert_eq!(balance(&wallet, &asset_id), (1000, 1050, 1000));
+    assert!(wallet.get_reserved_outpoints().unwrap().is_empty());
+
+    mine_and_refresh(&mut wallet, &online).await;
+    assert!(
+        inflations(&wallet)
+            .iter()
+            .all(|t| t.status == TransferStatus::Settled)
+    );
+    assert_eq!(balance(&wallet, &asset_id), (1050, 1050, 1050));
+
+    assert_no_partial_change(&mut wallet, "inflate", 1, async |w| {
+        w.inflate(online.clone(), asset_id.clone(), vec![10], 1, 1)
+            .await
+    })
+    .await;
 }
 
 // the inputs of a burn hold one allocation less than a bundle can spend

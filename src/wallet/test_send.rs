@@ -7,7 +7,7 @@ use super::online::{
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
-use crate::utils::TRANSITION_BUILDERS_LOADED;
+use crate::utils::{INDEXER_SYNCS, TRANSITION_BUILDERS_LOADED};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
@@ -370,6 +370,84 @@ async fn send_enters_the_stock_at_broadcast() {
     assert_eq!(witness_ord(&a, &txid), None);
     end(&mut a, &a_on, signed).await;
     assert!(witness_ord(&a, &txid).is_some());
+}
+
+#[wasm_bindgen_test]
+async fn send_one_step() {
+    let _reset = ResetMocks;
+    let (mut a, a_on) = nia_wallet(3).await;
+    let (mut r, r_on) = nia_wallet(1).await;
+    let asset_id = issue(&a, vec![AMOUNT]);
+    let map = |rid: &str, amount: u64| {
+        HashMap::from([(
+            asset_id.clone(),
+            vec![recipient(rid, amount, None, PROXY_URL)],
+        )])
+    };
+
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    let res = a
+        .send(
+            a_on.clone(),
+            map(&rid, 100),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+        )
+        .await
+        .unwrap();
+    let transfer = sent(&a, &res.txid);
+    assert_eq!(transfer.status, TransferStatus::WaitingCounterparty);
+    assert_eq!(transfer.batch_transfer_idx, res.batch_transfer_idx);
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+    assert_eq!(sent(&a, &res.txid).status, TransferStatus::Settled);
+    assert_eq!(r.get_asset_balance(asset_id.clone()).unwrap().settled, 100);
+
+    // a donation applies its TX locally, with no sync
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(50), &[PROXY_URL]).await;
+    INDEXER_SYNCS.set(0);
+    let res = a
+        .send(
+            a_on.clone(),
+            map(&rid, 50),
+            true,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(INDEXER_SYNCS.get(), 0);
+    assert!(
+        a.database
+            .iter_txos()
+            .unwrap()
+            .iter()
+            .any(|t| t.txid == res.txid && t.exists && !t.spent)
+    );
+    assert_eq!(
+        sent(&a, &res.txid).status,
+        TransferStatus::WaitingConfirmations
+    );
+    settle_both(&mut a, &a_on, &mut r, &r_on).await;
+
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(10), &[PROXY_URL]).await;
+    assert_no_partial_change(&mut a, "send", 0, async |w| {
+        w.send(
+            a_on.clone(),
+            map(&rid, 10),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+        )
+        .await
+    })
+    .await;
 }
 
 // a consignment that does not pay the recipient is refused

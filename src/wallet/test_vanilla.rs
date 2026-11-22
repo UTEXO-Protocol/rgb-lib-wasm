@@ -560,3 +560,84 @@ async fn drain_begin_backup_info() {
         assert_eq!(reserved(&w).is_empty(), dry_run);
     }
 }
+
+#[wasm_bindgen_test]
+async fn one_step_vanilla_calls() {
+    let (mut w, online) = vanilla_wallet(3).await;
+    let before: Vec<String> = w
+        .database
+        .iter_wallet_transactions()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.txid)
+        .collect();
+    let created = w
+        .create_utxos(online.clone(), false, Some(2), None, 1, true)
+        .await
+        .unwrap();
+    assert_eq!(created, 2);
+    let new_rows: Vec<_> = w
+        .database
+        .iter_wallet_transactions()
+        .unwrap()
+        .into_iter()
+        .filter(|r| !before.contains(&r.txid))
+        .collect();
+    assert_eq!(new_rows.len(), 1);
+    let create_txid = new_rows[0].txid.clone();
+    assert_eq!(new_rows[0].r#type, WalletTransactionType::CreateUtxos);
+    assert_eq!(new_rows[0].status, TransferStatus::WaitingConfirmations);
+    assert!(pending(&w).is_empty());
+    assert!(reserved(&w).is_empty());
+    assert_eq!(
+        w.create_utxos(online.clone(), true, Some(1), None, 1, true)
+            .await,
+        Err(Error::AllocationsAlreadyAvailable)
+    );
+
+    let send_txid = w
+        .send_btc(online.clone(), rcv_address(), AMOUNT, 1, true)
+        .await
+        .unwrap();
+    let send_row = row(&w, &send_txid);
+    assert_eq!(send_row.r#type, WalletTransactionType::SendBtc);
+    assert_eq!(send_row.status, TransferStatus::WaitingConfirmations);
+    assert!(pending(&w).is_empty());
+    assert!(reserved(&w).is_empty());
+
+    mine_and_refresh(&mut w, &online).await;
+    for txid in [&create_txid, &send_txid] {
+        assert_eq!(row(&w, txid).status, TransferStatus::Settled);
+    }
+
+    // a faulted create keeps colored outputs the DB does not know, so it runs last
+    assert_no_partial_change(&mut w, "send_btc", 1, async |w| {
+        w.send_btc(online.clone(), rcv_address(), AMOUNT, 1, true)
+            .await
+    })
+    .await;
+    assert_no_partial_change(&mut w, "create_utxos", 1, async |w| {
+        w.create_utxos(online.clone(), false, Some(1), None, 1, true)
+            .await
+    })
+    .await;
+
+    let drain_txid = w.drain_to(online.clone(), rcv_address(), 1).await.unwrap();
+    let drain_row = row(&w, &drain_txid);
+    assert_eq!(drain_row.r#type, WalletTransactionType::Drain);
+    assert_eq!(drain_row.status, TransferStatus::WaitingConfirmations);
+    assert!(pending(&w).is_empty());
+    mine_and_refresh(&mut w, &online).await;
+    assert_eq!(spendable(&mut w).await, 0);
+    assert_eq!(row(&w, &drain_txid).status, TransferStatus::Settled);
+}
+
+#[wasm_bindgen_test]
+async fn drain_to_one_step_is_atomic() {
+    // a faulted drain keeps a TX that spends everything
+    let (mut w, online) = vanilla_wallet(1).await;
+    assert_no_partial_change(&mut w, "drain_to", 1, async |w| {
+        w.drain_to(online.clone(), rcv_address(), 1).await
+    })
+    .await;
+}
