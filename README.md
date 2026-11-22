@@ -177,7 +177,7 @@ const ifa = wallet.issueAssetIfa('IFAT', 'Inflatable', 0, [1000], [500], undefin
 
 ### Sending RGB assets
 
-All send operations follow a three-step PSBT workflow: **begin** (build unsigned PSBT) → **sign** → **end** (broadcast).
+`send`, `sendBtc`, `inflate`, `createUtxos` and `drainTo` sign with the wallet keys in one call. For a separate signer, use the three-step PSBT workflow: **begin** (build unsigned PSBT) → **sign** → **end** (broadcast).
 
 ```javascript
 const recipientMap = {
@@ -275,7 +275,7 @@ const result = await wallet.inflateEnd(online, signed);
 const result = await wallet.burn(online, assetId, 50n, reason, 1n, 1);
 ```
 
-`sendEnd`, `inflateEnd`, `burn`, `burnEnd` and `mintEnd` return `{ txid, batchTransferIdx, entropy }`,
+`send`, `sendEnd`, `inflate`, `inflateEnd`, `burn`, `burnEnd` and `mintEnd` return `{ txid, batchTransferIdx, entropy }`,
 where `entropy` is the MPC entropy of the commitment.
 `inflateBegin` returns `{ psbt, batchTransferIdx, details: { fascia, minConfirmations, entropy } }`;
 `batchTransferIdx` is null when `dryRun` is true.
@@ -412,6 +412,7 @@ To protect a wallet:
 | `abortPendingVanillaTx(txid)` | no | Abort a begun vanilla operation: delete it and release its inputs |
 | `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. `vanillaSyncLookback` is how many vanilla addresses before the last used one a `FastSync` checks. |
 | `sync(online, {keychain, strategy})` | yes | Sync one keychain (`"Colored"` or `{Vanilla: {lookback}}`) with the indexer, by `"FullScan"`, `"FullSync"` or `"FastSync"` |
+| `createUtxos(online, upTo, num?, size?, feeRate, skipSync)` | yes | Create colored UTXOs, signing with the wallet keys |
 | `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
 | `createUtxosEnd(online, psbt)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
@@ -419,13 +420,17 @@ To protect a wallet:
 | `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
 | `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
 | `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
+| `send(online, recipientMap, donation, feeRate, minConf, expiration, senderEndpoint?)` | yes | Send RGB assets, signing with the wallet keys |
 | `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
 | `sendEnd(online, psbt)` | yes | Broadcast RGB send PSBT |
+| `sendBtc(online, addr, amount, feeRate, skipSync)` | yes | Send BTC, signing with the wallet keys |
 | `sendBtcBegin(...)` | yes | Prepare BTC send PSBT, reserve its inputs unless dryRun |
 | `sendBtcEnd(online, psbt)` | yes | Broadcast BTC send PSBT |
 | `getFeeEstimation(online, blocks)` | yes | Estimate fee rate for target blocks |
+| `drainTo(online, addr, feeRate)` | yes | Drain all wallet funds, signing with the wallet keys |
 | `drainToBegin(online, addr, feeRate, dryRun)` | yes | Prepare drain PSBT, reserve its inputs unless dryRun |
 | `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
+| `inflate(online, assetId, amounts, feeRate, minConf)` | yes | Inflate an IFA asset, signing with the wallet keys |
 | `inflateBegin(online, assetId, amounts, feeRate, minConf, dryRun)` | yes | Prepare IFA inflation PSBT, save it as Initiated unless dryRun |
 | `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
