@@ -392,9 +392,9 @@ async fn refresh_settles_ended() {
     assert_eq!(row(&w, &drain_txid).status, TransferStatus::Settled);
 }
 
-/// Create colored UTXOs that the DB does not know yet. Return the TXID that creates them.
-async fn unsynced_utxos(w: &mut Wallet) -> String {
-    let address = w.get_new_address().unwrap().to_string();
+/// Fund an address of the wallet with a confirmed output that the wallet does not know yet.
+/// Return the TXID.
+async fn unsynced_utxos(address: String) -> String {
     let txid = fund_address(&address, "0.001").await;
     mine_blocks(1).await;
     wait_for_esplora_sync().await;
@@ -413,7 +413,7 @@ fn has_txo(w: &Wallet, txid: &str) -> bool {
 async fn vanilla_operations_are_atomic() {
     let (mut w, online) = vanilla_wallet(3).await;
     // a failed sync drops the UTXOs it found, and a new sync finds them
-    let txid = unsynced_utxos(&mut w).await;
+    let txid = unsynced_utxos(w.get_new_address().unwrap().to_string()).await;
     assert_no_partial_change(&mut w, "sync", 0, async |w| {
         w.full_sync(online.clone()).await
     })
@@ -421,7 +421,7 @@ async fn vanilla_operations_are_atomic() {
     assert!(!has_txo(&w, &txid));
     w.full_sync(online.clone()).await.unwrap();
     assert!(has_txo(&w, &txid));
-    let txid = unsynced_utxos(&mut w).await;
+    let txid = unsynced_utxos(w.get_new_address().unwrap().to_string()).await;
     let full_scan = SyncOptions {
         keychain: SyncKeychain::Colored,
         strategy: SyncStrategy::FullScan,
@@ -433,16 +433,17 @@ async fn vanilla_operations_are_atomic() {
     assert!(!has_txo(&w, &txid));
     w.sync(online.clone(), full_scan).await.unwrap();
     assert!(has_txo(&w, &txid));
-    let txid = unsynced_utxos(&mut w).await;
+    // the vanilla listing syncs the vanilla keychain only, so it uses a vanilla address
+    let txid = unsynced_utxos(w.get_address().unwrap()).await;
     assert_no_partial_change(&mut w, "list_unspents_vanilla", 0, async |w| {
         w.list_unspents_vanilla(online.clone(), 0, false).await
     })
     .await;
-    assert!(!has_txo(&w, &txid));
-    w.list_unspents_vanilla(online.clone(), 0, false)
+    let unspents = w
+        .list_unspents_vanilla(online.clone(), 0, false)
         .await
         .unwrap();
-    assert!(has_txo(&w, &txid));
+    assert!(unspents.iter().any(|u| u.outpoint.txid.to_string() == txid));
 
     assert_no_partial_change(&mut w, "create_utxos_begin", 0, async |w| {
         create_begin(w, &online).await

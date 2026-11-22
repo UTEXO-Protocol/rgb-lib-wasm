@@ -224,6 +224,12 @@ fn get_burn_consignment_fails_for_unknown_asset() {
 }
 
 #[wasm_bindgen_test]
+fn list_asset_media_fails_for_unknown_asset() {
+    let e = err(wallet().list_asset_media("rgb:unknown").unwrap_err());
+    assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+}
+
+#[wasm_bindgen_test]
 fn get_keys_hides_mnemonic() {
     let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
     let mut keys: SinglesigKeys = serde_json::from_str(&keys).unwrap();

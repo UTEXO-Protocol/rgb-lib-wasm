@@ -505,7 +505,8 @@ async fn receive_processed_again_counted_once() {
 async fn receive_media_mismatch_retried() {
     let _reset = ResetMocks;
     let (mut a, a_on) = nia_wallet(5).await;
-    let (mut r, r_on) = nia_wallet(1).await;
+    let (mut r, r_on) = nia_wallet(2).await;
+    let (mut c, c_on) = nia_wallet(1).await;
     MOCK_ISSUE_MEDIA.set(Some(test_media()));
     let asset_id = issue(&a, vec![AMOUNT]);
     assert!(MOCK_ISSUE_MEDIA.with_borrow(|m| m.is_none()));
@@ -546,6 +547,7 @@ async fn receive_media_mismatch_retried() {
             TransferStatus::WaitingCounterparty
         );
         assert!(r.database.check_asset_exists(asset_id.clone()).is_err());
+        assert!(r.media.is_empty());
         assert!(
             r.list_unspents(None, false, true)
                 .await
@@ -571,12 +573,39 @@ async fn receive_media_mismatch_retried() {
             .media_idx
             .is_some()
     );
+    let digest = hex::encode(sha256_digest(b"media"));
+    assert_eq!(r.media.get(&digest), Some(&b"media".to_vec()));
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert_eq!(
         transfer_of(&r, &rcv.recipient_id).status,
         TransferStatus::Settled
     );
     assert_eq!(balance(&r, &asset_id).settled, 100);
+
+    // r posts the stored media when it sends the asset on, so c needs no hook
+    let rid = invoice(&mut c, &c_on, Assignment::Fungible(50), &[PROXY_URL]).await;
+    send_to(&mut r, &r_on, &asset_id, &rid, 50, PROXY_URL, false).await;
+    let res = c.refresh(c_on.clone(), None, vec![], false).await.unwrap();
+    assert!(res.values().all(|t| t.failure.is_none()), "{res:?}");
+    assert_eq!(
+        transfer_of(&c, &rid).status,
+        TransferStatus::WaitingConfirmations
+    );
+    assert_eq!(c.media.get(&digest), Some(&b"media".to_vec()));
+
+    // r does not fetch again a media it stores: a fetch would get the wrong bytes
+    MOCK_ISSUE_MEDIA.set(Some(test_media()));
+    let other_id = issue(&a, vec![AMOUNT]);
+    let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
+    send_to(&mut a, &a_on, &other_id, &rid, 100, PROXY_URL, false).await;
+    serve_media("other");
+    let res = r.refresh(r_on.clone(), None, vec![], false).await.unwrap();
+    clear_rpc_hooks();
+    assert!(res.values().all(|t| t.failure.is_none()), "{res:?}");
+    assert_eq!(
+        transfer_of(&r, &rid).status,
+        TransferStatus::WaitingConfirmations
+    );
 }
 
 // with no validated copy in memory, settlement validates the consignment again
