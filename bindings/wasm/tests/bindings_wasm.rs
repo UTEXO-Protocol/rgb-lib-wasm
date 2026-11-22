@@ -508,7 +508,7 @@ async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsVa
 }
 
 #[wasm_bindgen_test]
-async fn issue_bfa_returns_known_circulating_supply() {
+async fn issue_bfa_reports_supply_and_reject_list() {
     let (wallet, _online) = funded_wallet(vec![AssetSchema::Nia, AssetSchema::Bfa]).await;
     let unspents: js_sys::Array = wallet
         .list_unspents(JsValue::NULL, false, true)
@@ -522,6 +522,7 @@ async fn issue_bfa_returns_known_circulating_supply() {
             .as_f64()
             .is_some()
     }));
+    let reject_list = "0x00000000000000000000000000000000000000b2";
     let asset = wallet
         .issue_asset_bfa(
             "BFA",
@@ -530,7 +531,7 @@ async fn issue_bfa_returns_known_circulating_supply() {
             1,
             31337,
             "0x00000000000000000000000000000000000000b1",
-            None,
+            Some(reject_list.to_string()),
             false,
             None,
             false,
@@ -539,6 +540,14 @@ async fn issue_bfa_returns_known_circulating_supply() {
     let supply = prop(&asset, "knownCirculatingSupply");
     assert!(supply.is_bigint());
     assert!(supply.loose_eq(&JsValue::from(0u64)));
+    let evm = prop(&prop(&asset, "rejectList"), "Evm");
+    let chain_id = prop(&evm, "chainId");
+    assert!(chain_id.is_bigint());
+    assert!(chain_id.loose_eq(&JsValue::from(31337u64)));
+    assert_eq!(
+        prop(&evm, "address").as_string().as_deref(),
+        Some(reject_list)
+    );
 }
 
 #[wasm_bindgen_test]

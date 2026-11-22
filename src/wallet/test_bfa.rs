@@ -6,6 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 #[path = "../../tests/utils/mod.rs"]
 pub(super) mod utils;
 
+use crate::no_wallet::{RgbEvmContractInfo, RgbRejectListInfo};
 use crate::wallet::{
     AssetFilter, EvmChain, Online, OnlineOptions, Recipient, SinglesigKeys, TransferScope, Wallet,
     WalletData,
@@ -305,6 +306,7 @@ async fn bfa_issue_list_and_backup() {
     ));
 
     let ticker = s("₿FA");
+    let reject_list = new_evm_address();
     let bfa = wallet
         .issue_asset_bfa(
             ticker.clone(),
@@ -313,13 +315,18 @@ async fn bfa_issue_list_and_backup() {
             2,
             CHAIN_ID,
             s(BRIDGE),
-            None,
+            Some(reject_list.clone()),
             false,
             None,
             false,
         )
         .unwrap();
     assert_eq!(bfa.ticker, ticker);
+    let expected = Some(RgbRejectListInfo::Evm(RgbEvmContractInfo {
+        chain_id: CHAIN_ID,
+        address: reject_list.to_lowercase(),
+    }));
+    assert_eq!(bfa.reject_list, expected);
     assert_eq!(bfa.balance.settled, 0);
     let listed = wallet.list_assets(vec![]).unwrap().bfa.unwrap();
     assert_eq!(listed, vec![bfa.clone()]);
@@ -334,7 +341,30 @@ async fn bfa_issue_list_and_backup() {
             .asset_schema,
         AssetSchema::Bfa
     );
+    assert_eq!(
+        wallet
+            .get_asset_metadata(bfa.asset_id.clone())
+            .unwrap()
+            .reject_list,
+        expected
+    );
     assert_eq!(mint_rights(&mut wallet, &bfa.asset_id).await, 2);
+
+    // the asset survives a reload
+    wallet.flush().await.unwrap();
+    drop(wallet);
+    let wallet = Wallet::restore(wd.clone(), keys.clone()).await.unwrap();
+    assert_eq!(
+        wallet.list_assets(vec![]).unwrap().bfa.unwrap(),
+        vec![bfa.clone()]
+    );
+    assert_eq!(
+        wallet
+            .get_asset_metadata(bfa.asset_id.clone())
+            .unwrap()
+            .reject_list,
+        expected
+    );
 
     let backup = wallet.backup("password").unwrap();
     let mut restored = Wallet::new(wd, keys).unwrap();
@@ -347,6 +377,7 @@ async fn bfa_issue_list_and_backup() {
     assert_eq!(restored_bfa.len(), 1);
     assert_eq!(restored_bfa[0].asset_id, bfa.asset_id);
     assert_eq!(restored_bfa[0].ticker, ticker);
+    assert_eq!(restored_bfa[0].reject_list, expected);
     assert_eq!(mint_rights(&mut restored, &bfa.asset_id).await, 2);
 }
 
@@ -422,6 +453,14 @@ async fn bfa_mint_right_moves_with_another_asset() {
             false,
         )
         .unwrap();
+    // an asset with no reject list reports none
+    assert_eq!(bfa.reject_list, None);
+    assert_eq!(
+        a.get_asset_metadata(bfa.asset_id.clone())
+            .unwrap()
+            .reject_list,
+        None
+    );
     let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Nia]), 3).await;
     let nia = b
         .issue_asset_nia(s("NIA"), s("Plain"), 0, vec![100])
@@ -770,6 +809,17 @@ async fn bfa_receive_refuses_malicious_reject_list() {
     finalize_evm().await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+    let expected = Some(RgbRejectListInfo::Evm(RgbEvmContractInfo {
+        chain_id: CHAIN_ID,
+        address: reject_list.to_lowercase(),
+    }));
+    let listed = b.list_assets(vec![AssetSchema::Bfa]).unwrap().bfa.unwrap();
+    let listed = listed.iter().find(|x| x.asset_id == asset_id).unwrap();
+    assert_eq!(listed.reject_list, expected);
+    assert_eq!(
+        b.get_asset_metadata(asset_id.clone()).unwrap().reject_list,
+        expected
+    );
 }
 
 #[wasm_bindgen_test]

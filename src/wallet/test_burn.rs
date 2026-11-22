@@ -659,7 +659,7 @@ fn forget_reject_list_url(wallet: &Wallet, asset_id: &str) {
         .check_asset_exists(asset_id.to_string())
         .unwrap()
         .into();
-    asset.reject_list_url = ActiveValue::Set(None);
+    asset.reject_list = ActiveValue::Set(None);
     wallet.database.update_asset(&mut asset).unwrap();
 }
 

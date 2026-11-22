@@ -3,6 +3,7 @@ use wasm_bindgen_test::*;
 
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, settle_both, wallet_data};
+use crate::no_wallet::RgbRejectListInfo;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{Balance, Invoice, Online, Wallet, WalletData};
 use crate::{AssetSchema, Assignment, Error, FileContent, OS_ASSET, RgbTransfer, TransferStatus};
@@ -211,7 +212,7 @@ async fn import_contract_reject_list() {
     let schemas = vec![AssetSchema::Nia, AssetSchema::Ifa];
     let (mut a, a_on) = funded_wallet(wallet_data(schemas.clone()), 2).await;
     let (mut c, c_on) = funded_wallet(wallet_data(schemas.clone()), 1).await;
-    let asset_id = a
+    let issued = a
         .issue_asset_ifa(
             s("IFA"),
             s("Inflatable"),
@@ -223,9 +224,19 @@ async fn import_contract_reject_list() {
             None,
             false,
         )
-        .unwrap()
-        .asset_id;
+        .unwrap();
+    let asset_id = issued.asset_id.clone();
+    let expected = Some(RgbRejectListInfo::Url(url.clone()));
+    assert_eq!(issued.reject_list, expected);
+    let ifa = |w: &Wallet| w.list_assets(vec![AssetSchema::Ifa]).unwrap().ifa.unwrap();
+    let reported = |w: &Wallet| {
+        (
+            ifa(w)[0].reject_list.clone(),
+            w.get_asset_metadata(asset_id.clone()).unwrap().reject_list,
+        )
+    };
     let (bytes, txid) = sent_consignment(&mut a, &a_on, &asset_id, &mut c, &c_on).await;
+    assert_eq!(reported(&a), (expected.clone(), expected.clone()));
 
     let terminal = RgbTransfer::load(&bytes[..]).unwrap().terminal_ops();
     assert_eq!(terminal.len(), 1);
@@ -237,7 +248,6 @@ async fn import_contract_reject_list() {
         Err(Error::ConsignmentRejected { opouts }) => assert_eq!(opouts, vec![rejected]),
         res => panic!("unexpected result: {res:?}"),
     }
-    let ifa = |w: &Wallet| w.list_assets(vec![AssetSchema::Ifa]).unwrap().ifa.unwrap();
     assert!(ifa(&d).is_empty());
     assert!(d.rgb_contract_ids().unwrap().is_empty());
 
@@ -247,4 +257,5 @@ async fn import_contract_reject_list() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].asset_id, asset_id);
     assert_eq!(listed[0].balance, zero());
+    assert_eq!(reported(&d), (expected.clone(), expected));
 }
