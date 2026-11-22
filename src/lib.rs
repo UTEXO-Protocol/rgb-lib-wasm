@@ -237,8 +237,8 @@ use crate::database::{
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
 use crate::no_wallet::{
-    Outpoint, RgbRejectListInfo, beneficiary_from_script_buf, recipient_id_from_script_buf,
-    script_buf_from_recipient_id,
+    Outpoint, RgbBridgeLocationInfo, RgbRejectListInfo, beneficiary_from_script_buf,
+    recipient_id_from_script_buf, script_buf_from_recipient_id,
 };
 #[cfg(feature = "esplora")]
 use crate::utils::INDEXER_PARALLEL_REQUESTS;

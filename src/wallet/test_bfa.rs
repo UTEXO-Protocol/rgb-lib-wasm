@@ -6,7 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 #[path = "../../tests/utils/mod.rs"]
 pub(super) mod utils;
 
-use crate::no_wallet::{RgbEvmContractInfo, RgbRejectListInfo};
+use crate::no_wallet::{RgbBridgeLocationInfo, RgbEvmContractInfo, RgbRejectListInfo};
 use crate::wallet::{
     AssetFilter, EvmChain, Online, OnlineOptions, Recipient, SinglesigKeys, TransferScope, Wallet,
     WalletData,
@@ -322,6 +322,11 @@ async fn bfa_issue_list_and_backup() {
         )
         .unwrap();
     assert_eq!(bfa.ticker, ticker);
+    let bridge_location = RgbBridgeLocationInfo::Evm(RgbEvmContractInfo {
+        chain_id: CHAIN_ID,
+        address: s(BRIDGE),
+    });
+    assert_eq!(bfa.bridge_location, bridge_location);
     let expected = Some(RgbRejectListInfo::Evm(RgbEvmContractInfo {
         chain_id: CHAIN_ID,
         address: reject_list.to_lowercase(),
@@ -334,20 +339,10 @@ async fn bfa_issue_list_and_backup() {
         wallet.get_asset_balance(bfa.asset_id.clone()).unwrap(),
         bfa.balance
     );
-    assert_eq!(
-        wallet
-            .get_asset_metadata(bfa.asset_id.clone())
-            .unwrap()
-            .asset_schema,
-        AssetSchema::Bfa
-    );
-    assert_eq!(
-        wallet
-            .get_asset_metadata(bfa.asset_id.clone())
-            .unwrap()
-            .reject_list,
-        expected
-    );
+    let metadata = wallet.get_asset_metadata(bfa.asset_id.clone()).unwrap();
+    assert_eq!(metadata.asset_schema, AssetSchema::Bfa);
+    assert_eq!(metadata.reject_list, expected);
+    assert_eq!(metadata.bridge_location, Some(bridge_location.clone()));
     assert_eq!(mint_rights(&mut wallet, &bfa.asset_id).await, 2);
 
     // the asset survives a reload
@@ -358,13 +353,9 @@ async fn bfa_issue_list_and_backup() {
         wallet.list_assets(vec![]).unwrap().bfa.unwrap(),
         vec![bfa.clone()]
     );
-    assert_eq!(
-        wallet
-            .get_asset_metadata(bfa.asset_id.clone())
-            .unwrap()
-            .reject_list,
-        expected
-    );
+    let metadata = wallet.get_asset_metadata(bfa.asset_id.clone()).unwrap();
+    assert_eq!(metadata.reject_list, expected);
+    assert_eq!(metadata.bridge_location, Some(bridge_location.clone()));
 
     let backup = wallet.backup("password").unwrap();
     let mut restored = Wallet::new(wd, keys).unwrap();
@@ -378,6 +369,7 @@ async fn bfa_issue_list_and_backup() {
     assert_eq!(restored_bfa[0].asset_id, bfa.asset_id);
     assert_eq!(restored_bfa[0].ticker, ticker);
     assert_eq!(restored_bfa[0].reject_list, expected);
+    assert_eq!(restored_bfa[0].bridge_location, bridge_location);
     assert_eq!(mint_rights(&mut restored, &bfa.asset_id).await, 2);
 }
 
@@ -465,9 +457,21 @@ async fn bfa_mint_right_moves_with_another_asset() {
     let nia = b
         .issue_asset_nia(s("NIA"), s("Plain"), 0, vec![100])
         .unwrap();
+    assert_eq!(
+        b.get_asset_metadata(nia.asset_id.clone())
+            .unwrap()
+            .bridge_location,
+        None
+    );
 
     // the NIA lands on a UTXO of A that holds a mint right
     send_and_settle(&mut b, &b_online, &mut a, &a_online, &nia.asset_id, 50).await;
+    assert_eq!(
+        a.get_asset_metadata(nia.asset_id.clone())
+            .unwrap()
+            .bridge_location,
+        None
+    );
     assert_eq!(
         a.get_asset_balance(nia.asset_id.clone()).unwrap().settled,
         50
@@ -816,10 +820,14 @@ async fn bfa_receive_refuses_malicious_reject_list() {
     let listed = b.list_assets(vec![AssetSchema::Bfa]).unwrap().bfa.unwrap();
     let listed = listed.iter().find(|x| x.asset_id == asset_id).unwrap();
     assert_eq!(listed.reject_list, expected);
-    assert_eq!(
-        b.get_asset_metadata(asset_id.clone()).unwrap().reject_list,
-        expected
-    );
+    let bridge_location = Some(RgbBridgeLocationInfo::Evm(RgbEvmContractInfo {
+        chain_id: CHAIN_ID,
+        address: bridge.to_lowercase(),
+    }));
+    assert_eq!(Some(listed.bridge_location.clone()), bridge_location);
+    let metadata = b.get_asset_metadata(asset_id).unwrap();
+    assert_eq!(metadata.reject_list, expected);
+    assert_eq!(metadata.bridge_location, bridge_location);
 }
 
 #[wasm_bindgen_test]

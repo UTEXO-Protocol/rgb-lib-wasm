@@ -15582,6 +15582,7 @@ mod bfa_tests {
     fn bfa_known_circulating_supply_kept_when_unread() {
         use crate::api::evm::tests::{block_on, mock_rpc};
         use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+        use crate::no_wallet::{RgbBridgeLocationInfo, RgbEvmContractInfo};
 
         let wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
         let asset_id = ContractId::copy_from_slice([5; 32]).unwrap().to_string();
@@ -15592,6 +15593,12 @@ mod bfa_tests {
                 schema: ActiveValue::Set(AssetSchema::Bfa),
                 ticker: ActiveValue::Set(Some(s!("BFA"))),
                 known_circulating_supply: ActiveValue::Set(None),
+                bridge_location: ActiveValue::Set(Some(RgbBridgeLocationInfo::Evm(
+                    RgbEvmContractInfo {
+                        chain_id: 31337,
+                        address: s!("0x00000000000000000000000000000000000000b1"),
+                    },
+                ))),
                 ..Default::default()
             })
             .unwrap();

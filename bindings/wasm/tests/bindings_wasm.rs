@@ -508,7 +508,7 @@ async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsVa
 }
 
 #[wasm_bindgen_test]
-async fn issue_bfa_reports_supply_and_reject_list() {
+async fn issue_bfa_reports_supply_and_locations() {
     let (wallet, _online) = funded_wallet(vec![AssetSchema::Nia, AssetSchema::Bfa]).await;
     let unspents: js_sys::Array = wallet
         .list_unspents(JsValue::NULL, false, true)
@@ -547,6 +547,20 @@ async fn issue_bfa_reports_supply_and_reject_list() {
     assert_eq!(
         prop(&evm, "address").as_string().as_deref(),
         Some(reject_list)
+    );
+    let bridge = "0x00000000000000000000000000000000000000b1";
+    let bridge_evm = prop(&prop(&asset, "bridgeLocation"), "Evm");
+    assert_eq!(
+        prop(&bridge_evm, "address").as_string().as_deref(),
+        Some(bridge)
+    );
+    let asset_id = prop(&asset, "assetId").as_string().unwrap();
+    let metadata = wallet.get_asset_metadata(&asset_id).unwrap();
+    assert_eq!(
+        prop(&prop(&prop(&metadata, "bridgeLocation"), "Evm"), "address")
+            .as_string()
+            .as_deref(),
+        Some(bridge)
     );
 }
 

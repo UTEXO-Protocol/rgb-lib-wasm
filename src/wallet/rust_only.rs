@@ -360,6 +360,7 @@ impl Wallet {
                     initial_supply,
                     max_supply: None,
                     known_circulating_supply: None,
+                    bridge_location: None,
                     reject_list: None,
                     linked_from_contract: None,
                 }
@@ -397,6 +398,7 @@ impl Wallet {
                     initial_supply,
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
+                    bridge_location: None,
                     reject_list,
                     linked_from_contract: contract_link(contract.link_from())?,
                 }
@@ -421,6 +423,7 @@ impl Wallet {
                     initial_supply: 0,
                     max_supply: None,
                     known_circulating_supply: None,
+                    bridge_location: Some(contract.bridge_location().into()),
                     reject_list,
                     linked_from_contract: contract_link(contract.link_from())?,
                 }
