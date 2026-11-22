@@ -21,7 +21,7 @@ use crate::wallet::{
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, FileContent, OS_ASSET, OS_MINT,
     RgbTransfer, TransferKind, TransferStatus, TypeOfTransition, ValidationConfig,
-    script_buf_from_recipient_id,
+    script_buf_from_recipient_id, sha256_digest,
 };
 use amplify::ByteArray;
 use bdk_wallet::KeychainKind;
@@ -1774,6 +1774,8 @@ async fn bfa_mint_never_failed_by_clock() {
 
 #[wasm_bindgen_test]
 async fn bfa_mint_is_atomic() {
+    let _reset = ResetMocks;
+    MOCK_ISSUE_MEDIA.set(Some(test_media()));
     let (mut a, a_online, mut b, b_online, bridge, asset_id) =
         minter_and_receiver(2, 1, None).await;
     assert_no_partial_change(&mut a, "issue_asset_bfa", 0, async |w| {
@@ -1792,7 +1794,17 @@ async fn bfa_mint_is_atomic() {
     })
     .await;
 
-    let rcv = mint_rcv(&mut b, &b_online).await;
+    let rcv = blind_rcv_enc(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Fungible(MINT_AMOUNT),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+        Some(Encryption::Optional),
+    )
+    .await
+    .unwrap();
     let before_block = evm_block_number().await + 1000;
     let res = mint_begin_before(
         &mut a,
@@ -1803,7 +1815,10 @@ async fn bfa_mint_is_atomic() {
     )
     .await
     .unwrap();
-    // a failed refresh forgets the mint it checked
+    let old = ("11".repeat(32), b"old".to_vec());
+    b.media.insert(old.0.clone(), old.1.clone());
+    serve_media("media");
+    // a failed refresh forgets the mint it checked and the media it stored
     assert_no_partial_change(&mut b, "refresh", 0, async |w| {
         w.refresh(b_online.clone(), None, vec![], false).await
     })
@@ -1813,14 +1828,18 @@ async fn bfa_mint_is_atomic() {
             .unwrap()
             .is_none()
     );
+    assert_eq!(b.media, HashMap::from([old.clone()]));
     b.refresh(b_online.clone(), None, vec![], false)
         .await
         .unwrap();
+    clear_rpc_hooks();
     assert!(
         b.get_received_mint(rcv.recipient_id.clone())
             .unwrap()
             .is_some()
     );
+    let stored = (hex::encode(sha256_digest(b"media")), b"media".to_vec());
+    assert_eq!(b.media, HashMap::from([old, stored]));
     lock_mint(&bridge, &res, MINT_AMOUNT).await;
     assert_no_partial_change(&mut a, "mint_end", 1, async |w| {
         mint_end(w, &a_online, &res).await
@@ -2402,6 +2421,55 @@ async fn bfa_send_mint_right() {
         MINT_AMOUNT
     );
     assert_eq!(mint_rights(&mut b, &asset_id).await, 2);
+}
+
+// a received mint right mints with the stored media
+#[wasm_bindgen_test]
+async fn bfa_mint_posts_stored_media() {
+    let _reset = ResetMocks;
+    MOCK_ISSUE_MEDIA.set(Some(test_media()));
+    let (mut a, a_online, mut b, b_online, bridge, asset_id) =
+        minter_and_receiver(3, 3, None).await;
+    let (mut c, c_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 1).await;
+    // b needs two mint rights, as a minter keeps its last one
+    let mut recipients = vec![];
+    for _ in 0..2 {
+        let rcv = blind_rcv_enc(
+            &mut b,
+            &b_online,
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            Some(Encryption::Optional),
+        )
+        .await
+        .unwrap();
+        recipients.push(mint_right_recipient(&rcv, None));
+    }
+    send_recipients(&mut a, &a_online, &asset_id, recipients).await;
+    serve_media("media");
+    refresh(&mut b, &b_online).await;
+    clear_rpc_hooks();
+    settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    let digest = hex::encode(sha256_digest(b"media"));
+    assert_eq!(b.media.get(&digest), Some(&b"media".to_vec()));
+    assert_eq!(mint_rights(&mut b, &asset_id).await, 2);
+
+    // no hook: c gets the media that b posted
+    add_utxos(&mut b, &b_online, 1, None).await;
+    mint(
+        &mut b,
+        &b_online,
+        &mut c,
+        &c_online,
+        &asset_id,
+        &bridge,
+        MINT_AMOUNT,
+    )
+    .await;
+    assert_eq!(c.media.get(&digest), Some(&b"media".to_vec()));
+    assert_eq!(c.list_asset_media(asset_id.clone()).unwrap().len(), 1);
 }
 
 // a UTXO receives at most one mint right of an asset

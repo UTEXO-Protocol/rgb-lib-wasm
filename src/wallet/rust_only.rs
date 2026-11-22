@@ -453,6 +453,18 @@ impl Wallet {
         Ok(())
     }
 
+    /// List the media files for a given RGB asset.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn list_asset_media(&self, asset_id: String) -> Result<HashSet<Media>, Error> {
+        info!(self.logger, "Listing media for asset '{}'...", asset_id);
+        let asset = self.database.check_asset_exists(asset_id)?;
+        let medias = self.get_asset_medias(asset.media_idx)?;
+        info!(self.logger, "List asset media completed");
+        Ok(medias)
+    }
+
     /// Return the consignment file path for a send transfer of an asset.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
@@ -724,6 +736,61 @@ mod tests {
             })
             .unwrap();
         assert!(wallet.is_batch_transfer_sent(txid).unwrap());
+    }
+
+    #[test]
+    fn list_asset_media_lists_db_media() {
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod, DbMediaActMod};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        let asset_id = |b: u8| ContractId::copy_from_slice([b; 32]).unwrap().to_string();
+        assert!(matches!(
+            wallet.list_asset_media(asset_id(7)),
+            Err(Error::AssetNotFound { .. })
+        ));
+
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(asset_id(8)),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(wallet.list_asset_media(asset_id(8)).unwrap().is_empty());
+
+        let digest = hex::encode(sha256_digest(b"media"));
+        let media_idx = wallet
+            .database
+            .set_media(DbMediaActMod {
+                digest: ActiveValue::Set(digest.clone()),
+                mime: ActiveValue::Set(s!("text/plain")),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(asset_id(9)),
+                schema: ActiveValue::Set(AssetSchema::Ifa),
+                media_idx: ActiveValue::Set(Some(media_idx)),
+                ..Default::default()
+            })
+            .unwrap();
+        let media = Media {
+            file_path: wallet
+                .get_media_dir()
+                .join(&digest)
+                .to_string_lossy()
+                .into(),
+            digest,
+            mime: s!("text/plain"),
+        };
+        assert_eq!(
+            wallet.list_asset_media(asset_id(9)).unwrap(),
+            HashSet::from([media])
+        );
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
     /// Mint locks a received consignment waits for, keyed by recipient_id.
     pub(crate) pending_mint_locks: std::collections::HashMap<String, super::PendingMintLocks>,
+    /// Media bytes keyed by hex digest.
+    pub(crate) media: std::collections::HashMap<String, Vec<u8>>,
     /// Settings and public keys of the wallet.
     pub(crate) manifest: super::WalletManifest,
 }
@@ -200,6 +202,7 @@ impl super::Wallet {
             received_signed_txs: payload.received_signed_txs,
             received_mints: payload.received_mints,
             pending_mint_locks: payload.pending_mint_locks,
+            media: payload.media,
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
             manifest: payload.manifest,
@@ -330,6 +333,7 @@ impl super::Wallet {
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
+            media: self.media.clone(),
             manifest: super::WalletManifest::new(&self.wallet_data, &self.keys),
         };
 
@@ -943,6 +947,7 @@ mod tests {
         sender
             .pending_mint_locks
             .insert(s!("recipient"), pml.clone());
+        sender.media.insert(s!("digest"), vec![7, 8]);
         let payload_json = sender.serialize_backup_payload().unwrap();
 
         let mut restored = make_test_wallet_with_keys(keys.clone(), false);
@@ -973,6 +978,7 @@ mod tests {
                 Some(&vec![4, 5, 6])
             );
             assert_eq!(restored.pending_mint_locks.get("recipient"), Some(&pml));
+            assert_eq!(restored.media.get("digest"), Some(&vec![7, 8]));
         }
     }
 

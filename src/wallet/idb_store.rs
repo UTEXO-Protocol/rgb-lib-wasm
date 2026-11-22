@@ -41,6 +41,8 @@ pub struct WalletSnapshot {
     pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
     /// Mint locks a received consignment waits for, keyed by recipient_id.
     pub(crate) pending_mint_locks: HashMap<String, super::PendingMintLocks>,
+    /// Media bytes keyed by hex digest.
+    pub(crate) media: HashMap<String, Vec<u8>>,
     /// Encoded RGB store (base64).
     pub rgb_store: String,
     /// Pinned derivation index per keychain for address reuse.
@@ -363,6 +365,7 @@ mod tests {
                 },
             )]),
             pending_mint_locks: HashMap::from([("rid".to_owned(), pml)]),
+            media: HashMap::from([("digest".to_owned(), vec![10])]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
             manifest: super::super::WalletManifest::new(&w.wallet_data, &w.keys),
@@ -400,6 +403,7 @@ mod tests {
             restored_snapshot.pending_mint_locks,
             snapshot.pending_mint_locks
         );
+        assert_eq!(restored_snapshot.media, snapshot.media);
         assert_eq!(
             serde_json::to_string(&restored_snapshot.manifest).unwrap(),
             serde_json::to_string(&snapshot.manifest).unwrap()
