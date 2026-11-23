@@ -334,6 +334,8 @@ const failed = await wallet.failTransfers(online, null, false, false);
 const deleted = wallet.deleteTransfers(null, false);
 ```
 
+`refresh` returns a `Map` from batch transfer index to `{ updatedStatus, failure }`. A pending receive whose proxies answered with no transfer has no `failure`. When a proxy lookup fails and no other proxy has the transfer, `failure` names the kind: `ProxyUnreachable`, `ProxyTimeout`, `ProxyHttpError` (with a number `status`), `ProxyJsonRpcError` (with a number `code`) or `ProxyInvalidResponse`. Each kind has the proxy `endpoint`, and all except `ProxyHttpError` have `details`. For example: `{ ProxyTimeout: { endpoint, details } }`. The receive stays pending with its keys, and the next `refresh` tries again. A consignment that is not valid is refused, and its transfer becomes `Failed`.
+
 ### Utilities
 
 ```javascript
