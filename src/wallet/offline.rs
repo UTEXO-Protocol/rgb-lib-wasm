@@ -2941,6 +2941,126 @@ impl Wallet {
         Ok(inspection)
     }
 
+    /// Inspect a PSBT and fascia with wallet ownership and schema details.
+    pub fn inspect_fascia(
+        &self,
+        psbt: String,
+        fascia: &[u8],
+        entropy: Option<u64>,
+    ) -> Result<RgbInspection, Error> {
+        info!(self.logger, "Inspecting fascia...");
+        let psbt = Psbt::from_str(&psbt)?;
+        let fascia = parse_fascia(fascia)?;
+
+        // verify all PSBT inputs belong to this wallet
+        for psbt_input in psbt.inputs.iter() {
+            let script_pubkey = psbt_input
+                .witness_utxo
+                .as_ref()
+                .ok_or_else(|| Error::RgbInspection {
+                    details: s!("RGB-related PSBTs require segwit"),
+                })?
+                .script_pubkey
+                .clone();
+            if !self.bdk_wallet.is_mine(script_pubkey) {
+                return Err(Error::RgbInspection {
+                    details: s!("found a PSBT input that does not belong to this wallet"),
+                });
+            }
+        }
+
+        let runtime = self.rgb_runtime()?;
+        let prev_outputs: Vec<OutPoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect();
+        let is_revealed_seal_ours = |txid: TxPtr, vout: u32| -> bool {
+            if txid == TxPtr::WitnessTx {
+                psbt.unsigned_tx
+                    .output
+                    .get(vout as usize)
+                    .map(|output| self.bdk_wallet.is_mine(output.script_pubkey.clone()))
+                    .unwrap_or(false)
+            } else {
+                let outpoint = Outpoint {
+                    txid: txid.to_string(),
+                    vout,
+                };
+                self.database.get_txo(&outpoint).unwrap_or(None).is_some()
+            }
+        };
+        let inspection = fascia_inspection(
+            &psbt,
+            &fascia,
+            entropy,
+            |contract_id, bundle, witness_tx| {
+                // collect the RGB inputs allocated in stock to the spent outputs
+                let mut stock_inputs = HashMap::new();
+                if let Ok(ass_map) =
+                    runtime.contract_assignments_for(contract_id, prev_outputs.iter().copied())
+                {
+                    for (explicit_seal, opout_state_map) in ass_map {
+                        let outpoint = explicit_seal.to_outpoint();
+                        for (opout, state) in opout_state_map {
+                            let assignment = Assignment::from_opout_and_state(opout, &state);
+                            stock_inputs.insert(opout, (outpoint, assignment));
+                        }
+                    }
+                }
+
+                // the bundle must spend all the stock inputs, else they are lost
+                let bundle_input_opouts: HashSet<_> = bundle
+                    .known_transitions
+                    .iter()
+                    .flat_map(|KnownTransition { transition, .. }| transition.inputs())
+                    .collect();
+                let extra_in_stock: Vec<_> = stock_inputs
+                    .keys()
+                    .filter(|opout| !bundle_input_opouts.contains(opout))
+                    .collect();
+                if !extra_in_stock.is_empty() {
+                    return Err(Error::RgbInspection {
+                        details: format!(
+                            "bundle for contract {contract_id}: stock contains {} input(s) not declared in bundle (malformed transfer?): {extra_in_stock:?}",
+                            extra_in_stock.len(),
+                        ),
+                    });
+                }
+
+                let chain_net = runtime.genesis(contract_id)?.chain_net;
+                let asset_schema = AssetSchema::get_from_contract_id(contract_id, &runtime)?;
+                let is_ours = |seal: &BuilderSeal<GraphSeal>| {
+                    Some(match seal {
+                        BuilderSeal::Revealed(seal) => {
+                            is_revealed_seal_ours(seal.txid, seal.vout.into_u32())
+                        }
+                        BuilderSeal::Concealed(seal) => runtime
+                            .stock
+                            .as_store()
+                            .seal_of_secret(*seal)
+                            .unwrap_or(None)
+                            .is_some(),
+                    })
+                };
+                bundle_info(
+                    contract_id,
+                    Some(asset_schema),
+                    chain_net,
+                    bundle,
+                    witness_tx,
+                    true,
+                    |opout| stock_inputs.get(&opout).cloned(),
+                    is_ours,
+                    |_| None,
+                )
+            },
+        )?;
+        info!(self.logger, "Fascia inspection completed");
+        Ok(inspection)
+    }
+
     fn _delete_batch_transfer(
         &self,
         batch_transfer: &DbBatchTransfer,

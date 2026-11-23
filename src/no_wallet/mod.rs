@@ -10,8 +10,9 @@ pub use inspection::{
     BundleFilter, ConsignmentInspection, Opout, RgbBridgeLocationInfo, RgbEvmContractInfo,
     RgbGenesisInfo, RgbInputInfo, RgbInspection, RgbMediaInfo, RgbOperationInfo, RgbOutputInfo,
     RgbRejectListInfo, RgbTransitionInfo, TransitionGlobal, TransitionMetadata,
-    inspect_consignment,
+    inspect_consignment, inspect_fascia,
 };
+pub(crate) use inspection::{bundle_info, fascia_inspection, parse_fascia};
 #[cfg(feature = "esplora")]
 pub use spv::{SpvProofFill, WitnessWithoutProof, fill_spv_proofs};
 

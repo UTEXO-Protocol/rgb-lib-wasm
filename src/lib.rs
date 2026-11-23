@@ -111,7 +111,7 @@ use crate::database::{memory_db::ActiveValue, rgb_store::MemRgbStore};
 use amplify::confinement::NonEmptyVec;
 use amplify::{
     Bytes32, Wrapper, bmap,
-    confinement::{Confined, U32 as FILE_MAX_LEN},
+    confinement::{Confined, MediumOrdMap, U32 as FILE_MAX_LEN},
     s,
 };
 #[cfg(feature = "esplora")]
@@ -183,7 +183,10 @@ use rgbstd::{
         ContractAssignments, ContractStateSnapshot, RetrievedSpvProofs, RgbStore, Stock,
     },
     rgbcore::{
-        commit_verify::{Conceal, mpc::Commitment},
+        commit_verify::{
+            CommitId, Conceal, TryCommitVerify,
+            mpc::{Commitment, MerkleTree, Message, MultiSource, ProtocolId},
+        },
         dbc::Proof as _,
     },
     stl::{
@@ -240,8 +243,9 @@ use crate::database::{
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
 use crate::no_wallet::{
-    Outpoint, RgbBridgeLocationInfo, RgbRejectListInfo, beneficiary_from_script_buf,
-    recipient_id_from_script_buf, script_buf_from_recipient_id,
+    Outpoint, RgbBridgeLocationInfo, RgbInspection, RgbRejectListInfo, beneficiary_from_script_buf,
+    bundle_info, fascia_inspection, parse_fascia, recipient_id_from_script_buf,
+    script_buf_from_recipient_id,
 };
 #[cfg(feature = "esplora")]
 use crate::utils::INDEXER_PARALLEL_REQUESTS;

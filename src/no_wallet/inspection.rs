@@ -1,7 +1,7 @@
 //! Inspection.
 //!
-//! This module defines the consignment inspection, which doesn't require a wallet, and the objects
-//! it returns.
+//! This module defines the consignment and fascia inspections, which don't require a wallet,
+//! and the objects they return.
 
 use super::*;
 
@@ -454,11 +454,13 @@ fn consignment_inspection<const TRANSFER: bool>(
 
         let operation = bundle_info(
             contract_id,
-            asset_schema,
+            Some(asset_schema),
             consignment.genesis.chain_net,
             &witness_bundle.bundle,
             tx,
+            true,
             resolve_input,
+            |_| None,
             |opid| Some(terminal_ops.contains(opid)),
         )?;
 
@@ -478,6 +480,117 @@ fn consignment_inspection<const TRANSFER: bool>(
         asset_schema,
         genesis,
         witnesses,
+    })
+}
+
+/// Inspect a PSBT and the fascia of its RGB operation, given as bytes, without a wallet.
+///
+/// The entropy defaults to the one the fascia carries. This does not validate the operations.
+pub fn inspect_fascia(
+    psbt: String,
+    fascia: &[u8],
+    entropy: Option<u64>,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<RgbInspection, Error> {
+    let psbt = Psbt::from_str(&psbt)?;
+    let fascia = parse_fascia(fascia)?;
+
+    fascia_inspection(
+        &psbt,
+        &fascia,
+        entropy,
+        |contract_id, bundle, witness_tx| {
+            bundle_info(
+                contract_id,
+                None,
+                bitcoin_network.into(),
+                bundle,
+                witness_tx,
+                false,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+        },
+    )
+}
+
+/// Read a strict encoded fascia.
+pub(crate) fn parse_fascia(fascia: &[u8]) -> Result<Fascia, Error> {
+    let bytes = Confined::try_from(fascia.to_vec()).map_err(|_| Error::InvalidFascia)?;
+    Fascia::from_strict_serialized::<FILE_MAX_LEN>(bytes).map_err(|_| Error::InvalidFascia)
+}
+
+/// Inspect each bundle of a fascia with the given function, after checking that the PSBT commits
+/// to these bundles only.
+pub(crate) fn fascia_inspection(
+    psbt: &Psbt,
+    fascia: &Fascia,
+    entropy: Option<u64>,
+    mut bundle_operation: impl FnMut(
+        ContractId,
+        &TransitionBundle,
+        &BdkTransaction,
+    ) -> Result<RgbOperationInfo, Error>,
+) -> Result<RgbInspection, Error> {
+    // verify the fascia's witness ID matches the PSBT's transaction ID
+    let fascia_witness_id = fascia.witness_id();
+    let witness_id = psbt.unsigned_tx.compute_txid();
+    if fascia_witness_id != witness_id {
+        return Err(Error::RgbInspection {
+            details: format!(
+                "fascia witness ID {fascia_witness_id} does not match PSBT TXID {witness_id}"
+            ),
+        });
+    }
+
+    // inspect the fascia bundles and collect the operations and the commitment messages
+    let mut messages = BTreeMap::new();
+    let mut operations = Vec::new();
+    for (contract_id, bundle) in fascia.bundles() {
+        operations.push(bundle_operation(*contract_id, bundle, &psbt.unsigned_tx)?);
+        messages.insert(
+            ProtocolId::from(*contract_id),
+            Message::from(bundle.bundle_id()),
+        );
+    }
+
+    // the merkle block carries the entropy unless it is concealed
+    let entropy = match (entropy, fascia.seal_witness().mpc_merkle_block.entropy()) {
+        (Some(given), Some(carried)) if given != carried => {
+            return Err(Error::RgbInspection {
+                details: format!(
+                    "the MPC commitment of the fascia was built with entropy {carried}, not the \
+                     given {given}"
+                ),
+            });
+        }
+        (Some(entropy), _) | (None, Some(entropy)) => entropy,
+        (None, None) => {
+            return Err(Error::RgbInspection {
+                details: "the MPC commitment of the fascia doesn't carry the entropy it was built \
+                          with, which then has to be given"
+                    .to_string(),
+            });
+        }
+    };
+
+    // the PSBT must commit to these bundles only
+    let mut source = MultiSource::with_static_entropy(entropy);
+    source.messages = MediumOrdMap::from_checked(messages);
+    // a valid fascia always fits in a tree
+    let merkle_tree = MerkleTree::try_commit(&source).map_err(|e| Error::RgbInspection {
+        details: format!("cannot rebuild the MPC commitment of the fascia bundles: {e}"),
+    })?;
+    let commitment = merkle_tree.commit_id();
+    let dbc_proof = &fascia.seal_witness().dbc_proof;
+    verify_witness_commitment(dbc_proof, &commitment, &psbt.unsigned_tx)?;
+
+    Ok(RgbInspection {
+        txid: witness_id.to_string(),
+        close_method: dbc_proof.method(),
+        commitment_hex: hex::encode(commitment.to_byte_array()),
+        operations,
     })
 }
 
@@ -621,10 +734,11 @@ fn genesis_info(
         media,
         outputs: outputs_info(
             &format!("genesis of contract {contract_id}"),
-            asset_schema,
+            Some(asset_schema),
             &genesis.assignments,
             genesis.chain_net,
             None,
+            |_| None,
             Some(false),
         )?,
     })
@@ -634,14 +748,17 @@ fn genesis_info(
 ///
 /// The bundle ID commits only to the input map. Transitions with a different ID, of another
 /// contract, or listed twice are rejected. Every input must resolve, by the given function or by
-/// another transition of the bundle.
+/// another transition of the bundle. Without `resolve_inputs`, an input that does not spend the
+/// bundle reports only its opout.
 pub(crate) fn bundle_info(
     contract_id: ContractId,
-    asset_schema: AssetSchema,
+    asset_schema: Option<AssetSchema>,
     chain_net: ChainNet,
     bundle: &TransitionBundle,
     witness_tx: &BdkTransaction,
+    resolve_inputs: bool,
     mut resolve_input: impl FnMut(RgbOpout) -> Option<(OutPoint, Assignment)>,
+    mut is_ours: impl FnMut(&BuilderSeal<GraphSeal>) -> Option<bool>,
     mut is_terminal: impl FnMut(&OpId) -> Option<bool>,
 ) -> Result<RgbOperationInfo, Error> {
     // looked up for each input, as one may be assigned by another transition of the bundle
@@ -702,7 +819,7 @@ pub(crate) fn bundle_info(
                                 witness_tx.compute_txid()
                             ),
                         })?;
-                    (vin as u32, assignment)
+                    (Some(vin as u32), Some(assignment))
                 }
                 None if in_bundle => {
                     return Err(Error::RgbInspection {
@@ -712,13 +829,14 @@ pub(crate) fn bundle_info(
                         ),
                     });
                 }
-                None => {
+                None if resolve_inputs => {
                     return Err(Error::RgbInspection {
                         details: format!(
                             "bundle for contract {contract_id}: unknown input {opout}"
                         ),
                     });
                 }
+                None => (None, None),
             };
             inputs_info.push(RgbInputInfo {
                 opout: opout.try_into().map_err(|ty| Error::RgbInspection {
@@ -726,8 +844,8 @@ pub(crate) fn bundle_info(
                         "bundle for contract {contract_id}: unknown assignment type: {ty}"
                     ),
                 })?,
-                vin: Some(vin),
-                assignment: Some(assignment),
+                vin,
+                assignment,
             });
         }
         transitions.push(transition_info(
@@ -737,6 +855,7 @@ pub(crate) fn bundle_info(
             chain_net,
             witness_tx.compute_txid(),
             inputs_info,
+            &mut is_ours,
             is_terminal(opid),
         )?);
     }
@@ -764,15 +883,15 @@ fn bundle_output(
     Some((OutPoint::new(txid, seal.vout.into_u32()), assignment))
 }
 
-/// Build the inspection details of a transition, given its witness TXID, its already resolved
-/// inputs and whether it's a terminal operation.
+/// Build the inspection details of a transition.
 fn transition_info(
     contract_id: ContractId,
-    asset_schema: AssetSchema,
+    asset_schema: Option<AssetSchema>,
     transition: &Transition,
     chain_net: ChainNet,
     witness_txid: Txid,
     inputs: Vec<RgbInputInfo>,
+    mut is_ours: impl FnMut(&BuilderSeal<GraphSeal>) -> Option<bool>,
     is_terminal: Option<bool>,
 ) -> Result<RgbTransitionInfo, Error> {
     let r#type = TypeOfTransition::try_from(transition.transition_type).map_err(|_| {
@@ -790,6 +909,7 @@ fn transition_info(
         &transition.assignments,
         chain_net,
         Some(witness_txid),
+        &mut is_ours,
         is_terminal,
     )?;
 
@@ -886,13 +1006,14 @@ fn transition_info(
 
 /// Build the inspection details of the outputs of an operation.
 ///
-/// Assignment types rgb-lib can't represent are rejected, as unsupported or unknown.
+/// Reject assignment types that rgb-lib cannot represent. Without a schema, check only the type.
 fn outputs_info<Id: SealTxid>(
     context: &str,
-    asset_schema: AssetSchema,
+    asset_schema: Option<AssetSchema>,
     assignments: &Assignments<BlindSeal<Id>>,
     chain_net: ChainNet,
     witness_txid: Option<Txid>,
+    mut is_ours: impl FnMut(&BuilderSeal<BlindSeal<Id>>) -> Option<bool>,
     is_terminal: Option<bool>,
 ) -> Result<Vec<RgbOutputInfo>, Error>
 where
@@ -902,9 +1023,11 @@ where
     for (ass_type, typed_assigns) in assignments.iter() {
         for no in 0..typed_assigns.len_u16() {
             let Some(assignment) = Assignment::from_typed_assigns(*ass_type, typed_assigns, no)
-                .filter(|a| asset_schema.supports_assignment(a))
+                .filter(|a| asset_schema.is_none_or(|schema| schema.supports_assignment(a)))
             else {
-                let kind = if asset_schema.schema().owned_types.contains_key(ass_type) {
+                let in_schema = asset_schema
+                    .is_some_and(|schema| schema.schema().owned_types.contains_key(ass_type));
+                let kind = if in_schema {
                     "currently unsupported"
                 } else {
                     "unknown"
@@ -938,7 +1061,7 @@ where
                 assignment,
                 is_concealed: recipient_id.is_some(),
                 recipient_id,
-                is_ours: None,
+                is_ours: is_ours(seal),
                 is_terminal,
             });
         }
@@ -947,10 +1070,12 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    //! Expected values come from rgb-lib inspect_consignment at 6236d7e9.
+pub(crate) mod tests {
+    //! Expected values come from rgb-lib inspect_consignment at 6236d7e9 and inspect_fascia at
+    //! 4d87b372.
 
     use super::*;
+    use bdk_wallet::bitcoin::absolute::LockTime;
 
     macro_rules! fixture {
         ($name:literal) => {
@@ -1008,11 +1133,103 @@ mod tests {
         bundle.known_transitions = Confined::from_iter_checked(known_transitions);
     }
 
-    fn assert_inspection_error(result: Result<ConsignmentInspection, Error>, text: &str) {
+    fn assert_inspection_error<T: fmt::Debug>(result: Result<T, Error>, text: &str) {
         assert!(
             matches!(&result, Err(Error::RgbInspection { details }) if details.contains(text)),
             "{result:?}"
         );
+    }
+
+    fn psbt(bytes: &[u8]) -> String {
+        std::str::from_utf8(bytes).unwrap().trim().to_string()
+    }
+
+    fn entropy(fascia: &[u8]) -> u64 {
+        parse_fascia(fascia)
+            .unwrap()
+            .seal_witness()
+            .mpc_merkle_block
+            .entropy()
+            .unwrap()
+    }
+
+    fn fascia_json(
+        psbt: &str,
+        fascia: &[u8],
+        entropy: Option<u64>,
+        network: BitcoinNetwork,
+    ) -> serde_json::Value {
+        serde_json::to_value(inspect_fascia(psbt.to_string(), fascia, entropy, network).unwrap())
+            .unwrap()
+    }
+
+    /// Edit the JSON of a fascia and encode it again.
+    pub(crate) fn tampered_fascia(
+        fascia: &[u8],
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Vec<u8> {
+        let mut json = serde_json::to_value(parse_fascia(fascia).unwrap()).unwrap();
+        edit(&mut json);
+        serde_json::from_value::<Fascia>(json)
+            .unwrap()
+            .to_strict_serialized::<FILE_MAX_LEN>()
+            .unwrap()
+            .release()
+    }
+
+    /// Raise the nonce of the first known transition of the first bundle.
+    pub(crate) fn fascia_with_bumped_nonce(fascia: &[u8]) -> Vec<u8> {
+        tampered_fascia(fascia, |json| {
+            let transition = json["bundles"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap()["knownTransitions"][0]["transition"]
+                .as_object_mut()
+                .unwrap();
+            let nonce = transition["nonce"].as_u64().unwrap();
+            transition.insert(s!("nonce"), nonce.wrapping_add(1).into());
+        })
+    }
+
+    /// Conceal the seals of the transition that another transition of the same bundle spends.
+    /// The bundle ID does not change.
+    pub(crate) fn conceal_split(fascia: &[u8]) -> Vec<u8> {
+        let parsed = parse_fascia(fascia).unwrap();
+        let bundle = parsed.bundles().values().next().unwrap();
+        let spent_opids: Vec<OpId> = bundle
+            .known_transitions
+            .iter()
+            .flat_map(|kt| kt.transition.inputs().iter().map(|i| i.op))
+            .collect();
+        let split = bundle
+            .known_transitions
+            .iter()
+            .find(|kt| spent_opids.contains(&kt.opid))
+            .unwrap();
+        tampered_fascia(fascia, |json| {
+            let split_json = json["bundles"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap()["knownTransitions"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|kt| kt["opid"] == serde_json::to_value(split.opid).unwrap())
+                .unwrap();
+            for (ass_type, assignment_json) in split_json["transition"]["assignments"]
+                .as_object_mut()
+                .unwrap()
+                .iter_mut()
+            {
+                let ass_type = AssignmentType::with(ass_type.parse().unwrap());
+                let assignment = split.transition.assignments.get(&ass_type).unwrap();
+                *assignment_json = serde_json::to_value(assignment.conceal()).unwrap();
+            }
+        })
     }
 
     #[test]
@@ -1131,6 +1348,174 @@ mod tests {
     }
 
     #[test]
+    fn fascia_matches_rgb_lib() {
+        let cases: [(&[u8], &[u8], &[u8]); 4] = [
+            (
+                fixture!("fascia_send.psbt"),
+                fixture!("fascia_send.fascia"),
+                fixture!("fascia_send.json"),
+            ),
+            (
+                fixture!("fascia_burn.psbt"),
+                fixture!("fascia_burn.fascia"),
+                fixture!("fascia_burn.json"),
+            ),
+            (
+                fixture!("fascia_inflation.psbt"),
+                fixture!("fascia_inflation.fascia"),
+                fixture!("fascia_inflation.json"),
+            ),
+            (
+                fixture!("fascia_link.psbt"),
+                fixture!("fascia_link.fascia"),
+                fixture!("fascia_link.json"),
+            ),
+        ];
+        for (psbt_bytes, fascia, expected) in cases {
+            let psbt = psbt(psbt_bytes);
+            let e = entropy(fascia);
+            assert_eq!(
+                fascia_json(&psbt, fascia, Some(e), BitcoinNetwork::Regtest),
+                json(expected)
+            );
+            assert_eq!(
+                fascia_json(&psbt, fascia, None, BitcoinNetwork::Regtest),
+                json(expected)
+            );
+        }
+
+        let fascia = fixture!("fascia_send.fascia");
+        assert_eq!(
+            fascia_json(
+                &psbt(fixture!("fascia_send.psbt")),
+                fascia,
+                Some(entropy(fascia)),
+                BitcoinNetwork::Testnet
+            ),
+            json(
+                std::str::from_utf8(fixture!("fascia_send.json"))
+                    .unwrap()
+                    .replace("bcrt:utxob:", "tb3:utxob:")
+                    .as_bytes()
+            )
+        );
+    }
+
+    #[test]
+    fn inspect_fascia_invalid_input() {
+        let psbt = psbt(fixture!("fascia_send.psbt"));
+        let fascia = fixture!("fascia_send.fascia");
+        let inspect = |psbt: &str, fascia: &[u8]| {
+            inspect_fascia(psbt.to_string(), fascia, None, BitcoinNetwork::Regtest)
+        };
+
+        let result = inspect("not a PSBT", fascia);
+        assert!(
+            matches!(result, Err(Error::InvalidPsbt { .. })),
+            "{result:?}"
+        );
+
+        let mut trailing = fascia.to_vec();
+        trailing.push(0);
+        for bytes in [&b""[..], b"not a fascia", &trailing] {
+            let result = inspect(&psbt, bytes);
+            assert!(matches!(result, Err(Error::InvalidFascia)), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn forged_fascia_refused() {
+        let burn = fixture!("fascia_burn.fascia");
+        let burn_psbt = psbt(fixture!("fascia_burn.psbt"));
+        let psbt = psbt(fixture!("fascia_send.psbt"));
+        let fascia = fixture!("fascia_send.fascia");
+        let e = entropy(fascia);
+        let inspect = |fascia: &[u8], entropy: Option<u64>| {
+            inspect_fascia(psbt.clone(), fascia, entropy, BitcoinNetwork::Regtest)
+        };
+
+        // an entropy that is not the one the fascia carries
+        let result = inspect(fascia, Some(e.wrapping_add(1)));
+        assert_inspection_error(result, &format!("built with entropy {e}, not the given"));
+
+        // a transition not committed by its bundle
+        let tampered = fascia_with_bumped_nonce(fascia);
+        assert_inspection_error(inspect(&tampered, Some(e)), "is not committed");
+
+        // a bundle filed under another contract
+        let asset_id = json(fixture!("fascia_send.json"))["operations"][0]["asset_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tampered = tampered_fascia(fascia, |json| {
+            let bundle = json["bundles"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            json["bundles"] = serde_json::Value::Object(serde_json::Map::from_iter([(
+                ContractId::from([1u8; 32]).to_string(),
+                bundle,
+            )]));
+        });
+        assert_inspection_error(
+            inspect(&tampered, Some(e)),
+            &format!("is of contract {asset_id}"),
+        );
+
+        // a bundle that lists the same transition twice
+        let tampered = tampered_fascia(fascia, |json| {
+            let known_transitions = json["bundles"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap()["knownTransitions"]
+                .as_array_mut()
+                .unwrap();
+            known_transitions.push(known_transitions[0].clone());
+        });
+        assert_inspection_error(inspect(&tampered, Some(e)), "is listed twice");
+
+        // a commitment that does not carry its entropy
+        let tampered = tampered_fascia(fascia, |json| {
+            json["sealWitness"]["mpcMerkleBlock"]["entropy"] = serde_json::Value::Null;
+        });
+        assert_inspection_error(inspect(&tampered, None), "doesn't carry the entropy");
+        assert_eq!(
+            serde_json::to_value(inspect(&tampered, Some(e)).unwrap()).unwrap(),
+            json(fixture!("fascia_send.json"))
+        );
+        assert_inspection_error(
+            inspect(&tampered, Some(e.wrapping_add(1))),
+            "doesn't commit to",
+        );
+
+        // a PSBT of another transaction
+        let mut other_psbt = Psbt::from_str(&psbt).unwrap();
+        let lock_time = other_psbt.unsigned_tx.lock_time.to_consensus_u32();
+        other_psbt.unsigned_tx.lock_time = LockTime::from_consensus(lock_time.wrapping_add(1));
+        let result = inspect_fascia(
+            other_psbt.to_string(),
+            fascia,
+            Some(e),
+            BitcoinNetwork::Regtest,
+        );
+        assert_inspection_error(result, "does not match PSBT TXID");
+
+        // an input that spends a concealed seal of the bundle
+        let result = inspect_fascia(
+            burn_psbt,
+            &conceal_split(burn),
+            Some(entropy(burn)),
+            BitcoinNetwork::Regtest,
+        );
+        assert_inspection_error(result, "isn't assigned by the bundle");
+    }
+
+    #[test]
     fn forged_consignment_refused() {
         let t1 = witness_txid(fixture!("send.witness.json"));
         let t2 = witness_txid(fixture!("send.terminals.json"));
@@ -1233,32 +1618,47 @@ mod tests {
                 .unwrap();
             assignments
         };
-        let outputs = |asset_schema: AssetSchema, ty: AssignmentType| {
+        let outputs = |asset_schema: Option<AssetSchema>, ty: AssignmentType| {
             outputs_info(
                 "ctx",
                 asset_schema,
                 &assignments(ty),
                 ChainNet::BitcoinRegtest,
                 None,
+                |_| None,
                 None,
             )
         };
 
         // supported types
-        let result = outputs(AssetSchema::Ifa, OS_LINK).unwrap();
+        let result = outputs(Some(AssetSchema::Ifa), OS_LINK).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].assignment, Assignment::LinkRight);
-        let result = outputs(AssetSchema::Bfa, OS_MINT).unwrap();
+        let result = outputs(Some(AssetSchema::Bfa), OS_MINT).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].assignment, Assignment::MintRight);
 
         // type unknown to the schema
-        let result = outputs(AssetSchema::Nia, OS_LINK);
+        let result = outputs(Some(AssetSchema::Nia), OS_LINK);
         assert!(
             matches!(
                 &result,
                 Err(Error::RgbInspection { details })
                     if *details == format!("ctx: unknown assignment type: {OS_LINK}")
+            ),
+            "{result:?}"
+        );
+
+        // without a schema, only the type is checked
+        let result = outputs(None, OS_LINK).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].assignment, Assignment::LinkRight);
+        let result = outputs(None, AssignmentType::with(u16::MAX));
+        assert!(
+            matches!(
+                &result,
+                Err(Error::RgbInspection { details })
+                    if details == "ctx: unknown assignment type: 65535"
             ),
             "{result:?}"
         );
