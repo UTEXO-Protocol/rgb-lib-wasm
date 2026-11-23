@@ -57,7 +57,7 @@ async fn fund_and_sync(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Onlin
 
 async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, num: u8) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true, false)
+        .create_utxos_begin(online.clone(), true, false, Some(num), None, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();

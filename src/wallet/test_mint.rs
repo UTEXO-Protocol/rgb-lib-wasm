@@ -1546,7 +1546,16 @@ async fn bfa_mint_reject_list_not_repeated() {
     // nor is a mint whose lock is recorded but not finalized before the first check. An issue
     // needs empty UTXOs
     let unsigned = a
-        .create_utxos_begin(a_online.clone(), false, Some(2), None, 1, true, false)
+        .create_utxos_begin(
+            a_online.clone(),
+            false,
+            false,
+            Some(2),
+            None,
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = a.sign_psbt(unsigned, None).unwrap();

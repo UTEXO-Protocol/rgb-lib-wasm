@@ -79,7 +79,16 @@ pub(super) async fn funded_wallet_with(
     wait_for_esplora_sync().await;
     wallet.full_sync(online.clone()).await.unwrap();
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(utxos), size, 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            true,
+            false,
+            Some(utxos),
+            size,
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -96,7 +105,16 @@ pub(super) async fn funded_wallet_with(
 /// Create `num` UTXOs of `size` sats in `wallet`.
 pub(super) async fn add_utxos(wallet: &mut Wallet, online: &Online, num: u8, size: Option<u32>) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(num), size, 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(num),
+            size,
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();

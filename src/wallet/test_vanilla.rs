@@ -102,7 +102,7 @@ async fn send_begin(w: &mut Wallet, online: &Online) -> Result<String, Error> {
 }
 
 async fn create_begin(w: &mut Wallet, online: &Online) -> Result<String, Error> {
-    w.create_utxos_begin(online.clone(), false, Some(1), None, 1, true, false)
+    w.create_utxos_begin(online.clone(), false, false, Some(1), None, 1, true, false)
         .await
 }
 
@@ -232,7 +232,7 @@ async fn send_btc_two_concurrent_begins_pick_disjoint_inputs() {
 async fn create_utxos_begin_reservation_interactions() {
     let (mut w, online) = vanilla_wallet(2).await;
     let psbt = w
-        .create_utxos_begin(online.clone(), true, None, None, 1, false, false)
+        .create_utxos_begin(online.clone(), true, false, None, None, 1, false, false)
         .await
         .unwrap();
     let txid = txid_of(&psbt);
@@ -245,7 +245,7 @@ async fn create_utxos_begin_reservation_interactions() {
     assert_eq!(send_inputs.len(), 1);
     let before = reserved(&w);
     let dry = w
-        .create_utxos_begin(online.clone(), false, Some(1), None, 1, true, true)
+        .create_utxos_begin(online.clone(), false, false, Some(1), None, 1, true, true)
         .await
         .unwrap();
     let dry_inputs = inputs_of(&dry);
@@ -360,7 +360,7 @@ async fn pending_vanilla_survives_reload() {
 async fn refresh_settles_ended() {
     let (mut w, online) = vanilla_wallet(3).await;
     let create = w
-        .create_utxos_begin(online.clone(), false, Some(1), None, 1, false, false)
+        .create_utxos_begin(online.clone(), false, false, Some(1), None, 1, false, false)
         .await
         .unwrap();
     let create_txid = txid_of(&create);
@@ -522,7 +522,7 @@ async fn dry_begin_survives_reload() {
     ] {
         let psbt = match r#type {
             WalletTransactionType::CreateUtxos => {
-                w.create_utxos_begin(online.clone(), false, Some(1), None, 1, true, true)
+                w.create_utxos_begin(online.clone(), false, false, Some(1), None, 1, true, true)
                     .await
             }
             _ => {
@@ -572,7 +572,7 @@ async fn one_step_vanilla_calls() {
         .map(|r| r.txid)
         .collect();
     let created = w
-        .create_utxos(online.clone(), false, Some(2), None, 1, true)
+        .create_utxos(online.clone(), false, false, Some(2), None, 1, true)
         .await
         .unwrap();
     assert_eq!(created, 2);
@@ -590,7 +590,7 @@ async fn one_step_vanilla_calls() {
     assert!(pending(&w).is_empty());
     assert!(reserved(&w).is_empty());
     assert_eq!(
-        w.create_utxos(online.clone(), true, Some(1), None, 1, true)
+        w.create_utxos(online.clone(), true, false, Some(1), None, 1, true)
             .await,
         Err(Error::AllocationsAlreadyAvailable)
     );
@@ -617,7 +617,7 @@ async fn one_step_vanilla_calls() {
     })
     .await;
     assert_no_partial_change(&mut w, "create_utxos", 1, async |w| {
-        w.create_utxos(online.clone(), false, Some(1), None, 1, true)
+        w.create_utxos(online.clone(), false, false, Some(1), None, 1, true)
             .await
     })
     .await;

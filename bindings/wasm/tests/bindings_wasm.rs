@@ -494,7 +494,7 @@ async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsVa
     esplora_synced().await;
     full_sync(&wallet, &online).await;
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(5), None, 1, true, false)
+        .create_utxos_begin(online.clone(), true, false, Some(5), None, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(&unsigned, None).unwrap();
@@ -831,7 +831,7 @@ async fn one_step_calls_need_online() {
 async fn one_step_calls_return_results() {
     let (wallet, online) = funded_wallet(vec![AssetSchema::Nia, AssetSchema::Ifa]).await;
     let created = wallet
-        .create_utxos(online.clone(), false, Some(1), None, 1, true)
+        .create_utxos(online.clone(), false, true, Some(1), None, 1, true)
         .await
         .unwrap();
     assert_eq!(created, 1);
@@ -886,4 +886,92 @@ async fn one_step_calls_return_results() {
         .await
         .unwrap();
     txid.parse::<rgb_lib_wasm::bitcoin::Txid>().unwrap();
+}
+
+async fn funded_with(btc: &str) -> (WasmWallet, JsValue) {
+    let wallet = wallet();
+    let online = online(&wallet).await;
+    let address = wallet.get_address().unwrap();
+    helper_post(
+        "fund",
+        &format!(r#"{{"address":"{address}","amount":"{btc}"}}"#),
+    )
+    .await;
+    esplora_synced().await;
+    full_sync(&wallet, &online).await;
+    (wallet, online)
+}
+
+fn insufficient(e: JsValue) -> (u64, u64) {
+    let e = err(e);
+    let rest = e
+        .strip_prefix("Insufficient bitcoin funds: needed '")
+        .unwrap_or_else(|| panic!("unexpected error: {e}"));
+    let (needed, rest) = rest.split_once("', available '").unwrap();
+    let available = rest.strip_suffix('\'').unwrap();
+    (needed.parse().unwrap(), available.parse().unwrap())
+}
+
+fn pending_len(wallet: &WasmWallet) -> u32 {
+    js_sys::Array::from(&wallet.list_pending_vanilla_txs().unwrap()).length()
+}
+
+#[wasm_bindgen_test]
+async fn create_utxos_exact_partial_funds() {
+    let (wallet, online) = funded_with("0.000026").await;
+    let begin = wallet
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            true,
+            Some(5),
+            Some(1000),
+            1,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+    let one_step = wallet
+        .create_utxos(online.clone(), false, true, Some(5), Some(1000), 1, true)
+        .await
+        .unwrap_err();
+    for e in [begin, one_step] {
+        let (needed, available) = insufficient(e);
+        assert_eq!(available, 2600);
+        assert!(needed > 5000);
+    }
+    assert_eq!(pending_len(&wallet), 0);
+    let created = wallet
+        .create_utxos(online, false, false, Some(5), Some(1000), 1, true)
+        .await
+        .unwrap();
+    assert_eq!(created, 2);
+}
+
+#[wasm_bindgen_test]
+async fn create_utxos_exact_short_by_fee() {
+    let (wallet, online) = funded_with("0.0000205").await;
+    let e = wallet
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            true,
+            Some(2),
+            Some(1000),
+            1,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+    let (needed, available) = insufficient(e);
+    assert_eq!(available, 2050);
+    assert!(needed > 2050);
+    assert_eq!(pending_len(&wallet), 0);
+    let created = wallet
+        .create_utxos(online, false, false, Some(2), Some(1000), 1, true)
+        .await
+        .unwrap();
+    assert_eq!(created, 1);
 }
