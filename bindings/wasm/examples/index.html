@@ -161,7 +161,7 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringif
       <span class="step-number">5</span>
       <span class="step-title">Create UTXOs</span>
       <p>Allocate colored UTXOs for RGB operations. Required before issuing or receiving assets.</p>
-      <code class="snippet">await wallet.createUtxos(online, true, null, null, 1.5);</code>
+      <code class="snippet">await wallet.createUtxos(online, true, false, null, null, 1.5);</code>
     </div>
 
     <div class="step">
@@ -323,7 +323,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 6: Create UTXOs
         log('[6/12] Creating UTXOs...', 'log-info');
-        const utxoCount = await wallet.createUtxos(online, true, null, null, 1.5);
+        const utxoCount = await wallet.createUtxos(online, true, false, null, null, 1.5);
         append('[6/12] Created ' + utxoCount + ' UTXOs');
         log('[6/12] Created ' + utxoCount + ' UTXOs', 'log-ok');
 

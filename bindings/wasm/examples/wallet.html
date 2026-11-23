@@ -559,7 +559,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('createUtxosBegin...', 'log-warn');
         const unsignedPsbt = await state.wallet.createUtxosBegin(
-          state.online, upTo, num, size, BigInt(feeRate), skipSync, false
+          state.online, upTo, false, num, size, BigInt(feeRate), skipSync, false
         );
         document.getElementById('utxo-unsigned-psbt').value = unsignedPsbt;
         showResult('utxo-output', 'utxo-result', 'Unsigned PSBT created. Proceed to Sign.');
@@ -616,7 +616,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('createUtxos (auto) begin...', 'log-warn');
         const unsignedPsbt = await state.wallet.createUtxosBegin(
-          state.online, upTo, num, size, BigInt(feeRate), skipSync, true
+          state.online, upTo, false, num, size, BigInt(feeRate), skipSync, true
         );
         document.getElementById('utxo-unsigned-psbt').value = unsignedPsbt;
 

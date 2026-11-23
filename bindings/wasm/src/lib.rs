@@ -697,11 +697,15 @@ impl WasmWallet {
     }
 
     /// Create UTXOs: begin, sign with the wallet keys and end. Returns the number of created UTXOs.
+    /// If `exact` is true, create exactly the requested number of UTXOs, or fail with the
+    /// insufficient-funds error and reserve nothing.
     #[wasm_bindgen(js_name = "createUtxos")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_utxos(
         &self,
         online_js: JsValue,
         up_to: bool,
+        exact: bool,
         num: Option<u8>,
         size: Option<u32>,
         fee_rate: u64,
@@ -711,13 +715,15 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .create_utxos(online, up_to, num, size, fee_rate, skip_sync)
+            .create_utxos(online, up_to, exact, num, size, fee_rate, skip_sync)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Create UTXOs (begin): prepare a PSBT to create new UTXOs for RGB allocations.
     /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation.
+    /// If `exact` is true, create exactly the requested number of UTXOs, or fail with the
+    /// insufficient-funds error and reserve nothing.
     /// Returns the unsigned PSBT string.
     #[wasm_bindgen(js_name = "createUtxosBegin")]
     #[allow(clippy::too_many_arguments)]
@@ -725,6 +731,7 @@ impl WasmWallet {
         &self,
         online_js: JsValue,
         up_to: bool,
+        exact: bool,
         num: Option<u8>,
         size: Option<u32>,
         fee_rate: u64,
@@ -735,7 +742,9 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .create_utxos_begin(online, up_to, num, size, fee_rate, skip_sync, dry_run)
+            .create_utxos_begin(
+                online, up_to, exact, num, size, fee_rate, skip_sync, dry_run,
+            )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }

@@ -143,7 +143,10 @@ use bdk_wallet::{
 #[cfg(feature = "esplora")]
 use bdk_wallet::{
     Update,
-    bitcoin::blockdata::fee_rate::FeeRate,
+    bitcoin::{
+        TxIn, absolute::LockTime as BdkLockTime, blockdata::fee_rate::FeeRate,
+        transaction::Version as BdkTxVersion,
+    },
     chain::{
         DescriptorExt,
         spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse},
