@@ -35,7 +35,7 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
 
 async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true, false)
+        .create_utxos_begin(online.clone(), true, false, Some(num), None, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();

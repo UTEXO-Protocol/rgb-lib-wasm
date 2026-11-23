@@ -49,7 +49,7 @@ async fn create_utxos(
     size: Option<u32>,
 ) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), up_to, num, size, 1, true, false)
+        .create_utxos_begin(online.clone(), up_to, false, num, size, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();

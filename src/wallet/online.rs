@@ -3735,11 +3735,14 @@ impl Wallet {
     /// This calls [`create_utxos_begin`](Wallet::create_utxos_begin), signs the resulting PSBT and
     /// finally calls [`create_utxos_end`](Wallet::create_utxos_end).
     ///
+    /// `exact` works as in [`create_utxos_begin`](Wallet::create_utxos_begin).
+    ///
     /// A wallet with private keys is required.
     pub async fn create_utxos(
         &mut self,
         online: Online,
         up_to: bool,
+        exact: bool,
         num: Option<u8>,
         size: Option<u32>,
         fee_rate: u64,
@@ -3747,7 +3750,7 @@ impl Wallet {
     ) -> Result<u8, Error> {
         let cp = self.checkpoint("create_utxos");
         let res = self
-            ._create_utxos(online, up_to, num, size, fee_rate, skip_sync)
+            ._create_utxos(online, up_to, exact, num, size, fee_rate, skip_sync)
             .await;
         self.commit(cp, res, |_| false).await
     }
@@ -3756,6 +3759,7 @@ impl Wallet {
         &mut self,
         online: Online,
         up_to: bool,
+        exact: bool,
         num: Option<u8>,
         size: Option<u32>,
         fee_rate: u64,
@@ -3764,7 +3768,16 @@ impl Wallet {
         info!(self.logger, "Creating UTXOs...");
         self._check_xprv()?;
         let psbt = self
-            ._create_utxos_begin(online.clone(), up_to, num, size, fee_rate, skip_sync, true)
+            ._create_utxos_begin(
+                online.clone(),
+                up_to,
+                exact,
+                num,
+                size,
+                fee_rate,
+                skip_sync,
+                true,
+            )
             .await?;
         let signed_psbt = self.sign_psbt(psbt, None)?;
         let res = self._create_utxos_end(online, signed_psbt).await?;
@@ -3777,6 +3790,15 @@ impl Wallet {
     /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation. The
     /// PSBT can still be signed and ended, but other vanilla operations can select the same inputs.
     ///
+    /// If `exact` is true, the PSBT creates exactly the requested number of UTXOs of `size` sats.
+    /// The funds must pay for all the UTXOs and the fee. If they do not, the call fails with
+    /// [`Error::InsufficientBitcoins`] and reserves and records nothing. `needed` includes the fee.
+    /// If no vanilla UTXO is free, `needed` is the amount one vanilla UTXO must hold. If `exact` is
+    /// false, the PSBT creates as many of these UTXOs as the funds allow. When `up_to` is true, the
+    /// requested number is `num` less the UTXOs that can take an allocation. If that number is zero
+    /// or less, the call fails with [`Error::AllocationsAlreadyAvailable`] in both modes. A dry run
+    /// checks an exact request in the same way.
+    ///
     /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
     /// to be fed to the [`create_utxos_end`](Wallet::create_utxos_end) function.
     ///
@@ -3787,6 +3809,7 @@ impl Wallet {
         &mut self,
         online: Online,
         up_to: bool,
+        exact: bool,
         num: Option<u8>,
         size: Option<u32>,
         fee_rate: u64,
@@ -3795,7 +3818,9 @@ impl Wallet {
     ) -> Result<String, Error> {
         let cp = self.checkpoint("create_utxos_begin");
         let res = self
-            ._create_utxos_begin(online, up_to, num, size, fee_rate, skip_sync, dry_run)
+            ._create_utxos_begin(
+                online, up_to, exact, num, size, fee_rate, skip_sync, dry_run,
+            )
             .await;
         self.commit(cp, res, |_| false).await
     }
@@ -3804,6 +3829,7 @@ impl Wallet {
         &mut self,
         online: Online,
         up_to: bool,
+        exact: bool,
         num: Option<u8>,
         size: Option<u32>,
         fee_rate: u64,
@@ -3855,10 +3881,44 @@ impl Wallet {
         };
         let mut btc_needed: u64 = (utxo_size as u64 * utxos_to_create as u64) + 1000;
         let mut btc_available: u64 = 0;
-        let num_try_creating = min(utxos_to_create, max_possible_utxos);
+        let num_try_creating = if exact {
+            utxos_to_create
+        } else {
+            min(utxos_to_create, max_possible_utxos)
+        };
         let mut addresses = vec![];
         for _i in 0..num_try_creating {
             addresses.push(self.get_new_address()?.script_pubkey());
+        }
+        if exact && !addresses.is_empty() && inputs.is_empty() {
+            // BDK needs an input to compute the amount: assume one of the internal keychain
+            let output = addresses
+                .iter()
+                .map(|spk| TxOut {
+                    value: BdkAmount::from_sat(utxo_size as u64),
+                    script_pubkey: spk.clone(),
+                })
+                .collect();
+            let tx = BdkTransaction {
+                version: BdkTxVersion::TWO,
+                lock_time: BdkLockTime::ZERO,
+                input: vec![],
+                output,
+            };
+            let satisfaction = self
+                .bdk_wallet
+                .public_descriptor(KeychainKind::Internal)
+                .max_weight_to_satisfy()
+                .map_err(|e| Error::Internal {
+                    details: e.to_string(),
+                })?;
+            return Err(Error::InsufficientBitcoins {
+                needed: utxo_size as u64 * addresses.len() as u64
+                    + (fee_rate_checked * tx.weight()).to_sat()
+                    + (fee_rate_checked * (TxIn::default().segwit_weight() + satisfaction))
+                        .to_sat(),
+                available: 0,
+            });
         }
         while !addresses.is_empty() {
             match self._create_split_tx(&inputs, &addresses, utxo_size, fee_rate_checked) {
@@ -3884,6 +3944,9 @@ impl Wallet {
                             });
                         }
                     };
+                    if exact {
+                        break;
+                    }
                     addresses.pop()
                 }
             };
@@ -11462,7 +11525,7 @@ mod send_end_tests {
     use super::*;
     use crate::no_wallet::recipient_id_from_script_buf;
     use crate::wallet::offline::address_reuse_tests::{
-        assert_no_partial_change, make_test_wallet, pending_mint_locks,
+        assert_no_partial_change, make_test_wallet, pending_mint_locks, state,
     };
     use strict_encoding::StrictDumb;
 
@@ -12400,6 +12463,7 @@ mod send_end_tests {
         let create = block_on(wallet.create_utxos_begin(
             online.clone(),
             false,
+            false,
             Some(1),
             None,
             1,
@@ -12431,6 +12495,210 @@ mod send_end_tests {
         assert_eq!(row_inputs, inputs);
         assert_eq!(wallet.get_reserved_vanilla_outpoints().unwrap(), inputs);
         assert_ne!(wallet.database.get_backup_info().unwrap(), before);
+    }
+
+    fn fund_vanilla(wallet: &mut Wallet, sats: u64) {
+        let tx = BdkTransaction {
+            version: BdkTxVersion::TWO,
+            lock_time: BdkLockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(sats),
+                script_pubkey: wallet
+                    ._get_new_address(KeychainKind::Internal)
+                    .unwrap()
+                    .script_pubkey(),
+            }],
+        };
+        wallet.bdk_wallet.apply_unconfirmed_txs([(tx, 1)]);
+    }
+
+    fn colored_outputs(wallet: &Wallet, psbt: &str) -> Vec<u64> {
+        let tx = Psbt::from_str(psbt).unwrap().unsigned_tx;
+        tx.output
+            .iter()
+            .filter(|o| {
+                matches!(
+                    wallet.bdk_wallet.derivation_of_spk(o.script_pubkey.clone()),
+                    Some((KeychainKind::External, _))
+                )
+            })
+            .map(|o| o.value.to_sat())
+            .collect()
+    }
+
+    fn insufficient<T: std::fmt::Debug>(res: Result<T, Error>) -> (u64, u64) {
+        match res {
+            Err(Error::InsufficientBitcoins { needed, available }) => (needed, available),
+            r => panic!("unexpected result: {r:?}"),
+        }
+    }
+
+    fn exact_begin(
+        wallet: &mut Wallet,
+        online: &Online,
+        up_to: bool,
+        num: u8,
+        fee_rate: u64,
+        dry_run: bool,
+    ) -> Result<String, Error> {
+        block_on(wallet.create_utxos_begin(
+            online.clone(),
+            up_to,
+            true,
+            Some(num),
+            Some(1000),
+            fee_rate,
+            true,
+            dry_run,
+        ))
+    }
+
+    fn assert_nothing_pending(wallet: &Wallet) {
+        assert!(wallet.list_pending_vanilla_txs().unwrap().is_empty());
+        assert!(wallet.get_reserved_vanilla_outpoints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_utxos_exact_enough_funds() {
+        let (mut wallet, online) = setup();
+        fund_vanilla(&mut wallet, 100_000);
+        let psbt = block_on(wallet.create_utxos_begin(
+            online,
+            false,
+            true,
+            Some(3),
+            Some(1500),
+            1,
+            true,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(colored_outputs(&wallet, &psbt), [1500; 3]);
+        assert_nothing_pending(&wallet);
+    }
+
+    #[test]
+    fn create_utxos_exact_no_inputs() {
+        let (mut wallet, online) = setup();
+        let mut n0 = vec![];
+        for rate in [1, 100] {
+            let before = state(&wallet);
+            let (needed, available) =
+                insufficient(exact_begin(&mut wallet, &online, false, 5, rate, false));
+            assert_eq!(available, 0);
+            assert_eq!(state(&wallet), before);
+            n0.push(needed);
+        }
+
+        fund_vanilla(&mut wallet, 600);
+        for (i, rate) in [1, 100].into_iter().enumerate() {
+            let (needed, available) =
+                insufficient(exact_begin(&mut wallet, &online, false, 5, rate, false));
+            assert_eq!((needed, available), (n0[i], 600));
+        }
+        assert_nothing_pending(&wallet);
+
+        let (mut wallet, online) = setup();
+        fund_vanilla(&mut wallet, 100_000);
+        block_on(wallet.create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(1),
+            Some(1000),
+            1,
+            true,
+            false,
+        ))
+        .unwrap();
+        let (needed, available) =
+            insufficient(exact_begin(&mut wallet, &online, false, 2, 1, false));
+        assert_eq!(available, 0);
+        assert!(needed > 2000);
+        assert_eq!(wallet.list_pending_vanilla_txs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_utxos_exact_partial_funds() {
+        let (mut wallet, online) = setup();
+        fund_vanilla(&mut wallet, 2_600);
+        let before = state(&wallet);
+        for dry_run in [false, true] {
+            let (needed, available) =
+                insufficient(exact_begin(&mut wallet, &online, false, 5, 1, dry_run));
+            assert_eq!(available, 2600);
+            assert!(needed > 5000);
+            assert_eq!(state(&wallet), before);
+            assert_nothing_pending(&wallet);
+        }
+        let res = block_on(wallet.create_utxos(
+            online.clone(),
+            false,
+            true,
+            Some(5),
+            Some(1000),
+            1,
+            true,
+        ));
+        let (needed, available) = insufficient(res);
+        assert_eq!(available, 2600);
+        assert!(needed > 5000);
+        assert_eq!(state(&wallet), before);
+        assert!(wallet.broadcast_txs.is_empty());
+
+        let psbt = block_on(wallet.create_utxos_begin(
+            online,
+            false,
+            false,
+            Some(5),
+            Some(1000),
+            1,
+            true,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(colored_outputs(&wallet, &psbt), [1000; 2]);
+    }
+
+    #[test]
+    fn create_utxos_exact_short_by_fee() {
+        let (mut wallet, online) = setup();
+        fund_vanilla(&mut wallet, 2_050);
+        let before = state(&wallet);
+        let (needed, available) =
+            insufficient(exact_begin(&mut wallet, &online, false, 2, 1, false));
+        assert_eq!(available, 2050);
+        assert!(needed > 2050);
+        assert_eq!(state(&wallet), before);
+        assert_nothing_pending(&wallet);
+
+        let psbt = block_on(wallet.create_utxos_begin(
+            online,
+            false,
+            false,
+            Some(2),
+            Some(1000),
+            1,
+            true,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(colored_outputs(&wallet, &psbt), [1000]);
+    }
+
+    #[test]
+    fn create_utxos_exact_up_to() {
+        let (mut wallet, online) = setup();
+        let txid = Txid::from_byte_array([7; 32]).to_string();
+        seed_txo(&wallet, &txid, 0);
+        seed_txo(&wallet, &txid, 1);
+        fund_vanilla(&mut wallet, 4_000);
+        let psbt = exact_begin(&mut wallet, &online, true, 5, 1, true).unwrap();
+        assert_eq!(colored_outputs(&wallet, &psbt), [1000; 3]);
     }
 
     #[test]
@@ -12904,10 +13172,21 @@ mod send_end_tests {
         for vout in 0..256 {
             seed_txo(&wallet, &"11".repeat(32), vout);
         }
-        assert_eq!(
-            block_on(wallet.create_utxos_begin(online, true, Some(1), None, 1, true, false)),
-            Err(Error::AllocationsAlreadyAvailable)
-        );
+        for exact in [false, true] {
+            assert_eq!(
+                block_on(wallet.create_utxos_begin(
+                    online.clone(),
+                    true,
+                    exact,
+                    Some(1),
+                    None,
+                    1,
+                    true,
+                    false
+                )),
+                Err(Error::AllocationsAlreadyAvailable)
+            );
+        }
     }
 
     #[test]
@@ -16509,7 +16788,7 @@ mod bfa_tests {
         fn all(wallet: &mut Wallet, online: &Online, addr: &str) -> Vec<Error> {
             let exp = now().unix_timestamp() as u64 + 3600;
             vec![
-                block_on(wallet.create_utxos(online.clone(), true, None, None, 1, true))
+                block_on(wallet.create_utxos(online.clone(), true, false, None, None, 1, true))
                     .unwrap_err(),
                 block_on(wallet.drain_to(online.clone(), addr.to_string(), 1)).unwrap_err(),
                 block_on(wallet.send(online.clone(), HashMap::new(), false, 1, 1, exp, None))
@@ -16567,7 +16846,8 @@ mod bfa_tests {
         }
 
         assert_eq!(
-            block_on(wallet.create_utxos(online.clone(), true, None, None, 1, true)).unwrap_err(),
+            block_on(wallet.create_utxos(online.clone(), true, false, None, None, 1, true))
+                .unwrap_err(),
             Error::InsufficientBitcoins {
                 needed: UTXO_SIZE as u64 * UTXO_NUM as u64 + 1000,
                 available: 0,

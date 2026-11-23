@@ -85,7 +85,7 @@ async fn fund_and_sync(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Onlin
 
 async fn create_utxos(wallet: &mut Wallet, online: &rgb_lib_wasm::wallet::Online, num: u8) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, Some(num), None, 1, true, false)
+        .create_utxos_begin(online.clone(), true, false, Some(num), None, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -114,7 +114,16 @@ async fn test_no_receive_on_pending_send_input() {
 
     // issue an NIA asset on a UTXO with not enough bitcoins for a send
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(1),
+            Some(330),
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -136,7 +145,16 @@ async fn test_no_receive_on_pending_send_input() {
 
     // create 1 UTXO with no allocations, to be used as additional bitcoin input
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(1),
+            Some(5000),
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -328,7 +346,16 @@ async fn test_no_receive_on_pending_send_input() {
 
     // an expired send fails with no index
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(1),
+            Some(5000),
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -386,7 +413,16 @@ async fn test_no_inflate_end_after_fail() {
 
     // issue IFA inflation rights on a UTXO with not enough bitcoins for an inflation
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(330), 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(1),
+            Some(330),
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
@@ -413,7 +449,16 @@ async fn test_no_inflate_end_after_fail() {
 
     // create 1 UTXO with no allocations, to be used as additional bitcoin input
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(1), Some(5000), 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(1),
+            Some(5000),
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();

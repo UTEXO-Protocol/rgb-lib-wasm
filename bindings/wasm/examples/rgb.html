@@ -684,7 +684,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('createUtxos (auto) begin...', 'log-warn');
         const unsignedPsbt = await state.wallet.createUtxosBegin(
-          state.online, true, num, size, BigInt(feeRate), false, true
+          state.online, true, false, num, size, BigInt(feeRate), false, true
         );
         log('createUtxos (auto) sign...', 'log-warn');
         const signed = state.wallet.signPsbt(unsignedPsbt);

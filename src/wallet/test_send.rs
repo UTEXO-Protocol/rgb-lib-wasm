@@ -983,7 +983,7 @@ async fn utxo_allocations_limit_across_assets(x_first: bool) {
     assert_eq!(colored_allocations(&mut r).await.len(), 7);
 
     let unsigned = r
-        .create_utxos_begin(r_on.clone(), false, Some(1), None, 1, true, false)
+        .create_utxos_begin(r_on.clone(), false, false, Some(1), None, 1, true, false)
         .await
         .unwrap();
     let signed = r.sign_psbt(unsigned, None).unwrap();
@@ -1105,7 +1105,16 @@ async fn noutxo_wallet((wd, keys): (WalletData, SinglesigKeys)) -> (Wallet, Onli
 
 async fn create_utxos(wallet: &mut Wallet, online: &Online, num: u8, size: Option<u32>) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), false, Some(num), size, 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            false,
+            false,
+            Some(num),
+            size,
+            1,
+            true,
+            false,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
