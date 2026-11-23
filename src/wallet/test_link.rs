@@ -9,7 +9,7 @@ use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{AssetFilter, Invoice, Online, Recipient, TransferScope, Wallet};
 use crate::{
     AssetSchema, Assignment, Error, FileContent, OS_LINK, RgbTransfer, TS_LINK, TransferKind,
-    TransferStatus,
+    TransferStatus, TypeOfTransition,
 };
 use bdk_wallet::bitcoin::OutPoint;
 use bdk_wallet::bitcoin::psbt::Psbt;
@@ -349,7 +349,51 @@ async fn link_right_sent_beside_fungible() {
             ..recipient(&witness.recipient_id, 0, Some(1000), PROXY_URL)
         },
     ];
-    let txid = send_all(&mut a, &a_online, &asset_id, recipients).await;
+    let begin = a
+        .send_begin(
+            a_online.clone(),
+            HashMap::from([(asset_id.clone(), recipients)]),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let inspection = a
+        .inspect_fascia(
+            begin.psbt.clone(),
+            &begin.details.fascia,
+            Some(begin.details.entropy),
+        )
+        .unwrap();
+    let transitions = &inspection.operations[0].transitions;
+    let mut inspected_types: Vec<_> = transitions.iter().map(|t| t.r#type as u8).collect();
+    inspected_types.sort();
+    assert_eq!(
+        inspected_types,
+        vec![
+            TypeOfTransition::Transfer as u8,
+            TypeOfTransition::TransferLink as u8
+        ]
+    );
+    let link = transitions
+        .iter()
+        .find(|t| t.r#type == TypeOfTransition::TransferLink)
+        .unwrap();
+    let inputs: Vec<_> = link.inputs.iter().map(|i| i.assignment.clone()).collect();
+    assert_eq!(inputs, vec![Some(Assignment::LinkRight)]);
+    let outputs: Vec<_> = link
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_ours))
+        .collect();
+    assert_eq!(outputs, vec![(Assignment::LinkRight, Some(false))]);
+    let signed = a.sign_psbt(begin.psbt, None).unwrap();
+    let txid = a.send_end(a_online.clone(), signed).await.unwrap().txid;
 
     // a transfer moves the amount, a transfer of link rights moves the link right
     let consignment = consignment(&a, &asset_id, &txid);

@@ -193,6 +193,22 @@ async fn bfa_mint_settles_and_is_spendable() {
     .unwrap();
     assert_eq!(res.details.opid.len(), 64);
     assert_eq!(res.details.min_confirmations, 1);
+    let inspection = a
+        .inspect_fascia(
+            res.psbt.clone(),
+            &res.details.fascia,
+            Some(res.details.entropy),
+        )
+        .unwrap();
+    assert_eq!(inspection.operations.len(), 1);
+    assert_eq!(inspection.operations[0].asset_id, asset_id);
+    let mints: Vec<_> = inspection.operations[0]
+        .transitions
+        .iter()
+        .filter(|t| t.r#type == TypeOfTransition::Mint)
+        .collect();
+    assert_eq!(mints.len(), 1);
+    assert_eq!(mints[0].opid, res.details.opid);
     let psbt = Psbt::from_str(&res.psbt).unwrap();
 
     let txid = psbt.unsigned_tx.compute_txid().to_string();

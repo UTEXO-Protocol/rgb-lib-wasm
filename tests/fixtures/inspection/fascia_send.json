@@ -1,0 +1,69 @@
+{
+  "txid": "1a50c7d5798f312d3f2414980b7eb1d04690985ee971848c147d49c0bebf6337",
+  "close_method": "opretFirst",
+  "commitment_hex": "4f7f62f3f40b322b4ddc0a266ff1f6280d2737327880b140019c5907e7dc06af",
+  "operations": [
+    {
+      "asset_id": "rgb:v1QCA0ok-AAXXB5C-TqnziTB-8bh1iJt-CoBInCx-nBYfi0o",
+      "committed_transition_count": 1,
+      "committed_input_count": 1,
+      "transitions": [
+        {
+          "type": "Transfer",
+          "opid": "74fcac2ce24f788b7f691a477d79371b09109c6733dc9378586d012221e7f808",
+          "inputs": [
+            {
+              "opout": {
+                "opid": "bf5402034a240005d7079093aa7ce24c1f1b875889b42a012270b19c161f8b4a",
+                "assignment_type": "Asset",
+                "index": 0
+              },
+              "vin": null,
+              "assignment": null
+            }
+          ],
+          "outputs": [
+            {
+              "txid": "1a50c7d5798f312d3f2414980b7eb1d04690985ee971848c147d49c0bebf6337",
+              "vout": 1,
+              "blinding": 5357001631993771792,
+              "assignment": {
+                "Fungible": 77
+              },
+              "is_concealed": false,
+              "recipient_id": null,
+              "is_ours": null,
+              "is_terminal": null
+            },
+            {
+              "txid": "1a50c7d5798f312d3f2414980b7eb1d04690985ee971848c147d49c0bebf6337",
+              "vout": 2,
+              "blinding": 1644957906023357641,
+              "assignment": {
+                "Fungible": 523
+              },
+              "is_concealed": false,
+              "recipient_id": null,
+              "is_ours": null,
+              "is_terminal": null
+            },
+            {
+              "txid": null,
+              "vout": null,
+              "blinding": null,
+              "assignment": {
+                "Fungible": 66
+              },
+              "is_concealed": true,
+              "recipient_id": "bcrt:utxob:JrKAgxFL-Ji1j1TJ-QPAwUnT-ZPhgKHt-sovxTQW-isBQjoQ-b2NiM",
+              "is_ours": null,
+              "is_terminal": null
+            }
+          ],
+          "globals": [],
+          "metadata": []
+        }
+      ]
+    }
+  ]
+}

@@ -7,6 +7,7 @@ use super::test_send::{
     ResetMocks, consignment as saved_consignment, proven, witness_ord, witness_ords,
 };
 use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+use crate::no_wallet::inspection::tests::{conceal_split, tampered_fascia};
 use crate::utils::INDEXER_SYNCS;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::{
@@ -15,7 +16,8 @@ use crate::wallet::{
 };
 use crate::{
     AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbTransfer, TS_BURN,
-    TransferKind, TransferStatus, wallet::rust_only::validate_consignment_offchain,
+    TransferKind, TransferStatus, TypeOfTransition,
+    wallet::rust_only::validate_consignment_offchain,
 };
 use amplify::confinement::{Confined, U32};
 use bdk_wallet::bitcoin::psbt::Psbt;
@@ -269,6 +271,95 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(
         fascia.witness_id().to_string(),
         psbt.unsigned_tx.compute_txid().to_string()
+    );
+    let inspection = wallet
+        .inspect_fascia(
+            begin.psbt.clone(),
+            &begin.details.fascia,
+            Some(begin.details.entropy),
+        )
+        .unwrap();
+    let mut types: Vec<_> = inspection.operations[0]
+        .transitions
+        .iter()
+        .map(|t| t.r#type as u8)
+        .collect();
+    types.sort();
+    assert_eq!(
+        types,
+        vec![
+            TypeOfTransition::Transfer as u8,
+            TypeOfTransition::Burn as u8
+        ]
+    );
+    // the split output on a spent outpoint and the change are ours
+    let split = inspection.operations[0]
+        .transitions
+        .iter()
+        .find(|t| t.r#type == TypeOfTransition::Transfer)
+        .unwrap();
+    let mut outputs: Vec<_> = split
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_ours))
+        .collect();
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        vec![
+            (Assignment::Fungible(150), Some(true)),
+            (Assignment::Fungible(700), Some(true)),
+        ]
+    );
+    let spent = psbt.unsigned_tx.input[0].previous_output;
+    let on_spent = split
+        .outputs
+        .iter()
+        .find(|o| o.assignment == Assignment::Fungible(700))
+        .unwrap();
+    assert_eq!(
+        (on_spent.txid.clone(), on_spent.vout),
+        (Some(spent.txid.to_string()), Some(spent.vout))
+    );
+    let result = wallet.inspect_fascia(
+        begin.psbt.clone(),
+        &conceal_split(&begin.details.fascia),
+        Some(begin.details.entropy),
+    );
+    assert!(
+        matches!(&result, Err(Error::RgbInspection { details }) if details.contains("isn't assigned by the bundle")),
+        "{result:?}"
+    );
+    // a bundle that does not spend all the stock inputs loses assets
+    let split_opid = fascia
+        .bundles()
+        .values()
+        .next()
+        .unwrap()
+        .known_transitions
+        .iter()
+        .find(|kt| kt.transition.transition_type == TS_TRANSFER)
+        .map(|kt| serde_json::to_value(kt.opid).unwrap())
+        .unwrap();
+    let without_split = tampered_fascia(&begin.details.fascia, |json| {
+        json["bundles"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()["knownTransitions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|kt| kt["opid"] != split_opid);
+    });
+    let result = wallet.inspect_fascia(
+        begin.psbt.clone(),
+        &without_split,
+        Some(begin.details.entropy),
+    );
+    assert!(
+        matches!(&result, Err(Error::RgbInspection { details }) if details.contains("not declared in bundle")),
+        "{result:?}"
     );
     let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
     let ended = wallet.burn_end(online.clone(), signed).await.unwrap();
@@ -594,6 +685,13 @@ async fn ifa_send_moves_inflation_rights() {
             )
             .await
             .unwrap();
+        let inspection = a
+            .inspect_fascia(
+                begin.psbt.clone(),
+                &begin.details.fascia,
+                Some(begin.details.entropy),
+            )
+            .unwrap();
         let signed = a.sign_psbt(begin.psbt, None).unwrap();
         let txid = a.send_end(a_online.clone(), signed).await.unwrap().txid;
         let bytes = &a.transfer_artifacts[&txid].consignment_bytes[&asset_id];
@@ -604,11 +702,11 @@ async fn ifa_send_moves_inflation_rights() {
             .collect();
         types.sort();
         settle_both(a, &a_online, b, &b_online).await;
-        types
+        (types, inspection)
     };
 
     // the transfer moves the asset, a transfer of inflation rights moves the rights
-    let types = send_to_b(
+    let (types, _) = send_to_b(
         &mut a,
         &mut b,
         vec![Assignment::Fungible(66), Assignment::InflationRight(30)],
@@ -626,8 +724,31 @@ async fn ifa_send_moves_inflation_rights() {
     );
 
     // a send of rights only has no main transfer
-    let types = send_to_b(&mut a, &mut b, vec![Assignment::InflationRight(20)]).await;
+    let (types, inspection) = send_to_b(&mut a, &mut b, vec![Assignment::InflationRight(20)]).await;
     assert_eq!(types, vec![TS_TRANSFER_INFLATION]);
+    assert_eq!(inspection.operations.len(), 1);
+    // the rights share a UTXO with the asset, so the asset moves too
+    let transitions = &inspection.operations[0].transitions;
+    assert_eq!(transitions.len(), 2);
+    let rights = transitions
+        .iter()
+        .find(|t| t.r#type == TypeOfTransition::TransferInflation)
+        .unwrap();
+    let inputs: Vec<_> = rights.inputs.iter().map(|i| i.assignment.clone()).collect();
+    assert_eq!(inputs, vec![Some(Assignment::InflationRight(70))]);
+    let mut outputs: Vec<_> = rights
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_ours))
+        .collect();
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        vec![
+            (Assignment::InflationRight(20), Some(false)),
+            (Assignment::InflationRight(50), Some(true)),
+        ]
+    );
     assert_eq!(balance(&a, &asset_id).0, 934);
     assert!(
         assignments(&mut b, &asset_id)

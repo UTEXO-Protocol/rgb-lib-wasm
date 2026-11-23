@@ -10,7 +10,7 @@ use rgb_lib_wasm::wallet::{
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{
     WasmInvoice, WasmWallet, check_indexer_url, fill_spv_proofs, inspect_consignment,
-    max_expiration_secs,
+    inspect_fascia, max_expiration_secs,
 };
 
 fn wallet() -> WasmWallet {
@@ -447,6 +447,52 @@ fn inspect_consignment_js() {
     assert!(error(filter.into(), bytes).contains("Invalid TXID"));
     assert!(error(JsValue::from_str("All"), &[0]).contains("Invalid consignment"));
     assert!(error(JsValue::from_str("Bogus"), bytes).starts_with("Invalid bundle filter"));
+}
+
+#[wasm_bindgen_test]
+fn inspect_fascia_js() {
+    let psbt = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/inspection/fascia_send.psbt"
+    ))
+    .trim();
+    let fascia = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/inspection/fascia_send.fascia"
+    ));
+    let expected: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/inspection/fascia_send.json"
+    )))
+    .unwrap();
+    let get = |v: &JsValue, key: &str| js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap();
+
+    let inspection = inspect_fascia(psbt, fascia, None, "Regtest").unwrap();
+    assert_eq!(
+        get(&inspection, "txid"),
+        JsValue::from_str(expected["txid"].as_str().unwrap())
+    );
+    assert_eq!(
+        get(&inspection, "commitmentHex"),
+        JsValue::from_str(expected["commitment_hex"].as_str().unwrap())
+    );
+    let operations: js_sys::Array = get(&inspection, "operations").dyn_into().unwrap();
+    assert_eq!(operations.length(), 1);
+
+    let error = |result: Result<JsValue, JsValue>| result.unwrap_err().as_string().unwrap();
+    assert!(error(inspect_fascia(psbt, &[0], None, "Regtest")).contains("Invalid fascia"));
+    assert!(inspect_fascia(psbt, fascia, None, "Bogus").is_err());
+    let w = wallet();
+    assert!(
+        error(w.inspect_fascia(psbt, fascia, None))
+            .contains("found a PSBT input that does not belong to this wallet")
+    );
+    let mut non_segwit = psbt.parse::<rgb_lib_wasm::bitcoin::Psbt>().unwrap();
+    non_segwit.inputs[0].witness_utxo = None;
+    assert!(
+        error(w.inspect_fascia(&non_segwit.to_string(), fascia, None))
+            .contains("RGB-related PSBTs require segwit")
+    );
 }
 
 #[wasm_bindgen_test]

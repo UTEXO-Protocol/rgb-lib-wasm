@@ -1,0 +1,43 @@
+{
+  "txid": "1826ded1686a6dac56675df47edd358cc55a5ad5dae1114b219a18a3667f5178",
+  "close_method": "opretFirst",
+  "commitment_hex": "6d3f2845d325a0a1d489ddc0028e34b901c6ead8d101775786b91a449cd93a18",
+  "operations": [
+    {
+      "asset_id": "rgb:rOrTp7~9-yW36Fi5-KyRU9L7-KyeTwkZ-58GMy_H-W7oq6cc",
+      "committed_transition_count": 1,
+      "committed_input_count": 1,
+      "transitions": [
+        {
+          "type": "TransferLink",
+          "opid": "42ca0248f306b6d59604f980b9423a36138d886b9a6b3a3e177722a19d444f4e",
+          "inputs": [
+            {
+              "opout": {
+                "opid": "acead3a7bffdc96dfa162e4ac9153d2fb2b2793c24679f06332f875bba2ae9c7",
+                "assignment_type": "LinkRight",
+                "index": 0
+              },
+              "vin": null,
+              "assignment": null
+            }
+          ],
+          "outputs": [
+            {
+              "txid": null,
+              "vout": null,
+              "blinding": null,
+              "assignment": "LinkRight",
+              "is_concealed": true,
+              "recipient_id": "bcrt:utxob:3Orxkchm-A6Bjh7l-~RCJyMc-J~BJxuD-nOZgGCe-gs5SAZr-4o6Oe",
+              "is_ours": null,
+              "is_terminal": null
+            }
+          ],
+          "globals": [],
+          "metadata": []
+        }
+      ]
+    }
+  ]
+}
