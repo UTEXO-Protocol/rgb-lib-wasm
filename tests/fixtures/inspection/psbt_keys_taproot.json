@@ -1,0 +1,8 @@
+{
+  "account_xpub_vanilla": "tpubDDmopabyUqKReY6xKxvQvJDHGiJGauRVV5jTiKWSvA3xGp78bbsy8t7cmWUWUS8CF5ZrkrMzYXR7u1orje33RT3y8JDhYETdQxvEeRoxY93",
+  "account_xpub_colored": "tpubDDU9NjgFkQw79wWumKGEBnH6yHjBr7rmtnQJaLVM6zqxf6P9b71avZ8qsb7BNGm1n8vAPvfjMEqk7Fox3NtiFn39A7Qnd9bzA2dGgf9nPqQ",
+  "vanilla_keychain": null,
+  "master_fingerprint": "e7147b3a",
+  "mnemonic": null,
+  "witness_version": "Taproot"
+}
