@@ -740,6 +740,56 @@ pub enum TransactionType {
     Incoming,
 }
 
+/// Information about a PSBT input for inspection.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PsbtInputInfo {
+    /// The outpoint being spent
+    pub outpoint: Outpoint,
+    /// The amount in satoshis
+    pub amount_sat: u64,
+    /// Whether this input belongs to the wallet's descriptors
+    pub is_mine: bool,
+}
+
+/// Information about a PSBT output for inspection.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PsbtOutputInfo {
+    /// The output address (if parseable)
+    pub address: Option<String>,
+    /// The output script pubkey (hex encoded)
+    pub script_pubkey_hex: String,
+    /// The amount in satoshis
+    pub amount_sat: u64,
+    /// Whether this is an OP_RETURN output
+    pub is_op_return: bool,
+    /// Whether this is an output that will belong to the wallet
+    pub is_mine: bool,
+}
+
+/// Inspection results for a PSBT.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PsbtInspection {
+    /// Transaction ID
+    pub txid: String,
+    /// List of inputs
+    pub inputs: Vec<PsbtInputInfo>,
+    /// List of outputs
+    pub outputs: Vec<PsbtOutputInfo>,
+    /// Total input amount in satoshis
+    pub total_input_sat: u64,
+    /// Total output amount in satoshis
+    pub total_output_sat: u64,
+    /// Calculated fee in satoshis
+    pub fee_sat: u64,
+    /// Number of signatures present
+    pub signature_count: u16,
+    /// Transaction size in virtual bytes
+    pub size_vbytes: u64,
+}
+
 /// A begun vanilla operation that is not ended or aborted.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -2807,6 +2857,88 @@ impl Wallet {
         self._sign_psbt(&mut psbt, sign_options)?;
         info!(self.logger, "Sign PSBT completed");
         Ok(psbt.to_string())
+    }
+
+    /// Inspect a PSBT to return its information.
+    pub fn inspect_psbt(&self, psbt: String) -> Result<PsbtInspection, Error> {
+        info!(self.logger, "Inspecting PSBT...");
+        let psbt = Psbt::from_str(&psbt)?;
+
+        let mut inputs = Vec::new();
+        let mut total_input_sat = 0u64;
+        for (psbt_input, input) in psbt.inputs.iter().zip(psbt.unsigned_tx.input.iter()) {
+            let witness_utxo =
+                psbt_input
+                    .witness_utxo
+                    .as_ref()
+                    .ok_or_else(|| Error::PsbtInspection {
+                        details: s!("cannot inspect non-segwit PSBT"),
+                    })?;
+            let amount_sat = witness_utxo.value.to_sat();
+            let is_mine = self.bdk_wallet.is_mine(witness_utxo.script_pubkey.clone());
+            total_input_sat = total_input_sat
+                .checked_add(amount_sat)
+                .expect("should never overflow");
+            inputs.push(PsbtInputInfo {
+                outpoint: Outpoint {
+                    txid: input.previous_output.txid.to_string(),
+                    vout: input.previous_output.vout,
+                },
+                amount_sat,
+                is_mine,
+            });
+        }
+
+        let mut outputs = Vec::new();
+        let mut total_output_sat = 0u64;
+        let network = BdkNetwork::from(self.bitcoin_network());
+        for output in psbt.unsigned_tx.output.iter() {
+            let amount_sat = output.value.to_sat();
+            total_output_sat = total_output_sat
+                .checked_add(amount_sat)
+                .expect("should never overflow");
+            let is_op_return = output.script_pubkey.is_op_return();
+            let address = if !is_op_return {
+                BdkAddress::from_script(&output.script_pubkey, network)
+                    .ok()
+                    .map(|addr| addr.to_string())
+            } else {
+                None
+            };
+            let is_mine = self.bdk_wallet.is_mine(output.script_pubkey.clone());
+            outputs.push(PsbtOutputInfo {
+                address,
+                script_pubkey_hex: output.script_pubkey.to_hex_string(),
+                amount_sat,
+                is_op_return,
+                is_mine,
+            });
+        }
+
+        let mut signature_count = 0u16;
+        for input in psbt.inputs.iter() {
+            let partial_sigs_count = u16::try_from(input.partial_sigs.len())
+                .map_err(|_| Error::TooManySignaturesInPsbt)?;
+            let tap_script_sigs_count = u16::try_from(input.tap_script_sigs.len())
+                .map_err(|_| Error::TooManySignaturesInPsbt)?;
+            signature_count = signature_count
+                .checked_add(partial_sigs_count)
+                .and_then(|s| s.checked_add(tap_script_sigs_count))
+                .ok_or(Error::TooManySignaturesInPsbt)?;
+        }
+
+        let inspection = PsbtInspection {
+            txid: psbt.unsigned_tx.compute_txid().to_string(),
+            inputs,
+            outputs,
+            total_input_sat,
+            total_output_sat,
+            fee_sat: total_input_sat.saturating_sub(total_output_sat),
+            signature_count,
+            size_vbytes: psbt.unsigned_tx.vsize() as u64,
+        };
+        info!(self.logger, "PSBT inspection completed");
+        Ok(inspection)
     }
 
     fn _delete_batch_transfer(
@@ -5367,5 +5499,105 @@ mod available_allocations_tests {
         wallet.wallet_data.max_allocations_per_utxo = 5;
         unspents.push(unspent(3, 4, 0));
         assert_eq!(available(&wallet, &unspents, None), vec![3]);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod inspect_psbt_tests {
+    //! Expected values come from rgb-lib inspect_psbt at 4d87b372.
+    use super::*;
+    use bdk_wallet::bitcoin::{TapLeafHash, hashes::Hash};
+    use serde_json::Value;
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/inspection/",
+                $name
+            ))
+        };
+    }
+
+    fn wallet(keys: &str) -> Wallet {
+        address_reuse_tests::make_test_wallet_with_singlesig_keys(
+            serde_json::from_str(keys).unwrap(),
+            false,
+        )
+    }
+
+    fn matches_rgb_lib(w: &Wallet, psbt: &str, expected: &str) -> PsbtInspection {
+        let res = w.inspect_psbt(psbt.trim().to_string()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&res).unwrap(),
+            serde_json::from_str::<Value>(expected).unwrap()
+        );
+        res
+    }
+
+    #[test]
+    fn create_utxos_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        matches_rgb_lib(
+            &w,
+            fixture!("psbt_create_utxos.psbt"),
+            fixture!("psbt_create_utxos.json"),
+        );
+
+        // a key-path signature is not counted: same result as the unsigned PSBT
+        matches_rgb_lib(
+            &w,
+            fixture!("psbt_create_utxos_signed.psbt"),
+            fixture!("psbt_create_utxos.json"),
+        );
+
+        // a script-path signature is counted
+        let mut psbt = Psbt::from_str(fixture!("psbt_create_utxos_signed.psbt").trim()).unwrap();
+        let input = &mut psbt.inputs[0];
+        let sig = input.tap_key_sig.unwrap();
+        let key = input.tap_internal_key.unwrap();
+        input
+            .tap_script_sigs
+            .insert((key, TapLeafHash::from_byte_array([0; 32])), sig);
+        let res = w.inspect_psbt(psbt.to_string()).unwrap();
+        assert_eq!(res.signature_count, 1);
+    }
+
+    #[test]
+    fn signed_p2wpkh_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_p2wpkh.json"));
+        matches_rgb_lib(
+            &w,
+            fixture!("psbt_p2wpkh_signed.psbt"),
+            fixture!("psbt_p2wpkh_signed.json"),
+        );
+    }
+
+    #[test]
+    fn send_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        matches_rgb_lib(&w, fixture!("psbt_send.psbt"), fixture!("psbt_send.json"));
+    }
+
+    #[test]
+    fn edge_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        // a foreign input, an output without address, outputs above inputs (fee 0)
+        matches_rgb_lib(&w, fixture!("psbt_edge.psbt"), fixture!("psbt_edge.json"));
+    }
+
+    #[test]
+    fn inspect_psbt_errors() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        let res = w.inspect_psbt(s!("not a psbt"));
+        assert!(matches!(res, Err(Error::InvalidPsbt { .. })), "{res:?}");
+
+        let mut psbt = Psbt::from_str(fixture!("psbt_create_utxos.psbt").trim()).unwrap();
+        psbt.inputs[0].witness_utxo = None;
+        let res = w.inspect_psbt(psbt.to_string());
+        assert!(
+            matches!(&res, Err(Error::PsbtInspection { details }) if details == "cannot inspect non-segwit PSBT"),
+            "{res:?}"
+        );
     }
 }

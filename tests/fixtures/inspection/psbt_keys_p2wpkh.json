@@ -1,0 +1,8 @@
+{
+  "account_xpub_vanilla": "tpubDCGEzZbtRyJ6BZbqmtu6tktdxfpRtQibWgXpXF9oqft3CyaCGjTbxd9UvzhBkGidBxY8baJBADx1rsmEdaYtYRWPTg6f9RBN9yC1eLFLo2c",
+  "account_xpub_colored": "tpubDC8RjuMfgsqHcsyNKJdg1yE53LmR9VfeP5LNuE7hrmthixbBsKNtAvMLfxePRCVTairB61e5GujZ4TXL1D6hx1iLqfetPkkMYX4c1oRZabs",
+  "vanilla_keychain": null,
+  "master_fingerprint": "c3deb50a",
+  "mnemonic": null,
+  "witness_version": "SegWitV0"
+}

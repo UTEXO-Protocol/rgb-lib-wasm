@@ -715,6 +715,13 @@ pub enum Error {
         details: String,
     },
 
+    /// Error during PSBT inspection
+    #[error("Error during PSBT inspection: {details}")]
+    PsbtInspection {
+        /// Error details
+        details: String,
+    },
+
     /// Provided recipient ID has already been used for another transfer
     #[error("Recipient ID already used")]
     RecipientIDAlreadyUsed,
@@ -755,6 +762,10 @@ pub enum Error {
     /// Trying to issue too many assets
     #[error("Trying to issue too many assets")]
     TooHighIssuanceAmounts,
+
+    /// PSBT has too many signatures
+    #[error("PSBT has too many signatures")]
+    TooManySignaturesInPsbt,
 
     /// The transfer ID has been deleted on the recipient proxy and cannot be reused
     #[error("Transfer ID deleted")]

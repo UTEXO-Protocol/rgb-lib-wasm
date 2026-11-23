@@ -449,6 +449,34 @@ fn inspect_consignment_js() {
     assert!(error(JsValue::from_str("Bogus"), bytes).starts_with("Invalid bundle filter"));
 }
 
+#[wasm_bindgen_test]
+fn inspect_psbt_js() {
+    let w = wallet();
+    let psbt = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/inspection/psbt_send.psbt"
+    ));
+    let expected: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/inspection/psbt_send.json"
+    )))
+    .unwrap();
+
+    let v = w.inspect_psbt(psbt.trim()).unwrap();
+    assert_eq!(
+        prop(&v, "txid"),
+        JsValue::from_str(expected["txid"].as_str().unwrap())
+    );
+    let outputs = js_sys::Array::from(&prop(&v, "outputs"));
+    assert_eq!(prop(&outputs.get(0), "isOpReturn"), JsValue::TRUE);
+    let total = prop(&v, "totalInputSat");
+    assert!(total.is_bigint());
+    assert!(total.loose_eq(&JsValue::from(
+        expected["total_input_sat"].as_u64().unwrap()
+    )));
+    assert!(err(w.inspect_psbt("x").unwrap_err()).starts_with("Invalid PSBT"));
+}
+
 async fn await_js(code: &str) -> JsValue {
     let promise: js_sys::Promise = js_sys::eval(code).unwrap().dyn_into().unwrap();
     wasm_bindgen_futures::JsFuture::from(promise).await.unwrap()

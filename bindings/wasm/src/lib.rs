@@ -540,6 +540,18 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Inspect a PSBT (base64-encoded) without signing or changing it. Returns a PsbtInspection object.
+    #[wasm_bindgen(js_name = "inspectPsbt")]
+    pub fn inspect_psbt(&self, psbt: &str) -> Result<JsValue, JsValue> {
+        to_js(
+            &self
+                .inner
+                .borrow()
+                .inspect_psbt(psbt.to_string())
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        )
+    }
+
     /// Blind an UTXO to receive RGB assets. Returns ReceiveData as a JS object.
     ///
     /// `online_js` is the Online object returned by `goOnline` (the wallet reserves the invoice on

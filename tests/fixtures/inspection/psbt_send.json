@@ -1,0 +1,49 @@
+{
+  "txid": "b00d1970f308fb968f503b620695e394ba9f6f7cc62247fa4795bf37421c2c89",
+  "inputs": [
+    {
+      "outpoint": {
+        "txid": "f4e317212e181344ebb4c90822feb9ed7aa62b617d8bb0f5432e97b5e464e166",
+        "vout": 3
+      },
+      "amount_sat": 1000,
+      "is_mine": true
+    },
+    {
+      "outpoint": {
+        "txid": "f4e317212e181344ebb4c90822feb9ed7aa62b617d8bb0f5432e97b5e464e166",
+        "vout": 5
+      },
+      "amount_sat": 1000,
+      "is_mine": true
+    }
+  ],
+  "outputs": [
+    {
+      "address": null,
+      "script_pubkey_hex": "6a20be44aef561fd083470a8647a1bb653b954d114c3f292e52128cf296ec62cd542",
+      "amount_sat": 0,
+      "is_op_return": true,
+      "is_mine": false
+    },
+    {
+      "address": "bcrt1ptxmzqk6c4x8jr382x9fg5vf5dq5zj7z9l88rvv209czsn6zzzf7qc8y9sc",
+      "script_pubkey_hex": "512059b6205b58a98f21c4ea31528a31346828297845f9ce36314f2e0509e842127c",
+      "amount_sat": 1000,
+      "is_op_return": false,
+      "is_mine": false
+    },
+    {
+      "address": "bcrt1p4jsdlhfcjp9sw33dd8vjt9lvwucgc3fycg87rr5az206fx28sgzse8x2tv",
+      "script_pubkey_hex": "5120aca0dfdd38904b07462d69d92597ec77308c4524c20fe18e9d129fa499478205",
+      "amount_sat": 489,
+      "is_op_return": false,
+      "is_mine": true
+    }
+  ],
+  "total_input_sat": 2000,
+  "total_output_sat": 1489,
+  "fee_sat": 511,
+  "signature_count": 0,
+  "size_vbytes": 221
+}

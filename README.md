@@ -459,6 +459,7 @@ To protect a wallet:
 | `deleteTransfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
 | `signPsbt(psbt, signOptions?)` | no | Sign a PSBT. `signOptions` (`SignOptions`) takes `trustWitnessUtxo`, `assumeHeight`, `allowAllSighashes`, `tryFinalize`, `signWithTapInternalKey`, `allowGrinding`; an omitted field takes the BDK default |
 | `finalizePsbt(psbt)` | no | Finalize a signed PSBT |
+| `inspectPsbt(psbt)` | no | Inspect a PSBT: inputs, outputs, totals, fee, signature count and size, with the wallet's own ones marked. In JS, the amounts, totals, fee and size are BigInt |
 | `backup(password)` | no | Create encrypted backup (returns bytes) |
 | `restoreBackup(bytes, password)` | no | Restore from encrypted backup |
 | `backupInfo()` | no | Check if backup is needed |
