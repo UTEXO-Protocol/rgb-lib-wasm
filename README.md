@@ -160,10 +160,12 @@ await wallet.sync(online, { keychain: { Vanilla: { lookback: 20 } }, strategy: '
 RGB allocations live on UTXOs. Before issuing or receiving assets you need colored UTXOs:
 
 ```javascript
-const unsignedPsbt = await wallet.createUtxosBegin(online, true, 5, 1000, 1n, false, false);
+const unsignedPsbt = await wallet.createUtxosBegin(online, true, false, 5, 1000, 1n, false, false);
 const signedPsbt = wallet.signPsbt(unsignedPsbt);
 const count = await wallet.createUtxosEnd(online, signedPsbt);
 ```
+
+With `exact` false, the wallet creates as many UTXOs as its funds allow and returns the count. With `exact` true, the wallet creates exactly the requested number of UTXOs of `size` sats. The funds must pay for all of them and the fee. If they do not, the call fails with `Insufficient bitcoin funds: needed '<sats>', available '<sats>'` before it signs anything. `needed` includes the fee. If no vanilla UTXO is free, `needed` is the amount one vanilla UTXO must hold. `available` is the sats of the vanilla UTXOs that no other operation reserves. A failed call reserves no input and records no pending operation. With `upTo`, the requested number is `num` less the UTXOs that can already take an allocation. If none are missing, the call fails with `Allocations already available` in both modes. With `dryRun`, `createUtxosBegin` checks an exact request in the same way.
 
 ### Issuing assets
 
@@ -417,8 +419,8 @@ To protect a wallet:
 | `abortPendingVanillaTx(txid)` | no | Abort a begun vanilla operation: delete it and release its inputs |
 | `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. `vanillaSyncLookback` is how many vanilla addresses before the last used one a `FastSync` checks. |
 | `sync(online, {keychain, strategy})` | yes | Sync one keychain (`"Colored"` or `{Vanilla: {lookback}}`) with the indexer, by `"FullScan"`, `"FullSync"` or `"FastSync"` |
-| `createUtxos(online, upTo, num?, size?, feeRate, skipSync)` | yes | Create colored UTXOs, signing with the wallet keys |
-| `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
+| `createUtxos(online, upTo, exact, num?, size?, feeRate, skipSync)` | yes | Create colored UTXOs, signing with the wallet keys |
+| `createUtxosBegin(online, upTo, exact, num?, size?, feeRate, skipSync, dryRun)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
 | `createUtxosEnd(online, psbt)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
 | `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
