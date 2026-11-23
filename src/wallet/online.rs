@@ -881,6 +881,18 @@ fn mint_pays_requested(requested: Option<&Assignment>, received: u64) -> bool {
     }
 }
 
+/// Whether a receive lookup failed for a transport or protocol reason.
+fn proxy_lookup_failed(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::ProxyHttpError { .. }
+            | Error::ProxyInvalidResponse { .. }
+            | Error::ProxyJsonRpcError { .. }
+            | Error::ProxyTimeout { .. }
+            | Error::ProxyUnreachable { .. }
+    )
+}
+
 /// List the transfers to an invoice on a recipient proxy (`transfer.list`), signing the request
 /// with the recipient key.
 async fn list_invoice_transfers(
@@ -5085,51 +5097,34 @@ impl Wallet {
         &self,
         proxy_url: &str,
         transfer_id: &str,
-    ) -> Result<GetConsignmentResponse, Error> {
-        let consignment_res = ProxyClient::new(proxy_url)?
+    ) -> Result<Option<GetConsignmentResponse>, Error> {
+        let res = ProxyClient::new(proxy_url)?
             .get_consignment(transfer_id)
-            .await;
-        match consignment_res {
-            Ok(res) => match res.result {
-                Some(r) => Ok(r),
-                None => {
-                    debug!(
-                        self.logger,
-                        "Consignment GET response error: {:?}", res.error
-                    );
-                    Err(Error::NoConsignment)
-                }
-            },
-            Err(e) => {
-                debug!(self.logger, "Consignment GET response error: {e}");
-                Err(Error::NoConsignment)
-            }
+            .await?;
+        if res.error.is_some() {
+            debug!(
+                self.logger,
+                "Consignment GET response error: {:?}", res.error
+            );
         }
+        lookup_answer(proxy_url, res, CONSIGNMENT_GONE_CODES)
     }
 
     /// Find the transfer to an invoice on a recipient proxy and download its consignment.
     ///
     /// The proxy is asked for the pending transfers of the invoice, the first one whose transfer
-    /// ID matches the one derived from the invoice ID and the sender pubkey is returned. Proxy
-    /// errors (e.g. an unreachable proxy or an invoice it doesn't know) make it skip the proxy.
+    /// ID matches the one derived from the invoice ID and the sender pubkey is returned. It returns
+    /// Ok(None) when the proxy answers and holds no matching transfer. It returns an error when a
+    /// request fails or an answer cannot be read.
     async fn find_invoice_transfer(
         &self,
         proxy_url: &str,
         invoice_id: &str,
         recipient_seed: &[u8],
     ) -> Result<Option<(String, GetConsignmentResponse)>, Error> {
-        let transfers = match list_invoice_transfers(proxy_url, invoice_id, recipient_seed).await {
-            Ok(res) => match (res.result, res.error) {
-                (Some(transfers), None) => transfers,
-                (_, err) => {
-                    debug!(self.logger, "Transfer list error: {:?}", err);
-                    return Ok(None);
-                }
-            },
-            Err(e) => {
-                debug!(self.logger, "Transfer list error: {e}");
-                return Ok(None);
-            }
+        let res = list_invoice_transfers(proxy_url, invoice_id, recipient_seed).await?;
+        let Some(transfers) = lookup_answer(proxy_url, res, INVOICE_UNKNOWN_CODES)? else {
+            return Ok(None);
         };
         let mut pending: Vec<String> = transfers
             .into_iter()
@@ -5137,11 +5132,16 @@ impl Wallet {
             .map(|(tid, _)| tid)
             .collect();
         pending.sort();
+        let mut failure = None;
         for tid in pending {
             let result = match self._get_consignment_async(proxy_url, &tid).await {
-                Err(Error::NoConsignment) => continue,
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) if proxy_lookup_failed(&e) => {
+                    failure.get_or_insert(e);
+                    continue;
+                }
                 Err(e) => return Err(e),
-                Ok(r) => r,
             };
             // a transfer whose ID doesn't match the sender pubkey was not posted by its sender
             if transfer_id(invoice_id, &result.sender_pk) != tid {
@@ -5153,7 +5153,7 @@ impl Wallet {
             }
             return Ok(Some((tid, result)));
         }
-        Ok(None)
+        failure.map_or(Ok(None), Err)
     }
 
     /// Whether a blind receive still waiting for the counterparty may be failed, which releases its
@@ -5763,23 +5763,33 @@ impl Wallet {
             )?);
             let invoice_id = invoice_id(&recipient_id, &recipient_pk);
             let mut proxy_res = None;
+            let mut lookup_failure = None;
             for (transfer_transport_endpoint, transport_endpoint) in tte_data {
                 if transfer_transport_endpoint.kind != TransportEndpointKind::RecipientProxy {
                     continue;
                 }
-                let Some(found) = self
+                let found = match self
                     .find_invoice_transfer(
                         &transport_endpoint.endpoint,
                         &invoice_id,
                         &recipient_seed,
                     )
-                    .await?
-                else {
-                    info!(
-                        self.logger,
-                        "Skipping transport endpoint: {:?}", &transport_endpoint
-                    );
-                    continue;
+                    .await
+                {
+                    Ok(Some(found)) => found,
+                    Ok(None) => {
+                        info!(
+                            self.logger,
+                            "Skipping transport endpoint: {:?}", &transport_endpoint
+                        );
+                        continue;
+                    }
+                    Err(e) if proxy_lookup_failed(&e) => {
+                        warn!(self.logger, "Receive lookup failed: {e}");
+                        lookup_failure.get_or_insert(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 };
 
                 proxy_res = Some((transport_endpoint.endpoint, found));
@@ -5791,7 +5801,7 @@ impl Wallet {
                 break;
             }
             let Some((proxy_url, (transfer_id, result))) = proxy_res else {
-                return Ok(None);
+                return lookup_failure.map_or(Ok(None), Err);
             };
             // the sender endpoint arrives in RgbTransport (rpc://) format; convert to an HTTP URL
             let sender_proxy =
@@ -13793,14 +13803,15 @@ mod send_end_tests {
             &mut server,
             "transfer.list",
             &format!(
-                r#"{{"jsonrpc":"2.0","id":null,"result":{{"0":"pending","{valid}":"pending"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":null,"result":{{"0":"pending","00":"pending","{valid}":"pending"}}}}"#
             ),
         );
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":null,"result":{{"consignment":"","sender_transport_endpoint":"","sender_pk":"{sender_pk}","consignment_hash":"","batch":false}}}}"#
         );
-        // transfer "0" is checked first and does not match its sender pubkey
-        let forged = rpc_mock(&mut server, r#""transfer_id":"0""#, &body);
+        // the lookup of transfer "0" fails and transfer "00" does not match its sender pubkey
+        let failed = rpc_mock(&mut server, r#""transfer_id":"0""#, INTERNAL_ERROR);
+        let forged = rpc_mock(&mut server, r#""transfer_id":"00""#, &body);
         let genuine = rpc_mock(&mut server, &format!(r#""transfer_id":"{valid}""#), &body);
         let (tid, res) =
             block_on(wallet.find_invoice_transfer(&server.url(), &invoice, &RECIPIENT_SEED))
@@ -13808,8 +13819,234 @@ mod send_end_tests {
                 .unwrap();
         assert_eq!(tid, valid);
         assert_eq!(res.sender_pk, sender_pk);
+        failed.assert();
         forged.assert();
         genuine.assert();
+    }
+
+    // A witness receive waiting for its consignment on the recipient proxies `endpoints`.
+    fn seed_proxy_receive(wallet: &mut Wallet, endpoints: &[String]) -> (i32, String) {
+        let rid = recipient_id_from_script_buf(new_script(wallet), BitcoinNetwork::Regtest);
+        let expiration = now().unix_timestamp() + 3600;
+        let status = TransferStatus::WaitingCounterparty;
+        let idx = seed_batch(wallet, &"44".repeat(32), status, true, Some(expiration));
+        let mut batch = DbBatchTransferActMod {
+            idx: ActiveValue::Set(idx),
+            operation_secret_key: ActiveValue::Set(Some(RECIPIENT_SEED.to_vec())),
+            ..Default::default()
+        };
+        wallet.database.update_batch_transfer(&mut batch).unwrap();
+        let transfer = batch_transfer_row(wallet, idx);
+        let mut updated: DbTransferActMod = transfer.clone().into();
+        updated.recipient_type = ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
+        updated.recipient_id = ActiveValue::Set(Some(rid.clone()));
+        updated.recipient_pubkey = ActiveValue::Set(Some(recipient_pubkey()));
+        wallet.database.update_transfer(&mut updated).unwrap();
+        for endpoint in endpoints {
+            wallet
+                .save_transfer_transport_endpoint(
+                    transfer.idx,
+                    &LocalTransportEndpoint {
+                        transport_type: TransportType::JsonRpc,
+                        endpoint: endpoint.clone(),
+                        used: false,
+                        usable: true,
+                    },
+                )
+                .unwrap();
+        }
+        (idx, rid)
+    }
+
+    // The receive is unchanged and still waits for its consignment.
+    fn assert_pending(wallet: &Wallet, idx: i32, res: &RefreshResult) {
+        assert_eq!(res[&idx].updated_status, None);
+        assert_eq!(status(wallet, idx), TransferStatus::WaitingCounterparty);
+        let batch = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|bt| bt.idx == idx)
+            .unwrap();
+        assert_eq!(batch.operation_secret_key, Some(RECIPIENT_SEED.to_vec()));
+        assert!(ttes_used(wallet, idx).iter().all(|used| !used));
+    }
+
+    fn sender_pk() -> String {
+        hex::encode(
+            ed25519_from_seed(&OPERATION_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+
+    fn valid_tid(rid: &str) -> String {
+        transfer_id(
+            &invoice_id(rid, &hex::encode(recipient_pubkey())),
+            &sender_pk(),
+        )
+    }
+
+    // A consignment that cannot be decrypted, sent from a sender proxy on `server`.
+    fn consignment_body(server: &mockito::ServerGuard) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"result":{{"consignment":"AAAA","sender_transport_endpoint":"rpc://{}/json-rpc","sender_pk":"{}","consignment_hash":"{}","batch":false}}}}"#,
+            server.host_with_port(),
+            sender_pk(),
+            "00".repeat(32)
+        )
+    }
+
+    fn nack_mock(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/json-rpc")
+            .match_body(mockito::Matcher::Regex(s!("ack.post")))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#)
+            .create()
+    }
+
+    fn list_body(tid: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":null,"result":{{"{tid}":"pending"}}}}"#)
+    }
+
+    const EMPTY_LIST: &str = r#"{"jsonrpc":"2.0","id":null,"result":{}}"#;
+    const INTERNAL_ERROR: &str =
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal"}}"#;
+
+    #[test]
+    fn receive_lookup_empty_answer_stays_pending() {
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let (idx, rid) = seed_proxy_receive(&mut wallet, &[server.url()]);
+        let not_reserved = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-101,"message":"x"}}"#;
+        let gone = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-400,"message":"x"}}"#;
+        let answers = [
+            (EMPTY_LIST.to_string(), None),
+            (not_reserved.to_string(), None),
+            (list_body(&valid_tid(&rid)), Some(gone)),
+        ];
+        for (list, consignment) in answers {
+            let list = rpc_mock(&mut server, "transfer.list", &list);
+            let consignment = consignment.map(|b| rpc_mock(&mut server, "consignment.get", b));
+            let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
+            assert!(res[&idx].failure.is_none());
+            assert_pending(&wallet, idx, &res);
+            list.assert();
+            list.remove();
+            if let Some(consignment) = consignment {
+                consignment.assert();
+                consignment.remove();
+            }
+        }
+    }
+
+    #[test]
+    fn receive_lookup_failures_keep_the_receive_pending() {
+        let check = |url: String, mocks: &[(&str, String)], expected: fn(&Error) -> bool| {
+            let (mut wallet, online) = setup();
+            let mut server = mockito::Server::new();
+            let url = if url.is_empty() { server.url() } else { url };
+            let (idx, _) = seed_proxy_receive(&mut wallet, &[url.clone()]);
+            let _mocks: Vec<_> = mocks
+                .iter()
+                .map(|(method, body)| rpc_mock(&mut server, method, body))
+                .collect();
+            let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+            let failure = res[&idx].failure.as_ref().unwrap();
+            assert!(expected(failure), "{failure:?}");
+            assert!(matches!(
+                failure,
+                Error::ProxyTimeout { endpoint, .. }
+                    | Error::ProxyUnreachable { endpoint, .. }
+                    | Error::ProxyHttpError { endpoint, .. }
+                    | Error::ProxyJsonRpcError { endpoint, .. }
+                    | Error::ProxyInvalidResponse { endpoint, .. } if *endpoint == url
+            ));
+            assert_pending(&wallet, idx, &res);
+        };
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_url = format!("http://{}", silent.local_addr().unwrap());
+        check(silent_url, &[], |e| matches!(e, Error::ProxyTimeout { .. }));
+        check(ENDPOINT.to_string(), &[], |e| {
+            matches!(e, Error::ProxyUnreachable { .. })
+        });
+
+        let list = ("transfer.list", INTERNAL_ERROR.to_string());
+        check(String::new(), &[list], |e| {
+            matches!(e, Error::ProxyJsonRpcError { code: -32603, .. })
+        });
+        let list = ("transfer.list", s!(r#"{"result":"nope"}"#));
+        check(String::new(), &[list], |e| {
+            matches!(e, Error::ProxyInvalidResponse { .. })
+        });
+        let list = ("transfer.list", list_body("0"));
+        let consignment = ("consignment.get", INTERNAL_ERROR.to_string());
+        check(String::new(), &[list, consignment], |e| {
+            matches!(e, Error::ProxyJsonRpcError { code: -32603, .. })
+        });
+    }
+
+    #[test]
+    fn receive_lookup_uses_a_second_proxy() {
+        // the second proxy answers with no transfer
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let (idx, _) = seed_proxy_receive(&mut wallet, &[ENDPOINT.to_string(), server.url()]);
+        let list = rpc_mock(&mut server, "transfer.list", EMPTY_LIST);
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        assert!(matches!(
+            &res[&idx].failure,
+            Some(Error::ProxyUnreachable { endpoint, .. }) if endpoint == ENDPOINT
+        ));
+        assert_pending(&wallet, idx, &res);
+        list.assert();
+
+        // the second proxy has the transfer
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let (idx, rid) = seed_proxy_receive(&mut wallet, &[ENDPOINT.to_string(), server.url()]);
+        let _list = rpc_mock(&mut server, "transfer.list", &list_body(&valid_tid(&rid)));
+        let body = consignment_body(&server);
+        let consignment = rpc_mock(&mut server, "consignment.get", &body);
+        let nack = nack_mock(&mut server);
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        assert!(res[&idx].failure.is_none());
+        assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+        assert_eq!(ttes_used(&wallet, idx), vec![false, true]);
+        consignment.assert();
+        nack.assert();
+    }
+
+    #[test]
+    fn receive_lookup_retries_after_recovery() {
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let (idx, rid) = seed_proxy_receive(&mut wallet, &[server.url()]);
+
+        let down = server
+            .mock("POST", "/")
+            .with_status(503)
+            .with_body("unavailable")
+            .create();
+        let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
+        assert!(matches!(
+            res[&idx].failure,
+            Some(Error::ProxyHttpError { status: 503, .. })
+        ));
+        assert_pending(&wallet, idx, &res);
+        down.remove();
+
+        let _list = rpc_mock(&mut server, "transfer.list", &list_body(&valid_tid(&rid)));
+        let body = consignment_body(&server);
+        let consignment = rpc_mock(&mut server, "consignment.get", &body);
+        let nack = nack_mock(&mut server);
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+        assert_eq!(ttes_used(&wallet, idx), vec![true]);
+        consignment.assert();
+        nack.assert();
     }
 
     #[test]

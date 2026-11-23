@@ -166,6 +166,8 @@ jobs:
         run: wasm-pack test --headless --firefox --release -- --test wallet_wasm
 
       - name: Run binding tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 
       - name: Run integration tests

@@ -660,6 +660,44 @@ pub enum Error {
     #[error("Proxy draining")]
     ProxyDraining,
 
+    /// A receive lookup got an HTTP error status and no JSON-RPC answer from a proxy
+    #[error("Proxy {endpoint} answered with HTTP status {status}")]
+    ProxyHttpError {
+        /// Proxy URL
+        endpoint: String,
+        /// HTTP status code
+        status: u16,
+    },
+
+    /// A receive lookup got an answer from a proxy that is not a valid JSON-RPC answer
+    #[error("Proxy {endpoint} sent an invalid answer: {details}")]
+    ProxyInvalidResponse {
+        /// Proxy URL
+        endpoint: String,
+        /// Error details
+        details: String,
+    },
+
+    /// A receive lookup got a JSON-RPC error from a proxy
+    #[error("Proxy {endpoint} answered with JSON-RPC error {code}: {details}")]
+    ProxyJsonRpcError {
+        /// Proxy URL
+        endpoint: String,
+        /// JSON-RPC error code
+        code: i32,
+        /// Error details
+        details: String,
+    },
+
+    /// A receive lookup to a proxy timed out
+    #[error("Proxy {endpoint} did not answer in time: {details}")]
+    ProxyTimeout {
+        /// Proxy URL
+        endpoint: String,
+        /// Error details
+        details: String,
+    },
+
     /// The proxy doesn't accept any more media for the transfer
     #[error("Proxy doesn't accept so many media")]
     ProxyTooManyMedia,
@@ -667,6 +705,15 @@ pub enum Error {
     /// The signed TX was already released to a recipient, so it can no longer be revoked
     #[error("TX already released")]
     ProxyTxAlreadyReleased,
+
+    /// A receive lookup could not reach a proxy
+    #[error("Proxy {endpoint} is unreachable: {details}")]
+    ProxyUnreachable {
+        /// Proxy URL
+        endpoint: String,
+        /// Error details
+        details: String,
+    },
 
     /// Provided recipient ID has already been used for another transfer
     #[error("Recipient ID already used")]

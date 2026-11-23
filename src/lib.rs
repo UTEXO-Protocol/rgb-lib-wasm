@@ -166,7 +166,7 @@ use psrgbt::{
 };
 use rand::{Rng, TryRng, distr::Alphanumeric, rngs::SysRng};
 #[cfg(feature = "esplora")]
-use reqwest::{Client as RestClient, header::CONTENT_TYPE, multipart};
+use reqwest::{Client as RestClient, RequestBuilder, header::CONTENT_TYPE, multipart};
 use rgbinvoice::{AddressPayload, Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgbstd::{
     Allocation, Amount, Assign, Assignments, ExposedSeal, GlobalStateType, Identity,
@@ -253,9 +253,10 @@ use crate::{
     api::{
         evm::{EvmClient, MintClaimResolver, MintLockStatus},
         proxy_v1::{
-            AckTransferData, GetAckResponse, GetConsignmentResponse, InvoiceStatus, JsonRpcError,
-            JsonRpcResponse, PostAckResponse, PostConsignmentData, ProxyClient, ProxyTransferState,
-            ServerInfoResponse, get_ack_message, list_transfers_message, map_proxy_error,
+            AckTransferData, CONSIGNMENT_GONE_CODES, GetAckResponse, GetConsignmentResponse,
+            INVOICE_UNKNOWN_CODES, InvoiceStatus, JsonRpcError, JsonRpcResponse, PostAckResponse,
+            PostConsignmentData, ProxyClient, ProxyTransferState, ServerInfoResponse,
+            get_ack_message, list_transfers_message, lookup_answer, map_proxy_error,
             post_consignment_message, post_media_message, pow_difficulty_required,
             prepare_ack_auth_message, prepare_invoice_auth_message, transfer_retrieved_message,
         },

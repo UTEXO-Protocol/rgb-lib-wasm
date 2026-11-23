@@ -975,3 +975,116 @@ async fn create_utxos_exact_short_by_fee() {
         .unwrap();
     assert_eq!(created, 1);
 }
+
+#[wasm_bindgen_test]
+async fn refresh_reports_proxy_failures_to_js() {
+    // Stub the `transfer.list` answers of the proxies on ports 2 to 5.
+    js_sys::eval(
+        r#"if (!globalThis.__lookupFetch) {
+            globalThis.__lookupFetch = globalThis.fetch;
+            globalThis.fetch = async function (input, init) {
+                const orig = () => globalThis.__lookupFetch.call(this, input, init);
+                if (!(input instanceof Request)) return orig();
+                const stub = { '2': 'http', '3': 'jsonrpc', '4': 'invalid', '5': 'stall' }[new URL(input.url).port];
+                if (!stub) return orig();
+                let method = null;
+                try { method = (await input.clone().json()).method; } catch (e) {}
+                if (method !== 'transfer.list') return orig();
+                const headers = { 'content-type': 'application/json' };
+                let resp;
+                if (stub === 'http') resp = new Response('unavailable', { status: 503 });
+                else if (stub === 'jsonrpc') resp = new Response('{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal"}}', { status: 200, headers });
+                else if (stub === 'invalid') resp = new Response('not valid json', { status: 200, headers });
+                else {
+                    // the body never ends; an abort errors it with the abort reason, as fetch does
+                    const signal = input.signal;
+                    resp = new Response(new ReadableStream({ start(c) { signal.addEventListener('abort', () => c.error(signal.reason)); } }), { status: 200, headers });
+                }
+                // reqwest parses the response URL
+                Object.defineProperty(resp, 'url', { value: input.url });
+                return resp;
+            };
+        }"#,
+    )
+    .unwrap();
+    let wallet = wallet();
+    let online = online(&wallet).await;
+    let mut idxs = vec![];
+    for port in 1..=6 {
+        let eps = if port == 6 {
+            endpoints()
+        } else {
+            let stub = format!("rpc://127.0.0.1:{port}/json-rpc");
+            serde_wasm_bindgen::to_value(&vec![stub.as_str(), "rpc://127.0.0.1:3000/json-rpc"])
+                .unwrap()
+        };
+        let data = wallet
+            .witness_receive(
+                online.clone(),
+                None,
+                any(),
+                (now_secs() + 100_000).into(),
+                eps,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        idxs.push(prop(&data, "batchTransferIdx"));
+    }
+
+    let res = js_sys::Map::from(
+        wallet
+            .refresh(online, None, js_sys::Array::new().into(), true)
+            .await
+            .unwrap(),
+    );
+    let names = [
+        "ProxyUnreachable",
+        "ProxyHttpError",
+        "ProxyJsonRpcError",
+        "ProxyInvalidResponse",
+        "ProxyTimeout",
+    ];
+    for (port, (idx, name)) in (1..).zip(idxs.iter().zip(names)) {
+        let entry = res.get(idx);
+        let failure = prop(&entry, "failure");
+        let keys: Vec<String> = js_sys::Object::keys(&failure.clone().into())
+            .iter()
+            .map(|k| k.as_string().unwrap())
+            .collect();
+        assert_eq!(keys, vec![name]);
+        let kind = prop(&failure, name);
+        let endpoint = prop(&kind, "endpoint").as_string().unwrap();
+        assert!(
+            endpoint.ends_with(&format!("127.0.0.1:{port}/json-rpc")),
+            "{endpoint}"
+        );
+        assert!(prop(&entry, "updatedStatus").is_undefined());
+        match name {
+            "ProxyHttpError" => assert_eq!(prop(&kind, "status").as_f64(), Some(503.0)),
+            "ProxyJsonRpcError" => assert_eq!(prop(&kind, "code").as_f64(), Some(-32603.0)),
+            _ => {}
+        }
+    }
+    let entry = res.get(&idxs[5]);
+    assert!(prop(&entry, "failure").is_undefined());
+    assert!(prop(&entry, "updatedStatus").is_undefined());
+
+    for idx in &idxs {
+        let scope = js_sys::Object::new();
+        js_sys::Reflect::set(&scope, &"BatchTransfer".into(), idx).unwrap();
+        let transfers: js_sys::Array = wallet
+            .list_transfers(JsValue::from_str("AnyOrNone"), scope.into())
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(transfers.length() > 0);
+        for t in transfers.iter() {
+            assert_eq!(
+                prop(&t, "status").as_string().as_deref(),
+                Some("WaitingCounterparty")
+            );
+        }
+    }
+}
