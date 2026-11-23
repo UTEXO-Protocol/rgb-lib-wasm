@@ -150,8 +150,23 @@ async fn witness_receive_locates_payment() {
     let asset_id = issue(&wallet_a);
     let (mut wallet_b, online_b) = new_wallet().await;
 
-    let mut rids = vec![];
-    for amount in [66, 34, 10] {
+    // the first receive also has an unreachable proxy, before the working one
+    let endpoints = vec![
+        "rpc://127.0.0.1:1/json-rpc".to_string(),
+        transport_endpoint(PROXY_URL),
+    ];
+    let first = witness_rcv(
+        &mut wallet_b,
+        &online_b,
+        None,
+        Assignment::Fungible(66),
+        default_rcv_expiration(),
+        endpoints,
+    )
+    .await
+    .unwrap();
+    let mut rids = vec![first.recipient_id];
+    for amount in [34, 10] {
         rids.push(receive_witness(&mut wallet_b, &online_b, amount, PROXY_URL).await);
     }
     let map = HashMap::from([(
@@ -162,8 +177,37 @@ async fn witness_receive_locates_payment() {
         ],
     )]);
     let (signed, txid) = begin_end(&mut wallet_a, &online_a, map, false).await;
+    let idxs: Vec<i32> = rids
+        .iter()
+        .map(|rid| transfer_of(&wallet_b, rid).batch_transfer_idx)
+        .collect();
 
-    refresh(&mut wallet_b, &online_b).await;
+    // a failed lookup keeps each receive pending
+    rpc_fail(PROXY_URL, "transfer.list");
+    let res = wallet_b
+        .refresh(online_b.clone(), None, vec![], false)
+        .await;
+    clear_rpc_hooks();
+    let res = res.unwrap();
+    for (rid, idx) in rids.iter().zip(&idxs) {
+        assert!(matches!(
+            res[idx].failure,
+            Some(Error::ProxyUnreachable { .. })
+        ));
+        assert_eq!(
+            transfer_of(&wallet_b, rid).status,
+            TransferStatus::WaitingCounterparty
+        );
+    }
+
+    // the retry succeeds, through the second proxy for the first receive
+    let res = wallet_b
+        .refresh(online_b.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    for idx in &idxs {
+        assert!(res[idx].failure.is_none());
+    }
     for rid in &rids[..2] {
         let transfer = transfer_of(&wallet_b, rid);
         assert!(waiting_for_tx(&wallet_b, rid));
