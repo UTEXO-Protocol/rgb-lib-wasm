@@ -1,6 +1,6 @@
 # rgb-lib-wasm
 
-A WebAssembly port of [rgb-lib](https://github.com/UTEXO-Protocol/rgb-lib) for managing RGB protocol wallets in the browser.
+A WebAssembly port of [rgb-lib](https://github.com/RGB-Tools/rgb-lib) for managing RGB protocol wallets in the browser.
 
 > **Beta Software** — This library is under active development and has not been audited.
 > APIs may change without notice between versions. Use at your own risk.
