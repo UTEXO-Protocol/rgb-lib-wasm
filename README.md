@@ -129,6 +129,8 @@ Every save and backup stores the wallet settings and public keys, without the
 mnemonic. `create`, `restore`, `restoreBackup` and `vssRestoreBackup` refuse a
 changed vanilla keychain or account xpub with `WalletSettingMismatch`, and
 `restoreBackup` also refuses a changed fingerprint with it.
+`restoreBackup` and `vssRestoreBackup` refuse a backup of another network with
+`BackupNetworkMismatch`, which names both networks.
 Other settings changed in `create` are stored with the next save.
 
 Every call that changes the wallet saves it. Saves are written in order, and
@@ -347,6 +349,8 @@ await wallet.vssBackup();
 The store receives only encrypted data. It must honour expected versions: the library relies on
 them to never overwrite a newer backup. On a conflict, call
 `vssRestoreBackup()` to take the stored backup; the library never overwrites it.
+The backup of each wallet is at key `wallet/<fingerprint>/<network>` of namespace `backup`, so
+one store keeps one backup per network.
 
 ### Transfer management
 
