@@ -2,7 +2,7 @@
 #![allow(clippy::derivable_impls)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,32 @@ use crate::database::enums::{
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
+use crate::no_wallet::{RgbBridgeLocationInfo, RgbRejectListInfo};
+use crate::utils::now;
 use crate::wallet::{Balance, Outpoint};
+
+/// The unpaid blind invoices with their UTXO: incoming transfers that wait for the counterparty
+/// and have no colorings yet. Each one reserves the slot of the single allocation that pays it.
+fn unpaid_invoices<'a>(
+    transfers: &'a [DbTransfer],
+    asset_transfers: &[DbAssetTransfer],
+    batch_transfers: &[DbBatchTransfer],
+    colorings: &[DbColoring],
+) -> Vec<(&'a DbTransfer, &'a Outpoint)> {
+    let colored: HashSet<i32> = colorings.iter().map(|c| c.asset_transfer_idx).collect();
+    transfers
+        .iter()
+        .filter(|t| !colored.contains(&t.asset_transfer_idx))
+        .filter_map(|t| match (&t.recipient_type, t.incoming) {
+            (Some(RecipientTypeFull::Blind { unblinded_utxo }), true) => t
+                .related_transfers(asset_transfers, batch_transfers)
+                .ok()
+                .filter(|(_, bt)| bt.status.waiting_counterparty())
+                .map(|_| (t, unblinded_utxo)),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Lightweight ActiveValue (mirrors sea_orm::ActiveValue without the dependency).
 #[derive(Clone, Debug)]
@@ -69,7 +94,8 @@ pub struct DbAsset {
     pub timestamp: i64,
     pub max_supply: Option<String>,
     pub known_circulating_supply: Option<String>,
-    pub reject_list_url: Option<String>,
+    pub bridge_location: Option<RgbBridgeLocationInfo>,
+    pub reject_list: Option<RgbRejectListInfo>,
     pub linked_from_contract: Option<String>,
     pub linked_to_contract: Option<String>,
 }
@@ -89,7 +115,8 @@ pub struct DbAssetActMod {
     pub timestamp: ActiveValue<i64>,
     pub max_supply: ActiveValue<Option<String>>,
     pub known_circulating_supply: ActiveValue<Option<String>>,
-    pub reject_list_url: ActiveValue<Option<String>>,
+    pub bridge_location: ActiveValue<Option<RgbBridgeLocationInfo>>,
+    pub reject_list: ActiveValue<Option<RgbRejectListInfo>>,
     pub linked_from_contract: ActiveValue<Option<String>>,
     pub linked_to_contract: ActiveValue<Option<String>>,
 }
@@ -138,6 +165,7 @@ pub struct DbBatchTransfer {
     pub operation_secret_key: Option<Vec<u8>>,
     pub broadcast_deadline: Option<i64>,
     pub retention_deadline: Option<i64>,
+    pub unsigned_psbt: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for DbBatchTransfer {
@@ -172,6 +200,7 @@ pub struct DbBatchTransferActMod {
     pub operation_secret_key: ActiveValue<Option<Vec<u8>>>,
     pub broadcast_deadline: ActiveValue<Option<i64>>,
     pub retention_deadline: ActiveValue<Option<i64>>,
+    pub unsigned_psbt: ActiveValue<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for DbBatchTransferActMod {
@@ -417,7 +446,8 @@ impl DbAssetActMod {
             timestamp: av(self.timestamp),
             max_supply: av(self.max_supply),
             known_circulating_supply: av(self.known_circulating_supply),
-            reject_list_url: av(self.reject_list_url),
+            bridge_location: av(self.bridge_location),
+            reject_list: av(self.reject_list),
             linked_from_contract: av(self.linked_from_contract),
             linked_to_contract: av(self.linked_to_contract),
         })
@@ -437,6 +467,7 @@ impl From<DbBatchTransfer> for DbBatchTransferActMod {
             operation_secret_key: ActiveValue::Unchanged(m.operation_secret_key),
             broadcast_deadline: ActiveValue::Unchanged(m.broadcast_deadline),
             retention_deadline: ActiveValue::Unchanged(m.retention_deadline),
+            unsigned_psbt: ActiveValue::Unchanged(m.unsigned_psbt),
         }
     }
 }
@@ -513,7 +544,8 @@ impl From<DbAsset> for DbAssetActMod {
             timestamp: ActiveValue::Unchanged(m.timestamp),
             max_supply: ActiveValue::Unchanged(m.max_supply),
             known_circulating_supply: ActiveValue::Unchanged(m.known_circulating_supply),
-            reject_list_url: ActiveValue::Unchanged(m.reject_list_url),
+            bridge_location: ActiveValue::Unchanged(m.bridge_location),
+            reject_list: ActiveValue::Unchanged(m.reject_list),
             linked_from_contract: ActiveValue::Unchanged(m.linked_from_contract),
             linked_to_contract: ActiveValue::Unchanged(m.linked_to_contract),
         }
@@ -558,6 +590,73 @@ pub struct InMemoryDb {
 }
 
 impl InMemoryDb {
+    /// Replace every table with the one in `saved`.
+    pub(crate) fn restore(&self, saved: InMemoryDb) {
+        let InMemoryDb {
+            txos,
+            next_txo_idx,
+            media,
+            next_media_idx,
+            assets,
+            next_asset_idx,
+            batch_transfers,
+            next_batch_transfer_idx,
+            asset_transfers,
+            next_asset_transfer_idx,
+            colorings,
+            next_coloring_idx,
+            transfers,
+            next_transfer_idx,
+            transport_endpoints,
+            next_transport_endpoint_idx,
+            transfer_transport_endpoints,
+            next_transfer_transport_endpoint_idx,
+            wallet_transactions,
+            next_wallet_transaction_idx,
+            pending_witness_scripts,
+            next_pending_witness_script_idx,
+            backup_info,
+            next_backup_info_idx,
+        } = saved;
+        self.txos.replace(txos.into_inner());
+        self.next_txo_idx.replace(next_txo_idx.into_inner());
+        self.media.replace(media.into_inner());
+        self.next_media_idx.replace(next_media_idx.into_inner());
+        self.assets.replace(assets.into_inner());
+        self.next_asset_idx.replace(next_asset_idx.into_inner());
+        self.batch_transfers.replace(batch_transfers.into_inner());
+        self.next_batch_transfer_idx
+            .replace(next_batch_transfer_idx.into_inner());
+        self.asset_transfers.replace(asset_transfers.into_inner());
+        self.next_asset_transfer_idx
+            .replace(next_asset_transfer_idx.into_inner());
+        self.colorings.replace(colorings.into_inner());
+        self.next_coloring_idx
+            .replace(next_coloring_idx.into_inner());
+        self.transfers.replace(transfers.into_inner());
+        self.next_transfer_idx
+            .replace(next_transfer_idx.into_inner());
+        self.transport_endpoints
+            .replace(transport_endpoints.into_inner());
+        self.next_transport_endpoint_idx
+            .replace(next_transport_endpoint_idx.into_inner());
+        self.transfer_transport_endpoints
+            .replace(transfer_transport_endpoints.into_inner());
+        self.next_transfer_transport_endpoint_idx
+            .replace(next_transfer_transport_endpoint_idx.into_inner());
+        self.wallet_transactions
+            .replace(wallet_transactions.into_inner());
+        self.next_wallet_transaction_idx
+            .replace(next_wallet_transaction_idx.into_inner());
+        self.pending_witness_scripts
+            .replace(pending_witness_scripts.into_inner());
+        self.next_pending_witness_script_idx
+            .replace(next_pending_witness_script_idx.into_inner());
+        self.backup_info.replace(backup_info.into_inner());
+        self.next_backup_info_idx
+            .replace(next_backup_info_idx.into_inner());
+    }
+
     pub fn new() -> Self {
         Self {
             txos: RefCell::new(Vec::new()),
@@ -604,7 +703,8 @@ impl InMemoryDb {
             timestamp: av(a.timestamp),
             max_supply: av(a.max_supply),
             known_circulating_supply: av(a.known_circulating_supply),
-            reject_list_url: av(a.reject_list_url),
+            bridge_location: av(a.bridge_location),
+            reject_list: av(a.reject_list),
             linked_from_contract: av(a.linked_from_contract),
             linked_to_contract: av(a.linked_to_contract),
         };
@@ -659,6 +759,7 @@ impl InMemoryDb {
             operation_secret_key: av(b.operation_secret_key),
             broadcast_deadline: av(b.broadcast_deadline),
             retention_deadline: av(b.retention_deadline),
+            unsigned_psbt: av(b.unsigned_psbt),
         };
         self.batch_transfers.borrow_mut().push(row);
         Ok(idx)
@@ -903,8 +1004,11 @@ impl InMemoryDb {
         if let ActiveValue::Set(v) = &a.known_circulating_supply {
             row.known_circulating_supply = v.clone();
         }
-        if let ActiveValue::Set(v) = &a.reject_list_url {
-            row.reject_list_url = v.clone();
+        if let ActiveValue::Set(v) = &a.bridge_location {
+            row.bridge_location = v.clone();
+        }
+        if let ActiveValue::Set(v) = &a.reject_list {
+            row.reject_list = v.clone();
         }
         if let ActiveValue::Set(v) = &a.linked_from_contract {
             row.linked_from_contract = v.clone();
@@ -972,9 +1076,7 @@ impl InMemoryDb {
         if let ActiveValue::Set(v) = b.status {
             row.status = v;
         }
-        if let ActiveValue::Set(v) = b.updated_at {
-            row.updated_at = v;
-        }
+        row.updated_at = now().unix_timestamp();
         if let ActiveValue::Set(v) = &b.expiration {
             row.expiration = *v;
         }
@@ -1077,29 +1179,99 @@ impl InMemoryDb {
         Ok(())
     }
 
-    /// Count the incoming colorings of the asset with ID `asset_id` on the TXO with index
-    /// `txo_idx`, from transfers that did not fail.
-    pub(crate) fn count_txo_incoming_asset_colorings(
+    /// The incoming colorings (receives, changes, issuances) of a TXO, for one asset or all if
+    /// `None`. Failed transfers and the asset transfer `exclude_asset_transfer_idx` do not count.
+    pub(crate) fn txo_incoming_colorings(
         &self,
         txo_idx: i32,
-        asset_id: &str,
-    ) -> Result<usize, InternalError> {
+        asset_id: Option<&str>,
+        exclude_asset_transfer_idx: i32,
+    ) -> Result<Vec<DbColoring>, InternalError> {
         let asset_transfers = self.asset_transfers.borrow();
         let batch_transfers = self.batch_transfers.borrow();
         Ok(self
             .colorings
             .borrow()
             .iter()
-            .filter(|c| c.txo_idx == txo_idx && ColoringType::INCOMING.contains(&c.r#type))
+            .filter(|c| {
+                c.txo_idx == txo_idx
+                    && c.asset_transfer_idx != exclude_asset_transfer_idx
+                    && ColoringType::INCOMING.contains(&c.r#type)
+            })
             .filter(|c| {
                 asset_transfers.iter().any(|at| {
                     at.idx == c.asset_transfer_idx
-                        && at.asset_id.as_deref() == Some(asset_id)
+                        && asset_id.is_none_or(|id| at.asset_id.as_deref() == Some(id))
                         && batch_transfers.iter().any(|bt| {
                             bt.idx == at.batch_transfer_idx && bt.status != TransferStatus::Failed
                         })
                 })
             })
+            .cloned()
+            .collect())
+    }
+
+    /// The number of unpaid blind invoices on the UTXO at `outpoint`, other than the one of the
+    /// transfer with index `exclude_transfer_idx` (see `unpaid_invoices`).
+    pub(crate) fn count_utxo_unpaid_invoices(
+        &self,
+        outpoint: &Outpoint,
+        exclude_transfer_idx: i32,
+    ) -> Result<usize, InternalError> {
+        let transfers = self.transfers.borrow();
+        let asset_transfers = self.asset_transfers.borrow();
+        let batch_transfers = self.batch_transfers.borrow();
+        let colorings = self.colorings.borrow();
+        Ok(
+            unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+                .into_iter()
+                .filter(|(t, utxo)| t.idx != exclude_transfer_idx && *utxo == outpoint)
+                .count(),
+        )
+    }
+
+    fn unpaid_mint_right_invoices(&self, asset_id: &str) -> Vec<(i32, Outpoint)> {
+        let transfers = self.transfers.borrow();
+        let asset_transfers = self.asset_transfers.borrow();
+        let batch_transfers = self.batch_transfers.borrow();
+        let colorings = self.colorings.borrow();
+        unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+            .into_iter()
+            .filter(|(t, _)| {
+                asset_transfers
+                    .iter()
+                    .find(|at| at.idx == t.asset_transfer_idx)
+                    .is_some_and(|at| {
+                        t.requested_assignment == Some(Assignment::MintRight)
+                            && at.asset_id.as_deref() == Some(asset_id)
+                    })
+            })
+            .map(|(t, utxo)| (t.idx, utxo.clone()))
+            .collect()
+    }
+
+    /// The UTXOs of the unpaid invoices that request a mint right of asset `asset_id`.
+    pub(crate) fn get_mint_right_invoice_utxos(
+        &self,
+        asset_id: &str,
+    ) -> Result<HashSet<Outpoint>, InternalError> {
+        Ok(self
+            .unpaid_mint_right_invoices(asset_id)
+            .into_iter()
+            .map(|(_, utxo)| utxo)
+            .collect())
+    }
+
+    pub(crate) fn count_utxo_unpaid_mint_right_invoices(
+        &self,
+        outpoint: &Outpoint,
+        asset_id: &str,
+        exclude_transfer_idx: i32,
+    ) -> Result<usize, InternalError> {
+        Ok(self
+            .unpaid_mint_right_invoices(asset_id)
+            .into_iter()
+            .filter(|(idx, utxo)| *idx != exclude_transfer_idx && utxo == outpoint)
             .count())
     }
 
@@ -1114,6 +1286,13 @@ impl InMemoryDb {
         self.pending_witness_scripts
             .borrow_mut()
             .retain(|p| p.script != script);
+        Ok(())
+    }
+
+    pub(crate) fn del_wallet_transaction(&self, idx: i32) -> Result<(), InternalError> {
+        self.wallet_transactions
+            .borrow_mut()
+            .retain(|w| w.idx != idx);
         Ok(())
     }
 
@@ -1351,18 +1530,20 @@ impl InMemoryDb {
             .filter(|a| a.asset_id == Some(asset_id.clone()))
             .collect();
 
-        let settled: u64 = ass_allocations
+        // Pending transfers can double-spend each other, and an asset with no fixed supply can
+        // hold more than u64::MAX in total. So the sums use u128 and the balances cap at u64::MAX.
+        let settled: u128 = ass_allocations
             .iter()
             .filter(|a| a.settled())
-            .map(|a| a.assignment.main_amount())
+            .map(|a| u128::from(a.assignment.main_amount()))
             .sum();
 
-        let mut ass_pending_incoming: u64 = ass_allocations
+        let allocations_pending_incoming: u128 = ass_allocations
             .iter()
             .filter(|a| !a.txo_spent && a.incoming && a.status.pending())
-            .map(|a| a.assignment.main_amount())
+            .map(|a| u128::from(a.assignment.main_amount()))
             .sum();
-        let witness_pending: u64 = transfers
+        let witness_pending: u128 = transfers
             .iter()
             .filter(|t| {
                 t.incoming && matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
@@ -1374,11 +1555,12 @@ impl InMemoryDb {
                             if at.asset_id.as_deref() != Some(asset_id.as_str()) {
                                 return None;
                             }
-                            Some(Ok(t
-                                .requested_assignment
-                                .as_ref()
-                                .map(|a| a.main_amount())
-                                .unwrap_or(0)))
+                            Some(Ok(u128::from(
+                                t.requested_assignment
+                                    .as_ref()
+                                    .map(|a| a.main_amount())
+                                    .unwrap_or(0),
+                            )))
                         } else {
                             None
                         }
@@ -1386,20 +1568,21 @@ impl InMemoryDb {
                     Err(e) => Some(Err(e)),
                 },
             )
-            .collect::<Result<Vec<u64>, InternalError>>()?
+            .collect::<Result<Vec<u128>, InternalError>>()?
             .iter()
             .sum();
-        ass_pending_incoming += witness_pending;
-        let ass_pending_outgoing: u64 = ass_allocations
+        let ass_pending_incoming = allocations_pending_incoming + witness_pending;
+        let ass_pending_outgoing: u128 = ass_allocations
             .iter()
             .filter(|a| !a.incoming && a.status.pending())
-            .map(|a| a.assignment.main_amount())
+            .map(|a| u128::from(a.assignment.main_amount()))
             .sum();
-        let ass_pending: i128 = ass_pending_incoming as i128 - ass_pending_outgoing as i128;
 
-        let future = settled as i128 + ass_pending;
+        let future = (settled + ass_pending_incoming)
+            .checked_sub(ass_pending_outgoing)
+            .expect("pending outgoing cannot exceed available balance");
 
-        let unspendable: u64 = txos_allocations
+        let unspendable: u128 = txos_allocations
             .iter()
             .filter(|u| {
                 let unspent_with_pending = !u.utxo.spent
@@ -1412,21 +1595,23 @@ impl InMemoryDb {
                         .any(|a| !a.incoming && a.status.waiting_confirmations());
                 unspent_with_pending || spent_waiting
             })
-            .map(|u| {
+            .flat_map(|u| {
                 u.rgb_allocations
                     .iter()
                     .filter(|a| a.asset_id == Some(asset_id.clone()) && a.settled())
-                    .map(|a| a.assignment.main_amount())
-                    .sum::<u64>()
+                    .map(|a| u128::from(a.assignment.main_amount()))
             })
             .sum();
 
-        let spendable = settled.saturating_sub(unspendable);
+        let spendable = settled
+            .checked_sub(unspendable)
+            .expect("unspendable allocations are a subset of settled ones");
 
+        let capped = |amount: u128| u64::try_from(amount).unwrap_or(u64::MAX);
         Ok(Balance {
-            settled,
-            future: future as u64,
-            spendable,
+            settled: capped(settled),
+            future: capped(future),
+            spendable: capped(spendable),
         })
     }
 
@@ -1548,20 +1733,13 @@ impl InMemoryDb {
         let colorings = colorings.unwrap_or_else(|| self.iter_colorings().unwrap_or_default());
         let transfers = transfers.unwrap_or_else(|| self.iter_transfers().unwrap_or_default());
 
-        let pending_blinded_utxos = transfers
-            .iter()
-            .filter_map(|t| match (&t.recipient_type, t.incoming) {
-                (Some(RecipientTypeFull::Blind { unblinded_utxo }), true) => t
-                    .related_transfers(&asset_transfers, &batch_transfers)
-                    .ok()
-                    .filter(|(_, bt)| bt.status.waiting_counterparty())
-                    .map(|_| unblinded_utxo),
-                _ => None,
-            })
-            .fold(HashMap::new(), |mut acc, utxo| {
-                *acc.entry(utxo).or_insert(0) += 1;
-                acc
-            });
+        let pending_blinded_utxos =
+            unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
+                .into_iter()
+                .fold(HashMap::new(), |mut acc, (_, utxo)| {
+                    *acc.entry(utxo).or_insert(0) += 1;
+                    acc
+                });
 
         utxos
             .iter()
@@ -1755,10 +1933,12 @@ mod tests {
         let mut upd: DbBatchTransferActMod = bt.clone().into();
         upd.status = ActiveValue::Set(TransferStatus::Settled);
         upd.txid = ActiveValue::Set(Some("abc123".to_string()));
+        let before = now().unix_timestamp();
         let updated = db.update_batch_transfer(&mut upd).unwrap();
 
         assert_eq!(updated.status, TransferStatus::Settled);
         assert_eq!(updated.txid, Some("abc123".to_string()));
+        assert!(updated.updated_at >= before);
     }
 
     #[test]
@@ -2068,7 +2248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_txo_incoming_asset_colorings() {
+    fn test_count_txo_incoming_colorings() {
         let db = make_db();
         let bt_ok = db
             .set_batch_transfer(make_batch_transfer_mod(
@@ -2102,10 +2282,54 @@ mod tests {
         }
 
         // inputs, failed transfers and other assets do not count
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "a").unwrap(), 3);
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo2, "a").unwrap(), 1);
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "b").unwrap(), 1);
-        assert_eq!(db.count_txo_incoming_asset_colorings(txo1, "c").unwrap(), 0);
+        let count = |txo, asset_id| db.txo_incoming_colorings(txo, asset_id, -1).unwrap().len();
+        assert_eq!(count(txo1, Some("a")), 3);
+        assert_eq!(count(txo2, Some("a")), 1);
+        assert_eq!(count(txo1, Some("b")), 1);
+        assert_eq!(count(txo1, Some("c")), 0);
+        assert_eq!(count(txo1, None), 5);
+    }
+
+    #[test]
+    fn test_count_utxo_unpaid_invoices() {
+        let db = make_db();
+        let u_idx = db.set_txo(make_txo_mod("u", 0, "1000")).unwrap();
+        db.set_txo(make_txo_mod("v", 0, "1000")).unwrap();
+        let txos = db.iter_txos().unwrap();
+        let (u, v) = (txos[0].outpoint(), txos[1].outpoint());
+        let waiting = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::WaitingCounterparty))
+            .unwrap();
+        let failed = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Failed))
+            .unwrap();
+        let blind = |outpoint: &Outpoint, bt, incoming| {
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            let t = db
+                .set_transfer(DbTransferActMod {
+                    recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Blind {
+                        unblinded_utxo: outpoint.clone(),
+                    })),
+                    ..make_transfer_mod(at, incoming)
+                })
+                .unwrap();
+            (at, t)
+        };
+        let (_, t1) = blind(&u, waiting, true);
+        blind(&u, waiting, true);
+        let (at3, _) = blind(&u, waiting, true);
+        db.set_coloring(make_coloring_mod(u_idx, at3, ColoringType::Receive, 1))
+            .unwrap();
+        blind(&u, failed, true);
+        blind(&v, waiting, true);
+        blind(&u, waiting, false);
+
+        // paid, failed and outgoing invoices do not count
+        assert_eq!(db.count_utxo_unpaid_invoices(&u, -1).unwrap(), 2);
+        assert_eq!(db.count_utxo_unpaid_invoices(&u, t1).unwrap(), 1);
+        assert_eq!(db.count_utxo_unpaid_invoices(&v, -1).unwrap(), 1);
     }
 
     // ── Media ──────────────────────────────────────────────────────
@@ -2324,6 +2548,9 @@ mod tests {
             ..Default::default()
         };
         assert!(db.update_wallet_transaction(missing).is_err());
+        db.del_wallet_transaction(idx).unwrap();
+        assert!(db.get_wallet_transaction_by_txid("wtx2").unwrap().is_none());
+        assert!(db.get_wallet_transaction_by_txid("wtx1").unwrap().is_some());
     }
 
     // ── BackupInfo ─────────────────────────────────────────────────
@@ -2450,6 +2677,119 @@ mod tests {
         assert_eq!(balance.settled, 0);
         assert_eq!(balance.future, 0);
         assert_eq!(balance.spendable, 0);
+    }
+
+    fn set_balance_allocations(
+        status: TransferStatus,
+        coloring_type: ColoringType,
+        amount: u64,
+    ) -> InMemoryDb {
+        let db = make_db();
+        for i in 1..=2 {
+            let bt = db
+                .set_batch_transfer(make_batch_transfer_mod(status))
+                .unwrap();
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            db.set_transfer(make_transfer_mod(at, true)).unwrap();
+            let txo = db
+                .set_txo(make_txo_mod(&format!("tx{i}"), 0, "1000"))
+                .unwrap();
+            db.set_coloring(make_coloring_mod(txo, at, coloring_type, amount))
+                .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn test_get_asset_balance_pending_incoming_past_u64() {
+        let db = set_balance_allocations(
+            TransferStatus::WaitingConfirmations,
+            ColoringType::Receive,
+            u64::MAX - 1,
+        );
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            Balance {
+                settled: 0,
+                future: u64::MAX,
+                spendable: 0
+            }
+        );
+
+        let add_witness = |db: &InMemoryDb| {
+            let bt = db
+                .set_batch_transfer(make_batch_transfer_mod(
+                    TransferStatus::WaitingConfirmations,
+                ))
+                .unwrap();
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            db.set_transfer(DbTransferActMod {
+                requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(u64::MAX - 1))),
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None })),
+                ..make_transfer_mod(at, true)
+            })
+            .unwrap();
+        };
+        let pending_past_u64 = Balance {
+            settled: 0,
+            future: u64::MAX,
+            spendable: 0,
+        };
+
+        // witness transfers only
+        let db = make_db();
+        add_witness(&db);
+        add_witness(&db);
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            pending_past_u64
+        );
+
+        // one allocation and one witness transfer
+        let db = make_db();
+        let bt = db
+            .set_batch_transfer(make_batch_transfer_mod(
+                TransferStatus::WaitingConfirmations,
+            ))
+            .unwrap();
+        let at = db
+            .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+            .unwrap();
+        db.set_transfer(make_transfer_mod(at, true)).unwrap();
+        let txo = db.set_txo(make_txo_mod("tx1", 0, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(
+            txo,
+            at,
+            ColoringType::Receive,
+            u64::MAX - 1,
+        ))
+        .unwrap();
+        add_witness(&db);
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            pending_past_u64
+        );
+    }
+
+    #[test]
+    fn test_get_asset_balance_settled_past_u64() {
+        let db = set_balance_allocations(TransferStatus::Settled, ColoringType::Issue, u64::MAX);
+        assert_eq!(
+            db.get_asset_balance("a1".to_string(), None, None, None, None, None)
+                .unwrap(),
+            Balance {
+                settled: u64::MAX,
+                future: u64::MAX,
+                spendable: u64::MAX
+            }
+        );
     }
 
     // ── Update with missing idx fails ──────────────────────────────
@@ -2597,6 +2937,39 @@ mod tests {
     }
 
     // ── Fix #18: orphaned FK handling ─────────────────────────────
+
+    #[test]
+    fn test_pending_blinded_skips_colored_invoices() {
+        let db = make_db();
+        let txo_idx = db.set_txo(make_txo_mod("tx1", 0, "1000")).unwrap();
+        let txo = db.iter_txos().unwrap()[0].clone();
+        let bt = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::WaitingCounterparty))
+            .unwrap();
+        let blind = |bt| {
+            let at = db
+                .set_asset_transfer(make_asset_transfer_mod(bt, Some("a1")))
+                .unwrap();
+            db.set_transfer(DbTransferActMod {
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Blind {
+                    unblinded_utxo: txo.outpoint(),
+                })),
+                ..make_transfer_mod(at, true)
+            })
+            .unwrap();
+            at
+        };
+        let at1 = blind(bt);
+        blind(bt);
+        db.set_coloring(make_coloring_mod(txo_idx, at1, ColoringType::Receive, 1))
+            .unwrap();
+
+        // the colored invoice counts through its coloring only
+        let unspents = db
+            .get_rgb_allocations(vec![txo], None, None, None, None)
+            .unwrap();
+        assert_eq!(unspents[0].pending_blinded, 1);
+    }
 
     #[test]
     fn test_utxo_allocations_skips_orphaned_colorings() {

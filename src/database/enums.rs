@@ -55,6 +55,26 @@ impl AssetSchema {
         Self::from_schema_id_str(schema_id.to_string())
     }
 
+    pub(crate) fn schema(&self) -> Schema {
+        match self {
+            Self::Nia => NonInflatableAsset::schema(),
+            Self::Ifa => InflatableFungibleAsset::schema(),
+            Self::Bfa => BridgedFungibleAsset::schema(),
+        }
+    }
+
+    /// Whether the schema has state the given concrete `assignment` can refer to.
+    pub(crate) fn supports_assignment(&self, assignment: &Assignment) -> bool {
+        match assignment {
+            Assignment::Fungible(_) => true,
+            Assignment::NonFungible => false,
+            Assignment::InflationRight(_) => matches!(self, Self::Ifa),
+            Assignment::LinkRight => matches!(self, Self::Ifa | Self::Bfa),
+            Assignment::MintRight => matches!(self, Self::Bfa),
+            Assignment::Any => false,
+        }
+    }
+
     pub(crate) fn get_from_contract_id(
         contract_id: ContractId,
         runtime: &RgbRuntime,
@@ -63,10 +83,29 @@ impl AssetSchema {
         Self::from_schema_id(schema_id)
     }
 
+    /// Whether the schema can carry a reject list.
+    pub(crate) fn supports_reject_list(&self) -> bool {
+        matches!(self, Self::Ifa | Self::Bfa)
+    }
+
     pub(crate) fn supports_link(&self) -> bool {
         match self {
             Self::Ifa | Self::Bfa => true,
             Self::Nia => false,
+        }
+    }
+
+    pub(crate) fn supports_mint(&self) -> bool {
+        match self {
+            Self::Bfa => true,
+            Self::Nia | Self::Ifa => false,
+        }
+    }
+
+    pub(crate) fn allowed_on_mainnet(&self) -> bool {
+        match self {
+            Self::Nia => true,
+            Self::Ifa | Self::Bfa => false,
         }
     }
 
@@ -179,6 +218,8 @@ pub enum TransferStatus {
     Initiated = 5,
     /// Waiting for the counterparty to take action
     WaitingCounterparty = 1,
+    /// Waiting for safe height to be reached
+    WaitingSafeHeight = 6,
     /// Waiting for the transfer transaction to be broadcasted
     WaitingBroadcast = 7,
     /// Waiting for the transfer transaction to reach the required number of confirmations
@@ -202,6 +243,7 @@ impl TransferStatus {
         [
             TransferStatus::Initiated,
             TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingSafeHeight,
             TransferStatus::WaitingConfirmations,
             TransferStatus::WaitingBroadcast,
         ]
@@ -224,6 +266,7 @@ impl TransferStatus {
     pub(crate) fn waiting(&self) -> bool {
         [
             TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingSafeHeight,
             TransferStatus::WaitingConfirmations,
             TransferStatus::WaitingBroadcast,
         ]
@@ -235,6 +278,7 @@ impl TransferStatus {
         [
             TransferStatus::Initiated,
             TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingSafeHeight,
             TransferStatus::WaitingBroadcast,
         ]
         .contains(self)
@@ -314,21 +358,83 @@ impl Assignment {
             0
         }
     }
+
+    /// Get the assignment at the given index of the given typed assignments, returning `None` for
+    /// assignment types unknown to the supported schemas.
+    pub(crate) fn from_typed_assigns<Seal: ExposedSeal>(
+        ty: AssignmentType,
+        typed_assigns: &TypedAssigns<Seal>,
+        no: u16,
+    ) -> Option<Self> {
+        let no = no as usize;
+        match typed_assigns {
+            TypedAssigns::Fungible(assigns) => {
+                let amount = assigns.get(no)?.state.as_u64();
+                match ty {
+                    OS_ASSET => Some(Self::Fungible(amount)),
+                    OS_INFLATION => Some(Self::InflationRight(amount)),
+                    _ => None,
+                }
+            }
+            TypedAssigns::Structured(assigns) => match ty {
+                OS_ASSET => assigns.get(no).map(|_| Self::NonFungible),
+                _ => None,
+            },
+            TypedAssigns::Declarative(assigns) => match ty {
+                OS_LINK => assigns.get(no).map(|_| Self::LinkRight),
+                OS_MINT => assigns.get(no).map(|_| Self::MintRight),
+                _ => None,
+            },
+        }
+    }
 }
 
-/// The main transition of an outgoing operation.
+/// Type of RGB assignment
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TypeOfAssignment {
+    /// The asset itself, fungible or not
+    Asset,
+    /// An inflation right, allowing to issue new tokens
+    InflationRight,
+    /// A link right, allowing to link the asset to a contract on another chain
+    LinkRight,
+    /// A mint right, allowing to mint tokens backed by the ones locked on the external chain
+    MintRight,
+}
+
+impl TypeOfAssignment {
+    /// Get the type of the given RGB assignment type, returning `None` for the ones unknown to the
+    /// supported schemas.
+    pub(crate) fn from_assignment_type(ty: AssignmentType) -> Option<Self> {
+        match ty {
+            OS_ASSET => Some(Self::Asset),
+            OS_INFLATION => Some(Self::InflationRight),
+            OS_LINK => Some(Self::LinkRight),
+            OS_MINT => Some(Self::MintRight),
+            _ => None,
+        }
+    }
+}
+
+/// Type of RGB transition
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum TypeOfTransition {
     /// Inflation transition (issuing new tokens)
-    Inflate = 2,
+    Inflate = 1,
     /// Transfer transition (moving existing tokens)
-    Transfer = 1,
+    Transfer = 2,
     /// Burn transition (burning existing tokens)
     Burn = 3,
-    /// Mint transition (minting assets backed by tokens locked on the external chain)
-    Mint = 4,
     /// Link transition (spending the link right to link the asset to another contract)
-    Link = 5,
+    Link = 4,
+    /// Mint transition (minting assets backed by tokens locked on the external chain)
+    Mint = 7,
+    /// Transfer of inflation rights. The main transition of an operation cannot move them.
+    TransferInflation = 5,
+    /// Transfer of link rights. The main transition of an operation cannot move them.
+    TransferLink = 6,
+    /// Propagation of mint rights to other wallets, for later mint transitions.
+    Propagate = 8,
 }
 
 impl TypeOfTransition {
@@ -337,9 +443,30 @@ impl TypeOfTransition {
             Self::Inflate => "inflate",
             Self::Transfer => "transfer",
             Self::Burn => "burn",
-            Self::Mint => "mint",
             Self::Link => "link",
+            Self::Mint => "mint",
+            Self::TransferInflation => "transferInflation",
+            Self::TransferLink => "transferLink",
+            Self::Propagate => "propagate",
         }
+    }
+}
+
+impl TryFrom<TransitionType> for TypeOfTransition {
+    type Error = ();
+
+    fn try_from(transition_type: TransitionType) -> Result<Self, Self::Error> {
+        Ok(match transition_type {
+            TS_TRANSFER => Self::Transfer,
+            TS_INFLATION => Self::Inflate,
+            TS_BURN => Self::Burn,
+            TS_LINK => Self::Link,
+            TS_MINT => Self::Mint,
+            TS_TRANSFER_INFLATION => Self::TransferInflation,
+            TS_TRANSFER_LINK => Self::TransferLink,
+            TS_PROPAGATE => Self::Propagate,
+            _ => return Err(()),
+        })
     }
 }
 
@@ -367,12 +494,14 @@ mod tests {
         assert!(TransferStatus::Initiated.pending());
         assert!(TransferStatus::WaitingCounterparty.pending());
         assert!(TransferStatus::WaitingConfirmations.pending());
+        assert!(TransferStatus::WaitingSafeHeight.pending());
         assert!(TransferStatus::WaitingBroadcast.pending());
         assert!(!TransferStatus::Settled.pending());
         assert!(!TransferStatus::Failed.pending());
 
         assert!(TransferStatus::WaitingCounterparty.waiting());
         assert!(TransferStatus::WaitingConfirmations.waiting());
+        assert!(TransferStatus::WaitingSafeHeight.waiting());
         assert!(TransferStatus::WaitingBroadcast.waiting());
         assert!(!TransferStatus::Initiated.waiting());
         assert!(!TransferStatus::Settled.waiting());
@@ -380,10 +509,17 @@ mod tests {
 
         assert!(TransferStatus::Initiated.is_fallible());
         assert!(TransferStatus::WaitingCounterparty.is_fallible());
+        assert!(TransferStatus::WaitingSafeHeight.is_fallible());
         assert!(TransferStatus::WaitingBroadcast.is_fallible());
         assert!(!TransferStatus::WaitingConfirmations.is_fallible());
         assert!(!TransferStatus::Settled.is_fallible());
         assert!(!TransferStatus::Failed.is_fallible());
+
+        assert!(!TransferStatus::WaitingSafeHeight.failed());
+        assert!(!TransferStatus::WaitingSafeHeight.initiated());
+        assert!(!TransferStatus::WaitingSafeHeight.settled());
+        assert!(!TransferStatus::WaitingSafeHeight.waiting_confirmations());
+        assert!(!TransferStatus::WaitingSafeHeight.waiting_counterparty());
     }
 
     #[test]
@@ -413,5 +549,82 @@ mod tests {
             // the integer stored in the DB must not change across versions
             assert_eq!(encryption as u8, num_value);
         }
+    }
+
+    #[test]
+    fn type_of_transition_variants() {
+        for (variant, discriminant, name) in [
+            (TypeOfTransition::Inflate, 1, "inflate"),
+            (TypeOfTransition::Transfer, 2, "transfer"),
+            (TypeOfTransition::Burn, 3, "burn"),
+            (TypeOfTransition::Link, 4, "link"),
+            (TypeOfTransition::TransferInflation, 5, "transferInflation"),
+            (TypeOfTransition::TransferLink, 6, "transferLink"),
+            (TypeOfTransition::Mint, 7, "mint"),
+            (TypeOfTransition::Propagate, 8, "propagate"),
+        ] {
+            assert_eq!(variant as u8, discriminant);
+            assert_eq!(variant.type_name(), name);
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn assignment_from_typed_assigns() {
+        let seal = || BuilderSeal::Revealed(GraphSeal::new_random_vout(0));
+
+        let fungible: TypedAssigns<GraphSeal> = TypedAssigns::Fungible(AssignVec::with(
+            NonEmptyVec::with(Assign::with(seal(), RevealedValue::new(7))),
+        ));
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &fungible, 0),
+            Some(Assignment::Fungible(7))
+        );
+        assert_eq!(Assignment::from_typed_assigns(OS_ASSET, &fungible, 1), None);
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_INFLATION, &fungible, 0),
+            Some(Assignment::InflationRight(7))
+        );
+        assert_eq!(Assignment::from_typed_assigns(OS_LINK, &fungible, 0), None);
+
+        let structured: TypedAssigns<GraphSeal> = TypedAssigns::Structured(AssignVec::with(
+            NonEmptyVec::with(Assign::with(seal(), RevealedData::default())),
+        ));
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &structured, 0),
+            Some(Assignment::NonFungible)
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &structured, 1),
+            None
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_LINK, &structured, 0),
+            None
+        );
+
+        let declarative: TypedAssigns<GraphSeal> = TypedAssigns::Declarative(AssignVec::with(
+            NonEmptyVec::with(Assign::with(seal(), VoidState::default())),
+        ));
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_LINK, &declarative, 0),
+            Some(Assignment::LinkRight)
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_LINK, &declarative, 1),
+            None
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_MINT, &declarative, 0),
+            Some(Assignment::MintRight)
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_MINT, &declarative, 1),
+            None
+        );
+        assert_eq!(
+            Assignment::from_typed_assigns(OS_ASSET, &declarative, 0),
+            None
+        );
     }
 }

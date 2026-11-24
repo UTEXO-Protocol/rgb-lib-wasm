@@ -1,0 +1,51 @@
+{
+  "consignment_id": "rgb:csg:rKKM5RX3-qAtvvTu-_ijOZkH-Wrwan9J-cAy6pSF-~fdknus#trade-buffalo-egypt",
+  "version": 1,
+  "is_transfer": false,
+  "asset_id": "rgb:rlvdieKc-NIYPnIO-pMpRREY-uyb4epa-PUhevm_-51xcdhc",
+  "asset_schema": "Ifa",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795085543,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": 666,
+    "max_supply": 1066,
+    "linked_from_contract": null,
+    "bridge_location": null,
+    "reject_list": {
+      "Url": "http://example.com/reject-list"
+    },
+    "media": [],
+    "outputs": [
+      {
+        "txid": "867f89890411bd0c8deb51ab48b08dab274ad612dca1fbd0a0a960e291ad8a89",
+        "vout": 0,
+        "blinding": 13073819409112210449,
+        "assignment": {
+          "Fungible": 666
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      },
+      {
+        "txid": "867f89890411bd0c8deb51ab48b08dab274ad612dca1fbd0a0a960e291ad8a89",
+        "vout": 3,
+        "blinding": 1296648861951437402,
+        "assignment": {
+          "InflationRight": 400
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": []
+}

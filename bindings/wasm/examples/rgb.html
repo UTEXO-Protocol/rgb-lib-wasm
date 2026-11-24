@@ -125,6 +125,8 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     <div>
       <label for="wallet-data">WalletData JSON (auto-filled from Generate / Auto Setup)</label>
       <textarea id="wallet-data" rows="6" placeholder='{"dataDir": ":memory:", "bitcoinNetwork": "Regtest", ...}'></textarea>
+      <label for="wallet-keys">SinglesigKeys JSON (auto-filled from generated keys)</label>
+      <textarea id="wallet-keys" rows="6" placeholder='{"accountXpubVanilla": "...", "masterFingerprint": "...", "witnessVersion": "Taproot", ...}'></textarea>
     </div>
     <div class="btn-group">
       <button id="btn-generate" disabled>Generate Keys</button>
@@ -347,10 +349,6 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     <label class="checkbox-label">
       <input type="checkbox" id="send-rgb-donation"> Donation
     </label>
-    <br />
-    <label class="checkbox-label">
-      <input type="checkbox" id="send-rgb-skip-sync"> Skip sync
-    </label>
     <div class="btn-group">
       <button id="btn-send-rgb-begin" disabled>1. Begin</button>
       <button id="btn-send-rgb-sign" disabled>2. Sign</button>
@@ -491,6 +489,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       fundAddress,
       mineAndWait,
       fillWalletData,
+      fillWalletKeys,
       enableBtns,
     } from './lib/shared.js';
 
@@ -555,17 +554,18 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Auto setup: generating keys...', 'log-warn');
         const network = document.getElementById('setup-network').value;
-        const keys = generateKeys(network);
+        const keys = generateKeys(network, 'Taproot');
         log('Keys generated', 'log-ok');
 
-        const wd = fillWalletData(keys, network);
+        const wd = fillWalletData(network);
+        const sk = fillWalletKeys(keys);
         log('Auto setup: creating wallet...', 'log-warn');
-        state.wallet = await WasmWallet.create(JSON.stringify(wd));
+        state.wallet = await WasmWallet.create(JSON.stringify(wd), JSON.stringify(sk));
         log('Wallet created', 'log-ok');
 
         const url = document.getElementById('setup-indexer-url').value.trim();
         log('Auto setup: going online (' + url + ')...', 'log-warn');
-        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         log('Online', 'log-ok');
 
         enableBtns(walletBtns);
@@ -587,8 +587,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     document.getElementById('btn-generate').addEventListener('click', () => {
       const network = document.getElementById('setup-network').value;
       try {
-        const keys = generateKeys(network);
-        fillWalletData(keys, network);
+        const keys = generateKeys(network, 'Taproot');
+        fillWalletData(network);
+        fillWalletKeys(keys);
         showResult('setup-output', 'setup-result', 'Keys generated.\n\n' + json(keys));
         log('generateKeys(' + network + ') OK', 'log-ok');
       } catch (e) {
@@ -602,13 +603,14 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
     // =======================================================================
     document.getElementById('btn-create-wallet').addEventListener('click', async () => {
       const walletDataJson = document.getElementById('wallet-data').value.trim();
+      const keysJson = document.getElementById('wallet-keys').value.trim();
       if (!walletDataJson) {
         showResult('setup-output', 'setup-result', 'Enter WalletData JSON or generate keys first');
         return;
       }
       try {
         log('Creating wallet...', 'log-warn');
-        state.wallet = await WasmWallet.create(walletDataJson);
+        state.wallet = await WasmWallet.create(walletDataJson, keysJson);
         showResult('setup-output', 'setup-result', 'Wallet created.\n\n' + json(state.wallet.getWalletData()));
         enableBtns(walletBtns);
         log('Wallet created', 'log-ok');
@@ -627,7 +629,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const url = document.getElementById('setup-indexer-url').value.trim();
       try {
         log('Going online: ' + url + '...', 'log-warn');
-        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
+        state.online = await state.wallet.goOnline({ indexerConfig: { Esplora: { url } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         enableBtns(onlineBtns);
         showResult('setup-output', 'setup-result', 'Online!\n\n' + json(state.online));
         log('Online: ' + url, 'log-ok');
@@ -656,9 +658,10 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         log('Mined to height ' + mineResult.height, 'log-info');
 
         log('Syncing wallet...', 'log-warn');
-        await state.wallet.sync(state.online);
+        await state.wallet.sync(state.online, { keychain: 'Colored', strategy: 'FastSync' });
+        await state.wallet.sync(state.online, { keychain: { Vanilla: { lookback: 20 } }, strategy: 'FastSync' });
 
-        const balance = state.wallet.getBtcBalance();
+        const balance = await state.wallet.getBtcBalance(state.online, false);
         showResult('setup-output', 'setup-result',
           'Funded ' + address + ' with ' + amount + ' BTC\n' +
           'Mine height: ' + mineResult.height + '\n\n' +
@@ -681,12 +684,12 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('createUtxos (auto) begin...', 'log-warn');
         const unsignedPsbt = await state.wallet.createUtxosBegin(
-          state.online, true, num, size, BigInt(feeRate), false
+          state.online, true, false, num, size, BigInt(feeRate), false, true
         );
         log('createUtxos (auto) sign...', 'log-warn');
         const signed = state.wallet.signPsbt(unsignedPsbt);
         log('createUtxos (auto) end...', 'log-warn');
-        const count = await state.wallet.createUtxosEnd(state.online, signed, false);
+        const count = await state.wallet.createUtxosEnd(state.online, signed);
         showResult('setup-output', 'setup-result', 'UTXOs created: ' + count);
         log('createUtxos complete: ' + count + ' UTXOs', 'log-ok');
       } catch (e) {
@@ -730,7 +733,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       try {
         log('Issuing IFA: ' + ticker + '...', 'log-warn');
         const asset = state.wallet.issueAssetIfa(
-          ticker, name, precision, amounts, inflationAmounts, rejectListUrl, false, null
+          ticker, name, precision, amounts, inflationAmounts, rejectListUrl, false, null, false
         );
         showJson('ifa-output', 'ifa-result', asset);
         log('IFA issued: ' + (asset.assetId || ticker), 'log-ok');
@@ -882,10 +885,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         showResult('send-rgb-output', 'send-rgb-result', 'No signed PSBT. Run Sign first.');
         return;
       }
-      const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
         log('sendEnd (RGB)...', 'log-warn');
-        const result = await state.wallet.sendEnd(state.online, signed, skipSync);
+        const result = await state.wallet.sendEnd(state.online, signed);
         showJson('send-rgb-output', 'send-rgb-result', result);
         log('sendEnd OK', 'log-ok');
       } catch (e) {
@@ -909,7 +911,6 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const donation = document.getElementById('send-rgb-donation').checked;
       const feeRate = parseInt(document.getElementById('send-rgb-fee-rate').value, 10) || 1;
       const minConf = parseInt(document.getElementById('send-rgb-min-conf').value, 10) || 1;
-      const skipSync = document.getElementById('send-rgb-skip-sync').checked;
       try {
         log('send RGB (auto) begin...', 'log-warn');
         const unsignedPsbt = (await state.wallet.sendBegin(
@@ -923,7 +924,7 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
         document.getElementById('send-rgb-signed-psbt').value = signed;
 
         log('send RGB (auto) end...', 'log-warn');
-        const result = await state.wallet.sendEnd(state.online, signed, skipSync);
+        const result = await state.wallet.sendEnd(state.online, signed);
         showJson('send-rgb-output', 'send-rgb-result', result);
         log('send RGB (auto) complete', 'log-ok');
       } catch (e) {
@@ -947,9 +948,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
       try {
         log('inflateBegin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.inflateBegin(
-          state.online, assetId, amounts, BigInt(feeRate), minConf
-        );
+        const unsignedPsbt = (await state.wallet.inflateBegin(
+          state.online, assetId, amounts, BigInt(feeRate), minConf, false
+        )).psbt;
         document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
         showResult('inflate-output', 'inflate-result', 'Unsigned PSBT created. Proceed to Sign.');
         log('inflateBegin OK', 'log-ok');
@@ -1007,9 +1008,9 @@ hr.divider { border: none; border-top: 1px solid #30363d; margin: 1rem 0; }
       const minConf = parseInt(document.getElementById('inflate-min-conf').value, 10) || 1;
       try {
         log('inflate (auto) begin...', 'log-warn');
-        const unsignedPsbt = await state.wallet.inflateBegin(
-          state.online, assetId, amounts, BigInt(feeRate), minConf
-        );
+        const unsignedPsbt = (await state.wallet.inflateBegin(
+          state.online, assetId, amounts, BigInt(feeRate), minConf, false
+        )).psbt;
         document.getElementById('inflate-unsigned-psbt').value = unsignedPsbt;
 
         log('inflate (auto) sign...', 'log-warn');

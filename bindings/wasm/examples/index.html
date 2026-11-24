@@ -116,8 +116,8 @@ code.snippet {
       <span class="step-number">1</span>
       <span class="step-title">Generate Keys</span>
       <p>Create a new BIP39 mnemonic and derive account xpubs for vanilla (Bitcoin) and colored (RGB) keychains.</p>
-      <code class="snippet">const keys = generateKeys("regtest");
-// { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint }</code>
+      <code class="snippet">const keys = generateKeys("regtest", "Taproot");
+// { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint, witnessVersion }</code>
     </div>
 
     <div class="step">
@@ -129,21 +129,24 @@ code.snippet {
   bitcoinNetwork: "Regtest",
   databaseType: "Sqlite",
   maxAllocationsPerUtxo: 5,
-  accountXpubVanilla: keys.accountXpubVanilla,
-  accountXpubColored: keys.accountXpubColored,
-  mnemonic: keys.mnemonic,
-  masterFingerprint: keys.masterFingerprint,
-  vanillaKeychain: null,
   supportedSchemas: ["Nia", "Ifa"],
 };
-const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
+const walletKeys = {
+  accountXpubVanilla: keys.accountXpubVanilla,
+  accountXpubColored: keys.accountXpubColored,
+  masterFingerprint: keys.masterFingerprint,
+  witnessVersion: keys.witnessVersion,
+  mnemonic: keys.mnemonic,
+  vanillaKeychain: null,
+};
+const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));</code>
     </div>
 
     <div class="step">
       <span class="step-number">3</span>
       <span class="step-title">Go Online</span>
       <p>Connect the wallet to an Esplora indexer. Returns an Online object used by subsequent operations.</p>
-      <code class="snippet">const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: "http://127.0.0.1:8094/regtest/api" } }, skipConsistencyCheck: true, proxyAuthKeys: {} });</code>
+      <code class="snippet">const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: "http://127.0.0.1:8094/regtest/api" } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });</code>
     </div>
 
     <div class="step">
@@ -158,7 +161,7 @@ const wallet = await WasmWallet.create(JSON.stringify(walletData));</code>
       <span class="step-number">5</span>
       <span class="step-title">Create UTXOs</span>
       <p>Allocate colored UTXOs for RGB operations. Required before issuing or receiving assets.</p>
-      <code class="snippet">await wallet.createUtxos(online, true, null, null, 1.5);</code>
+      <code class="snippet">await wallet.createUtxos(online, true, false, null, null, 1.5);</code>
     </div>
 
     <div class="step">
@@ -241,6 +244,7 @@ bash tests/regtest.sh stop</pre>
       fundAddress,
       mineAndWait,
       fillWalletData,
+      fillWalletKeys,
       ESPLORA_API,
       PROXY_URL,
     } from './lib/shared.js';
@@ -276,7 +280,7 @@ bash tests/regtest.sh stop</pre>
       try {
         // Step 1: Generate keys
         log('[1/12] Generating keys...', 'log-info');
-        const keys = generateKeys('regtest');
+        const keys = generateKeys('regtest', 'Taproot');
         append('[1/12] Keys generated');
         append('  mnemonic: ' + keys.mnemonic.split(' ').slice(0, 3).join(' ') + ' ...');
         append('  fingerprint: ' + keys.masterFingerprint);
@@ -284,7 +288,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 2: Restore keys (round-trip verification)
         log('[2/12] Restoring keys (round-trip)...', 'log-info');
-        const restored = restoreKeys('regtest', keys.mnemonic);
+        const restored = restoreKeys('regtest', keys.mnemonic, 'Taproot');
         const match =
           restored.accountXpubVanilla === keys.accountXpubVanilla &&
           restored.accountXpubColored === keys.accountXpubColored &&
@@ -294,15 +298,16 @@ bash tests/regtest.sh stop</pre>
 
         // Step 3: Create wallet
         log('[3/12] Creating wallet...', 'log-info');
-        const walletData = fillWalletData(keys, 'regtest');
-        const wallet = await WasmWallet.create(JSON.stringify(walletData));
+        const walletData = fillWalletData('regtest');
+        const walletKeys = fillWalletKeys(keys);
+        const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));
         state.wallet = wallet;
         append('[3/12] Wallet created');
         log('[3/12] Wallet created', 'log-ok');
 
         // Step 4: Go online
         log('[4/12] Going online...', 'log-info');
-        const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: ESPLORA_API } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
+        const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: ESPLORA_API } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
         state.online = online;
         append('[4/12] Wallet online (Esplora connected)');
         log('[4/12] Online', 'log-ok');
@@ -318,7 +323,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 6: Create UTXOs
         log('[6/12] Creating UTXOs...', 'log-info');
-        const utxoCount = await wallet.createUtxos(online, true, null, null, 1.5);
+        const utxoCount = await wallet.createUtxos(online, true, false, null, null, 1.5);
         append('[6/12] Created ' + utxoCount + ' UTXOs');
         log('[6/12] Created ' + utxoCount + ' UTXOs', 'log-ok');
 
@@ -330,7 +335,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 8: Issue IFA asset
         log('[8/12] Issuing IFA asset...', 'log-info');
-        const ifa = wallet.issueAssetIfa('INFL', 'Inflatable Token', 0, [500], [], undefined, false, null);
+        const ifa = wallet.issueAssetIfa('INFL', 'Inflatable Token', 0, [500], [], undefined, false, null, false);
         append('[8/12] IFA issued: ' + ifa.assetId);
         log('[8/12] IFA issued', 'log-ok');
 
@@ -396,7 +401,7 @@ bash tests/regtest.sh stop</pre>
       try {
         // Step 1: Generate keys
         log('[1/6] Generating keys...', 'log-info');
-        const keys = generateKeys('regtest');
+        const keys = generateKeys('regtest', 'Taproot');
         append('[1/6] Keys generated');
         append('  mnemonic: ' + keys.mnemonic);
         append('  xpub_vanilla: ' + keys.accountXpubVanilla.substring(0, 30) + '...');
@@ -406,7 +411,7 @@ bash tests/regtest.sh stop</pre>
 
         // Step 2: Restore round-trip
         log('[2/6] Restore round-trip...', 'log-info');
-        const restored = restoreKeys('regtest', keys.mnemonic);
+        const restored = restoreKeys('regtest', keys.mnemonic, 'Taproot');
         const match =
           restored.accountXpubVanilla === keys.accountXpubVanilla &&
           restored.accountXpubColored === keys.accountXpubColored &&
@@ -419,8 +424,9 @@ bash tests/regtest.sh stop</pre>
 
         // Step 3: Create wallet
         log('[3/6] Creating wallet...', 'log-info');
-        const walletData = fillWalletData(keys, 'regtest');
-        const wallet = await WasmWallet.create(JSON.stringify(walletData));
+        const walletData = fillWalletData('regtest');
+        const walletKeys = fillWalletKeys(keys);
+        const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));
         state.wallet = wallet;
         append('[3/6] Wallet created');
         log('[3/6] Wallet created', 'log-ok');
@@ -447,7 +453,7 @@ bash tests/regtest.sh stop</pre>
         // Test: invalid network
         errCount++;
         try {
-          generateKeys('invalid_network');
+          generateKeys('invalid_network', 'Taproot');
           append('[6/6] ERROR: invalid network should have thrown');
         } catch (e) {
           errPassed++;
@@ -457,7 +463,7 @@ bash tests/regtest.sh stop</pre>
         // Test: bad mnemonic
         errCount++;
         try {
-          restoreKeys('regtest', 'not a valid mnemonic phrase at all');
+          restoreKeys('regtest', 'not a valid mnemonic phrase at all', 'Taproot');
           append('[6/6] ERROR: bad mnemonic should have thrown');
         } catch (e) {
           errPassed++;
@@ -467,7 +473,7 @@ bash tests/regtest.sh stop</pre>
         // Test: bad wallet data
         errCount++;
         try {
-          await WasmWallet.create('{"invalid": "data"}');
+          await WasmWallet.create('{"invalid": "data"}', '{}');
           append('[6/6] ERROR: bad wallet data should have thrown');
         } catch (e) {
           errPassed++;

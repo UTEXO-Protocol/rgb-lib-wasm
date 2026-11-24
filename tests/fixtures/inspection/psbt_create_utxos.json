@@ -1,0 +1,62 @@
+{
+  "txid": "89cd1eac42322a08703c13a9e17ddd3fc420d48a8a546496f4b799d61ee41d0a",
+  "inputs": [
+    {
+      "outpoint": {
+        "txid": "f4e317212e181344ebb4c90822feb9ed7aa62b617d8bb0f5432e97b5e464e166",
+        "vout": 0
+      },
+      "amount_sat": 99994347,
+      "is_mine": true
+    }
+  ],
+  "outputs": [
+    {
+      "address": "bcrt1pem94zy39m6h0sy4dn8lqu0c4u6hn8r499dr7kwxwczdcjmrskjmqzevqzn",
+      "script_pubkey_hex": "5120cecb511225deaef812ad99fe0e3f15e6af338ea52b47eb38cec09b896c70b4b6",
+      "amount_sat": 1000,
+      "is_op_return": false,
+      "is_mine": true
+    },
+    {
+      "address": "bcrt1p6tsrgcmtd9vfcu8v3hrh8zup2etrg54eeczpcwufzp79jdw3s4gs65a3jl",
+      "script_pubkey_hex": "5120d2e034636b69589c70ec8dc7738b8156563452b9ce041c3b89107c5935d18551",
+      "amount_sat": 99988694,
+      "is_op_return": false,
+      "is_mine": true
+    },
+    {
+      "address": "bcrt1ph3uh54p82zx028s8vamkhusrae6cmne2cnqv68fp9dau6v3uydqqqhw09t",
+      "script_pubkey_hex": "5120bc797a5427508cf51e0767776bf203ee758dcf2ac4c0cd1d212b7bcd323c2340",
+      "amount_sat": 1000,
+      "is_op_return": false,
+      "is_mine": true
+    },
+    {
+      "address": "bcrt1pj582ajxsd34248puwj2z3lce4x3m39gh38acnzwmrsrgzh7mssxql8elm7",
+      "script_pubkey_hex": "5120950eaec8d06c6aaa9c3c749428ff19a9a3b8951789fb8989db1c06815fdb840c",
+      "amount_sat": 1000,
+      "is_op_return": false,
+      "is_mine": true
+    },
+    {
+      "address": "bcrt1pf3pm67cry7wu90necugzx0wmac8ggrq9xluhqtncr9q6h3wcgevs8s7ycd",
+      "script_pubkey_hex": "51204c43bd7b03279dc2be79c710233ddbee0e840c0537f9702e781941abc5d84659",
+      "amount_sat": 1000,
+      "is_op_return": false,
+      "is_mine": true
+    },
+    {
+      "address": "bcrt1p7vaup52tt97k6ju8py78f3c6s3n2nyf5pnwys233z0vh5dr0sats5twwse",
+      "script_pubkey_hex": "5120f33bc0d14b597d6d4b87093c74c71a8466a991340cdc482a3113d97a346f8757",
+      "amount_sat": 1000,
+      "is_op_return": false,
+      "is_mine": true
+    }
+  ],
+  "total_input_sat": 99994347,
+  "total_output_sat": 99993694,
+  "fee_sat": 653,
+  "signature_count": 0,
+  "size_vbytes": 309
+}

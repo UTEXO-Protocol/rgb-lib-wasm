@@ -42,35 +42,30 @@ impl RejectListClient {
     /// every opout. A body larger than [`MAX_REJECT_LIST_SIZE`] is refused.
     #[cfg(target_arch = "wasm32")]
     pub(crate) async fn get_reject_list(&self) -> Result<String, Error> {
-        use wasm_bindgen::JsCast;
+        // abort the fetch when the caller drops this future
+        struct AbortOnDrop(web_sys::AbortController);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let guard = AbortOnDrop(
+            web_sys::AbortController::new().map_err(|e| Self::req_err(format!("{e:?}")))?,
+        );
+        let timeout = web_sys::AbortSignal::timeout_with_u32(CLIENT_TIMEOUT.as_millis() as u32);
+        let signal = web_sys::AbortSignal::any(&js_sys::Array::of2(&timeout, &guard.0.signal()));
         let resp = gloo_net::http::Request::get(&self.base_url)
             .redirect(web_sys::RequestRedirect::Error)
+            .abort_signal(Some(&signal))
             .send()
             .await
             .map_err(Self::req_err)?;
         if !resp.ok() {
             return Err(Self::status_err(resp.status()));
         }
-        let mut body = vec![];
-        if let Some(stream) = resp.body() {
-            let reader: web_sys::ReadableStreamDefaultReader = stream.get_reader().unchecked_into();
-            let js_err = |e: wasm_bindgen::JsValue| Self::req_err(format!("{e:?}"));
-            // read one byte past the bound to tell a body of the maximum size from a longer one
-            while body.len() as u64 <= MAX_REJECT_LIST_SIZE {
-                let chunk = wasm_bindgen_futures::JsFuture::from(reader.read())
-                    .await
-                    .map_err(js_err)?;
-                if js_sys::Reflect::get(&chunk, &"done".into())
-                    .map_err(js_err)?
-                    .is_truthy()
-                {
-                    break;
-                }
-                let value = js_sys::Reflect::get(&chunk, &"value".into()).map_err(js_err)?;
-                body.extend(js_sys::Uint8Array::new(&value).to_vec());
-            }
-            let _ = reader.cancel();
-        }
+        let body = crate::utils::read_body_limited(resp.body(), MAX_REJECT_LIST_SIZE)
+            .await
+            .map_err(Self::req_err)?;
         Self::checked_body(body)
     }
 
@@ -79,6 +74,7 @@ impl RejectListClient {
     pub(crate) async fn get_reject_list(&self) -> Result<String, Error> {
         let mut resp = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(CLIENT_TIMEOUT)
             .build()
             .map_err(Self::req_err)?
             .get(&self.base_url)
@@ -140,6 +136,33 @@ mod tests {
                 Some(Error::RejectListService { .. })
             ));
         }
+
+        // a server that does not answer in time is refused
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/")
+            .with_body_from_request(|_| {
+                std::thread::sleep(CLIENT_TIMEOUT + Duration::from_secs(1));
+                b"".to_vec()
+            })
+            .create();
+        let start = std::time::Instant::now();
+        let result = block_on(
+            RejectListClient::new(&server.url())
+                .unwrap()
+                .get_reject_list(),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(Error::RejectListService { .. })),
+            "{result:?}"
+        );
+        assert!(elapsed >= CLIENT_TIMEOUT, "{elapsed:?}");
+        assert!(
+            elapsed < CLIENT_TIMEOUT + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        mock.assert();
     }
 
     #[test]

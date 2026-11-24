@@ -8,7 +8,19 @@
 use super::*;
 
 const JSON: &str = "application/json";
+#[cfg(not(all(test, not(target_arch = "wasm32"))))]
 const READ_WRITE_TIMEOUT: u64 = 120;
+// Native tests use a short limit.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+const READ_WRITE_TIMEOUT: u64 = 3;
+// reqwest on wasm does not mark a timeout during the body read as a timeout. The body read
+// fails with the abort reason, or with an AbortError in Firefox.
+const WASM_TIMED_OUT: [&str; 2] = ["reqwest::errors::TimedOut", "AbortError"];
+
+// the proxy does not know the invoice, so it holds no transfer to it
+pub(crate) const INVOICE_UNKNOWN_CODES: &[i64] = &[-101];
+// the transfer is deleted or its consignment is not available
+pub(crate) const CONSIGNMENT_GONE_CODES: &[i64] = &[-113, -400, -402, -403];
 
 /// Number of transfers an invoice is reserved for: invoices are single-use.
 pub(crate) const INVOICE_QUOTA: u32 = 1;
@@ -391,6 +403,88 @@ pub(crate) fn map_proxy_error(err: JsonRpcError) -> Error {
     }
 }
 
+/// Why a proxy call got no JSON-RPC answer.
+enum CallFailure {
+    Unreachable(String),
+    Timeout(String),
+    HttpStatus(u16),
+    InvalidResponse(String),
+}
+
+impl CallFailure {
+    fn from_request(e: reqwest::Error) -> Self {
+        let wasm_timeout = std::iter::successors(std::error::Error::source(&e), |s| s.source())
+            .any(|s| WASM_TIMED_OUT.iter().any(|t| s.to_string().contains(t)));
+        if e.is_timeout() || wasm_timeout {
+            Self::Timeout(e.to_string())
+        } else {
+            Self::Unreachable(e.to_string())
+        }
+    }
+
+    fn into_error(self) -> Error {
+        let details = match self {
+            Self::Unreachable(d) | Self::Timeout(d) | Self::InvalidResponse(d) => d,
+            Self::HttpStatus(s) => format!("HTTP status {s}"),
+        };
+        Error::Proxy { details }
+    }
+
+    fn into_lookup_error(self, endpoint: &str) -> Error {
+        let endpoint = endpoint.to_string();
+        match self {
+            Self::Unreachable(details) => Error::ProxyUnreachable { endpoint, details },
+            Self::Timeout(details) => Error::ProxyTimeout { endpoint, details },
+            Self::HttpStatus(status) => Error::ProxyHttpError { endpoint, status },
+            Self::InvalidResponse(details) => Error::ProxyInvalidResponse { endpoint, details },
+        }
+    }
+}
+
+/// Send a request and read its JSON-RPC answer.
+async fn answer<R: serde::de::DeserializeOwned>(
+    request: RequestBuilder,
+) -> Result<JsonRpcResponse<R>, CallFailure> {
+    let resp = request.send().await.map_err(CallFailure::from_request)?;
+    let status = resp.status();
+    let bytes = resp.bytes().await.map_err(CallFailure::from_request)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        if status.is_success() {
+            CallFailure::InvalidResponse(format!("error decoding response body: {e}"))
+        } else {
+            CallFailure::HttpStatus(status.as_u16())
+        }
+    })
+}
+
+/// Read the answer of a receive lookup. An error code in `empty_codes` means nothing is there.
+pub(crate) fn lookup_answer<R>(
+    endpoint: &str,
+    res: JsonRpcResponse<R>,
+    empty_codes: &[i64],
+) -> Result<Option<R>, Error> {
+    let endpoint = endpoint.to_string();
+    match (res.error, res.result) {
+        (Some(err), _) if empty_codes.contains(&err.code) => Ok(None),
+        (Some(err), _) => match i32::try_from(err.code) {
+            Ok(code) => Err(Error::ProxyJsonRpcError {
+                endpoint,
+                code,
+                details: err.details(),
+            }),
+            Err(_) => Err(Error::ProxyInvalidResponse {
+                endpoint,
+                details: format!("JSON-RPC error code {} is out of range", err.code),
+            }),
+        },
+        (None, Some(r)) => Ok(Some(r)),
+        (None, None) => Err(Error::ProxyInvalidResponse {
+            endpoint,
+            details: s!("no result and no error"),
+        }),
+    }
+}
+
 impl ProxyClient {
     pub(crate) fn new(base_url: &str) -> Result<Self, Error> {
         Ok(Self {
@@ -399,17 +493,7 @@ impl ProxyClient {
         })
     }
 
-    fn req_err(e: impl std::fmt::Display) -> Error {
-        Error::Proxy {
-            details: e.to_string(),
-        }
-    }
-
-    async fn call<P: Serialize, R: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        params: Option<P>,
-    ) -> Result<JsonRpcResponse<R>, Error> {
+    fn json_request<P: Serialize>(&self, method: &str, params: Option<P>) -> RequestBuilder {
         let body = JsonRpcRequest {
             method: method.to_string(),
             jsonrpc: s!("2.0"),
@@ -421,12 +505,40 @@ impl ProxyClient {
             .header(CONTENT_TYPE, JSON)
             .timeout(Duration::from_secs(READ_WRITE_TIMEOUT))
             .json(&body)
-            .send()
-            .await
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<R>>()
-            .await
-            .map_err(Self::req_err)
+    }
+
+    async fn call<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<P>,
+    ) -> Result<JsonRpcResponse<R>, Error> {
+        crate::abort::race(async {
+            answer(self.json_request(method, params))
+                .await
+                .map_err(CallFailure::into_error)
+        })
+        .await
+    }
+
+    async fn write_call<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<P>,
+    ) -> Result<JsonRpcResponse<R>, Error> {
+        crate::abort::write(self.call(method, params)).await
+    }
+
+    async fn lookup_call<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<P>,
+    ) -> Result<JsonRpcResponse<R>, Error> {
+        crate::abort::race(async {
+            answer(self.json_request(method, params))
+                .await
+                .map_err(|f| f.into_lookup_error(&self.base_url))
+        })
+        .await
     }
 
     async fn call_multipart<R: serde::de::DeserializeOwned>(
@@ -441,16 +553,12 @@ impl ProxyClient {
             .text("id", "null")
             .text("params", params_json)
             .part("file", file);
-        self.client
+        let req = self
+            .client
             .post(&self.base_url)
             .timeout(Duration::from_secs(READ_WRITE_TIMEOUT))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(Self::req_err)?
-            .json::<JsonRpcResponse<R>>()
-            .await
-            .map_err(Self::req_err)
+            .multipart(form);
+        crate::abort::write(async { answer(req).await.map_err(CallFailure::into_error) }).await
     }
 
     pub(crate) async fn get_info(&self) -> Result<JsonRpcResponse<ServerInfoResponse>, Error> {
@@ -477,7 +585,7 @@ impl ProxyClient {
         recipient_pk: &str,
         signature: Option<String>,
     ) -> Result<JsonRpcResponse<bool>, Error> {
-        self.call(
+        self.write_call(
             "invoice.prepare",
             Some(PrepareInvoiceParams {
                 invoice_id: invoice_id.to_string(),
@@ -493,7 +601,7 @@ impl ProxyClient {
         &self,
         transfer_id: &str,
     ) -> Result<JsonRpcResponse<GetConsignmentResponse>, Error> {
-        self.call(
+        self.lookup_call(
             "consignment.get",
             Some(TransferIDParam {
                 transfer_id: transfer_id.to_string(),
@@ -569,7 +677,7 @@ impl ProxyClient {
         signature: &str,
         timestamp: &str,
     ) -> Result<JsonRpcResponse<HashMap<String, ProxyTransferState>>, Error> {
-        self.call(
+        self.lookup_call(
             "transfer.list",
             Some(ListTransfersParams {
                 invoice_id: invoice_id.to_string(),
@@ -585,7 +693,7 @@ impl ProxyClient {
         transfer_id: &str,
         signature: &str,
     ) -> Result<JsonRpcResponse<bool>, Error> {
-        self.call(
+        self.write_call(
             "transfer.retrieved",
             Some(TransferRetrievedParams {
                 transfer_id: transfer_id.to_string(),
@@ -642,7 +750,7 @@ impl ProxyClient {
         ack: bool,
         signature: &str,
     ) -> Result<JsonRpcResponse<PostAckResponse>, Error> {
-        self.call(
+        self.write_call(
             "ack.post",
             Some(PostAckParams {
                 transfer_id: transfer_id.to_string(),
@@ -675,7 +783,7 @@ impl ProxyClient {
         transfer_ids: &[String],
         signature: &str,
     ) -> Result<JsonRpcResponse<bool>, Error> {
-        self.call(
+        self.write_call(
             "ack.clean",
             Some(CleanAckParams {
                 transfer_ids: transfer_ids.to_vec(),
@@ -732,6 +840,115 @@ mod tests {
             Error::Proxy { .. }
         ));
         mock.assert();
+    }
+
+    fn assert_lookup_errors<T, F, Fut>(f: F)
+    where
+        T: std::fmt::Debug,
+        F: Fn(ProxyClient) -> Fut,
+        Fut: std::future::Future<Output = Result<JsonRpcResponse<T>, Error>>,
+    {
+        let call = |url: &str| block_on(f(ProxyClient::new(url).unwrap()));
+
+        // network error
+        let url = "http://127.0.0.1:1";
+        assert!(matches!(
+            call(url).unwrap_err(),
+            Error::ProxyUnreachable { endpoint, .. } if endpoint == url
+        ));
+
+        // connection accepted by the kernel, no answer
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        assert!(matches!(
+            call(&url).unwrap_err(),
+            Error::ProxyTimeout { endpoint, .. } if endpoint == url
+        ));
+
+        // headers sent, body stalls
+        let stall = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", stall.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = stall.accept().unwrap();
+            let _ = stream.read(&mut [0; 4096]);
+            let head =
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{";
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+        assert!(matches!(
+            call(&url).unwrap_err(),
+            Error::ProxyTimeout { .. }
+        ));
+
+        let mut server = mockito::Server::new();
+        let mut answer = |status: usize, body: &str| {
+            let mock = server
+                .mock("POST", "/")
+                .with_status(status)
+                .with_header("content-type", JSON)
+                .with_body(body)
+                .create();
+            let res = call(&server.url());
+            mock.assert();
+            mock.remove();
+            res
+        };
+
+        // HTTP error without a JSON-RPC answer
+        assert!(matches!(
+            answer(503, "unavailable").unwrap_err(),
+            Error::ProxyHttpError { status: 503, .. }
+        ));
+
+        // malformed and unexpected JSON
+        assert!(matches!(
+            answer(200, "not valid json").unwrap_err(),
+            Error::ProxyInvalidResponse { .. }
+        ));
+        assert!(matches!(
+            answer(200, r#"{"unexpected": "json"}"#).unwrap_err(),
+            Error::ProxyInvalidResponse { .. }
+        ));
+
+        // a JSON-RPC answer is read whatever the HTTP status
+        let res = answer(
+            500,
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-400,"message":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(res.error.unwrap().code, -400);
+    }
+
+    #[test]
+    fn lookup_answer_reads_errors() {
+        let res = |code: Option<i64>, result: Option<bool>| JsonRpcResponse {
+            jsonrpc: s!("2.0"),
+            id: None,
+            result,
+            error: code.map(|code| JsonRpcError {
+                code,
+                message: s!("msg"),
+                data: None,
+            }),
+        };
+        let read = |r| lookup_answer("url", r, &[-400]);
+        assert!(matches!(read(res(Some(-400), None)), Ok(None)));
+        assert!(matches!(
+            read(res(Some(-32603), None)),
+            Err(Error::ProxyJsonRpcError { code: -32603, .. })
+        ));
+        assert!(matches!(
+            read(res(Some(i64::from(i32::MAX) + 1), None)),
+            Err(Error::ProxyInvalidResponse { .. })
+        ));
+        assert!(matches!(read(res(None, Some(true))), Ok(Some(true))));
+        assert!(matches!(
+            read(res(None, None)),
+            Err(Error::ProxyInvalidResponse { .. })
+        ));
     }
 
     #[test]
@@ -820,7 +1037,7 @@ mod tests {
 
     #[test]
     fn list_transfers_error() {
-        assert_proxy_errors(|c| async move { c.list_transfers("123", "00", "999").await });
+        assert_lookup_errors(|c| async move { c.list_transfers("123", "00", "999").await });
     }
 
     #[test]
@@ -865,7 +1082,7 @@ mod tests {
 
     #[test]
     fn get_consignment_error() {
-        assert_proxy_errors(|c| async move { c.get_consignment("123").await });
+        assert_lookup_errors(|c| async move { c.get_consignment("123").await });
     }
 
     #[test]

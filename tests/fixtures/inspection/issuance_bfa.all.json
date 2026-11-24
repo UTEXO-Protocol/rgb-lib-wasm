@@ -1,0 +1,45 @@
+{
+  "consignment_id": "rgb:csg:6QovJ4ph-Y7PVu2x-Y9NmOxJ-LHdUe0_-Hoo4gta-dx7r42M#strong-savage-metro",
+  "version": 1,
+  "is_transfer": false,
+  "asset_id": "rgb:UZssdm5T-OMTf7W6-6M6Ro1V-z2GYTAB-18xfcg1-uKe8F74",
+  "asset_schema": "Bfa",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795085543,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": null,
+    "max_supply": null,
+    "linked_from_contract": null,
+    "bridge_location": {
+      "Evm": {
+        "chain_id": 31337,
+        "address": "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+      }
+    },
+    "reject_list": {
+      "Evm": {
+        "chain_id": 31337,
+        "address": "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+      }
+    },
+    "media": [],
+    "outputs": [
+      {
+        "txid": "b40c2f0319b763ec833f05e7671aba24ccfc3c752f5f9d452ea9c6c24a463254",
+        "vout": 0,
+        "blinding": 4930083712928007910,
+        "assignment": "MintRight",
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": []
+}

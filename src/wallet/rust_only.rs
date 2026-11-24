@@ -27,19 +27,6 @@ pub struct ColoringInfo {
 /// Map of contract ID and list of its beneficiaries
 pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>>>;
 
-/// Indexer protocol
-#[derive(Clone, Debug)]
-pub enum IndexerProtocol {
-    /// An indexer implementing the esplora protocol
-    Esplora,
-}
-
-impl fmt::Display for IndexerProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
 /// Result of consignment validation (offchain or indexer-based).
 #[cfg(feature = "esplora")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +197,8 @@ impl Wallet {
         let fascia = psbt.rgb_commit().map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
+        strip_rgb_data(psbt);
+        check_psbt_parsable(psbt)?;
 
         info!(self.logger, "Color PSBT completed");
         Ok((fascia, asset_beneficiaries))
@@ -247,12 +236,17 @@ impl Wallet {
                     }
                 };
             }
-            transfers.push(runtime.transfer(
+            #[cfg_attr(not(feature = "esplora"), allow(unused_mut))]
+            let mut transfer = runtime.transfer(
                 contract_id,
                 beneficiaries_witness,
                 beneficiaries_blinded,
                 Some(witness_txid),
-            )?);
+            )?;
+            #[cfg(feature = "esplora")]
+            self.attach_spv_proofs(&mut runtime, &mut transfer, witness_txid)
+                .await?;
+            transfers.push(transfer);
         }
         drop(runtime);
         self.flush().await?;
@@ -326,7 +320,7 @@ impl Wallet {
     pub fn get_online(&self) -> Option<Online> {
         self.online_data.as_ref().map(|od| Online {
             id: od.id,
-            indexer_url: od.indexer_url.clone(),
+            indexer_url: od.indexer_config.url().to_string(),
         })
     }
 
@@ -366,7 +360,8 @@ impl Wallet {
                     initial_supply,
                     max_supply: None,
                     known_circulating_supply: None,
-                    reject_list_url: None,
+                    bridge_location: None,
+                    reject_list: None,
                     linked_from_contract: None,
                 }
             }
@@ -391,7 +386,9 @@ impl Wallet {
                     IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
                         .total_issued_supply()
                         .into();
-                let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
+                let reject_list = contract
+                    .reject_list_url()
+                    .map(|u| RgbRejectListInfo::Url(u.to_string()));
                 LocalAssetData {
                     name,
                     precision,
@@ -401,7 +398,8 @@ impl Wallet {
                     initial_supply,
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
-                    reject_list_url,
+                    bridge_location: None,
+                    reject_list,
                     linked_from_contract: contract_link(contract.link_from())?,
                 }
             }
@@ -415,11 +413,7 @@ impl Wallet {
                 } else {
                     None
                 };
-                // the DB keeps only a reject list URL
-                let reject_list_url = match contract.reject_list() {
-                    Some(RejectListLocation::Url(url)) => Some(url.to_string()),
-                    _ => None,
-                };
+                let reject_list = contract.reject_list().map(RgbRejectListInfo::from);
                 LocalAssetData {
                     name: contract.name().to_string(),
                     precision: contract.precision().into(),
@@ -429,7 +423,8 @@ impl Wallet {
                     initial_supply: 0,
                     max_supply: None,
                     known_circulating_supply: None,
-                    reject_list_url,
+                    bridge_location: Some(contract.bridge_location().into()),
+                    reject_list,
                     linked_from_contract: contract_link(contract.link_from())?,
                 }
             }
@@ -444,6 +439,18 @@ impl Wallet {
         )?;
 
         Ok(())
+    }
+
+    /// List the media files for a given RGB asset.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn list_asset_media(&self, asset_id: String) -> Result<HashSet<Media>, Error> {
+        info!(self.logger, "Listing media for asset '{}'...", asset_id);
+        let asset = self.database.check_asset_exists(asset_id)?;
+        let medias = self.get_asset_medias(asset.media_idx)?;
+        info!(self.logger, "List asset media completed");
+        Ok(medias)
     }
 
     /// Return the consignment file path for a send transfer of an asset.
@@ -464,8 +471,8 @@ impl Wallet {
             .and_then(|a| a.consignment_bytes.get(asset_id).cloned())
     }
 
-    /// Replace the consignment bytes of a pending send, for tests. [`Wallet::send_end`] then
-    /// hashes, encrypts and posts the replaced bytes.
+    /// Set the consignment bytes of a pending send, for tests. [`Wallet::send_end`] then hashes,
+    /// encrypts and posts them.
     #[doc(hidden)]
     pub fn set_send_consignment_bytes(
         &mut self,
@@ -473,19 +480,24 @@ impl Wallet {
         asset_id: &str,
         bytes: Vec<u8>,
     ) -> Result<(), Error> {
-        let artifacts =
-            self.transfer_artifacts
-                .get_mut(txid)
-                .ok_or_else(|| Error::UnknownTransfer {
-                    txid: txid.to_string(),
-                })?;
-        let entry = artifacts
+        self.transfer_artifacts
+            .get_mut(txid)
+            .ok_or_else(|| Error::UnknownTransfer {
+                txid: txid.to_string(),
+            })?
             .consignment_bytes
-            .get_mut(asset_id)
-            .ok_or_else(|| Error::Internal {
-                details: s!("missing consignment bytes"),
-            })?;
-        *entry = bytes;
+            .insert(asset_id.to_string(), bytes);
+        Ok(())
+    }
+
+    /// Build the consignments of a pending send before its end, for tests.
+    #[cfg(feature = "esplora")]
+    #[doc(hidden)]
+    pub async fn build_send_consignments(&mut self, signed_psbt: &str) -> Result<(), Error> {
+        let psbt = Psbt::from_str(signed_psbt)?;
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let tx = psbt.extract_tx().map_err(InternalError::from)?;
+        self._build_send_consignments(&txid, &tx).await?;
         Ok(())
     }
 
@@ -712,6 +724,61 @@ mod tests {
             })
             .unwrap();
         assert!(wallet.is_batch_transfer_sent(txid).unwrap());
+    }
+
+    #[test]
+    fn list_asset_media_lists_db_media() {
+        use crate::database::memory_db::{ActiveValue, DbAssetActMod, DbMediaActMod};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        let asset_id = |b: u8| ContractId::copy_from_slice([b; 32]).unwrap().to_string();
+        assert!(matches!(
+            wallet.list_asset_media(asset_id(7)),
+            Err(Error::AssetNotFound { .. })
+        ));
+
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(asset_id(8)),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(wallet.list_asset_media(asset_id(8)).unwrap().is_empty());
+
+        let digest = hex::encode(sha256_digest(b"media"));
+        let media_idx = wallet
+            .database
+            .set_media(DbMediaActMod {
+                digest: ActiveValue::Set(digest.clone()),
+                mime: ActiveValue::Set(s!("text/plain")),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(asset_id(9)),
+                schema: ActiveValue::Set(AssetSchema::Ifa),
+                media_idx: ActiveValue::Set(Some(media_idx)),
+                ..Default::default()
+            })
+            .unwrap();
+        let media = Media {
+            file_path: wallet
+                .get_media_dir()
+                .join(&digest)
+                .to_string_lossy()
+                .into(),
+            digest,
+            mime: s!("text/plain"),
+        };
+        assert_eq!(
+            wallet.list_asset_media(asset_id(9)).unwrap(),
+            HashSet::from([media])
+        );
     }
 
     #[test]

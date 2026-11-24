@@ -39,11 +39,19 @@ pub struct WalletSnapshot {
     pub received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints keyed by recipient_id.
     pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
+    pub(crate) pending_mint_locks: HashMap<String, super::PendingMintLocks>,
+    /// Media bytes keyed by hex digest.
+    pub(crate) media: HashMap<String, Vec<u8>>,
     /// Encoded RGB store (base64).
     pub rgb_store: String,
     /// Pinned derivation index per keychain for address reuse.
     #[serde(default)]
     pub reuse_address_index: HashMap<KeychainKind, u32>,
+    /// Settings and public keys of the wallet.
+    pub(crate) manifest: super::WalletManifest,
+    /// Version that the wallet last wrote or restored, per store label.
+    pub(crate) backup_versions: HashMap<String, i64>,
 }
 
 #[wasm_bindgen]
@@ -245,6 +253,8 @@ pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BTreeSet;
+    use crate::wallet::backup_store::store_label;
     use rgbstd::containers::ConsignmentExt;
     use rgbstd::contract::IssuerWrapper;
     use schemata::NonInflatableAsset;
@@ -322,8 +332,10 @@ mod tests {
         transfer_artifact
             .consignment_bytes
             .insert("asset-id".to_owned(), vec![1, 2, 3, 4]);
-        transfer_artifact.signed_psbt = Some("signed-psbt".to_owned());
+        transfer_artifact.signed_tx = Some(vec![9]);
         transfer_artifact.fascia = Some(vec![7, 8]);
+        let pml = crate::wallet::offline::address_reuse_tests::pending_mint_locks();
+        let w = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
         let snapshot = WalletSnapshot {
             writer: 1,
             sequence: 1,
@@ -340,6 +352,7 @@ mod tests {
                     sender_pubkey: "pk".to_owned(),
                     consignment_hash: "hash".to_owned(),
                     batch: true,
+                    unsafe_txids: BTreeSet::from(["txid".to_owned()]),
                 },
             )]),
             received_signed_txs: HashMap::from([("rid".to_owned(), vec![6])]),
@@ -354,8 +367,12 @@ mod tests {
                     bridge_contract: "bridge".to_owned(),
                 },
             )]),
+            pending_mint_locks: HashMap::from([("rid".to_owned(), pml)]),
+            media: HashMap::from([("digest".to_owned(), vec![10])]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
+            manifest: super::super::WalletManifest::new(&w.wallet_data, &w.keys),
+            backup_versions: HashMap::from([(store_label("vss", &["x", "y", "z"]), 7)]),
         };
 
         // JSON round-trip (what IndexedDB does)
@@ -370,10 +387,7 @@ mod tests {
             restored_artifact.consignment_bytes.get("asset-id"),
             Some(&vec![1, 2, 3, 4])
         );
-        assert_eq!(
-            restored_artifact.signed_psbt.as_deref(),
-            Some("signed-psbt")
-        );
+        assert_eq!(restored_artifact.signed_tx, Some(vec![9]));
         assert_eq!(restored_artifact.fascia, Some(vec![7, 8]));
 
         assert_eq!(
@@ -388,7 +402,17 @@ mod tests {
             restored_snapshot.received_signed_txs,
             snapshot.received_signed_txs
         );
+        assert_eq!(restored_snapshot.backup_versions, snapshot.backup_versions);
         assert_eq!(restored_snapshot.received_mints, snapshot.received_mints);
+        assert_eq!(
+            restored_snapshot.pending_mint_locks,
+            snapshot.pending_mint_locks
+        );
+        assert_eq!(restored_snapshot.media, snapshot.media);
+        assert_eq!(
+            serde_json::to_string(&restored_snapshot.manifest).unwrap(),
+            serde_json::to_string(&snapshot.manifest).unwrap()
+        );
 
         let restored = deserialize_stock(&restored_snapshot.rgb_store).expect("deserialize stock");
 

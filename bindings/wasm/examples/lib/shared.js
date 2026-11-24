@@ -280,30 +280,44 @@ export function enableBtns(ids) {
 // ---------------------------------------------------------------------------
 
 /**
- * Build a WalletData-compatible object from generated keys and fill the
- * #wallet-data textarea if present.
- * @param {Object} keys    - result of generateKeys / restoreKeys
+ * Build a WalletData-compatible object and fill the #wallet-data textarea
+ * if present.
  * @param {string} network - e.g. "regtest"
  * @returns {Object} walletData
  */
-export function fillWalletData(keys, network) {
+export function fillWalletData(network) {
   const netCapitalized = network.charAt(0).toUpperCase() + network.slice(1);
   const wd = {
     dataDir: ':memory:',
     bitcoinNetwork: netCapitalized,
     databaseType: 'Sqlite',
     maxAllocationsPerUtxo: 5,
-    accountXpubVanilla: keys.accountXpubVanilla,
-    accountXpubColored: keys.accountXpubColored,
-    mnemonic: keys.mnemonic,
-    masterFingerprint: keys.masterFingerprint,
-    vanillaKeychain: null,
     supportedSchemas: ['Nia', 'Ifa'],
     reuseAddresses: false,
   };
   const el = document.getElementById('wallet-data');
   if (el) el.value = json(wd);
   return wd;
+}
+
+/**
+ * Build a SinglesigKeys-compatible object from generated keys and fill the
+ * #wallet-keys textarea if present.
+ * @param {Object} keys - result of generateKeys / restoreKeys
+ * @returns {Object} singlesigKeys
+ */
+export function fillWalletKeys(keys) {
+  const sk = {
+    accountXpubVanilla: keys.accountXpubVanilla,
+    accountXpubColored: keys.accountXpubColored,
+    masterFingerprint: keys.masterFingerprint,
+    witnessVersion: keys.witnessVersion,
+    mnemonic: keys.mnemonic,
+    vanillaKeychain: null,
+  };
+  const el = document.getElementById('wallet-keys');
+  if (el) el.value = json(sk);
+  return sk;
 }
 
 // ---------------------------------------------------------------------------

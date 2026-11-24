@@ -1,6 +1,6 @@
 # rgb-lib-wasm
 
-A WebAssembly port of [rgb-lib](https://github.com/UTEXO-Protocol/rgb-lib) for managing RGB protocol wallets in the browser.
+A WebAssembly port of [rgb-lib](https://github.com/RGB-Tools/rgb-lib) for managing RGB protocol wallets in the browser.
 
 > **Beta Software** — This library is under active development and has not been audited.
 > APIs may change without notice between versions. Use at your own risk.
@@ -20,7 +20,7 @@ Supported asset types:
 
 ## Prerequisites
 
-- Rust 1.88.0+ with the `wasm32-unknown-unknown` target
+- Rust 1.94.0+ with the `wasm32-unknown-unknown` target
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/) 0.14+
 
 ```bash
@@ -61,8 +61,8 @@ All pages share `examples/lib/shared.js` (WASM init, helpers, regtest utilities)
 
 ```javascript
 import init, {
-  generateKeys, restoreKeys, checkProxyUrl,
-  validateConsignmentOffchain,
+  generateKeys, restoreKeys, checkProxyUrl, checkIndexerUrl, maxExpirationSecs,
+  validateConsignmentOffchain, inspectConsignment, inspectFascia, fillSpvProofs,
   WasmWallet, WasmInvoice,
 } from './pkg/rgb_lib_wasm.js';
 
@@ -72,10 +72,10 @@ await init();
 ### Key generation
 
 ```javascript
-const keys = generateKeys('Regtest');
-// keys: { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint }
+const keys = generateKeys('Regtest', 'Taproot');
+// keys: { mnemonic, accountXpubVanilla, accountXpubColored, masterFingerprint, witnessVersion }
 
-const restored = restoreKeys('Regtest', keys.mnemonic);
+const restored = restoreKeys('Regtest', keys.mnemonic, 'Taproot');
 ```
 
 ### Creating a wallet
@@ -86,20 +86,28 @@ const walletData = {
   bitcoinNetwork: 'Regtest',
   databaseType: 'Sqlite',
   maxAllocationsPerUtxo: 5,
+  supportedSchemas: ['Nia', 'Ifa'],
+  allowRecklessSchemas: false,
+};
+const walletKeys = {
   accountXpubVanilla: keys.accountXpubVanilla,
   accountXpubColored: keys.accountXpubColored,
-  mnemonic: keys.mnemonic,
   masterFingerprint: keys.masterFingerprint,
+  witnessVersion: keys.witnessVersion,
+  mnemonic: keys.mnemonic,
   vanillaKeychain: null,
-  supportedSchemas: ['Nia', 'Ifa'],
 };
 
 // create() restores state from IndexedDB if available
-const wallet = await WasmWallet.create(JSON.stringify(walletData));
+const wallet = await WasmWallet.create(JSON.stringify(walletData), JSON.stringify(walletKeys));
 
 // Await durable IndexedDB commit before persisting dependent application state.
 await wallet.flush();
 ```
+
+On `Mainnet`, a wallet that supports `Ifa` or `Bfa` fails with `Cannot use <schema> schema on mainnet`.
+Set `allowRecklessSchemas: true` to allow it. The wallet then logs a warning.
+The field is optional and defaults to `false`. Other networks allow every schema.
 
 ### Persistence ordering
 
@@ -113,13 +121,21 @@ acknowledge accepted RGB funding, or broadcast a transaction that depends on an
 RGB mutation only after the flush succeeds. A failed flush leaves the current
 in-memory wallet state intact and can be retried. A flush that writes nothing
 fails. A wallet saves over a stored snapshot only if it loaded that snapshot
-through `create()` or `Wallet::restore()`, or wrote it itself. A wallet built with
+through `create()`, `Wallet::restore()` or `Wallet::load()`, or wrote it itself. A wallet built with
 `new` on a data directory that holds a snapshot cannot save: its saves fail and
 its calls return a persistence error.
 
+Every save and backup stores the wallet settings and public keys, without the
+mnemonic. `create`, `restore`, `restoreBackup` and `vssRestoreBackup` refuse a
+changed vanilla keychain or account xpub with `WalletSettingMismatch`, and
+`restoreBackup` also refuses a changed fingerprint with it.
+`restoreBackup` and `vssRestoreBackup` refuse a backup of another network with
+`BackupNetworkMismatch`, which names both networks.
+Other settings changed in `create` are stored with the next save.
+
 Every call that changes the wallet saves it. Saves are written in order, and
 none is dropped. An async call returns after its save commits, and returns a
-persistence error if the save fails. `sync`, `full_scan`, `refresh`,
+persistence error if the save fails. `sync`, the listing calls that sync, `refresh`,
 `fail_transfers` and the begins that sync first also save when they keep a
 change and then fail. `backup` and `vss_backup` save the backup time. A sync call
 (`issue_asset_*`, `get_address`, `rotate_address`, `delete_transfers`,
@@ -136,8 +152,9 @@ await this durable commit before returning success.
 ### Going online
 
 ```javascript
-const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, proxyAuthKeys: {} });
-await wallet.sync(online);
+const online = await wallet.goOnline({ indexerConfig: { Esplora: { url: 'http://localhost:8094/regtest/api' } }, skipConsistencyCheck: true, failedWitnessReceiveGraceSecs: 604800, proxyAuthKeys: {}, vanillaSyncLookback: 20 });
+await wallet.sync(online, { keychain: 'Colored', strategy: 'FastSync' });
+await wallet.sync(online, { keychain: { Vanilla: { lookback: 20 } }, strategy: 'FastSync' });
 ```
 
 ### Creating UTXOs
@@ -145,10 +162,12 @@ await wallet.sync(online);
 RGB allocations live on UTXOs. Before issuing or receiving assets you need colored UTXOs:
 
 ```javascript
-const unsignedPsbt = await wallet.createUtxosBegin(online, true, 5, 1000, 1n, false);
+const unsignedPsbt = await wallet.createUtxosBegin(online, true, false, 5, 1000, 1n, false, false);
 const signedPsbt = wallet.signPsbt(unsignedPsbt);
-const count = await wallet.createUtxosEnd(online, signedPsbt, false);
+const count = await wallet.createUtxosEnd(online, signedPsbt);
 ```
+
+With `exact` false, the wallet creates as many UTXOs as its funds allow and returns the count. With `exact` true, the wallet creates exactly the requested number of UTXOs of `size` sats. The funds must pay for all of them and the fee. If they do not, the call fails with `Insufficient bitcoin funds: needed '<sats>', available '<sats>'` before it signs anything. `needed` includes the fee. If no vanilla UTXO is free, `needed` is the amount one vanilla UTXO must hold. `available` is the sats of the vanilla UTXOs that no other operation reserves. A failed call reserves no input and records no pending operation. With `upTo`, the requested number is `num` less the UTXOs that can already take an allocation. If none are missing, the call fails with `Allocations already available` in both modes. With `dryRun`, `createUtxosBegin` checks an exact request in the same way.
 
 ### Issuing assets
 
@@ -157,12 +176,12 @@ const count = await wallet.createUtxosEnd(online, signedPsbt, false);
 const nia = wallet.issueAssetNia('TICK', 'My Token', 0, [1000]);
 
 // IFA (inflatable supply)
-const ifa = wallet.issueAssetIfa('IFAT', 'Inflatable', 0, [1000], [500], undefined, false, null);
+const ifa = wallet.issueAssetIfa('IFAT', 'Inflatable', 0, [1000], [500], undefined, false, null, false);
 ```
 
 ### Sending RGB assets
 
-All send operations follow a three-step PSBT workflow: **begin** (build unsigned PSBT) → **sign** → **end** (broadcast).
+`send`, `sendBtc`, `inflate`, `createUtxos` and `drainTo` sign with the wallet keys in one call. For a separate signer, use the three-step PSBT workflow: **begin** (build unsigned PSBT) → **sign** → **end** (broadcast).
 
 ```javascript
 const recipientMap = {
@@ -182,16 +201,16 @@ const senderEndpoint = 'rpc://localhost:3000/json-rpc';
 const begin = await wallet.sendBegin(online, recipientMap, false, 1n, 1, Math.floor(Date.now() / 1000) + 3600, senderEndpoint, null, false);
 // begin: { psbt, batchTransferIdx, details }; dryRun = true saves nothing and gives batchTransferIdx null
 const signed = wallet.signPsbt(begin.psbt);
-const result = await wallet.sendEnd(online, signed, false);
+const result = await wallet.sendEnd(online, signed);
 // result: { txid, batchTransferIdx }
 ```
 
 ### Sending BTC
 
 ```javascript
-const psbt = await wallet.sendBtcBegin(online, address, 50000n, 1n, false);
+const psbt = await wallet.sendBtcBegin(online, address, 50000n, 1n, false, false);
 const signed = wallet.signPsbt(psbt);
-const txid = await wallet.sendBtcEnd(online, signed, false);
+const txid = await wallet.sendBtcEnd(online, signed);
 ```
 
 ### Receiving assets
@@ -220,14 +239,14 @@ const str = invoice.invoiceString(); // original string
 ### Querying wallet state
 
 ```javascript
-const btcBalance = wallet.getBtcBalance();
+const btcBalance = await wallet.getBtcBalance(online, false);
 const assetBalance = wallet.getAssetBalance(assetId);
 const metadata = wallet.getAssetMetadata(assetId);
 // metadata: { assetSchema, name, ticker, precision, initialSupply, maxSupply, knownCirculatingSupply, timestamp, ... }
 const assets = wallet.listAssets([]);              // all schemas
-const transfers = wallet.listTransfers(null);       // all assets
-const unspents = wallet.listUnspents(false);
-const transactions = wallet.listTransactions();
+const transfers = wallet.listTransfers("AnyOrNone", "All"); // all transfers
+const unspents = await wallet.listUnspents(online, false, false);
+const transactions = await wallet.listTransactions(online, false);
 const address = wallet.getAddress();
 ```
 
@@ -240,7 +259,7 @@ const feeRate = await wallet.getFeeEstimation(online, 6); // target 6 blocks
 ### Draining the wallet
 
 ```javascript
-const psbt = await wallet.drainToBegin(online, destinationAddress, true, 1n);
+const psbt = await wallet.drainToBegin(online, destinationAddress, 1n, false);
 const signed = wallet.signPsbt(psbt);
 const txid = await wallet.drainToEnd(online, signed);
 ```
@@ -248,7 +267,7 @@ const txid = await wallet.drainToEnd(online, signed);
 ### Inflating an IFA asset
 
 ```javascript
-const psbt = await wallet.inflateBegin(online, assetId, [200], 1n, 1);
+const { psbt } = await wallet.inflateBegin(online, assetId, [200], 1n, 1, false);
 const signed = wallet.signPsbt(psbt);
 const result = await wallet.inflateEnd(online, signed);
 ```
@@ -260,8 +279,10 @@ const result = await wallet.inflateEnd(online, signed);
 const result = await wallet.burn(online, assetId, 50n, reason, 1n, 1);
 ```
 
-`sendEnd`, `inflateEnd`, `burn`, `burnEnd` and `mintEnd` return `{ txid, batchTransferIdx, entropy }`,
+`send`, `sendEnd`, `inflate`, `inflateEnd`, `burn`, `burnEnd` and `mintEnd` return `{ txid, batchTransferIdx, entropy }`,
 where `entropy` is the MPC entropy of the commitment.
+`inflateBegin` returns `{ psbt, batchTransferIdx, details: { fascia, minConfirmations, entropy } }`;
+`batchTransferIdx` is null when `dryRun` is true.
 
 ### Local encrypted backup
 
@@ -307,6 +328,30 @@ await wallet.vssRestoreBackup();
 wallet.disableVssBackup();
 ```
 
+#### Own backup store
+
+An app can keep the backup in its own store instead of VSS. The store is a plain object with four
+methods, each of which may return a promise:
+
+```js
+wallet.configureBackupStore(store, 'my-store', encryptionKeyHex);
+await wallet.vssBackup();
+```
+
+- `read(namespace, key)` returns `{ value, version }`, or `null` when the key is absent.
+- `write(namespace, key, value, expectedVersion?)` returns the new version: greater than
+  `expectedVersion`, or 1 or more for a create. Without
+  `expectedVersion` it creates the key. It throws an error with `code: 'CONFLICT'` when the key
+  exists, or when the stored version is not `expectedVersion`.
+- `remove(namespace, key, version?)` removes the key, only at `version` when it is set.
+- `list(namespace)` returns the keys of the namespace.
+
+The store receives only encrypted data. It must honour expected versions: the library relies on
+them to never overwrite a newer backup. On a conflict, call
+`vssRestoreBackup()` to take the stored backup; the library never overwrites it.
+The backup of each wallet is at key `wallet/<fingerprint>/<network>` of namespace `backup`, so
+one store keeps one backup per network.
+
 ### Transfer management
 
 ```javascript
@@ -315,17 +360,45 @@ const failed = await wallet.failTransfers(online, null, false, false);
 const deleted = wallet.deleteTransfers(null, false);
 ```
 
+`refresh` returns a `Map` from batch transfer index to `{ updatedStatus, failure }`. A pending receive whose proxies answered with no transfer has no `failure`. When a proxy lookup fails and no other proxy has the transfer, `failure` names the kind: `ProxyUnreachable`, `ProxyTimeout`, `ProxyHttpError` (with a number `status`), `ProxyJsonRpcError` (with a number `code`) or `ProxyInvalidResponse`. Each kind has the proxy `endpoint`, and all except `ProxyHttpError` have `details`. For example: `{ ProxyTimeout: { endpoint, details } }`. The receive stays pending with its keys, and the next `refresh` tries again. A consignment that is not valid is refused, and its transfer becomes `Failed`.
+
+### Stopping a call
+
+```javascript
+const controller = new AbortController();
+await wallet.sync(online, { keychain: 'Colored', strategy: 'FullScan' }, controller.signal);
+await wallet.refresh(online, null, [], false, AbortSignal.timeout(30000));
+```
+
+- `goOnline`, `sync`, `refresh` and the `*Begin` calls take an `AbortSignal` as their last argument. When it fires, the call stops its requests.
+- The promise rejects with `"Aborted"` after the wallet is restored. The wallet can make the call again.
+- A `refresh` that already broadcast a TX or wrote to a proxy keeps that change, as a failure at that point does.
+
 ### Utilities
 
 ```javascript
 // Validate an RGB proxy server
 await checkProxyUrl('http://localhost:3000/json-rpc');
 
+// Validate an esplora indexer for the network, return its protocol ('Esplora')
+const protocol = await checkIndexerUrl('http://localhost:8094/regtest/api', 'Regtest');
+
 // Validate an RGB consignment offchain (before TX is broadcast)
 // consignmentBytes is a Uint8Array of the strict-encoded consignment
 const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
 // result: { valid: true, warnings: [...] }
 // result: { valid: false, error: "invalid", details: "..." }
+
+// Inspect an RGB consignment without a wallet
+// the filter is 'All', 'Terminals' or { Witness: txid }
+const inspection = inspectConsignment(consignmentBytes, 'Terminals');
+
+// Inspect the PSBT and fascia of a *Begin result without a wallet (entropy is optional)
+const fasciaInspection = inspectFascia(begin.psbt, new Uint8Array(begin.details.fascia), begin.details.entropy, 'Regtest');
+
+// Fill in the SPV proofs a transfer consignment misses, from an esplora indexer
+// consignment is null when no proof was set
+const { withoutProof, rewritten, consignment } = await fillSpvProofs(consignmentBytes, 'http://localhost:8094/regtest/api');
 
 // PSBT signing and finalization (standalone)
 const signed = wallet.signPsbt(unsignedPsbtBase64);
@@ -334,13 +407,13 @@ const finalized = wallet.finalizePsbt(signedPsbtBase64);
 
 ## Security
 
-The wallet trusts every script on its page. A script in the same page can call every wallet method, read the wasm memory, which holds the mnemonic while the wallet exists, and read the IndexedDB snapshot, which holds the wallet database without the mnemonic. `getWalletData` and `Debug` output do not show the mnemonic. This stops accidental leaks, not a hostile script.
+The wallet trusts every script on its page. A script in the same page can call every wallet method, read the wasm memory, which holds the mnemonic while the wallet exists, and read the IndexedDB snapshot, which holds the wallet database without the mnemonic. `getWalletData`, `getKeys` and `Debug` output do not show the mnemonic. `getDescriptors` of a signing wallet returns the account private keys. This stops accidental leaks, not a hostile script.
 
 To protect a wallet:
 
 - Load no third-party scripts on the wallet's origin. Set a strict Content Security Policy and use Subresource Integrity on the scripts you load.
 - Run the wallet on its own origin, for example in an iframe on a dedicated subdomain, and talk to it with `postMessage`. Scripts on the main page then cannot reach its memory or its storage.
-- To keep the mnemonic out of the page, create the wallet with `mnemonic: null` (watch-only). Sign the PSBT of each `*Begin` call elsewhere, for example on a hardware wallet, and pass the signed PSBT to the matching `*End` call.
+- To keep the mnemonic out of the page, create the wallet with keys whose `mnemonic` is null (watch-only). Sign the PSBT of each `*Begin` call elsewhere, for example on a hardware wallet, and pass the signed PSBT to the matching `*End` call.
 
 ## API reference
 
@@ -348,10 +421,15 @@ To protect a wallet:
 
 | Function | Description |
 |----------|-------------|
-| `generateKeys(network)` | Generate a new BIP39 mnemonic and derive xpubs |
-| `restoreKeys(network, mnemonic)` | Restore xpubs from a mnemonic |
+| `generateKeys(network, witnessVersion)` | Generate a new BIP39 mnemonic and derive xpubs; `witnessVersion` is `'Taproot'` (BIP86, P2TR) or `'SegWitV0'` (BIP84, P2WPKH) |
+| `maxExpirationSecs()` | Maximum seconds in the future an expiration can be |
+| `restoreKeys(network, mnemonic, witnessVersion)` | Restore xpubs from a mnemonic |
 | `checkProxyUrl(url)` | Validate an RGB proxy server URL |
+| `checkIndexerUrl(url, network)` | Validate an indexer URL for the network and return its protocol ('Esplora') |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
+| `inspectConsignment(bytes, bundleFilter)` | Inspect an RGB consignment without a wallet |
+| `inspectFascia(psbt, fascia, entropy?, network)` | Check that a PSBT commits to the fascia of its RGB operation and inspect the operation, without a wallet |
+| `fillSpvProofs(bytes, indexerUrl)` | Fill in the SPV proofs a transfer consignment misses, from an esplora indexer |
 
 ### `WasmInvoice`
 
@@ -365,58 +443,72 @@ To protect a wallet:
 
 | Method | Async | Description |
 |--------|-------|-------------|
-| `new(walletDataJson)` | no | Create wallet (no IndexedDB restore) |
-| `create(walletDataJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
+| `new(walletDataJson, keysJson)` | no | Create wallet (no IndexedDB restore) |
+| `create(walletDataJson, keysJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
+| `load(dataDir, network, masterFingerprint, mnemonic?)` | yes | Load a saved wallet with its saved settings; `mnemonic` null loads it watch-only |
 | `flush()` | yes | Durably commit current wallet state to IndexedDB |
-| `getWalletData()` | no | Return WalletData as JS object; the mnemonic is not returned (`mnemonic` is null) |
+| `getWalletData()` | no | Return WalletData as JS object |
+| `getKeys()` | no | Return SinglesigKeys; `mnemonic` is null |
+| `getDescriptors()` | no | Return `{colored, vanilla}`; a signing wallet's descriptors hold its account private keys |
 | `getAddress()` | no | Get a new Bitcoin address |
-| `getBtcBalance()` | no | Get BTC balance |
+| `getBtcBalance(online?, skipSync)` | yes | Get BTC balance, after a sync unless `skipSync` |
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
 | `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
+| `listAssetMedia(assetId)` | no | List the media of an RGB asset |
 | `listAssets(schemas)` | no | List known RGB assets |
-| `listTransfers(assetId?)` | no | List RGB transfers |
-| `listUnspents(settledOnly)` | no | List unspent outputs with RGB allocations |
-| `listTransactions()` | no | List Bitcoin transactions, and begun vanilla operations with `pending: true` |
+| `listTransfers(assetFilter, scope)` | no | List RGB transfers by asset filter and scope |
+| `listUnspents(online?, settledOnly, skipSync)` | yes | List unspent outputs with RGB allocations, after a sync unless `skipSync` |
+| `listTransactions(online?, skipSync)` | yes | List Bitcoin transactions, and begun vanilla operations with `pending: true`, after a sync unless `skipSync` |
 | `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
-| `abortPendingVanillaTx(txid)` | no | Fail a begun vanilla operation and release its inputs |
-| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. |
-| `sync(online)` | yes | Sync wallet with indexer |
-| `createUtxosBegin(...)` | yes | Prepare PSBT to create colored UTXOs |
-| `createUtxosEnd(online, psbt, skipSync)` | yes | Broadcast UTXO creation PSBT |
+| `abortPendingVanillaTx(txid)` | no | Abort a begun vanilla operation: delete it and release its inputs |
+| `goOnline(onlineOptions, signal?)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. `vanillaSyncLookback` is how many vanilla addresses before the last used one a `FastSync` checks. |
+| `sync(online, {keychain, strategy}, signal?)` | yes | Sync one keychain (`"Colored"` or `{Vanilla: {lookback}}`) with the indexer, by `"FullScan"`, `"FullSync"` or `"FastSync"` |
+| `createUtxos(online, upTo, exact, num?, size?, feeRate, skipSync)` | yes | Create colored UTXOs, signing with the wallet keys |
+| `createUtxosBegin(online, upTo, exact, num?, size?, feeRate, skipSync, dryRun, signal?)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
+| `createUtxosEnd(online, psbt)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
-| `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight` |
-| `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight` |
+| `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
+| `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
 | `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
 | `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
-| `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
-| `sendEnd(online, psbt, skipSync)` | yes | Broadcast RGB send PSBT |
-| `sendBtcBegin(...)` | yes | Prepare BTC send PSBT |
-| `sendBtcEnd(online, psbt, skipSync)` | yes | Broadcast BTC send PSBT |
+| `send(online, recipientMap, donation, feeRate, minConf, expiration, senderEndpoint?)` | yes | Send RGB assets, signing with the wallet keys |
+| `sendBegin(..., signal?)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
+| `sendEnd(online, psbt)` | yes | Broadcast RGB send PSBT |
+| `sendBtc(online, addr, amount, feeRate, skipSync)` | yes | Send BTC, signing with the wallet keys |
+| `sendBtcBegin(..., signal?)` | yes | Prepare BTC send PSBT, reserve its inputs unless dryRun |
+| `sendBtcEnd(online, psbt)` | yes | Broadcast BTC send PSBT |
 | `getFeeEstimation(online, blocks)` | yes | Estimate fee rate for target blocks |
-| `drainToBegin(online, addr, destroyAssets, feeRate)` | yes | Prepare drain PSBT |
+| `drainTo(online, addr, feeRate)` | yes | Drain all wallet funds, signing with the wallet keys |
+| `drainToBegin(online, addr, feeRate, dryRun, signal?)` | yes | Prepare drain PSBT, reserve its inputs unless dryRun |
 | `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
-| `inflateBegin(...)` | yes | Prepare IFA inflation PSBT |
+| `inflate(online, assetId, amounts, feeRate, minConf)` | yes | Inflate an IFA asset, signing with the wallet keys |
+| `inflateBegin(online, assetId, amounts, feeRate, minConf, dryRun, signal?)` | yes | Prepare IFA inflation PSBT, save it as Initiated unless dryRun |
 | `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
-| `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
+| `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun, signal?)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
-| `link(online, assetId, linkedToContract, feeRate, minConf)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
-| `linkBegin(online, assetId, linkedToContract, feeRate, minConf, dryRun)` | yes | Prepare link PSBT |
+| `getBurnConsignment(assetId, txid)` | no | Return the consignment of an ended burn (bytes), which proves it with its history |
+| `link(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
+| `linkBegin(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks, dryRun, signal?)` | yes | Prepare link PSBT |
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
-| `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
+| `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint, signal?)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
 | `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
-| `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers and settle ended vanilla operations |
+| `refresh(online, assetId?, filter, skipSync, signal?)` | yes | Refresh pending transfers and settle ended vanilla operations |
+| `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
 | `deleteTransfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
-| `signPsbt(psbt)` | no | Sign a PSBT |
+| `signPsbt(psbt, signOptions?)` | no | Sign a PSBT. `signOptions` (`SignOptions`) takes `trustWitnessUtxo`, `assumeHeight`, `allowAllSighashes`, `tryFinalize`, `signWithTapInternalKey`, `allowGrinding`; an omitted field takes the BDK default |
 | `finalizePsbt(psbt)` | no | Finalize a signed PSBT |
+| `inspectPsbt(psbt)` | no | Inspect a PSBT: inputs, outputs, totals, fee, signature count and size, with the wallet's own ones marked. In JS, the amounts, totals, fee and size are BigInt |
+| `inspectFascia(psbt, fascia, entropy?)` | no | Check that a PSBT commits to the fascia this wallet built and inspect the operation, with spent allocations and the wallet's outputs. `entropy` is a BigInt |
 | `backup(password)` | no | Create encrypted backup (returns bytes) |
 | `restoreBackup(bytes, password)` | no | Restore from encrypted backup |
 | `backupInfo()` | no | Check if backup is needed |
 | `configureVssBackup(url, storeId, keyHex)` | no | Configure VSS cloud backup |
-| `disableVssBackup()` | no | Disable VSS cloud backup |
+| `configureBackupStore(store, storeId, keyHex)` | no | Configure an own backup store |
+| `disableVssBackup()` | no | Disable the backup store |
 | `vssBackup()` | yes | Upload backup to VSS server |
 | `ensureInitialBackup()` | yes | Upload a VSS backup if the wallet has changes |
 | `vssRestoreBackup()` | yes | Restore from VSS server |
@@ -433,7 +525,7 @@ To protect a wallet:
 ## Running tests
 
 ```bash
-# Native unit tests (94 tests)
+# Native unit tests (281 tests)
 cargo test --lib
 
 # WASM unit tests (headless Firefox)

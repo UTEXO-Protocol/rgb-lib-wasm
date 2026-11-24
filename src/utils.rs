@@ -11,7 +11,6 @@ const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem] = time::
 pub(crate) const RGB_RUNTIME_DIR: &str = "rgb";
 pub(crate) const LOG_FILE: &str = "log";
 
-pub(crate) const PURPOSE: u8 = 86;
 pub(crate) const COIN_RGB_MAINNET: u32 = 827166;
 pub(crate) const COIN_RGB_TESTNET: u32 = 827167;
 pub(crate) const ACCOUNT: u8 = 0;
@@ -27,15 +26,82 @@ pub(crate) const INDEXER_RETRIES: u8 = 3;
 #[cfg(feature = "esplora")]
 pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 
+/// Read a response body up to one byte past `limit`, so a caller can refuse a longer body.
+pub(crate) async fn read_body_limited(
+    body: Option<web_sys::ReadableStream>,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+    let mut buf = vec![];
+    let Some(stream) = body else {
+        return Ok(buf);
+    };
+    let reader: web_sys::ReadableStreamDefaultReader = stream.get_reader().unchecked_into();
+    let js_err = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    while buf.len() as u64 <= limit {
+        let chunk = wasm_bindgen_futures::JsFuture::from(reader.read())
+            .await
+            .map_err(js_err)?;
+        if js_sys::Reflect::get(&chunk, &"done".into())
+            .map_err(js_err)?
+            .is_truthy()
+        {
+            break;
+        }
+        let value = js_sys::Uint8Array::new(
+            &js_sys::Reflect::get(&chunk, &"value".into()).map_err(js_err)?,
+        );
+        let room = limit + 1 - buf.len() as u64;
+        let take = u64::from(value.length()).min(room) as u32;
+        buf.extend(value.subarray(0, take).to_vec());
+    }
+    let _ = reader.cancel();
+    Ok(buf)
+}
+
+// test probe: count the transition builders loaded from the stock
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TRANSITION_BUILDERS_LOADED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // test probe: count the indexer syncs
+    pub(crate) static INDEXER_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(feature = "esplora")]
 #[derive(Clone)]
 pub(crate) struct WasmSleeper;
 
 #[cfg(feature = "esplora")]
 impl esplora_client::Sleeper for WasmSleeper {
+    // A Send future: bdk_esplora needs it.
+    #[cfg(target_arch = "wasm32")]
+    type Sleep = tokio::sync::futures::OwnedNotified;
+    #[cfg(not(target_arch = "wasm32"))]
     type Sleep = core::future::Ready<()>;
 
-    fn sleep(_duration: std::time::Duration) -> Self::Sleep {
+    #[cfg(target_arch = "wasm32")]
+    fn sleep(duration: std::time::Duration) -> Self::Sleep {
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fired = notify.clone();
+        let callback = wasm_bindgen::closure::Closure::once_into_js(move || fired.notify_one());
+        // setTimeout of the global scope, so that it also works in a worker
+        let set_timeout: js_sys::Function =
+            js_sys::Reflect::get(&js_sys::global(), &"setTimeout".into())
+                .expect("setTimeout")
+                .into();
+        set_timeout
+            .call2(
+                &wasm_bindgen::JsValue::NULL,
+                &callback,
+                &(duration.as_millis() as f64).into(),
+            )
+            .expect("setTimeout call");
+        notify.notified_owned()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sleep(duration: std::time::Duration) -> Self::Sleep {
+        std::thread::sleep(duration);
         core::future::ready(())
     }
 }
@@ -243,9 +309,12 @@ pub(crate) fn get_coin_type(bitcoin_network: &BitcoinNetwork, rgb: bool) -> u32 
     }
 }
 
-pub(crate) fn get_account_derivation_children(coin_type: u32) -> Vec<ChildNumber> {
+pub(crate) fn get_account_derivation_children(
+    witness_version: WitnessVersion,
+    coin_type: u32,
+) -> Vec<ChildNumber> {
     vec![
-        ChildNumber::from_hardened_idx(PURPOSE as u32).unwrap(),
+        ChildNumber::from_hardened_idx(witness_version.purpose()).unwrap(),
         ChildNumber::from_hardened_idx(coin_type).unwrap(),
         ChildNumber::from_hardened_idx(ACCOUNT as u32).unwrap(),
     ]
@@ -255,9 +324,10 @@ fn derive_account_xprv_from_mnemonic(
     bitcoin_network: BitcoinNetwork,
     mnemonic: &str,
     rgb: bool,
+    witness_version: WitnessVersion,
 ) -> Result<(Xpriv, Fingerprint), Error> {
     let coin_type = get_coin_type(&bitcoin_network, rgb);
-    let account_derivation_children = get_account_derivation_children(coin_type);
+    let account_derivation_children = get_account_derivation_children(witness_version, coin_type);
     let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.to_string())?;
     let master_xprv = Xpriv::new_master(bitcoin_network, &mnemonic.to_seed("")).unwrap();
     let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
@@ -270,15 +340,16 @@ fn get_xpub_from_xprv(xprv: &Xpriv) -> Xpub {
     Xpub::from_priv(&Secp256k1::new(), xprv)
 }
 
-/// Get the account-level xPriv and xPub for the given mnemonic and Bitcoin network based on the
-/// requested wallet side (colored or vanilla)
+/// Get the account-level xPriv and xPub for the given mnemonic, Bitcoin network and witness
+/// version, based on the requested wallet side (colored or vanilla).
 pub fn get_account_data(
     bitcoin_network: BitcoinNetwork,
     mnemonic: &str,
     rgb: bool,
+    witness_version: WitnessVersion,
 ) -> Result<(Xpriv, Xpub, Fingerprint), Error> {
     let (account_xprv, master_fingerprint) =
-        derive_account_xprv_from_mnemonic(bitcoin_network, mnemonic, rgb)?;
+        derive_account_xprv_from_mnemonic(bitcoin_network, mnemonic, rgb, witness_version)?;
     let account_xpub = get_xpub_from_xprv(&account_xprv);
     Ok((account_xprv, account_xpub, master_fingerprint))
 }
@@ -286,9 +357,12 @@ pub fn get_account_data(
 pub(crate) fn get_account_xpubs(
     bitcoin_network: BitcoinNetwork,
     mnemonic: &str,
+    witness_version: WitnessVersion,
 ) -> Result<(Xpub, Xpub), Error> {
-    let (_, account_xpub_vanilla, _) = get_account_data(bitcoin_network, mnemonic, false)?;
-    let (_, account_xpub_colored, _) = get_account_data(bitcoin_network, mnemonic, true)?;
+    let (_, account_xpub_vanilla, _) =
+        get_account_data(bitcoin_network, mnemonic, false, witness_version)?;
+    let (_, account_xpub_colored, _) =
+        get_account_data(bitcoin_network, mnemonic, true, witness_version)?;
     Ok((account_xpub_vanilla, account_xpub_colored))
 }
 
@@ -298,14 +372,21 @@ fn derive_descriptor(
     rgb: bool,
     keychain: u8,
     expected_xpub: Xpub,
+    witness_version: WitnessVersion,
 ) -> Result<String, Error> {
     let (account_xprv, account_xpub, master_fingerprint) =
-        get_account_data(bitcoin_network, mnemonic, rgb)?;
+        get_account_data(bitcoin_network, mnemonic, rgb, witness_version)?;
     if account_xpub != expected_xpub {
         return Err(Error::InvalidBitcoinKeys);
     }
     let coin_type = get_coin_type(&bitcoin_network, rgb);
-    calculate_descriptor_from_xprv(&master_fingerprint, coin_type, account_xprv, keychain)
+    calculate_descriptor_from_xprv(
+        &master_fingerprint,
+        coin_type,
+        account_xprv,
+        keychain,
+        witness_version,
+    )
 }
 
 pub(crate) fn get_descriptors(
@@ -314,6 +395,7 @@ pub(crate) fn get_descriptors(
     vanilla_keychain: Option<u8>,
     expected_xpub_btc: Xpub,
     expected_xpub_rgb: Xpub,
+    witness_version: WitnessVersion,
 ) -> Result<(String, String), Error> {
     let descriptor_colored = derive_descriptor(
         bitcoin_network,
@@ -321,6 +403,7 @@ pub(crate) fn get_descriptors(
         true,
         KEYCHAIN_RGB,
         expected_xpub_rgb,
+        witness_version,
     )?;
     let descriptor_vanilla = derive_descriptor(
         bitcoin_network,
@@ -328,6 +411,7 @@ pub(crate) fn get_descriptors(
         false,
         vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
         expected_xpub_btc,
+        witness_version,
     )?;
     Ok((descriptor_colored, descriptor_vanilla))
 }
@@ -338,6 +422,7 @@ pub(crate) fn get_descriptors_from_xpubs(
     xpub_rgb: Xpub,
     xpub_btc: Xpub,
     vanilla_keychain: Option<u8>,
+    witness_version: WitnessVersion,
 ) -> Result<(String, String), Error> {
     let master_fingerprint =
         Fingerprint::from_str(master_fingerprint).map_err(|_| Error::InvalidFingerprint)?;
@@ -346,12 +431,14 @@ pub(crate) fn get_descriptors_from_xpubs(
         get_coin_type(&bitcoin_network, true),
         xpub_rgb,
         KEYCHAIN_RGB,
+        witness_version,
     )?;
     let descriptor_vanilla = calculate_descriptor_from_xpub(
         &master_fingerprint,
         get_coin_type(&bitcoin_network, false),
         xpub_btc,
         vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
+        witness_version,
     )?;
     Ok((descriptor_colored, descriptor_vanilla))
 }
@@ -368,33 +455,6 @@ pub(crate) fn parse_address_str(
         .map_err(|_| Error::InvalidAddress {
             details: s!("belongs to another network"),
         })
-}
-
-/// Extract the witness script if recipient is a Witness one
-pub fn script_buf_from_recipient_id(recipient_id: String) -> Result<Option<ScriptBuf>, Error> {
-    let xchainnet_beneficiary =
-        XChainNet::<Beneficiary>::from_str(&recipient_id).map_err(|_| Error::InvalidRecipientID)?;
-    match xchainnet_beneficiary.into_inner() {
-        Beneficiary::WitnessVout(pay_2_vout, _) => {
-            let script_buf = pay_2_vout.to_script();
-            Ok(Some(script_buf))
-        }
-        Beneficiary::BlindedSeal(_) => Ok(None),
-    }
-}
-
-pub(crate) fn beneficiary_from_script_buf(script_buf: ScriptBuf) -> Beneficiary {
-    let address_payload = AddressPayload::from_script(&script_buf).unwrap();
-    Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None)
-}
-
-/// Return the recipient ID for a specific script buf
-pub fn recipient_id_from_script_buf(
-    script_buf: ScriptBuf,
-    bitcoin_network: BitcoinNetwork,
-) -> String {
-    let beneficiary = beneficiary_from_script_buf(script_buf);
-    XChainNet::with(bitcoin_network.into(), beneficiary).to_string()
 }
 
 fn get_derivation_path(keychain: u8) -> DerivationPath {
@@ -416,12 +476,13 @@ pub(crate) fn calculate_descriptor_from_xprv(
     coin_type: u32,
     xprv: Xpriv,
     keychain: u8,
+    witness_version: WitnessVersion,
 ) -> Result<String, Error> {
     let path = get_derivation_path(keychain);
     let der_xprv = &xprv
         .derive_priv(&Secp256k1::new(), &path)
         .expect("provided path should be derivable in an xprv");
-    let account_derivation_children = get_account_derivation_children(coin_type);
+    let account_derivation_children = get_account_derivation_children(witness_version, coin_type);
     let full_path = get_extended_derivation_path(account_derivation_children, keychain);
     let origin_prv: KeySource = (*master_fingerprint, full_path.clone());
     let der_xprv_desc_key: DescriptorKey<Segwitv0> = der_xprv
@@ -432,7 +493,7 @@ pub(crate) fn calculate_descriptor_from_xprv(
     } else {
         return Err(InternalError::Unexpected)?;
     };
-    Ok(format!("tr({key})"))
+    Ok(format!("{}({key})", witness_version.descriptor_fn()))
 }
 
 pub(crate) fn calculate_descriptor_from_xpub(
@@ -440,12 +501,13 @@ pub(crate) fn calculate_descriptor_from_xpub(
     coin_type: u32,
     xpub: Xpub,
     keychain: u8,
+    witness_version: WitnessVersion,
 ) -> Result<String, Error> {
     let path = get_derivation_path(keychain);
     let der_xpub = &xpub
         .derive_pub(&Secp256k1::new(), &path)
         .expect("provided path should be derivable in an xpub");
-    let account_derivation_children = get_account_derivation_children(coin_type);
+    let account_derivation_children = get_account_derivation_children(witness_version, coin_type);
     let full_path = get_extended_derivation_path(account_derivation_children, keychain);
     let origin_pub: KeySource = (*master_fingerprint, full_path);
     let der_xpub_desc_key: DescriptorKey<Segwitv0> = der_xpub
@@ -456,7 +518,7 @@ pub(crate) fn calculate_descriptor_from_xpub(
     } else {
         return Err(InternalError::Unexpected)?;
     };
-    Ok(format!("tr({key})"))
+    Ok(format!("{}({key})", witness_version.descriptor_fn()))
 }
 
 /// The retention grace advertised by a proxy (`retention_grace_secs`), i.e. how long after an
@@ -500,10 +562,17 @@ pub(crate) async fn check_proxy(proxy_url: &str) -> Result<ServerInfoResponse, E
 
 #[cfg(feature = "esplora")]
 pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
-    use crate::wallet::online::Indexer;
     #[cfg(target_arch = "wasm32")]
     no_store_fetch(indexer_url, u32::from(INDEXER_TIMEOUT) * 1000);
-    let opts = esplora_client::Builder::new(indexer_url).timeout(INDEXER_TIMEOUT.into());
+    esplora_indexer(indexer_url)
+}
+
+#[cfg(feature = "esplora")]
+pub(crate) fn esplora_indexer(indexer_url: &str) -> Option<Indexer> {
+    use crate::wallet::online::Indexer;
+    let opts = esplora_client::Builder::new(indexer_url)
+        .timeout(INDEXER_TIMEOUT.into())
+        .max_retries(INDEXER_RETRIES.into());
     let client = opts.build_async_with_sleeper::<WasmSleeper>().ok()?;
     Some(Indexer::EsploraAsync(Box::new(client)))
 }
@@ -511,29 +580,74 @@ pub(crate) fn build_indexer(indexer_url: &str) -> Option<Indexer> {
 // Esplora sends `cache-control: max-age`, so the browser can serve stale chain data.
 // The client cannot set the fetch cache mode or a timeout on wasm32.
 // This wrapper sets `no-store` and a timeout on indexer requests. It compares normalized URLs.
+// If other code replaces fetch, the next call wraps fetch again, so the wrapper stays outermost.
 #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-export function no_store_fetch(base, timeout_ms) {
+function urls() {
     const g = globalThis;
-    if (!g.__rgbLibNoStoreUrls) {
-        g.__rgbLibNoStoreUrls = new Map();
+    if (!g.__rgbLibNoStoreUrls) g.__rgbLibNoStoreUrls = new Map();
+    if (g.fetch !== g.__rgbLibNoStoreFetch) {
         const fetch = g.fetch;
-        g.fetch = function (input, init) {
+        g.fetch = g.__rgbLibNoStoreFetch = function (input, init) {
             const m = input instanceof Request && [...g.__rgbLibNoStoreUrls].find(([p]) => input.url.startsWith(p));
             if (m) {
-                const signal = AbortSignal.any([input.signal, AbortSignal.timeout(m[1])]);
+                const signal = AbortSignal.any([input.signal, AbortSignal.timeout(m[1].ms)]);
                 input = new Request(input, { cache: 'no-store', signal });
             }
             return fetch.call(this, input, init);
         };
     }
-    let key = base;
-    try { key = new URL(base).href; } catch (e) {}
-    g.__rgbLibNoStoreUrls.set(key, timeout_ms);
+    return g.__rgbLibNoStoreUrls;
+}
+function href(base) {
+    try { return new URL(base).href; } catch (e) { return null; }
+}
+export function no_store_fetch(base, timeout_ms) {
+    const map = urls();
+    const key = href(base) ?? base;
+    map.set(key, { ms: timeout_ms, wallet: true, holds: map.get(key)?.holds ?? 0 });
+}
+// A check holds a URL while it runs. A release keeps a URL that a wallet registered.
+export function no_store_fetch_hold(base, timeout_ms) {
+    const key = href(base);
+    if (key === null) return;
+    const map = urls();
+    const e = map.get(key) ?? { ms: timeout_ms, wallet: false, holds: 0 };
+    e.holds += 1;
+    map.set(key, e);
+}
+export function no_store_fetch_release(base) {
+    const key = href(base);
+    const map = globalThis.__rgbLibNoStoreUrls;
+    const e = key !== null && map?.get(key);
+    if (!e) return;
+    e.holds -= 1;
+    if (!e.wallet && e.holds <= 0) map.delete(key);
 }
 "#)]
 extern "C" {
     fn no_store_fetch(base: &str, timeout_ms: u32);
+    fn no_store_fetch_hold(base: &str, timeout_ms: u32);
+    fn no_store_fetch_release(base: &str);
+}
+
+/// Bypass the cache and time out requests to the URL while the guard lives.
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+pub(crate) struct NoStoreHold(String);
+
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+impl NoStoreHold {
+    pub(crate) fn new(url: &str) -> Self {
+        no_store_fetch_hold(url, u32::from(INDEXER_TIMEOUT) * 1000);
+        Self(url.to_string())
+    }
+}
+
+#[cfg(all(feature = "esplora", target_arch = "wasm32"))]
+impl Drop for NoStoreHold {
+    fn drop(&mut self) {
+        no_store_fetch_release(&self.0);
+    }
 }
 
 #[cfg(feature = "esplora")]
@@ -593,6 +707,37 @@ pub(crate) fn now() -> OffsetDateTime {
 thread_local! {
     /// Seconds a native test adds to the clock of its thread.
     pub(crate) static CLOCK_OFFSET: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The fault point that fails next in this test thread.
+    pub(crate) static FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The fault point that fires an abort controller next in this test thread.
+    pub(crate) static ABORT_AT: std::cell::RefCell<
+        Option<(&'static str, std::rc::Rc<crate::AbortController>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Fail when a test injects a fault at `point`.
+pub(crate) fn fault_point(point: &'static str) -> Result<(), Error> {
+    #[cfg(test)]
+    if let Some((_, controller)) = ABORT_AT.with_borrow_mut(|a| a.take_if(|(p, _)| *p == point)) {
+        controller.abort();
+    }
+    #[cfg(test)]
+    if FAULT.with(|f| f.get() == Some(point)) {
+        FAULT.with(|f| f.set(None));
+        return Err(Error::Internal {
+            details: format!("fault injected in {point}"),
+        });
+    }
+    let _ = point;
+    Ok(())
 }
 
 pub(crate) struct DumbResolver;
@@ -787,21 +932,6 @@ impl RgbRuntime {
     }
 
     #[cfg(feature = "esplora")]
-    pub(crate) fn transfer_with_dag(
-        &self,
-        contract_id: ContractId,
-        outputs: impl AsRef<[OutputSeal]>,
-        secret_seals: impl AsRef<[SecretSeal]>,
-        opids: impl IntoIterator<Item = OpId>,
-        witness_id: Option<RgbTxid>,
-    ) -> Result<(RgbTransfer, OpsDag), Error> {
-        self.stock
-            .transfer_with_dag(contract_id, outputs, secret_seals, opids, witness_id, None)
-            .map(|(consignment, dag, _)| (consignment, dag))
-            .map_err(Error::from)
-    }
-
-    #[cfg(feature = "esplora")]
     pub(crate) fn transfer_from_fascia(
         &self,
         contract_id: ContractId,
@@ -848,6 +978,8 @@ impl RgbRuntime {
         contract_id: ContractId,
         transition_type: TransitionType,
     ) -> Result<TransitionBuilder, Error> {
+        #[cfg(test)]
+        TRANSITION_BUILDERS_LOADED.set(TRANSITION_BUILDERS_LOADED.get() + 1);
         self.stock
             .transition_builder_raw(contract_id, transition_type)
             .map_err(Error::from)
@@ -928,6 +1060,7 @@ pub(crate) async fn fetch_esplora_broadcast_async(
 #[cfg(feature = "esplora")]
 pub(crate) struct PreFetchResolver {
     witness_cache: HashMap<RgbTxid, WitnessStatus>,
+    headers: HashMap<NonZeroU32, BlockHeader>,
     chain_net: ChainNet,
 }
 
@@ -936,8 +1069,14 @@ impl PreFetchResolver {
     pub(crate) fn new(cache: HashMap<RgbTxid, WitnessStatus>, chain_net: ChainNet) -> Self {
         Self {
             witness_cache: cache,
+            headers: HashMap::new(),
             chain_net,
         }
+    }
+
+    pub(crate) fn with_headers(mut self, headers: HashMap<NonZeroU32, BlockHeader>) -> Self {
+        self.headers = headers;
+        self
     }
 }
 
@@ -952,6 +1091,13 @@ impl ResolveWitness for PreFetchResolver {
                 s!("witness not pre-fetched"),
             ))
     }
+    fn get_block_header(&self, height: NonZeroU32) -> Result<BlockHeader, WitnessResolverError> {
+        // a missing header makes the validator fetch the witness TX
+        self.headers
+            .get(&height)
+            .copied()
+            .ok_or(WitnessResolverError::NotSupported)
+    }
     fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
         if self.chain_net == chain_net {
             Ok(())
@@ -959,6 +1105,22 @@ impl ResolveWitness for PreFetchResolver {
             Err(WitnessResolverError::WrongChainNet)
         }
     }
+}
+
+/// Converts an Esplora merkle proof to an SPV proof.
+#[cfg(feature = "esplora")]
+pub(crate) fn spv_proof_from_esplora(proof: esplora_client::MerkleProof) -> Option<SpvProof> {
+    // the nodes come as txids, so they are already in internal byte order
+    let merkle = proof
+        .merkle
+        .into_iter()
+        .map(|node| TxMerkleNode::from_byte_array(node.to_byte_array()))
+        .collect::<Vec<_>>();
+    Some(SpvProof {
+        block_height: NonZeroU32::new(proof.block_height)?,
+        pos: u32::try_from(proof.pos).ok()?,
+        merkle: Confined::try_from(merkle).ok()?,
+    })
 }
 
 /// Offchain resolver variant for wasm32.
@@ -986,20 +1148,53 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolverWasm<'_, '_, TRANS
                 |tx| Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
             )
     }
+    fn get_block_header(&self, height: NonZeroU32) -> Result<BlockHeader, WitnessResolverError> {
+        self.fallback.get_block_header(height)
+    }
     fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
         self.fallback.check_chain_net(chain_net)
     }
 }
 
+/// Remove the RGB data from a committed PSBT, so it stays small enough to parse back.
+pub(crate) fn strip_rgb_data(psbt: &mut Psbt) {
+    let is_rgb = |key: &bdk_wallet::bitcoin::psbt::raw::ProprietaryKey| {
+        [
+            &PSBT_RGB_PREFIX[..],
+            &PSBT_MPC_PREFIX[..],
+            &PSBT_OPRET_PREFIX[..],
+            &PSBT_TAPRET_PREFIX[..],
+        ]
+        .contains(&key.prefix.as_slice())
+    };
+    psbt.proprietary.retain(|key, _| !is_rgb(key));
+    for input in &mut psbt.inputs {
+        input.proprietary.retain(|key, _| !is_rgb(key));
+    }
+    for output in &mut psbt.outputs {
+        output.proprietary.retain(|key, _| !is_rgb(key));
+    }
+}
+
+/// Fail if the PSBT can't be parsed back (its global map exceeds MAX_VEC_SIZE).
+pub(crate) fn check_psbt_parsable(psbt: &Psbt) -> Result<(), Error> {
+    Psbt::deserialize(&psbt.serialize())
+        .map(|_| ())
+        .map_err(|e| Error::Internal {
+            details: format!("PSBT can't be parsed back: {e}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bdk_wallet::bitcoin::psbt::raw::ProprietaryKey;
     use std::str::FromStr;
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn fresh_keys() -> crate::keys::Keys {
-        crate::keys::generate_keys(BitcoinNetwork::Regtest)
+        crate::keys::generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot)
     }
 
     #[test]
@@ -1197,9 +1392,13 @@ mod tests {
 
     #[test]
     fn derive_account_xprv_produces_valid_key() {
-        let (xprv, fingerprint) =
-            derive_account_xprv_from_mnemonic(BitcoinNetwork::Regtest, TEST_MNEMONIC, true)
-                .expect("derivation should succeed");
+        let (xprv, fingerprint) = derive_account_xprv_from_mnemonic(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            true,
+            WitnessVersion::Taproot,
+        )
+        .expect("derivation should succeed");
         // The xprv should be a valid extended private key
         let xpub = get_xpub_from_xprv(&xprv);
         assert_ne!(xpub.to_string(), "");
@@ -1209,9 +1408,13 @@ mod tests {
 
     #[test]
     fn get_xpub_from_xprv_produces_valid_xpub() {
-        let (xprv, _) =
-            derive_account_xprv_from_mnemonic(BitcoinNetwork::Regtest, TEST_MNEMONIC, true)
-                .unwrap();
+        let (xprv, _) = derive_account_xprv_from_mnemonic(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            true,
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         let xpub = get_xpub_from_xprv(&xprv);
         // xpub string should start with "xpub" or "tpub" depending on network
         let xpub_str = xpub.to_string();
@@ -1223,7 +1426,12 @@ mod tests {
 
     #[test]
     fn get_account_xpubs_returns_two_different_keys() {
-        let (vanilla, colored) = get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC).unwrap();
+        let (vanilla, colored) = get_account_xpubs(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         // The vanilla and colored xpubs must differ (different derivation paths)
         assert_ne!(vanilla, colored);
         // Both should be valid xpub strings
@@ -1233,64 +1441,81 @@ mod tests {
 
     #[test]
     fn get_descriptors_produce_valid_strings() {
-        let (vanilla_xpub, colored_xpub) =
-            get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC).unwrap();
-        let (desc_colored, desc_vanilla) = get_descriptors(
-            BitcoinNetwork::Regtest,
-            TEST_MNEMONIC,
-            None,
-            vanilla_xpub,
-            colored_xpub,
-        )
-        .unwrap();
-        // Both descriptors should start with "tr(" (taproot)
-        assert!(
-            desc_colored.starts_with("tr("),
-            "colored descriptor: {desc_colored}"
-        );
-        assert!(
-            desc_vanilla.starts_with("tr("),
-            "vanilla descriptor: {desc_vanilla}"
-        );
-        // They should contain different xpub material since they derive from different coin types
-        assert_ne!(desc_colored, desc_vanilla);
+        for (wv, prefix) in [
+            (WitnessVersion::Taproot, "tr("),
+            (WitnessVersion::SegWitV0, "wpkh("),
+        ] {
+            let (vanilla_xpub, colored_xpub) =
+                get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC, wv).unwrap();
+            let (desc_colored, desc_vanilla) = get_descriptors(
+                BitcoinNetwork::Regtest,
+                TEST_MNEMONIC,
+                None,
+                vanilla_xpub,
+                colored_xpub,
+                wv,
+            )
+            .unwrap();
+            assert!(
+                desc_colored.starts_with(prefix),
+                "colored descriptor: {desc_colored}"
+            );
+            assert!(
+                desc_vanilla.starts_with(prefix),
+                "vanilla descriptor: {desc_vanilla}"
+            );
+            // They should contain different xpub material since they derive from different coin types
+            assert_ne!(desc_colored, desc_vanilla);
+        }
     }
 
     #[test]
     fn get_descriptors_from_xpubs_produces_valid_descriptors() {
-        let keys =
-            crate::keys::restore_keys(BitcoinNetwork::Regtest, TEST_MNEMONIC.to_string()).unwrap();
-        let vanilla_xpub = Xpub::from_str(&keys.account_xpub_vanilla).unwrap();
-        let colored_xpub = Xpub::from_str(&keys.account_xpub_colored).unwrap();
+        for (wv, prefix) in [
+            (WitnessVersion::Taproot, "tr("),
+            (WitnessVersion::SegWitV0, "wpkh("),
+        ] {
+            let keys =
+                crate::keys::restore_keys(BitcoinNetwork::Regtest, TEST_MNEMONIC.to_string(), wv)
+                    .unwrap();
+            let vanilla_xpub = Xpub::from_str(&keys.account_xpub_vanilla).unwrap();
+            let colored_xpub = Xpub::from_str(&keys.account_xpub_colored).unwrap();
 
-        let (desc_colored, desc_vanilla) = get_descriptors_from_xpubs(
-            BitcoinNetwork::Regtest,
-            &keys.master_fingerprint,
-            colored_xpub,
-            vanilla_xpub,
-            None,
-        )
-        .unwrap();
-        assert!(
-            desc_colored.starts_with("tr("),
-            "colored descriptor: {desc_colored}"
-        );
-        assert!(
-            desc_vanilla.starts_with("tr("),
-            "vanilla descriptor: {desc_vanilla}"
-        );
+            let (desc_colored, desc_vanilla) = get_descriptors_from_xpubs(
+                BitcoinNetwork::Regtest,
+                &keys.master_fingerprint,
+                colored_xpub,
+                vanilla_xpub,
+                None,
+                wv,
+            )
+            .unwrap();
+            assert!(
+                desc_colored.starts_with(prefix),
+                "colored descriptor: {desc_colored}"
+            );
+            assert!(
+                desc_vanilla.starts_with(prefix),
+                "vanilla descriptor: {desc_vanilla}"
+            );
+        }
     }
 
     /// Helper: derive a valid regtest address from the test mnemonic's descriptor
     fn regtest_address() -> BdkAddress {
-        let (vanilla_xpub, colored_xpub) =
-            get_account_xpubs(BitcoinNetwork::Regtest, TEST_MNEMONIC).unwrap();
+        let (vanilla_xpub, colored_xpub) = get_account_xpubs(
+            BitcoinNetwork::Regtest,
+            TEST_MNEMONIC,
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         let (_, desc_vanilla) = get_descriptors(
             BitcoinNetwork::Regtest,
             TEST_MNEMONIC,
             None,
             vanilla_xpub,
             colored_xpub,
+            WitnessVersion::Taproot,
         )
         .unwrap();
         // Use BDK to derive address 0 from the vanilla descriptor
@@ -1400,20 +1625,28 @@ mod tests {
 
     #[test]
     fn get_account_derivation_children_has_three_levels() {
-        let children = get_account_derivation_children(COIN_RGB_TESTNET);
-        assert_eq!(children.len(), 3);
-        // First child is PURPOSE (86')
-        assert_eq!(
-            children[0],
-            ChildNumber::from_hardened_idx(PURPOSE as u32).unwrap()
-        );
+        for (wv, purpose) in [
+            (WitnessVersion::SegWitV0, 84),
+            (WitnessVersion::Taproot, 86),
+        ] {
+            let children = get_account_derivation_children(wv, COIN_RGB_TESTNET);
+            assert_eq!(children.len(), 3);
+            assert_eq!(
+                children[0],
+                ChildNumber::from_hardened_idx(purpose).unwrap()
+            );
+        }
     }
 
     #[test]
     fn generate_and_restore_keys_round_trip() {
         let keys = fresh_keys();
-        let restored =
-            crate::keys::restore_keys(BitcoinNetwork::Regtest, keys.mnemonic.to_string()).unwrap();
+        let restored = crate::keys::restore_keys(
+            BitcoinNetwork::Regtest,
+            keys.mnemonic.to_string(),
+            WitnessVersion::Taproot,
+        )
+        .unwrap();
         assert_eq!(keys.xpub, restored.xpub);
         assert_eq!(keys.account_xpub_vanilla, restored.account_xpub_vanilla);
         assert_eq!(keys.account_xpub_colored, restored.account_xpub_colored);
@@ -1518,8 +1751,124 @@ mod tests {
 
     #[cfg(all(feature = "esplora", target_arch = "wasm32"))]
     mod no_store_fetch_browser {
-        use super::super::no_store_fetch;
+        use super::super::{
+            build_indexer, no_store_fetch, no_store_fetch_hold, no_store_fetch_release,
+        };
+        use crate::wallet::{IndexerProtocol, check_indexer_url};
+        use crate::{BitcoinNetwork, Error};
+        use wasm_bindgen::JsValue;
         use wasm_bindgen_test::*;
+
+        const SAVE: &str = "const g = globalThis; g.__realUrls = g.__rgbLibNoStoreUrls; \
+            delete g.__rgbLibNoStoreUrls; g.__realFetch = g.fetch; g.__seen = []; \
+            const res = (input, body, status) => Object.defineProperty( \
+              new Response(body, { status }), 'url', { value: input.url });";
+        const RESTORE: &str = "g.fetch = g.__realFetch; g.__rgbLibNoStoreUrls = g.__realUrls;";
+        const BAD_INDEXER: &str = "not a valid electrum nor esplora server";
+
+        async fn js(src: &str) -> JsValue {
+            let v = js_sys::Function::new_no_args(src)
+                .call0(&JsValue::NULL)
+                .unwrap();
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&v))
+                .await
+                .unwrap()
+        }
+
+        async fn has(url: &str) -> bool {
+            js(&format!(
+                "return globalThis.__rgbLibNoStoreUrls?.has(new URL('{url}').href) ?? false"
+            ))
+            .await
+            .as_bool()
+            .unwrap()
+        }
+
+        fn bad_indexer() -> Result<IndexerProtocol, Error> {
+            Err(Error::InvalidIndexer {
+                details: BAD_INDEXER.to_string(),
+            })
+        }
+
+        // A wallet registers the URL while a failing check waits for its response.
+        #[wasm_bindgen_test]
+        async fn failed_check_keeps_wallet_registration() {
+            const U: &str = "http://127.0.0.1:1/race";
+            js(&format!(
+                "{SAVE} g.fetch = (input) => {{ g.__seen.push(input.cache); \
+                 if (g.__seen.length > 1) return Promise.resolve(res(input, '', 200)); \
+                 return new Promise(r => {{ g.__answer = () => r(res(input, '', 404)); }}); }};"
+            ))
+            .await;
+            wasm_bindgen_futures::spawn_local(async {
+                let mut ticks = 0;
+                while js("return globalThis.__seen.length").await.as_f64() == Some(0.0) {
+                    ticks += 1;
+                    assert!(ticks < 1000, "check sent no request");
+                    js("return new Promise(r => setTimeout(r, 0))").await;
+                }
+                build_indexer(U);
+                js("globalThis.__answer()").await;
+            });
+            assert_eq!(
+                check_indexer_url(U, BitcoinNetwork::Regtest).await,
+                bad_indexer()
+            );
+            let registered = has(U).await;
+            let out = js(&format!(
+                "const g = globalThis; return g.fetch(new Request('{U}/blocks/tip/height')).then(() => {{ \
+                 const out = g.__seen.join(); {RESTORE} return out; }});"
+            ))
+            .await;
+            assert_eq!(
+                format!("{},{registered}", out.as_string().unwrap()),
+                "no-store,no-store,true"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        async fn check_releases_only_its_own_holds() {
+            const OK: &str = "http://127.0.0.1:1/ok/";
+            const BAD: &str = "http://127.0.0.1:1/bad/";
+            const W: &str = "http://127.0.0.1:1/wallet/";
+            const H: &str = "http://127.0.0.1:1/hold/";
+            js(&format!(
+                "{SAVE} g.fetch = (input) => {{ g.__seen.push(input.cache); \
+                 return Promise.resolve(input.url.includes('/ok/') \
+                   ? res(input, '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206', 200) \
+                   : res(input, '', 404)); }};"
+            ))
+            .await;
+            let regtest = BitcoinNetwork::Regtest;
+            assert_eq!(
+                check_indexer_url(OK, regtest).await,
+                Ok(IndexerProtocol::Esplora)
+            );
+            assert!(!has(OK).await);
+            assert_eq!(check_indexer_url(BAD, regtest).await, bad_indexer());
+            assert!(!has(BAD).await);
+            build_indexer(W);
+            assert!(check_indexer_url(W, regtest).await.is_err());
+            assert!(has(W).await);
+            assert!(check_indexer_url("", regtest).await.is_err());
+            assert_eq!(
+                js("return globalThis.__rgbLibNoStoreUrls.size")
+                    .await
+                    .as_f64(),
+                Some(1.0)
+            );
+            no_store_fetch_hold(H, 10_000);
+            no_store_fetch_hold(H, 10_000);
+            no_store_fetch_release(H);
+            assert!(has(H).await);
+            no_store_fetch_release(H);
+            assert!(!has(H).await);
+            let out = js(&format!(
+                "const g = globalThis; const out = g.__seen.join(); {RESTORE} return out;"
+            ))
+            .await;
+            assert_eq!(out.as_string().unwrap(), "no-store,no-store,no-store");
+        }
 
         // Stub fetch, register indexers, and record what reaches the stub.
         #[wasm_bindgen_test]
@@ -1557,5 +1906,174 @@ mod tests {
                 "5,no-store,no-store,POST,tx,true,true,false,TimeoutError,AbortError"
             );
         }
+
+        // A chunk n holds n bytes of value n. Chunk 0 ends the stream. Else the stream stays open.
+        #[wasm_bindgen_test]
+        async fn body_read_stops_past_limit() {
+            use super::super::read_body_limited;
+            use wasm_bindgen::JsCast;
+            for (chunks, want, cancelled) in [
+                ("[4, 0]", vec![4; 4], false),
+                ("[10]", vec![10; 5], true),
+                ("[2, 2, 2, 2, 2]", vec![2; 5], true),
+            ] {
+                let s = js(&format!(
+                    "const s = {{ cancelled: false }}; const c = {chunks}; \
+                     s.stream = new ReadableStream({{ \
+                       pull(ctl) {{ const n = c.shift(); \
+                         if (n === undefined) return new Promise(() => {{}}); \
+                         if (n === 0) ctl.close(); else ctl.enqueue(new Uint8Array(n).fill(n)); }}, \
+                       cancel() {{ s.cancelled = true; }} }}); \
+                     return s;"
+                ))
+                .await;
+                let stream = js_sys::Reflect::get(&s, &"stream".into()).unwrap();
+                let got = read_body_limited(Some(stream.unchecked_into()), 4)
+                    .await
+                    .unwrap();
+                assert_eq!(got, want, "{chunks}");
+                let flag = js_sys::Reflect::get(&s, &"cancelled".into()).unwrap();
+                assert_eq!(flag.as_bool(), Some(cancelled), "{chunks}");
+            }
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    mod spv {
+        use super::*;
+        use bdk_wallet::bitcoin::{
+            CompactTarget,
+            block::Version,
+            hashes::{Hash, HashEngine, sha256d},
+        };
+
+        const TXID: [u8; 32] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31,
+        ];
+        const SIBLING: [u8; 32] = [
+            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+            54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+        ];
+        // the sibling as the esplora API sends it: txid hex, reversed from the internal bytes
+        const MERKLE_PROOF_JSON: &str = r#"{"block_height":1,"merkle":["3f3e3d3c3b3a393837363534333231302f2e2d2c2b2a29282726252423222120"],"pos":0}"#;
+
+        fn header() -> BlockHeader {
+            let mut engine = sha256d::Hash::engine();
+            engine.input(&TXID);
+            engine.input(&SIBLING);
+            BlockHeader {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::from_raw_hash(sha256d::Hash::from_engine(engine)),
+                time: 1,
+                bits: CompactTarget::from_consensus(0),
+                nonce: 0,
+            }
+        }
+
+        #[test]
+        fn spv_proof_from_esplora_verifies() {
+            let parsed: esplora_client::MerkleProof =
+                serde_json::from_str(MERKLE_PROOF_JSON).unwrap();
+            let proof = spv_proof_from_esplora(parsed).unwrap();
+            assert_eq!(
+                proof.validate(RgbTxid::from_byte_array(TXID), &header()),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn spv_proof_from_esplora_rejects_bad_data() {
+            let proof = |block_height, nodes| esplora_client::MerkleProof {
+                block_height,
+                merkle: vec![Txid::from_byte_array(SIBLING); nodes],
+                pos: 0,
+            };
+            assert!(spv_proof_from_esplora(proof(0, 1)).is_none());
+            assert!(spv_proof_from_esplora(proof(1, 33)).is_none());
+        }
+
+        #[test]
+        fn prefetch_resolver_serves_headers() {
+            let header = header();
+            let one = NonZeroU32::new(1).unwrap();
+            let resolver = PreFetchResolver::new(HashMap::new(), ChainNet::BitcoinRegtest)
+                .with_headers(HashMap::from([(one, header)]));
+            assert_eq!(resolver.get_block_header(one).unwrap(), header);
+            assert!(matches!(
+                resolver.get_block_header(NonZeroU32::new(2).unwrap()),
+                Err(WitnessResolverError::NotSupported)
+            ));
+        }
+    }
+
+    fn test_psbt() -> Psbt {
+        Psbt::from_unsigned_tx(BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn::default()],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    fn proprietary_key(prefix: &[u8], subtype: u8) -> ProprietaryKey {
+        ProprietaryKey {
+            prefix: prefix.to_vec(),
+            subtype,
+            key: vec![],
+        }
+    }
+
+    #[test]
+    fn strip_rgb_data_removes_only_rgb_keys() {
+        let prefixes: [&[u8]; 5] = [
+            &PSBT_RGB_PREFIX,
+            &PSBT_MPC_PREFIX,
+            &PSBT_OPRET_PREFIX,
+            &PSBT_TAPRET_PREFIX,
+            b"OTHER",
+        ];
+        let mut psbt = test_psbt();
+        for prefix in prefixes {
+            let key = proprietary_key(prefix, 0);
+            psbt.proprietary.insert(key.clone(), vec![1]);
+            psbt.inputs[0].proprietary.insert(key.clone(), vec![1]);
+            psbt.outputs[0].proprietary.insert(key, vec![1]);
+        }
+
+        strip_rgb_data(&mut psbt);
+
+        let other = vec![proprietary_key(b"OTHER", 0)];
+        for map in [
+            &psbt.proprietary,
+            &psbt.inputs[0].proprietary,
+            &psbt.outputs[0].proprietary,
+        ] {
+            assert_eq!(map.keys().cloned().collect::<Vec<_>>(), other);
+        }
+    }
+
+    #[test]
+    fn check_psbt_parsable_refuses_a_global_map_over_max_vec_size() {
+        let mut psbt = test_psbt();
+        assert_eq!(check_psbt_parsable(&psbt), Ok(()));
+        // the global map is read through a MAX_VEC_SIZE (4 MB) limit
+        for subtype in 0..5 {
+            psbt.proprietary.insert(
+                proprietary_key(&PSBT_RGB_PREFIX, subtype),
+                vec![0; 1_000_000],
+            );
+        }
+        assert!(matches!(
+            check_psbt_parsable(&psbt),
+            Err(Error::Internal { details }) if details.starts_with("PSBT can't be parsed back")
+        ));
+        strip_rgb_data(&mut psbt);
+        assert_eq!(check_psbt_parsable(&psbt), Ok(()));
     }
 }

@@ -13,6 +13,10 @@ pub(crate) const BACKUP_VERSION: u8 = 1;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
+pub(crate) fn parse_backup_timestamp(timestamp: &str) -> i128 {
+    timestamp.parse().expect("backup timestamp is an integer")
+}
+
 /// Public (unencrypted) metadata stored alongside the encrypted payload.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct BackupPubData {
@@ -41,6 +45,12 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
     /// Received mints, keyed by recipient_id.
     pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
+    pub(crate) pending_mint_locks: std::collections::HashMap<String, super::PendingMintLocks>,
+    /// Media bytes keyed by hex digest.
+    pub(crate) media: std::collections::HashMap<String, Vec<u8>>,
+    /// Settings and public keys of the wallet.
+    pub(crate) manifest: super::WalletManifest,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -157,9 +167,10 @@ impl super::Wallet {
     }
 
     /// Restore wallet state from an encrypted backup.
-    /// The wallet must be created first via `Wallet::new()` with the same mnemonic/xpubs.
-    /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()`, or its data directory holds no snapshot.
+    /// The wallet must be created first with the same keys, witness version and vanilla keychain; other keys give `WalletSettingMismatch`. The wallet keeps its own mutable settings.
+    /// The restored state persists only if this wallet may save: it was built with `Wallet::restore()` or `Wallet::load()`, or its data directory holds no snapshot.
     /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
+    /// A backup of another network gives [`Error::BackupNetworkMismatch`].
     pub fn restore_backup(&mut self, backup_bytes: &[u8], password: &str) -> Result<(), Error> {
         let (pub_data, ciphertext) = decode_backup(backup_bytes)?;
         let payload_json = decrypt_payload(ciphertext, password, &pub_data)?;
@@ -176,6 +187,12 @@ impl super::Wallet {
     fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
         let payload: WalletBackupPayload =
             serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
+        if payload.manifest.bitcoin_network != self.wallet_data.bitcoin_network {
+            return Err(Error::BackupNetworkMismatch {
+                backup_network: payload.manifest.bitcoin_network,
+                wallet_network: self.wallet_data.bitcoin_network,
+            });
+        }
         // Without a BDK changeset the restore skips the descriptor check.
         if payload.bdk_changeset.is_none() && self.bdk_database.get_data().is_some() {
             return Err(Error::InvalidBackup);
@@ -191,93 +208,161 @@ impl super::Wallet {
             received_consignment_meta: payload.received_consignment_meta,
             received_signed_txs: payload.received_signed_txs,
             received_mints: payload.received_mints,
+            pending_mint_locks: payload.pending_mint_locks,
+            media: payload.media,
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
+            manifest: payload.manifest,
+            backup_versions: self.backup_versions.borrow().clone(),
         };
         self.restore_from_snapshot(snapshot)
     }
 
     /// Returns true if the wallet has been modified since the last backup.
     pub fn backup_info(&self) -> Result<bool, Error> {
-        let info = self.database.get_backup_info()?;
-        match info {
-            None => Ok(true), // never backed up
-            Some(info) => {
-                if info.last_backup_timestamp.is_empty() {
-                    Ok(true)
-                } else {
-                    Ok(info.last_operation_timestamp > info.last_backup_timestamp)
-                }
-            }
-        }
+        Ok(self.database.get_backup_info()?.is_some_and(|info| {
+            parse_backup_timestamp(&info.last_operation_timestamp)
+                > parse_backup_timestamp(&info.last_backup_timestamp)
+        }))
     }
 }
 
-use super::vss::{VssBackupClient, VssBackupConfig, VssBackupInfo};
+use std::rc::Rc;
+
+use bdk_wallet::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+use super::backup_store::{
+    BACKUP_NAMESPACE, BackupTarget, KvStore, backup_key, check_new_version, decode_backup_blob,
+    encode_backup_blob, store_label,
+};
+use super::vss::{VssBackupConfig, VssBackupInfo, VssStore};
 
 impl super::Wallet {
+    fn set_backup_target(&mut self, store: Box<dyn KvStore>, id: String, key: SecretKey) {
+        self.backup_store = Some(Rc::new(BackupTarget {
+            store,
+            id,
+            key,
+            lock: tokio::sync::Mutex::new(()),
+        }));
+    }
+
     /// Configure VSS backup for this wallet.
     pub fn configure_vss_backup(&mut self, config: &VssBackupConfig) {
-        self.vss_client = Some(VssBackupClient::new(config));
+        let pubkey = PublicKey::from_secret_key(&Secp256k1::signing_only(), &config.signing_key);
+        let id = store_label(
+            "vss",
+            &[&config.server_url, &config.store_id, &pubkey.to_string()],
+        );
+        self.set_backup_target(Box::new(VssStore::new(config)), id, config.signing_key);
     }
 
-    /// Disable VSS backup.
+    /// Configure an app backup store. `store_id` names the store on this device. The store must
+    /// honour expected versions: the library relies on it to never overwrite a newer backup.
+    pub fn configure_backup_store(
+        &mut self,
+        store: Box<dyn KvStore>,
+        store_id: &str,
+        encryption_key: SecretKey,
+    ) {
+        let id = store_label("app", &[store_id]);
+        self.set_backup_target(store, id, encryption_key);
+    }
+
+    /// Disable the backup store.
     pub fn disable_vss_backup(&mut self) {
-        self.vss_client = None;
+        self.backup_store = None;
     }
 
-    /// Upload an encrypted backup to the configured VSS server.
-    /// The wallet must have a VSS client configured via configure_vss_backup().
-    pub async fn vss_backup(&self) -> Result<i64, Error> {
-        let client = self.vss_client.as_ref().ok_or(Error::Internal {
+    fn store_key(&self) -> String {
+        backup_key(
+            &self.keys.master_fingerprint,
+            self.wallet_data.bitcoin_network,
+        )
+    }
+
+    fn backup_target(&self) -> Result<Rc<BackupTarget>, Error> {
+        self.backup_store.clone().ok_or(Error::Internal {
             details: s!("VSS backup not configured"),
-        })?;
+        })
+    }
+
+    /// Upload an encrypted backup to the configured backup store. Return the store version.
+    /// A write over a version that this wallet did not see fails with a conflict.
+    pub async fn vss_backup(&self) -> Result<i64, Error> {
+        let target = self.backup_target()?;
+        let _guard = target.lock.lock().await;
 
         let payload_json = self.serialize_backup_payload()?;
-        let fingerprint = self.wallet_data.master_fingerprint.clone();
+        let blob = encode_backup_blob(&payload_json, &self.keys.master_fingerprint, &target.key)?;
 
         self.update_backup_info(true)?;
-        let res = match client.upload_backup(&payload_json, &fingerprint).await {
+        let expected = self.backup_versions.borrow().get(&target.id).copied();
+        let key = self.store_key();
+        let store = &target.store;
+        let mut res = store
+            .write(BACKUP_NAMESPACE, &key, blob.clone(), expected)
+            .await
+            .and_then(|v| check_new_version(v, expected));
+        if matches!(res, Err(Error::VssVersionConflict { .. })) && expected.is_some() {
+            // Create the key again only when the store lost it.
+            match store.read(BACKUP_NAMESPACE, &key).await {
+                Ok(None) => {
+                    res = store
+                        .write(BACKUP_NAMESPACE, &key, blob, None)
+                        .await
+                        .and_then(|v| check_new_version(v, None));
+                }
+                Ok(Some(_)) => {}
+                Err(e) => res = Err(e),
+            }
+        }
+        match &res {
             Ok(version) => {
+                self.backup_versions
+                    .borrow_mut()
+                    .insert(target.id.clone(), *version);
                 *self.last_vss_backup_error.borrow_mut() = None;
-                Ok(version)
             }
             Err(e) => {
                 let _ = self.update_backup_info(false);
                 *self.last_vss_backup_error.borrow_mut() = Some(e.to_string());
-                Err(e)
             }
-        };
+        }
         self.flush().await?;
         res
     }
 
-    /// Upload a backup if the wallet has changes not yet backed up. Call after
+    /// Upload a backup if the wallet has no backup record or has changes not yet backed up. Call after
     /// `configure_vss_backup` so enabling backups never leaves an empty store.
     /// Returns the new server version, or `None` when no upload was needed.
     pub async fn ensure_initial_backup(&self) -> Result<Option<i64>, Error> {
-        if self.vss_client.is_none() {
-            return Err(Error::Internal {
-                details: s!("VSS backup not configured"),
-            });
-        }
-        if !self.backup_info()? {
+        self.backup_target()?;
+        if self.database.get_backup_info()?.is_some() && !self.backup_info()? {
             return Ok(None);
         }
         self.vss_backup().await.map(Some)
     }
 
-    /// Download and restore wallet state from VSS server.
+    /// Download and restore wallet state from the configured backup store.
     /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
+    /// A backup of another network gives [`Error::BackupNetworkMismatch`].
     pub async fn vss_restore_backup(&mut self) -> Result<(), Error> {
-        let client = self.vss_client.as_ref().ok_or(Error::Internal {
-            details: s!("VSS backup not configured"),
-        })?;
+        let target = self.backup_target()?;
+        let _guard = target.lock.lock().await;
 
-        let payload_json = client
-            .download_backup(&self.wallet_data.master_fingerprint)
-            .await?;
+        let key = self.store_key();
+        let stored = target
+            .store
+            .read(BACKUP_NAMESPACE, &key)
+            .await?
+            .ok_or(Error::VssBackupNotFound)?;
+        let payload_json =
+            decode_backup_blob(&stored.value, &self.keys.master_fingerprint, &target.key)?;
         self.restore_payload(&payload_json)?;
+        self.backup_versions
+            .borrow_mut()
+            .insert(target.id.clone(), stored.version);
 
         // Persist restored state to IndexedDB so it survives page reloads
         self.flush().await?;
@@ -286,12 +371,16 @@ impl super::Wallet {
         Ok(())
     }
 
-    /// Query VSS backup status.
+    /// Query the backup status of the configured backup store.
     pub async fn vss_backup_info(&self) -> Result<VssBackupInfo, Error> {
-        let client = self.vss_client.as_ref().ok_or(Error::Internal {
-            details: s!("VSS backup not configured"),
-        })?;
-        let server_version = client.get_backup_version().await?;
+        let target = self.backup_target()?;
+        let _guard = target.lock.lock().await;
+        let key = self.store_key();
+        let server_version = target
+            .store
+            .read(BACKUP_NAMESPACE, &key)
+            .await?
+            .map(|r| r.version);
         let backup_required = self.backup_info()?;
 
         Ok(VssBackupInfo {
@@ -326,6 +415,9 @@ impl super::Wallet {
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
+            pending_mint_locks: self.pending_mint_locks.clone(),
+            media: self.media.clone(),
+            manifest: super::WalletManifest::new(&self.wallet_data, &self.keys),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
@@ -422,6 +514,42 @@ mod tests {
         assert_ne!(k1, k3);
     }
 
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_info_is_false_without_row() {
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        assert!(wallet.database.get_backup_info().unwrap().is_none());
+        assert!(!wallet.backup_info().unwrap());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_info_compares_integer_timestamps() {
+        use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+
+        let wallet = make_test_wallet(false);
+        let info = wallet.update_backup_info(true).unwrap().unwrap();
+        assert_eq!(info.last_operation_timestamp, "0");
+        assert!(!wallet.backup_info().unwrap());
+
+        wallet.update_backup_info(false).unwrap();
+        assert!(wallet.backup_info().unwrap());
+
+        // as text "10" < "9"
+        wallet
+            .database
+            .update_backup_info(&mut DbBackupInfoActMod {
+                last_backup_timestamp: ActiveValue::Set(s!("9")),
+                last_operation_timestamp: ActiveValue::Set(s!("10")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(wallet.backup_info().unwrap());
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     // A sender proxy that has no ACK to serve.
     fn ack_proxy() -> (mockito::ServerGuard, mockito::Mock) {
@@ -502,7 +630,127 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_after_restore_backup_reads_signed_psbt_impl(asset_id: Option<&str>) {
+    // Rows and artifacts of one settled outgoing transfer without a recipient.
+    fn seed_ended_without_recipient(
+        wallet: &mut crate::wallet::Wallet,
+        txid: &str,
+        asset_id: &str,
+        transition: crate::database::enums::TypeOfTransition,
+        bytes: Vec<u8>,
+    ) {
+        use crate::database::enums::{AssetSchema, TransferStatus};
+        use crate::database::memory_db::{
+            ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
+            DbTransferActMod,
+        };
+        use crate::wallet::online::TransferArtifacts;
+
+        let batch_idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::Settled),
+                expiration: ActiveValue::Set(Some(i64::MAX)),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(asset_id.to_string()),
+                schema: ActiveValue::Set(AssetSchema::Ifa),
+                added_at: ActiveValue::Set(1000),
+                name: ActiveValue::Set(s!("Test Asset")),
+                precision: ActiveValue::Set(8),
+                initial_supply: ActiveValue::Set(s!("1000")),
+                timestamp: ActiveValue::Set(1000),
+                ..Default::default()
+            })
+            .unwrap();
+        let asset_transfer_idx = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                asset_id: ActiveValue::Set(Some(asset_id.to_string())),
+                transition_type: ActiveValue::Set(Some(transition)),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                incoming: ActiveValue::Set(false),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet.transfer_artifacts.insert(
+            txid.to_string(),
+            TransferArtifacts {
+                signed_tx: Some(vec![1]),
+                consignment_bytes: crate::HashMap::from([(asset_id.to_string(), bytes)]),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Only a burn returns its consignment.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_burn_consignment_returns_only_burns() {
+        use crate::database::enums::TypeOfTransition;
+        use crate::keys::generate_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+
+        let burn = "4".repeat(64);
+        let link = "6".repeat(64);
+        let mut wallet = make_test_wallet_with_keys(
+            generate_keys(
+                crate::BitcoinNetwork::Regtest,
+                crate::WitnessVersion::Taproot,
+            ),
+            false,
+        );
+        seed_ended_without_recipient(
+            &mut wallet,
+            &burn,
+            "rgb:burn",
+            TypeOfTransition::Burn,
+            vec![1, 2, 3],
+        );
+        seed_ended_without_recipient(
+            &mut wallet,
+            &link,
+            "rgb:link",
+            TypeOfTransition::Link,
+            vec![7],
+        );
+
+        let get = |asset_id: &str, txid: &str| {
+            wallet.get_burn_consignment(asset_id.to_string(), txid.to_string())
+        };
+        let unknown = |txid: &str| {
+            Err(Error::UnknownTransfer {
+                txid: txid.to_string(),
+            })
+        };
+        assert_eq!(get("rgb:burn", &burn), Ok(vec![1, 2, 3]));
+        assert_eq!(get("rgb:link", &link), unknown(&link));
+        assert_eq!(get("rgb:link", &burn), unknown(&burn));
+        let missing = "f".repeat(64);
+        assert_eq!(get("rgb:burn", &missing), unknown(&missing));
+        assert_eq!(
+            get("rgb:unknown", &burn),
+            Err(Error::AssetNotFound {
+                asset_id: s!("rgb:unknown")
+            })
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_after_restore_backup_reads_signed_tx_impl(asset_id: Option<&str>) {
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::Online;
@@ -512,17 +760,20 @@ mod tests {
         let txid = "1".repeat(64);
         let indexer_url = "http://127.0.0.1:1";
         let password = "pw";
-        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+        let keys = generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
 
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
         let (proxy, _mock) = ack_proxy();
         let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id, &proxy.url());
-        // The stored PSBT is a sentinel: refresh rejects it only after it reads it back.
+        // The stored TX is a sentinel: refresh rejects it only after it reads it back.
         sender.transfer_artifacts.insert(
             txid,
             TransferArtifacts {
-                signed_psbt: Some(s!("not a psbt")),
+                signed_tx: Some(vec![0xff]),
                 ..Default::default()
             },
         );
@@ -550,26 +801,26 @@ mod tests {
 
         let refreshed = &result[&batch_idx];
         assert!(
-            matches!(refreshed.failure, Some(Error::InvalidPsbt { .. })),
-            "rebuilt wallet lost the signed PSBT: {:?}",
+            matches!(&refreshed.failure, Some(Error::Internal { details }) if details.starts_with("invalid signed TX")),
+            "rebuilt wallet lost the signed TX: {:?}",
             refreshed.failure
         );
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_after_restore_backup_reads_signed_psbt() {
-        refresh_after_restore_backup_reads_signed_psbt_impl(None);
+    fn refresh_after_restore_backup_reads_signed_tx() {
+        refresh_after_restore_backup_reads_signed_tx_impl(None);
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_after_restore_backup_reads_signed_psbt_for_rgb_asset() {
-        refresh_after_restore_backup_reads_signed_psbt_impl(Some("rgb:test-asset"));
+    fn refresh_after_restore_backup_reads_signed_tx_for_rgb_asset() {
+        refresh_after_restore_backup_reads_signed_tx_impl(Some("rgb:test-asset"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_fails_transfer_without_signed_psbt_impl(asset_id: Option<&str>) {
+    fn refresh_fails_transfer_without_signed_tx_impl(asset_id: Option<&str>) {
         use crate::database::enums::TransferStatus;
         use crate::wallet::Online;
         use crate::wallet::offline::address_reuse_tests::make_test_wallet;
@@ -632,14 +883,14 @@ mod tests {
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_fails_transfer_without_signed_psbt() {
-        refresh_fails_transfer_without_signed_psbt_impl(None);
+    fn refresh_fails_transfer_without_signed_tx() {
+        refresh_fails_transfer_without_signed_tx_impl(None);
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn refresh_fails_transfer_without_signed_psbt_for_rgb_asset() {
-        refresh_fails_transfer_without_signed_psbt_impl(Some("rgb:test-asset"));
+    fn refresh_fails_transfer_without_signed_tx_for_rgb_asset() {
+        refresh_fails_transfer_without_signed_tx_impl(Some("rgb:test-asset"));
     }
 
     #[test]
@@ -735,6 +986,7 @@ mod tests {
     #[test]
     fn vss_restore_payload_keeps_transfer_artifacts() {
         // vss_restore_backup uses restore_payload, so this covers the VSS path.
+        use crate::BTreeSet;
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::offline::ReceivedConsignmentMeta;
@@ -742,14 +994,17 @@ mod tests {
         use crate::wallet::online::TransferArtifacts;
 
         let txid = "2".repeat(64);
-        let keys = generate_keys(crate::BitcoinNetwork::Regtest);
+        let keys = generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
 
         let mut sender = make_test_wallet_with_keys(keys.clone(), false);
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
         sender.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
-                signed_psbt: Some(s!("psbt")),
+                signed_tx: Some(vec![1]),
                 ..Default::default()
             },
         );
@@ -760,6 +1015,7 @@ mod tests {
             sender_pubkey: "11".repeat(32),
             consignment_hash: "22".repeat(32),
             batch: true,
+            unsafe_txids: BTreeSet::from(["33".repeat(32)]),
         };
         sender
             .received_consignments
@@ -770,6 +1026,11 @@ mod tests {
         sender
             .received_signed_txs
             .insert(s!("recipient"), vec![4, 5, 6]);
+        let pml = crate::wallet::offline::address_reuse_tests::pending_mint_locks();
+        sender
+            .pending_mint_locks
+            .insert(s!("recipient"), pml.clone());
+        sender.media.insert(s!("digest"), vec![7, 8]);
         let payload_json = sender.serialize_backup_payload().unwrap();
 
         let mut restored = make_test_wallet_with_keys(keys.clone(), false);
@@ -783,8 +1044,8 @@ mod tests {
             restored
                 .transfer_artifacts
                 .get(&txid)
-                .and_then(|a| a.signed_psbt.clone()),
-            Some(s!("psbt"))
+                .and_then(|a| a.signed_tx.clone()),
+            Some(vec![1])
         );
         for restored in [&restored, &from_snapshot] {
             assert_eq!(
@@ -799,6 +1060,8 @@ mod tests {
                 restored.received_signed_txs.get("recipient"),
                 Some(&vec![4, 5, 6])
             );
+            assert_eq!(restored.pending_mint_locks.get("recipient"), Some(&pml));
+            assert_eq!(restored.media.get("digest"), Some(&vec![7, 8]));
         }
     }
 
@@ -820,7 +1083,7 @@ mod tests {
         wallet.transfer_artifacts.insert(
             "3".repeat(64),
             TransferArtifacts {
-                signed_psbt: Some(s!("psbt")),
+                signed_tx: Some(vec![1]),
                 ..Default::default()
             },
         );
@@ -831,11 +1094,11 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn backup_payload_of(keys: crate::keys::Keys) -> WalletBackupPayload {
+    fn backup_payload_of(keys: crate::wallet::SinglesigKeys) -> WalletBackupPayload {
         use crate::utils::MemStock;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_singlesig_keys;
 
-        let source = make_test_wallet_with_keys(keys, false);
+        let source = make_test_wallet_with_singlesig_keys(keys, false);
         *source.rgb_stock.borrow_mut() = Some(MemStock::default());
         serde_json::from_slice(&source.serialize_backup_payload().unwrap()).unwrap()
     }
@@ -844,28 +1107,33 @@ mod tests {
     fn assert_failed_restore_keeps_wallet(
         wallet: &mut crate::wallet::Wallet,
         payload: &WalletBackupPayload,
-    ) {
+    ) -> Error {
         let before = wallet.serialize_backup_payload().unwrap();
         let (ciphertext, pub_data) =
             encrypt_payload(&serde_json::to_vec(payload).unwrap(), "pw").unwrap();
         let backup = encode_backup(&ciphertext, &pub_data).unwrap();
 
-        let result = wallet.restore_backup(&backup, "pw");
+        let err = wallet
+            .restore_backup(&backup, "pw")
+            .expect_err("restore of a broken backup succeeded");
 
-        assert!(result.is_err(), "restore of a broken backup succeeded");
         assert_eq!(
             wallet.serialize_backup_payload().unwrap(),
             before,
             "the failed restore changed the wallet"
         );
+        err
     }
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn failed_restore_with_bad_rgb_store_keeps_wallet() {
-        let keys = crate::keys::generate_keys(crate::BitcoinNetwork::Regtest);
+        let keys = crate::keys::generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
         let mut wallet = wallet_with_transfer(keys.clone());
-        let mut payload = backup_payload_of(keys);
+        let mut payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(&keys, None));
         payload.rgb_store = s!("not base64!");
 
         assert_failed_restore_keeps_wallet(&mut wallet, &payload);
@@ -876,13 +1144,231 @@ mod tests {
     fn failed_restore_of_other_wallet_keeps_wallet() {
         use crate::keys::generate_keys;
 
-        let mut wallet = wallet_with_transfer(generate_keys(crate::BitcoinNetwork::Regtest));
-        let mut payload = backup_payload_of(generate_keys(crate::BitcoinNetwork::Regtest));
+        let mut wallet = wallet_with_transfer(generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        ));
+        let mut payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(
+            &generate_keys(
+                crate::BitcoinNetwork::Regtest,
+                crate::WitnessVersion::Taproot,
+            ),
+            None,
+        ));
         assert!(payload.bdk_changeset.is_some());
 
         assert_failed_restore_keeps_wallet(&mut wallet, &payload);
 
         payload.bdk_changeset = None;
         assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn restore_backup_refuses_changed_settings() {
+        let keys = crate::keys::generate_keys(
+            crate::BitcoinNetwork::Regtest,
+            crate::WitnessVersion::Taproot,
+        );
+        let mut wallet = wallet_with_transfer(keys.clone());
+        let payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(&keys, Some(1)));
+
+        let err = assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+
+        assert!(
+            matches!(
+                &err,
+                Error::WalletSettingMismatch { setting, expected, provided }
+                    if setting == "vanilla_keychain" && expected == "1" && provided == "0"
+            ),
+            "{err:?}"
+        );
+
+        let mut payload = backup_payload_of(crate::wallet::SinglesigKeys::from_keys(&keys, None));
+        payload.manifest.bitcoin_network = crate::BitcoinNetwork::Signet;
+
+        let err = assert_failed_restore_keeps_wallet(&mut wallet, &payload);
+
+        assert!(
+            matches!(
+                err,
+                Error::BackupNetworkMismatch {
+                    backup_network: crate::BitcoinNetwork::Signet,
+                    wallet_network: crate::BitcoinNetwork::Regtest
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::wallet::backup_store::{StoreFuture, StoredValue};
+
+    /// An in-memory store that follows the `KvStore` contract. Clones share the data.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Clone, Default)]
+    struct MemKvStore(
+        Rc<std::cell::RefCell<std::collections::BTreeMap<(String, String), StoredValue>>>,
+    );
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl KvStore for MemKvStore {
+        fn read<'a>(
+            &'a self,
+            namespace: &'a str,
+            key: &'a str,
+        ) -> StoreFuture<'a, Option<StoredValue>> {
+            let entry = self
+                .0
+                .borrow()
+                .get(&(namespace.to_string(), key.to_string()))
+                .cloned();
+            Box::pin(async move { Ok(entry) })
+        }
+
+        fn write<'a>(
+            &'a self,
+            namespace: &'a str,
+            key: &'a str,
+            value: Vec<u8>,
+            expected_version: Option<i64>,
+        ) -> StoreFuture<'a, i64> {
+            Box::pin(async move {
+                let mut data = self.0.borrow_mut();
+                let k = (namespace.to_string(), key.to_string());
+                let cur = data.get(&k).map(|v| v.version);
+                if cur != expected_version {
+                    return Err(Error::VssVersionConflict {
+                        details: s!("version"),
+                    });
+                }
+                let version = cur.unwrap_or(0) + 1;
+                data.insert(k, StoredValue { value, version });
+                Ok(version)
+            })
+        }
+
+        fn remove<'a>(
+            &'a self,
+            namespace: &'a str,
+            key: &'a str,
+            _version: Option<i64>,
+        ) -> StoreFuture<'a, ()> {
+            self.0
+                .borrow_mut()
+                .remove(&(namespace.to_string(), key.to_string()));
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list<'a>(&'a self, _namespace: &'a str) -> StoreFuture<'a, Vec<String>> {
+            unreachable!()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wallet_on(
+        keys: &crate::keys::Keys,
+        network: crate::BitcoinNetwork,
+        store: &MemKvStore,
+    ) -> crate::wallet::Wallet {
+        use crate::utils::MemStock;
+        use crate::wallet::offline::address_reuse_tests::make_test_wallet_on_network;
+
+        let mut wallet = make_test_wallet_on_network(
+            crate::wallet::SinglesigKeys::from_keys(keys, None),
+            false,
+            network,
+        );
+        *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
+        wallet.configure_backup_store(
+            Box::new(store.clone()),
+            "mem",
+            SecretKey::from_slice(&[1; 32]).unwrap(),
+        );
+        wallet
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_store_keeps_one_backup_per_network() {
+        use crate::BitcoinNetwork::{Regtest, Signet};
+        use crate::api::evm::tests::block_on;
+
+        let keys = crate::keys::generate_keys(Regtest, crate::WitnessVersion::Taproot);
+        let store = MemKvStore::default();
+        let mut r = wallet_on(&keys, Regtest, &store);
+        r.media.insert(s!("regtest"), vec![1]);
+        block_on(r.vss_backup()).unwrap();
+
+        let mut s = wallet_on(&keys, Signet, &store);
+        assert!(!block_on(s.vss_backup_info()).unwrap().backup_exists);
+        assert!(matches!(
+            block_on(s.vss_restore_backup()),
+            Err(Error::VssBackupNotFound)
+        ));
+        s.media.insert(s!("signet"), vec![2]);
+        block_on(s.vss_backup()).unwrap();
+
+        let fp = &keys.master_fingerprint;
+        assert_eq!(
+            store.0.borrow().keys().cloned().collect::<Vec<_>>(),
+            [
+                (s!("backup"), format!("wallet/{fp}/Regtest")),
+                (s!("backup"), format!("wallet/{fp}/Signet")),
+            ]
+        );
+        for (network, own, other) in [
+            (Regtest, "regtest", "signet"),
+            (Signet, "signet", "regtest"),
+        ] {
+            let mut w = wallet_on(&keys, network, &store);
+            block_on(w.vss_restore_backup()).unwrap();
+            assert!(w.media.contains_key(own), "{network}");
+            assert!(!w.media.contains_key(other), "{network}");
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backup_store_refuses_other_network() {
+        use crate::BitcoinNetwork::{Regtest, Signet};
+        use crate::api::evm::tests::block_on;
+
+        let keys = crate::keys::generate_keys(Regtest, crate::WitnessVersion::Taproot);
+        let store = MemKvStore::default();
+        block_on(wallet_on(&keys, Regtest, &store).vss_backup()).unwrap();
+        let mut s = wallet_on(&keys, Signet, &store);
+        block_on(s.vss_backup()).unwrap();
+        {
+            let fp = &keys.master_fingerprint;
+            let mut data = store.0.borrow_mut();
+            let regtest = data[&(s!("backup"), backup_key(fp, Regtest))].value.clone();
+            let signet = data
+                .get_mut(&(s!("backup"), backup_key(fp, Signet)))
+                .unwrap();
+            signet.value = regtest;
+            signet.version += 1;
+        }
+        let before = s.serialize_backup_payload().unwrap();
+        let versions = s.backup_versions.borrow().clone();
+
+        let err = block_on(s.vss_restore_backup()).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                Error::BackupNetworkMismatch {
+                    backup_network: Regtest,
+                    wallet_network: Signet
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Backup network Regtest does not match the wallet network Signet"
+        );
+        assert_eq!(s.serialize_backup_payload().unwrap(), before);
+        assert_eq!(*s.backup_versions.borrow(), versions);
     }
 }

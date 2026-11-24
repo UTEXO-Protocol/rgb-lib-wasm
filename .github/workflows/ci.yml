@@ -80,6 +80,10 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release -- --test pow_wasm
+      - name: Run overflow check tests
+        run: wasm-pack test --headless --firefox --release -- --test overflow_checks_wasm
+      - name: Run indexer registry tests
+        run: 'wasm-pack test --headless --firefox --release --lib -- no_store_fetch_browser'
 
   integration-tests:
     name: Integration tests (Firefox + regtest)
@@ -162,6 +166,8 @@ jobs:
         run: wasm-pack test --headless --firefox --release -- --test wallet_wasm
 
       - name: Run binding tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 
       - name: Run integration tests
@@ -205,6 +211,10 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
+      - name: Run import tests
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_import::'
       - name: Run link tests
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800

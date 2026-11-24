@@ -1,6 +1,6 @@
 use rgb_lib_wasm::wallet::{
-    AssetFilter, IndexerConfig, Online, OnlineOptions, ReceiveData, Recipient, Transfer, Wallet,
-    WitnessData,
+    AssetFilter, IndexerConfig, Online, OnlineOptions, ReceiveData, Recipient, SyncKeychain,
+    SyncOptions, SyncStrategy, Transfer, TransferScope, Wallet, WitnessData,
 };
 use rgb_lib_wasm::{Assignment, Encryption, Error, TransferStatus};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
 #[allow(dead_code)]
 pub const EVM_RPC_URL: &str = "http://127.0.0.1:8545";
 
+pub const INDEXER_SYNC_LOOKBACK: u32 = 20;
+
 #[allow(dead_code)]
 const DURATION_RCV_TRANSFER: u64 = 86400;
 #[allow(dead_code)]
@@ -33,15 +35,19 @@ pub fn go_online_options(skip_consistency_check: bool) -> OnlineOptions {
             url: ESPLORA_URL.to_string(),
         },
         skip_consistency_check,
+        failed_witness_receive_grace_secs: 604_800,
         proxy_auth_keys: HashMap::new(),
         evm_chains: HashMap::new(),
+        vanilla_sync_lookback: INDEXER_SYNC_LOOKBACK,
     }
 }
 
 /// Load what the wallet saved in IndexedDB as a second wallet, with no flush.
 #[allow(dead_code)]
 pub async fn saved_wallet(wallet: &Wallet) -> (Wallet, Online) {
-    let mut saved = Wallet::restore(wallet.get_wallet_data()).await.unwrap();
+    let mut saved = Wallet::restore(wallet.get_wallet_data(), wallet.get_keys())
+        .await
+        .unwrap();
     let online = saved.go_online(go_online_options(true)).await.unwrap();
     (saved, online)
 }
@@ -187,13 +193,34 @@ pub async fn sleep_ms(ms: u32) {
     wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
 }
 
+#[allow(dead_code)]
+pub fn run_js(body: &str) -> JsValue {
+    js_sys::Function::new_no_args(body)
+        .call0(&JsValue::NULL)
+        .unwrap()
+}
+
+/// Return `None` when `fut` is not ready within `ms`.
+#[allow(dead_code)]
+pub async fn within<F: std::future::Future>(ms: u32, fut: F) -> Option<F::Output> {
+    let mut timer = std::pin::pin!(sleep_ms(ms));
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(out));
+        }
+        timer.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
 thread_local! {
     // public key, expiration and encryption of the invoices created by the receive helpers
     static RECEIVES: RefCell<HashMap<String, (String, u64, Encryption)>> =
         RefCell::new(HashMap::new());
 }
 
-fn register_receive(data: &ReceiveData, encryption: Encryption) {
+pub fn register_receive(data: &ReceiveData, encryption: Encryption) {
     RECEIVES.with(|r| {
         r.borrow_mut().insert(
             data.recipient_id.clone(),
@@ -510,12 +537,29 @@ pub async fn rpc_post(url: &str, method: &str, params: serde_json::Value) -> ser
         .expect("proxy response parse failed")
 }
 
+/// Sync all revealed scripts of both keychains.
+#[allow(dead_code)]
+pub async fn full_sync(wallet: &mut Wallet, online: &Online) {
+    for keychain in [
+        SyncKeychain::Colored,
+        SyncKeychain::Vanilla {
+            lookback: INDEXER_SYNC_LOOKBACK,
+        },
+    ] {
+        let options = SyncOptions {
+            keychain,
+            strategy: SyncStrategy::FullSync,
+        };
+        wallet.sync(online.clone(), options).await.unwrap();
+    }
+}
+
 #[allow(dead_code)]
 pub async fn fund_and_sync(wallet: &mut Wallet, online: &Online, amount: &str) {
     let addr = wallet.get_address().unwrap();
     fund_address(&addr, amount).await;
     wait_for_esplora_sync().await;
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 #[allow(dead_code)]
@@ -545,7 +589,7 @@ pub fn recipient(id: &str, amount: u64, sat: Option<u64>, url: &str) -> Recipien
 #[allow(dead_code)]
 pub fn transfer_of(wallet: &Wallet, recipient_id: &str) -> Transfer {
     wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.recipient_id.as_deref() == Some(recipient_id))
@@ -565,7 +609,7 @@ pub async fn settle(wallet: &mut Wallet, online: &Online, recipient_ids: &[Strin
     for _ in 0..5 {
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
-        wallet.sync(online.clone()).await.unwrap();
+        full_sync(wallet, &online).await;
         refresh(wallet, online).await;
         if recipient_ids
             .iter()
@@ -603,6 +647,43 @@ pub fn serve_reject_list(url: &str, body: &str) {
     )
     .call2(&JsValue::NULL, &url.into(), &body.into())
     .unwrap();
+}
+
+/// Make the page refuse every request for a transaction in `txids`. Reset the count of refused
+/// requests. An empty list stops the refusal.
+#[allow(dead_code)]
+pub fn refuse_tx_lookups(txids: &[&str]) {
+    let txids: js_sys::Array = txids.iter().map(|t| JsValue::from_str(t)).collect();
+    js_sys::Function::new_with_args(
+        "txids",
+        "if (!globalThis.__rgbTxLookups) {
+            globalThis.__rgbTxLookups = { txids: [], count: 0 };
+            const next = globalThis.fetch;
+            globalThis.fetch = function (input, init) {
+                const u = input instanceof Request ? input.url : String(input);
+                const state = globalThis.__rgbTxLookups;
+                if (state.txids.some((t) => u.includes('/tx/' + t))) {
+                    state.count += 1;
+                    return Promise.reject(new TypeError('witness lookup refused'));
+                }
+                return next.call(this, input, init);
+            };
+        }
+        globalThis.__rgbTxLookups.txids = txids;
+        globalThis.__rgbTxLookups.count = 0;",
+    )
+    .call1(&JsValue::NULL, &txids)
+    .unwrap();
+}
+
+/// The number of requests the page refused since the last call to `refuse_tx_lookups`.
+#[allow(dead_code)]
+pub fn refused_tx_lookups() -> u32 {
+    js_sys::Function::new_no_args("return (globalThis.__rgbTxLookups || { count: 0 }).count;")
+        .call0(&JsValue::NULL)
+        .unwrap()
+        .as_f64()
+        .unwrap() as u32
 }
 
 /// The number of times the page served the reject list at `url`.

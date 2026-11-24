@@ -8,6 +8,10 @@ use super::*;
 /// The error variants returned by functions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Deserialize, Serialize)]
 pub enum Error {
+    /// The call stopped because its abort signal fired
+    #[error("Aborted")]
+    Aborted,
+
     /// Address rotation called when reuse_addresses is false
     #[error("Address reuse is not enabled")]
     AddressReuseDisabled,
@@ -21,6 +25,15 @@ pub enum Error {
     AssetNotFound {
         /// Asset ID
         asset_id: String,
+    },
+
+    /// The backup is for another bitcoin network than the wallet
+    #[error("Backup network {backup_network} does not match the wallet network {wallet_network}")]
+    BackupNetworkMismatch {
+        /// The network of the backup
+        backup_network: BitcoinNetwork,
+        /// The network of the wallet
+        wallet_network: BitcoinNetwork,
     },
 
     /// The requested batch transfer was not found
@@ -69,13 +82,26 @@ pub enum Error {
     #[error("An asset cannot be linked to itself")]
     CannotLinkToItself,
 
-    /// Cannot use BFA schema on mainnet
-    #[error("Cannot use BFA schema on mainnet")]
-    CannotUseBfaOnMainnet,
+    /// The schema cannot be used on mainnet, unless `allow_reckless_schemas` is set (see `WalletData`)
+    #[error("Cannot use {asset_schema} schema on mainnet")]
+    CannotUseSchemaOnMainnet {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
 
-    /// Cannot use IFA schema on mainnet
-    #[error("Cannot use IFA schema on mainnet")]
-    CannotUseIfaOnMainnet,
+    /// The reject list refuses opouts of the consignment
+    #[error("Consignment rejected by the reject list, rejected opouts: {opouts:?}")]
+    ConsignmentRejected {
+        /// The rejected opouts
+        opouts: Vec<String>,
+    },
+
+    /// The consignment failed validation
+    #[error("Consignment validation failed: {details}")]
+    ConsignmentValidationFailed {
+        /// Error details
+        details: String,
+    },
 
     /// Two proxy authentication key entries resolve to the same proxy URL
     #[error("Duplicate proxy authentication key: {details}")]
@@ -217,6 +243,13 @@ pub enum Error {
     /// The provided directory does not exist
     #[error("Inexistent data directory")]
     InexistentDataDir,
+
+    /// IndexedDB holds no saved wallet to load
+    #[error("Inexistent wallet manifest: {path}")]
+    InexistentWalletManifest {
+        /// The IndexedDB key
+        path: String,
+    },
 
     /// There are not enough available allocation slots (UTXOs with available slots)
     #[error("Insufficient allocations")]
@@ -375,6 +408,10 @@ pub enum Error {
         details: String,
     },
 
+    /// The fascia is invalid
+    #[error("Invalid fascia")]
+    InvalidFascia,
+
     /// The provided file path is invalid
     #[error("Invalid file path: {file_path}")]
     InvalidFilePath {
@@ -396,6 +433,15 @@ pub enum Error {
     /// The provided invoice is invalid
     #[error("Invalid invoice: {details}")]
     InvalidInvoice {
+        /// Error details
+        details: String,
+    },
+
+    /// The contract that is linked from or to cannot be linked
+    #[error("Contract {contract_id} cannot be linked: {details}")]
+    InvalidLinkedContract {
+        /// Contract ID
+        contract_id: String,
         /// Error details
         details: String,
     },
@@ -504,6 +550,13 @@ pub enum Error {
     #[error("Invalid vanilla keychain")]
     InvalidVanillaKeychain,
 
+    /// Invalid witness version
+    #[error("Invalid witness version: {witness_version}")]
+    InvalidWitnessVersion {
+        /// The invalid witness version
+        witness_version: String,
+    },
+
     /// The maximum fee has been exceeded
     #[error("Max fee exceeded for transfer with TXID: {txid}")]
     MaxFeeExceeded {
@@ -578,6 +631,10 @@ pub enum Error {
     #[error("Issuance request with no provided amounts")]
     NoIssuanceAmounts,
 
+    /// Cannot allocate assets with zero allocations per UTXO
+    #[error("Cannot allocate assets with zero allocations per UTXO")]
+    NoMaxAllocationsPerUtxo,
+
     /// Cannot issue an asset with zero mint rights
     #[error("Issuance request with zero mint rights")]
     NoMintRights,
@@ -620,6 +677,44 @@ pub enum Error {
     #[error("Proxy draining")]
     ProxyDraining,
 
+    /// A receive lookup got an HTTP error status and no JSON-RPC answer from a proxy
+    #[error("Proxy {endpoint} answered with HTTP status {status}")]
+    ProxyHttpError {
+        /// Proxy URL
+        endpoint: String,
+        /// HTTP status code
+        status: u16,
+    },
+
+    /// A receive lookup got an answer from a proxy that is not a valid JSON-RPC answer
+    #[error("Proxy {endpoint} sent an invalid answer: {details}")]
+    ProxyInvalidResponse {
+        /// Proxy URL
+        endpoint: String,
+        /// Error details
+        details: String,
+    },
+
+    /// A receive lookup got a JSON-RPC error from a proxy
+    #[error("Proxy {endpoint} answered with JSON-RPC error {code}: {details}")]
+    ProxyJsonRpcError {
+        /// Proxy URL
+        endpoint: String,
+        /// JSON-RPC error code
+        code: i32,
+        /// Error details
+        details: String,
+    },
+
+    /// A receive lookup to a proxy timed out
+    #[error("Proxy {endpoint} did not answer in time: {details}")]
+    ProxyTimeout {
+        /// Proxy URL
+        endpoint: String,
+        /// Error details
+        details: String,
+    },
+
     /// The proxy doesn't accept any more media for the transfer
     #[error("Proxy doesn't accept so many media")]
     ProxyTooManyMedia,
@@ -627,6 +722,22 @@ pub enum Error {
     /// The signed TX was already released to a recipient, so it can no longer be revoked
     #[error("TX already released")]
     ProxyTxAlreadyReleased,
+
+    /// A receive lookup could not reach a proxy
+    #[error("Proxy {endpoint} is unreachable: {details}")]
+    ProxyUnreachable {
+        /// Proxy URL
+        endpoint: String,
+        /// Error details
+        details: String,
+    },
+
+    /// Error during PSBT inspection
+    #[error("Error during PSBT inspection: {details}")]
+    PsbtInspection {
+        /// Error details
+        details: String,
+    },
 
     /// Provided recipient ID has already been used for another transfer
     #[error("Recipient ID already used")]
@@ -650,6 +761,13 @@ pub enum Error {
         details: String,
     },
 
+    /// Error during RGB inspection
+    #[error("Error during RGB inspection: {details}")]
+    RgbInspection {
+        /// Error details
+        details: String,
+    },
+
     /// The proxy's registered signed TX for this operation was previously cleared
     #[error("Signed TX was cleared")]
     SignedTxCleared,
@@ -662,6 +780,10 @@ pub enum Error {
     #[error("Trying to issue too many assets")]
     TooHighIssuanceAmounts,
 
+    /// PSBT has too many signatures
+    #[error("PSBT has too many signatures")]
+    TooManySignaturesInPsbt,
+
     /// The transfer ID has been deleted on the recipient proxy and cannot be reused
     #[error("Transfer ID deleted")]
     TransferIDDeleted,
@@ -670,16 +792,19 @@ pub enum Error {
     #[error("Transfer ID in use")]
     TransferIDInUse,
 
+    /// The contract that is linked from or to is not known to the wallet
+    #[error("Contract {contract_id} is not known to the wallet")]
+    UnknownLinkedContract {
+        /// Contract ID
+        contract_id: String,
+    },
+
     /// The detected RGB schema is unknown
     #[error("Unknown RGB schema: {schema_id}")]
     UnknownRgbSchema {
         /// RGB schema ID
         schema_id: String,
     },
-
-    /// The transfer has expired
-    #[error("Transfer expired")]
-    TransferExpired,
 
     /// The detected transfer is unknown
     #[error("Unknown transfer: {txid}")]
@@ -773,6 +898,19 @@ pub enum Error {
         path: String,
     },
 
+    /// A wallet setting fixed when the wallet was created has been given a different value
+    #[error(
+        "Wallet setting '{setting}' cannot be changed: the wallet was created with '{expected}', got '{provided}'"
+    )]
+    WalletSettingMismatch {
+        /// The setting name
+        setting: String,
+        /// The value the wallet was created with
+        expected: String,
+        /// The value that has been provided
+        provided: String,
+    },
+
     /// The requested operation cannot be processed by a watch-only wallet
     #[error("Operation not allowed on watch only wallet")]
     WatchOnly,
@@ -791,6 +929,9 @@ pub enum Error {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
+    #[error("Aborted")]
+    Aborted,
+
     #[cfg(feature = "esplora")]
     #[error("Esplora async error: {0}")]
     EsploraAsync(String),
@@ -896,9 +1037,24 @@ impl From<bdk_wallet::bitcoin::psbt::PsbtParseError> for Error {
 
 impl From<IndexerError> for Error {
     fn from(e: IndexerError) -> Self {
-        Error::Indexer {
-            details: e.to_string(),
+        match e {
+            IndexerError::Aborted => Error::Aborted,
+            e => Error::Indexer {
+                details: e.to_string(),
+            },
         }
+    }
+}
+
+impl From<crate::abort::Aborted> for Error {
+    fn from(_: crate::abort::Aborted) -> Self {
+        Error::Aborted
+    }
+}
+
+impl From<crate::abort::Aborted> for IndexerError {
+    fn from(_: crate::abort::Aborted) -> Self {
+        IndexerError::Aborted
     }
 }
 

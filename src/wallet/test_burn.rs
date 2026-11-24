@@ -1,11 +1,24 @@
 use wasm_bindgen_test::*;
 
+use super::offline::MOCK_MAX_UTXO_ASSET_ALLOCATIONS;
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
-use crate::wallet::{AssetFilter, Online, Outpoint, Recipient, Transfer, Wallet, WalletData};
+use super::test_send::{
+    ResetMocks, consignment as saved_consignment, proven, witness_ord, witness_ords,
+};
+use crate::database::memory_db::{ActiveValue, DbAssetActMod};
+use crate::no_wallet::inspection::tests::{conceal_split, tampered_fascia};
+use crate::utils::INDEXER_SYNCS;
+use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::online::assert_abort_restores;
+use crate::wallet::{
+    AssetFilter, Online, Outpoint, Recipient, SinglesigKeys, Transfer, TransferScope, Wallet,
+    WalletData,
+};
 use crate::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbOutExt, RgbTransfer,
-    TS_BURN, TransferKind, TransferStatus, wallet::rust_only::validate_consignment_offchain,
+    AssetSchema, Assignment, BitcoinNetwork, Error, Fascia, FileContent, RgbTransfer, TS_BURN,
+    TransferKind, TransferStatus, TypeOfTransition,
+    wallet::rust_only::validate_consignment_offchain,
 };
 use amplify::confinement::{Confined, U32};
 use bdk_wallet::bitcoin::psbt::Psbt;
@@ -24,7 +37,7 @@ pub(super) async fn mine_and_refresh(wallet: &mut Wallet, online: &Online) {
     for _ in 0..3 {
         mine_blocks(1).await;
         wait_for_esplora_sync().await;
-        wallet.sync(online.clone()).await.unwrap();
+        wallet.full_sync(online.clone()).await.unwrap();
         wallet
             .refresh(online.clone(), None, vec![], false)
             .await
@@ -39,7 +52,7 @@ fn balance(wallet: &Wallet, asset_id: &str) -> (u64, u64, u64) {
 
 pub(super) fn transfer(wallet: &Wallet, asset_id: &str, batch_transfer_idx: i32) -> Transfer {
     wallet
-        .list_transfers(AssetFilter::Id(asset_id.to_string()), None)
+        .list_transfers(AssetFilter::Id(asset_id.to_string()), TransferScope::All)
         .unwrap()
         .into_iter()
         .find(|t| t.batch_transfer_idx == batch_transfer_idx)
@@ -48,7 +61,7 @@ pub(super) fn transfer(wallet: &Wallet, asset_id: &str, batch_transfer_idx: i32)
 
 fn burns(wallet: &Wallet, asset_id: &str) -> Vec<(TransferKind, Option<String>)> {
     wallet
-        .list_transfers(AssetFilter::Id(asset_id.to_string()), None)
+        .list_transfers(AssetFilter::Id(asset_id.to_string()), TransferScope::All)
         .unwrap()
         .into_iter()
         .filter(|t| t.kind == TransferKind::Burn)
@@ -93,9 +106,10 @@ fn assert_burn_split(consignment: &RgbTransfer, txid: &str) {
     assert_eq!(consignment.terminal_ops(), BTreeSet::from([burns[0].opid]));
 }
 
-pub(super) fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment> {
+pub(super) async fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment> {
     wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .flat_map(|u| u.rgb_allocations)
@@ -107,7 +121,7 @@ pub(super) fn assignments(wallet: &mut Wallet, asset_id: &str) -> Vec<Assignment
 async fn ifa(
     wallet_utxos: u8,
     reject_list_url: Option<String>,
-) -> (Wallet, Online, String, WalletData) {
+) -> (Wallet, Online, String, (WalletData, SinglesigKeys)) {
     let wd = wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]);
     let (wallet, online) = funded_wallet(wd.clone(), wallet_utxos).await;
     let asset = wallet
@@ -120,6 +134,7 @@ async fn ifa(
             reject_list_url,
             false,
             None,
+            false,
         )
         .unwrap();
     (wallet, online, asset.asset_id, wd)
@@ -129,10 +144,12 @@ async fn ifa(
 async fn ifa_burn_with_and_without_reason_settles() {
     let url = format!("{REGTEST_HELPER_URL}/reject-list/test/burn");
     serve_reject_list(&url, "");
-    let (mut wallet, online, asset_id, wd) = ifa(5, Some(url.clone())).await;
+    let (mut wallet, online, asset_id, (wd, keys)) = ifa(5, Some(url.clone())).await;
 
     // a burn only the rejected allocation could cover fails
-    let rejected = opouts_holding(&mut wallet, &asset_id, &Assignment::Fungible(600)).concat();
+    let rejected = opouts_holding(&mut wallet, &asset_id, &Assignment::Fungible(600))
+        .await
+        .concat();
     assert_eq!(rejected.len(), 1);
     serve_reject_list(&url, &rejected[0].to_string());
     let result = wallet
@@ -157,13 +174,24 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(burned.requested_assignment, Some(Assignment::Fungible(150)));
     assert_eq!(burned.assignments, vec![Assignment::Fungible(250)]);
     assert_eq!(burned.recipient_id, None);
-    assert!(burned.change_utxo.is_some());
-    let held = assignments(&mut wallet, &asset_id);
+    assert_eq!(burned.change_utxos.len(), 1);
+    // the stored PSBT is the unsigned PSBT of this burn
+    let unsigned = Psbt::deserialize(burned.psbt.as_ref().unwrap()).unwrap();
+    assert_eq!(unsigned.unsigned_tx.compute_txid().to_string(), res.txid);
+    assert!(
+        unsigned
+            .inputs
+            .iter()
+            .all(|i| i.final_script_witness.is_none())
+    );
+    let held = assignments(&mut wallet, &asset_id).await;
     assert!(held.contains(&Assignment::Fungible(600)) && held.contains(&Assignment::Fungible(250)));
     serve_reject_list(&url, "");
 
     // the kept consignment proves the burn with the signed transaction
-    let bytes = wallet.transfer_artifacts[&res.txid].consignment_bytes[&asset_id].clone();
+    let bytes = wallet
+        .get_burn_consignment(asset_id.clone(), res.txid.clone())
+        .unwrap();
     assert!(
         validate_consignment_offchain(&bytes, &res.txid, BitcoinNetwork::Regtest)
             .unwrap()
@@ -184,7 +212,7 @@ async fn ifa_burn_with_and_without_reason_settles() {
             .all(|i| !i.witness.is_empty())
     );
     assert!(bytes.windows(32).any(|w| w == [0xab; 32]));
-    let unspents = wallet.list_unspents(None, false, true).unwrap();
+    let unspents = wallet.list_unspents(None, false, true).await.unwrap();
     assert!(
         unspents
             .iter()
@@ -215,15 +243,27 @@ async fn ifa_burn_with_and_without_reason_settles() {
     ));
     assert_eq!(begin.details.burn_reason, None);
     let psbt = Psbt::from_str(&begin.psbt).unwrap();
-    let opret = psbt
-        .unsigned_tx
-        .output
-        .iter()
-        .position(|o| o.script_pubkey.is_op_return())
-        .unwrap();
+    // a begun burn has no consignment yet
+    let begun = psbt.unsigned_tx.compute_txid().to_string();
     assert_eq!(
-        psbt.outputs[opret].mpc_entropy(),
-        Some(begin.details.entropy)
+        wallet.get_burn_consignment(asset_id.clone(), begun.clone()),
+        Err(Error::UnknownTransfer { txid: begun })
+    );
+    // a burn has no recipient and no output other than the OP_RETURN and the BTC change
+    let artifacts = &wallet.transfer_artifacts[&psbt.unsigned_tx.compute_txid().to_string()];
+    let change_vout =
+        serde_json::to_value(artifacts.batch_info.as_ref().unwrap()).unwrap()["btc_change"]["vout"]
+            .as_u64();
+    for (vout, output) in psbt.unsigned_tx.output.iter().enumerate() {
+        assert!(
+            output.script_pubkey.is_op_return() || Some(vout as u64) == change_vout,
+            "a burn pays a new address"
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(&artifacts.asset_infos[&asset_id]).unwrap()["recipients"],
+        serde_json::json!([]),
+        "a burn records a recipient"
     );
     let fascia = Fascia::from_strict_serialized::<U32>(
         Confined::try_from(begin.details.fascia.clone()).unwrap(),
@@ -233,10 +273,104 @@ async fn ifa_burn_with_and_without_reason_settles() {
         fascia.witness_id().to_string(),
         psbt.unsigned_tx.compute_txid().to_string()
     );
+    let inspection = wallet
+        .inspect_fascia(
+            begin.psbt.clone(),
+            &begin.details.fascia,
+            Some(begin.details.entropy),
+        )
+        .unwrap();
+    let mut types: Vec<_> = inspection.operations[0]
+        .transitions
+        .iter()
+        .map(|t| t.r#type as u8)
+        .collect();
+    types.sort();
+    assert_eq!(
+        types,
+        vec![
+            TypeOfTransition::Transfer as u8,
+            TypeOfTransition::Burn as u8
+        ]
+    );
+    // the split output on a spent outpoint and the change are ours
+    let split = inspection.operations[0]
+        .transitions
+        .iter()
+        .find(|t| t.r#type == TypeOfTransition::Transfer)
+        .unwrap();
+    let mut outputs: Vec<_> = split
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_ours))
+        .collect();
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        vec![
+            (Assignment::Fungible(150), Some(true)),
+            (Assignment::Fungible(700), Some(true)),
+        ]
+    );
+    let spent = psbt.unsigned_tx.input[0].previous_output;
+    let on_spent = split
+        .outputs
+        .iter()
+        .find(|o| o.assignment == Assignment::Fungible(700))
+        .unwrap();
+    assert_eq!(
+        (on_spent.txid.clone(), on_spent.vout),
+        (Some(spent.txid.to_string()), Some(spent.vout))
+    );
+    let result = wallet.inspect_fascia(
+        begin.psbt.clone(),
+        &conceal_split(&begin.details.fascia),
+        Some(begin.details.entropy),
+    );
+    assert!(
+        matches!(&result, Err(Error::RgbInspection { details }) if details.contains("isn't assigned by the bundle")),
+        "{result:?}"
+    );
+    // a bundle that does not spend all the stock inputs loses assets
+    let split_opid = fascia
+        .bundles()
+        .values()
+        .next()
+        .unwrap()
+        .known_transitions
+        .iter()
+        .find(|kt| kt.transition.transition_type == TS_TRANSFER)
+        .map(|kt| serde_json::to_value(kt.opid).unwrap())
+        .unwrap();
+    let without_split = tampered_fascia(&begin.details.fascia, |json| {
+        json["bundles"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()["knownTransitions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|kt| kt["opid"] != split_opid);
+    });
+    let result = wallet.inspect_fascia(
+        begin.psbt.clone(),
+        &without_split,
+        Some(begin.details.entropy),
+    );
+    assert!(
+        matches!(&result, Err(Error::RgbInspection { details }) if details.contains("not declared in bundle")),
+        "{result:?}"
+    );
     let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
-    let res = wallet.burn_end(online.clone(), signed).await.unwrap();
-    assert_eq!(res.batch_transfer_idx, idx);
-    assert_eq!(res.entropy, begin.details.entropy);
+    let ended = wallet.burn_end(online.clone(), signed).await.unwrap();
+    assert_eq!(ended.batch_transfer_idx, idx);
+    assert_eq!(ended.entropy, begin.details.entropy);
+    // the second burn spends the change of the mined first burn and carries its proof
+    let consignment = wallet
+        .get_burn_consignment(asset_id.clone(), ended.txid.clone())
+        .unwrap();
+    assert!(proven(&RgbTransfer::load(&consignment[..]).unwrap())[&res.txid]);
     mine_and_refresh(&mut wallet, &online).await;
     let burned = transfer(&wallet, &asset_id, idx);
     assert_eq!(burned.status, TransferStatus::Settled);
@@ -246,9 +380,9 @@ async fn ifa_burn_with_and_without_reason_settles() {
     // a reload and a restore keep the burns
     wallet.flush().await.unwrap();
     drop(wallet);
-    let wallet = Wallet::restore(wd.clone()).await.unwrap();
+    let wallet = Wallet::restore(wd.clone(), keys.clone()).await.unwrap();
     let backup = wallet.backup("password").unwrap();
-    let mut restored = Wallet::new(wd).unwrap();
+    let mut restored = Wallet::new(wd, keys).unwrap();
     restored.restore_backup(&backup, "password").unwrap();
     let expected = vec![
         (TransferKind::Burn, Some(reason())),
@@ -257,6 +391,13 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(burns(&wallet, &asset_id), expected);
     assert_eq!(burns(&restored, &asset_id), expected);
     assert_eq!(balance(&restored, &asset_id), (150, 150, 150));
+    for w in [&wallet, &restored] {
+        assert_eq!(
+            w.get_burn_consignment(asset_id.clone(), res.txid.clone())
+                .unwrap(),
+            bytes
+        );
+    }
 }
 
 #[wasm_bindgen_test]
@@ -294,14 +435,16 @@ async fn bfa_burn_settles_and_keeps_send_receive() {
         .unwrap();
     assert_eq!(begin.batch_transfer_idx, None);
     let signed = a.sign_psbt(begin.psbt, None).unwrap();
-    let res = a.burn_end(a_online.clone(), signed).await.unwrap();
+    let ended = a.burn_end(a_online.clone(), signed).await.unwrap();
+    // the second burn spends the change of the mined first burn and carries its proof
+    assert!(proven(&saved_consignment(&a, &asset_id, &ended.txid))[&res.txid]);
     mine_and_refresh(&mut a, &a_online).await;
     assert_eq!(balance(&a, &asset_id), (50, 50, 50));
     assert_eq!(
-        transfer(&a, &asset_id, res.batch_transfer_idx).burn_reason,
+        transfer(&a, &asset_id, ended.batch_transfer_idx).burn_reason,
         None
     );
-    assert_eq!(mint_rights(&mut a, &asset_id), 1);
+    assert_eq!(mint_rights(&mut a, &asset_id).await, 1);
 
     record_lock(&bridge, &lock_id, 100, evm_block_number().await).await;
     finalize_evm().await;
@@ -374,7 +517,7 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
     let wrong = |r: &Result<(), Error>| matches!(r, Err(Error::WrongOperation { .. }));
     let results = [
         wallet
-            .send_end(online.clone(), signed.clone(), false)
+            .send_end(online.clone(), signed.clone())
             .await
             .map(|_| ()),
         wallet
@@ -382,7 +525,7 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
             .await
             .map(|_| ()),
         wallet
-            .create_utxos_end(online.clone(), signed.clone(), false)
+            .create_utxos_end(online.clone(), signed.clone())
             .await
             .map(|_| ()),
         wallet
@@ -390,7 +533,7 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
             .await
             .map(|_| ()),
         wallet
-            .send_btc_end(online.clone(), signed.clone(), false)
+            .send_btc_end(online.clone(), signed.clone())
             .await
             .map(|_| ()),
         wallet
@@ -419,16 +562,17 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
     ));
     assert!(wrong(
         &wallet
-            .create_utxos_end(online.clone(), signed.clone(), false)
+            .create_utxos_end(online.clone(), signed.clone())
             .await
             .map(|_| ())
     ));
 
     // an inflate PSBT in burn_end
     let unsigned = wallet
-        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1)
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
     let inflate = wallet.sign_psbt(unsigned, None).unwrap();
     assert!(wrong(
         &wallet
@@ -439,7 +583,8 @@ async fn burn_end_refuses_failed_ended_and_other_operations() {
     wallet.inflate_end(online.clone(), inflate).await.unwrap();
 
     // a burn of another wallet
-    let mut other = Wallet::new(wallet_data(vec![AssetSchema::Ifa])).unwrap();
+    let (other_wd, other_keys) = wallet_data(vec![AssetSchema::Ifa]);
+    let mut other = Wallet::new(other_wd, other_keys).unwrap();
     let other_online = other.go_online(go_online_options(false)).await.unwrap();
     assert!(matches!(
         other.burn_end(other_online, signed).await,
@@ -541,12 +686,15 @@ async fn ifa_send_moves_inflation_rights() {
             )
             .await
             .unwrap();
+        let inspection = a
+            .inspect_fascia(
+                begin.psbt.clone(),
+                &begin.details.fascia,
+                Some(begin.details.entropy),
+            )
+            .unwrap();
         let signed = a.sign_psbt(begin.psbt, None).unwrap();
-        let txid = a
-            .send_end(a_online.clone(), signed, false)
-            .await
-            .unwrap()
-            .txid;
+        let txid = a.send_end(a_online.clone(), signed).await.unwrap().txid;
         let bytes = &a.transfer_artifacts[&txid].consignment_bytes[&asset_id];
         let consignment = RgbTransfer::load(&bytes[..]).unwrap();
         let mut types: Vec<_> = known_transitions(&consignment, &txid)
@@ -555,43 +703,92 @@ async fn ifa_send_moves_inflation_rights() {
             .collect();
         types.sort();
         settle_both(a, &a_online, b, &b_online).await;
-        types
+        (types, inspection)
     };
 
     // the transfer moves the asset, a transfer of inflation rights moves the rights
-    let types = send_to_b(
+    let (types, _) = send_to_b(
         &mut a,
         &mut b,
         vec![Assignment::Fungible(66), Assignment::InflationRight(30)],
     )
     .await;
     assert_eq!(types, vec![TS_TRANSFER_INFLATION, TS_TRANSFER]);
-    let b_assignments = assignments(&mut b, &asset_id);
+    let b_assignments = assignments(&mut b, &asset_id).await;
     assert!(b_assignments.contains(&Assignment::Fungible(66)));
     assert!(b_assignments.contains(&Assignment::InflationRight(30)));
     assert_eq!(balance(&a, &asset_id).0, 934);
-    assert!(assignments(&mut a, &asset_id).contains(&Assignment::InflationRight(70)));
+    assert!(
+        assignments(&mut a, &asset_id)
+            .await
+            .contains(&Assignment::InflationRight(70))
+    );
 
     // a send of rights only has no main transfer
-    let types = send_to_b(&mut a, &mut b, vec![Assignment::InflationRight(20)]).await;
+    let (types, inspection) = send_to_b(&mut a, &mut b, vec![Assignment::InflationRight(20)]).await;
     assert_eq!(types, vec![TS_TRANSFER_INFLATION]);
+    assert_eq!(inspection.operations.len(), 1);
+    // the rights share a UTXO with the asset, so the asset moves too
+    let transitions = &inspection.operations[0].transitions;
+    assert_eq!(transitions.len(), 2);
+    let rights = transitions
+        .iter()
+        .find(|t| t.r#type == TypeOfTransition::TransferInflation)
+        .unwrap();
+    let inputs: Vec<_> = rights.inputs.iter().map(|i| i.assignment.clone()).collect();
+    assert_eq!(inputs, vec![Some(Assignment::InflationRight(70))]);
+    let mut outputs: Vec<_> = rights
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_ours))
+        .collect();
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        vec![
+            (Assignment::InflationRight(20), Some(false)),
+            (Assignment::InflationRight(50), Some(true)),
+        ]
+    );
     assert_eq!(balance(&a, &asset_id).0, 934);
-    assert!(assignments(&mut b, &asset_id).contains(&Assignment::InflationRight(20)));
+    assert!(
+        assignments(&mut b, &asset_id)
+            .await
+            .contains(&Assignment::InflationRight(20))
+    );
 
     // a send that selects a rejected right retries with the other one and gets the list once
-    let r20 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(20)).concat();
+    let r20 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(20))
+        .await
+        .concat();
     assert_eq!(r20.len(), 1);
     serve_reject_list(&url, &r20[0].to_string());
+    forget_reject_list_url(&a, &asset_id);
+    forget_reject_list_url(&b, &asset_id);
     let fetches = reject_list_fetches(&url);
     let right = Assignment::InflationRight(10);
     send(&mut b, &b_online, &mut a, &a_online, &asset_id, right).await;
     assert_eq!(reject_list_fetches(&url) - fetches, 1);
     settle_both(&mut b, &b_online, &mut a, &a_online).await;
-    assert_eq!(inflation_rights(&mut b, &asset_id), vec![20, 20]);
+    // The recipient also reads the list from the genesis.
+    assert_eq!(reject_list_fetches(&url) - fetches, 2);
+    assert_eq!(inflation_rights(&mut b, &asset_id).await, vec![20, 20]);
 }
 
-fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
+// Erase the reject list URL from the DB. Only the genesis has it.
+fn forget_reject_list_url(wallet: &Wallet, asset_id: &str) {
+    let mut asset: DbAssetActMod = wallet
+        .database
+        .check_asset_exists(asset_id.to_string())
+        .unwrap()
+        .into();
+    asset.reject_list = ActiveValue::Set(None);
+    wallet.database.update_asset(&mut asset).unwrap();
+}
+
+async fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
     let mut rights: Vec<u64> = assignments(wallet, asset_id)
+        .await
         .into_iter()
         .filter_map(|a| match a {
             Assignment::InflationRight(amount) => Some(amount),
@@ -603,12 +800,30 @@ fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
 }
 
 async fn inflate_and_settle(b: &mut Wallet, b_online: &Online, asset_id: &str, amount: u64) {
+    let ords = witness_ords(b);
     let unsigned = b
-        .inflate_begin(b_online.clone(), asset_id.to_string(), vec![amount], 1, 1)
+        .inflate_begin(
+            b_online.clone(),
+            asset_id.to_string(),
+            vec![amount],
+            1,
+            1,
+            false,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .psbt;
+    // an inflation builds no consignment and enters the stock at its end
+    let txid = Psbt::from_str(&unsigned)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    assert_eq!(witness_ords(b), ords);
+    assert!(b.transfer_artifacts[&txid].consignment_bytes.is_empty());
     let signed = b.sign_psbt(unsigned, None).unwrap();
     let res = b.inflate_end(b_online.clone(), signed).await.unwrap();
+    assert!(witness_ord(b, &txid).is_some());
     mine_and_refresh(b, b_online).await;
     assert_eq!(
         transfer(b, asset_id, res.batch_transfer_idx).status,
@@ -628,14 +843,18 @@ async fn ifa_inflate_reject_list() {
         send(&mut a, &a_online, &mut b, &b_online, &asset_id, right).await;
         settle_both(&mut a, &a_online, &mut b, &b_online).await;
     }
-    let r60 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(60)).concat();
-    let r40 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(40)).concat();
+    let r60 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(60))
+        .await
+        .concat();
+    let r40 = opouts_holding(&mut b, &asset_id, &Assignment::InflationRight(40))
+        .await
+        .concat();
     assert_eq!((r60.len(), r40.len()), (1, 1));
 
     // an inflation only the rejected right could cover fails
     serve_reject_list(&url, &r60[0].to_string());
     let result = b
-        .inflate_begin(b_online.clone(), asset_id.clone(), vec![41], 1, 1)
+        .inflate_begin(b_online.clone(), asset_id.clone(), vec![41], 1, 1, false)
         .await;
     assert!(
         matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
@@ -644,24 +863,329 @@ async fn ifa_inflate_reject_list() {
 
     // an inflation the allowed right covers spends it and leaves the rejected one out
     inflate_and_settle(&mut b, &b_online, &asset_id, 30).await;
-    assert_eq!(inflation_rights(&mut b, &asset_id), vec![10, 60]);
-    assert!(assignments(&mut b, &asset_id).contains(&Assignment::Fungible(30)));
+    assert_eq!(inflation_rights(&mut b, &asset_id).await, vec![10, 60]);
+    assert!(
+        assignments(&mut b, &asset_id)
+            .await
+            .contains(&Assignment::Fungible(30))
+    );
 
     // an inflation that selects a rejected right retries with the other one and gets the list once
     serve_reject_list(&url, &r40[0].to_string());
     let fetches = reject_list_fetches(&url);
+    let ords = witness_ords(&b);
     inflate_and_settle(&mut b, &b_online, &asset_id, 5).await;
+    assert_eq!(witness_ords(&b).len(), ords.len() + 1);
     assert_eq!(reject_list_fetches(&url) - fetches, 1);
-    assert_eq!(inflation_rights(&mut b, &asset_id), vec![10, 55]);
-    assert!(assignments(&mut b, &asset_id).contains(&Assignment::Fungible(5)));
+    assert_eq!(inflation_rights(&mut b, &asset_id).await, vec![10, 55]);
+    assert!(
+        assignments(&mut b, &asset_id)
+            .await
+            .contains(&Assignment::Fungible(5))
+    );
 
     // a right with a rejected allocation in its history is refused
     serve_reject_list(&url, &format!("{}\n{}", r60[0], r40[0]));
+    let ords = witness_ords(&b);
     let result = b
-        .inflate_begin(b_online.clone(), asset_id.clone(), vec![5], 1, 1)
+        .inflate_begin(b_online.clone(), asset_id.clone(), vec![5], 1, 1, false)
         .await;
     assert!(
         matches!(result, Err(Error::InsufficientAssignments { asset_id: ref id, .. }) if id == &asset_id),
         "{result:?}"
     );
+    assert_eq!(witness_ords(&b), ords);
+}
+
+#[wasm_bindgen_test]
+async fn inflate_and_burn_are_atomic() {
+    let (mut wallet, online, asset_id, _) = ifa(6, None).await;
+    assert_no_partial_change(&mut wallet, "issue_asset_ifa", 0, async |w| {
+        w.issue_asset_ifa(
+            s("IFA"),
+            s("Inflatable"),
+            0,
+            vec![600, 400],
+            vec![100],
+            None,
+            false,
+            None,
+            false,
+        )
+    })
+    .await;
+
+    assert_no_partial_change(&mut wallet, "inflate_begin", 0, async |w| {
+        w.inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
+            .await
+    })
+    .await;
+    let unsigned = assert_abort_restores(&mut wallet, "inflate_begin", async |w| {
+        w.inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
+            .await
+    })
+    .await
+    .psbt;
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    assert_no_partial_change(&mut wallet, "inflate_end", 1, async |w| {
+        w.inflate_end(online.clone(), signed.clone()).await
+    })
+    .await;
+    wallet.inflate_end(online.clone(), signed).await.unwrap();
+    mine_and_refresh(&mut wallet, &online).await;
+
+    assert_no_partial_change(&mut wallet, "burn_begin", 0, async |w| {
+        w.burn_begin(online.clone(), asset_id.clone(), 10, None, 1, 1, false)
+            .await
+    })
+    .await;
+    let begin = assert_abort_restores(&mut wallet, "burn_begin", async |w| {
+        w.burn_begin(online.clone(), asset_id.clone(), 10, None, 1, 1, false)
+            .await
+    })
+    .await;
+    let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+    assert_no_partial_change(&mut wallet, "burn_end", 1, async |w| {
+        w.burn_end(online.clone(), signed.clone()).await
+    })
+    .await;
+    wallet.burn_end(online.clone(), signed).await.unwrap();
+    mine_and_refresh(&mut wallet, &online).await;
+
+    assert_no_partial_change(&mut wallet, "burn", 1, async |w| {
+        w.burn(online.clone(), asset_id.clone(), 10, None, 1, 1)
+            .await
+    })
+    .await;
+}
+
+#[wasm_bindgen_test]
+async fn inflate_begin_end() {
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let last_operation = |wallet: &Wallet| {
+        wallet
+            .database
+            .get_backup_info()
+            .unwrap()
+            .map(|b| b.last_operation_timestamp)
+    };
+    let transfers = |wallet: &Wallet| {
+        wallet
+            .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
+            .unwrap()
+            .len()
+    };
+
+    // a dry run saves and reserves nothing
+    let before = last_operation(&wallet);
+    let count = transfers(&wallet);
+    let res = wallet
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, true)
+        .await
+        .unwrap();
+    assert_eq!(res.batch_transfer_idx, None);
+    assert_eq!(last_operation(&wallet), before);
+    assert_eq!(transfers(&wallet), count);
+    assert!(wallet.get_reserved_outpoints().unwrap().is_empty());
+
+    // begin saves the inflation as initiated
+    let before = last_operation(&wallet);
+    let begin = wallet
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
+        .await
+        .unwrap();
+    assert_ne!(last_operation(&wallet), before);
+    let idx = begin.batch_transfer_idx.unwrap();
+    let initiated = transfer(&wallet, &asset_id, idx);
+    assert_eq!(initiated.status, TransferStatus::Initiated);
+    assert_eq!(initiated.kind, TransferKind::Inflation);
+    let psbt = Psbt::from_str(&begin.psbt).unwrap();
+    let reserved = wallet.get_reserved_outpoints().unwrap();
+    assert!(
+        psbt.unsigned_tx
+            .input
+            .iter()
+            .all(|i| reserved.contains(&i.previous_output.into()))
+    );
+    assert_eq!(begin.details.min_confirmations, 1);
+    let fascia = Fascia::from_strict_serialized::<U32>(
+        Confined::try_from(begin.details.fascia.clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fascia.bundles().len(), 1);
+
+    // end moves the saved inflation on
+    let before = last_operation(&wallet);
+    let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+    let res = wallet.inflate_end(online.clone(), signed).await.unwrap();
+    assert_ne!(last_operation(&wallet), before);
+    assert_eq!(res.batch_transfer_idx, idx);
+    assert_eq!(res.entropy, begin.details.entropy);
+    assert_eq!(
+        transfer(&wallet, &asset_id, idx).status,
+        TransferStatus::WaitingConfirmations
+    );
+    let inflations: Vec<Transfer> = wallet
+        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == TransferKind::Inflation)
+        .collect();
+    assert_eq!(inflations.len(), 1);
+    assert_eq!(inflations[0].txid.as_ref(), Some(&res.txid));
+    assert!(wallet.get_reserved_outpoints().unwrap().is_empty());
+
+    mine_and_refresh(&mut wallet, &online).await;
+    assert_eq!(
+        transfer(&wallet, &asset_id, idx).status,
+        TransferStatus::Settled
+    );
+    assert_eq!(balance(&wallet, &asset_id), (1050, 1050, 1050));
+}
+
+#[wasm_bindgen_test]
+async fn inflate_dry_run_end_saves_transfer() {
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let begin = wallet
+        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+
+    // a dry run has no expiration
+    js_sys::eval("globalThis.realDateNow = Date.now; Date.now = () => realDateNow() + 7200000")
+        .unwrap();
+    let res = wallet.inflate_end(online.clone(), signed).await;
+    js_sys::eval("Date.now = realDateNow").unwrap();
+    let res = res.unwrap();
+    let saved = transfer(&wallet, &asset_id, res.batch_transfer_idx);
+    assert_eq!(saved.status, TransferStatus::WaitingConfirmations);
+    assert_eq!(saved.kind, TransferKind::Inflation);
+}
+
+#[wasm_bindgen_test]
+async fn inflate_one_step() {
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let last_operation = |wallet: &Wallet| {
+        wallet
+            .database
+            .get_backup_info()
+            .unwrap()
+            .map(|b| b.last_operation_timestamp)
+    };
+    let inflations = |wallet: &Wallet| -> Vec<Transfer> {
+        wallet
+            .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind == TransferKind::Inflation)
+            .collect()
+    };
+
+    let before = last_operation(&wallet);
+    INDEXER_SYNCS.set(0);
+    let res = wallet
+        .inflate(online.clone(), asset_id.clone(), vec![30, 20], 1, 1)
+        .await
+        .unwrap();
+    // the broadcast is applied locally, with no sync
+    assert_eq!(INDEXER_SYNCS.get(), 0);
+    assert!(
+        wallet
+            .database
+            .iter_txos()
+            .unwrap()
+            .iter()
+            .any(|t| t.txid == res.txid && t.exists && !t.spent)
+    );
+    assert_ne!(last_operation(&wallet), before);
+    let saved = inflations(&wallet);
+    assert_eq!(saved.len(), 2);
+    for t in &saved {
+        assert_eq!(t.batch_transfer_idx, res.batch_transfer_idx);
+        assert_eq!(t.txid.as_ref(), Some(&res.txid));
+        assert_eq!(t.status, TransferStatus::WaitingConfirmations);
+    }
+    assert_eq!(balance(&wallet, &asset_id), (1000, 1050, 1000));
+    assert!(wallet.get_reserved_outpoints().unwrap().is_empty());
+
+    mine_and_refresh(&mut wallet, &online).await;
+    assert!(
+        inflations(&wallet)
+            .iter()
+            .all(|t| t.status == TransferStatus::Settled)
+    );
+    assert_eq!(balance(&wallet, &asset_id), (1050, 1050, 1050));
+
+    assert_no_partial_change(&mut wallet, "inflate", 1, async |w| {
+        w.inflate(online.clone(), asset_id.clone(), vec![10], 1, 1)
+            .await
+    })
+    .await;
+}
+
+// the inputs of a burn hold one allocation less than a bundle can spend
+#[wasm_bindgen_test]
+async fn burn_inputs_leave_one_bundle_slot() {
+    let _reset = ResetMocks;
+    let (mut wallet, online, asset_id, _) = ifa(5, None).await;
+    let colored: Vec<usize> = wallet
+        .list_unspents(None, false, true)
+        .await
+        .unwrap()
+        .iter()
+        .map(|u| {
+            u.rgb_allocations
+                .iter()
+                .filter(|a| a.asset_id.as_deref() == Some(asset_id.as_str()))
+                .count()
+        })
+        .filter(|n| *n > 0)
+        .collect();
+    assert_eq!(colored, vec![1, 1, 1]);
+    let (mut rcv, rcv_online) =
+        funded_wallet(wallet_data(vec![AssetSchema::Nia, AssetSchema::Ifa]), 1).await;
+    let rid = blind_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(100),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(1));
+    assert!(matches!(
+        wallet
+            .burn_begin(online.clone(), asset_id.clone(), 100, None, 1, 1, true)
+            .await,
+        Err(Error::InsufficientAssignments { .. })
+    ));
+    // a transfer keeps the whole limit
+    wallet
+        .send_begin(
+            online.clone(),
+            HashMap::from([(
+                asset_id.clone(),
+                vec![recipient(&rid, 100, None, PROXY_URL)],
+            )]),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(2));
+    wallet
+        .burn_begin(online.clone(), asset_id.clone(), 100, None, 1, 1, true)
+        .await
+        .unwrap();
 }

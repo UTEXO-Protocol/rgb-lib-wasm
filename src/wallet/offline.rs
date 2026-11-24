@@ -23,6 +23,36 @@ pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 #[cfg(feature = "esplora")]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
+/// Maximum time in the future, in seconds, that the expiration of an outgoing operation, or of an
+/// invoice it pays, can have: about 10 years. `send_begin` refuses a later one with
+/// [`Error::InvalidExpiration`].
+pub const MAX_EXPIRATION_SECS: u32 = 10 * 365 * 24 * 60 * 60;
+
+/// The maximum length of a confined collection, given an accessor returning it from a bundle.
+const fn bundle_confinement_max<
+    C: amplify::confinement::Collection,
+    const MIN: usize,
+    const MAX: usize,
+>(
+    _: fn(&TransitionBundle) -> &Confined<C, MIN, MAX>,
+) -> usize {
+    MAX
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold and still be spent. A bundle spends
+/// at most as many opouts as its input map holds.
+pub(crate) const MAX_UTXO_ASSET_ALLOCATIONS: usize =
+    bundle_confinement_max(|b: &TransitionBundle| &b.input_map);
+
+/// Maximum number of allocations of an asset a UTXO can hold (see [`MAX_UTXO_ASSET_ALLOCATIONS`]).
+pub(crate) fn max_utxo_asset_allocations() -> usize {
+    #[cfg(test)]
+    if let Some(max_allocations) = MOCK_MAX_UTXO_ASSET_ALLOCATIONS.with_borrow(|m| *m) {
+        return max_allocations;
+    }
+    MAX_UTXO_ASSET_ALLOCATIONS
+}
+
 /// Minimum `retention_grace_secs` a recipient requires from the sender proxy to ACK a transfer.
 /// A transfer whose sender proxy grants less is NACKed.
 #[cfg(feature = "esplora")]
@@ -46,21 +76,17 @@ pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
 
 const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
-pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
-pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
-pub(crate) const RGB_STATE_LINK_RIGHT: &str = "linkRight";
-pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
 pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
 pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
 pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
+pub(crate) const RGB_GLOBAL_BURNED_INFLATION: &str = "burnedInflation";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
 pub(crate) const RGB_GLOBAL_LINKED_FROM_CONTRACT: &str = "linkedFromContract";
-#[cfg(feature = "esplora")]
 pub(crate) const RGB_GLOBAL_LINKED_TO_CONTRACT: &str = "linkedToContract";
 pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";
-#[cfg(feature = "esplora")]
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";
+pub(crate) const RGB_METADATA_BEFORE_BLOCK: &str = "beforeBlock";
 
 pub(crate) const SCHEMA_ID_NIA: &str =
     "rgb:sch:RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus";
@@ -79,7 +105,8 @@ pub(crate) struct LocalAssetData {
     pub(crate) initial_supply: u64,
     pub(crate) max_supply: Option<u64>,
     pub(crate) known_circulating_supply: Option<u64>,
-    pub(crate) reject_list_url: Option<String>,
+    pub(crate) bridge_location: Option<RgbBridgeLocationInfo>,
+    pub(crate) reject_list: Option<RgbRejectListInfo>,
     pub(crate) linked_from_contract: Option<String>,
 }
 
@@ -87,6 +114,11 @@ pub(crate) struct LocalAssetData {
 thread_local! {
     /// Seal the genesis of the next IFA asset issued assigns a link right to, if set.
     pub(crate) static MOCK_IFA_LINK_RIGHT: std::cell::RefCell<Option<BuilderSeal<BlindSeal<RgbTxid>>>> =
+        const { std::cell::RefCell::new(None) };
+    pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: std::cell::RefCell<Option<usize>> =
+        const { std::cell::RefCell::new(None) };
+    /// Media of the next asset issued, if set.
+    pub(crate) static MOCK_ISSUE_MEDIA: std::cell::RefCell<Option<Attachment>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -191,8 +223,10 @@ pub struct Metadata {
     pub ticker: Option<String>,
     /// Asset details
     pub details: Option<String>,
-    /// Reject list URL
-    pub reject_list_url: Option<String>,
+    /// Where the bridge contract backing the asset is deployed, which only a BFA asset has
+    pub bridge_location: Option<RgbBridgeLocationInfo>,
+    /// Where the reject list the asset commits to is published, if any
+    pub reject_list: Option<RgbRejectListInfo>,
     /// ID of the contract the asset is linked from (e.g. the one it replaces), if any
     pub linked_from_contract: Option<String>,
     /// ID of the contract the asset has been linked to (e.g. the one replacing it), if linked by
@@ -273,7 +307,7 @@ impl AssetNIA {
 }
 
 /// An Inflatable Fungible Asset.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct AssetIFA {
     /// ID of the asset
@@ -300,8 +334,8 @@ pub struct AssetIFA {
     pub balance: Balance,
     /// Asset media attachment
     pub media: Option<Media>,
-    /// Reject list URL
-    pub reject_list_url: Option<String>,
+    /// Where the reject list the asset commits to is published, if any
+    pub reject_list: Option<RgbRejectListInfo>,
 }
 
 impl AssetIFA {
@@ -355,13 +389,13 @@ impl AssetIFA {
             added_at: asset.added_at,
             balance,
             media,
-            reject_list_url: asset.reject_list_url.clone(),
+            reject_list: asset.reject_list.clone(),
         })
     }
 }
 
 /// A Bridged Fungible Asset.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct AssetBFA {
     /// ID of the asset
@@ -374,8 +408,9 @@ pub struct AssetBFA {
     pub details: Option<String>,
     /// Precision, also known as divisibility, of the asset
     pub precision: u8,
-    /// Initial issued supply
-    pub initial_supply: u64,
+    /// Amount locked on the bridge contract, as read at the last mint end or asset receive.
+    /// It is 0 if the wallet never read it. It counts incomplete mints, so it is an upper bound
+    pub known_circulating_supply: u64,
     /// Timestamp of asset genesis
     pub timestamp: i64,
     /// Timestamp of asset import
@@ -384,8 +419,10 @@ pub struct AssetBFA {
     pub balance: Balance,
     /// Asset media attachment
     pub media: Option<Media>,
-    /// Reject list URL
-    pub reject_list_url: Option<String>,
+    /// Where the bridge contract backing the asset is deployed
+    pub bridge_location: RgbBridgeLocationInfo,
+    /// Where the reject list the asset commits to is published, if any
+    pub reject_list: Option<RgbRejectListInfo>,
 }
 
 impl AssetBFA {
@@ -418,18 +455,26 @@ impl AssetBFA {
             colorings,
             txos,
         )?;
+        let known_circulating_supply = asset
+            .known_circulating_supply
+            .as_ref()
+            .map_or(0, |s| s.parse::<u64>().unwrap());
         Ok(AssetBFA {
             asset_id: asset.id.clone(),
             ticker: asset.ticker.clone().unwrap(),
             name: asset.name.clone(),
             details: asset.details.clone(),
             precision: asset.precision,
-            initial_supply: asset.initial_supply.parse::<u64>().unwrap(),
+            known_circulating_supply,
             timestamp: asset.timestamp,
             added_at: asset.added_at,
             balance,
             media,
-            reject_list_url: asset.reject_list_url.clone(),
+            bridge_location: asset
+                .bridge_location
+                .clone()
+                .expect("a BFA asset has a bridge location"),
+            reject_list: asset.reject_list.clone(),
         })
     }
 }
@@ -450,6 +495,9 @@ pub struct Assets {
 ///
 /// This structure is used both for RGB assets and BTC balances (in sats). When used for a BTC
 /// balance it can be used both for the vanilla wallet and the colored wallet.
+///
+/// An RGB balance above `u64::MAX` is capped to `u64::MAX`. For example, pending incoming
+/// transfers that double-spend each other can make the future balance exceed it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct Balance {
@@ -497,82 +545,6 @@ pub(crate) struct ReceiveDataInternal {
     retention_deadline: Option<i64>,
 }
 
-/// The type of an RGB recipient
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum RecipientType {
-    /// Receive via blinded UTXO
-    Blind,
-    /// Receive via witness TX
-    Witness,
-}
-
-/// RGB recipient information used to be paid
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct RecipientInfo {
-    /// Recipient ID
-    pub recipient_id: String,
-    /// Recipient type
-    pub recipient_type: RecipientType,
-    /// Recipient network
-    pub network: BitcoinNetwork,
-}
-
-impl RecipientInfo {
-    /// Builds a new [`RecipientInfo`] from the provided string, checking that it is valid.
-    pub fn new(recipient_id: String) -> Result<Self, Error> {
-        let xchainnet_beneficiary = XChainNet::<Beneficiary>::from_str(&recipient_id)
-            .map_err(|_| Error::InvalidRecipientID)?;
-        let recipient_type = match xchainnet_beneficiary.into_inner() {
-            Beneficiary::WitnessVout(_, _) => RecipientType::Witness,
-            Beneficiary::BlindedSeal(_) => RecipientType::Blind,
-        };
-        Ok(Self {
-            recipient_id,
-            recipient_type,
-            network: xchainnet_beneficiary.chain_network().try_into()?,
-        })
-    }
-}
-
-/// An RGB transport endpoint.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct TransportEndpoint {
-    /// Endpoint address
-    pub endpoint: String,
-    /// Endpoint transport type
-    pub transport_type: TransportType,
-}
-
-impl TransportEndpoint {
-    /// Builds a new [`TransportEndpoint::endpoint`] from the provided string, checking that it is
-    /// valid.
-    pub fn new(transport_endpoint: String) -> Result<Self, Error> {
-        let rgb_transport = RgbTransport::from_str(&transport_endpoint)?;
-        TransportEndpoint::try_from(rgb_transport)
-    }
-
-    /// Return the transport type of this transport endpoint.
-    pub fn transport_type(&self) -> TransportType {
-        self.transport_type
-    }
-}
-
-impl TryFrom<RgbTransport> for TransportEndpoint {
-    type Error = Error;
-
-    fn try_from(x: RgbTransport) -> Result<Self, Self::Error> {
-        match x {
-            RgbTransport::JsonRpc { tls, host } => Ok(TransportEndpoint {
-                endpoint: format!("http{}://{host}", if tls { "s" } else { "" }),
-                transport_type: TransportType::JsonRpc,
-            }),
-            _ => Err(Error::UnsupportedTransportType),
-        }
-    }
-}
-
 /// Supported database types.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DatabaseType {
@@ -603,178 +575,6 @@ impl Address {
     }
 }
 
-/// An RGB invoice.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct Invoice {
-    /// The RGB invoice string
-    invoice_string: String,
-    /// The data of the RGB invoice
-    pub(crate) invoice_data: InvoiceData,
-}
-
-impl Invoice {
-    /// Parse the provided `invoice_string`.
-    /// Throws an error if the provided string is not a valid RGB invoice.
-    pub fn new(invoice_string: String) -> Result<Self, Error> {
-        let decoded = RgbInvoice::from_str(&invoice_string).map_err(|e| Error::InvalidInvoice {
-            details: e.to_string(),
-        })?;
-        let asset_id = decoded.contract.map(|cid| cid.to_string());
-        let asset_schema = if let Some(schema_id) = decoded.schema {
-            Some(<AssetSchema as std::convert::TryFrom<_>>::try_from(
-                schema_id,
-            )?)
-        } else {
-            None
-        };
-        let assignment_name = decoded.assignment_name.map(|a| a.to_string());
-        let assignment = match asset_schema {
-            None => match (decoded.assignment_state, assignment_name.as_deref()) {
-                (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
-                    Assignment::Fungible(v.value())
-                }
-                (Some(InvoiceState::Amount(v)), Some(RGB_STATE_INFLATION_ALLOWANCE)) => {
-                    Assignment::InflationRight(v.value())
-                }
-                (Some(InvoiceState::Amount(_)), _) => Assignment::Any,
-                (Some(InvoiceState::Data(_)), Some(RGB_STATE_ASSET_OWNER) | None) => {
-                    Assignment::NonFungible
-                }
-                (None, None) => Assignment::Any,
-                (_, _) => {
-                    return Err(Error::InvalidInvoice {
-                        details: s!("unsupported assignment"),
-                    });
-                }
-            },
-            Some(AssetSchema::Nia) => {
-                match (decoded.assignment_state, assignment_name.as_deref()) {
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER) | None) => {
-                        Assignment::Fungible(v.value())
-                    }
-                    (None, Some(RGB_STATE_ASSET_OWNER) | None) => Assignment::Fungible(0),
-                    (_, _) => {
-                        return Err(Error::InvalidInvoice {
-                            details: s!("invalid assignment"),
-                        });
-                    }
-                }
-            }
-            Some(AssetSchema::Ifa) => {
-                match (decoded.assignment_state, assignment_name.as_deref()) {
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
-                        Assignment::Fungible(v.value())
-                    }
-                    (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_INFLATION_ALLOWANCE)) => {
-                        Assignment::InflationRight(v.value())
-                    }
-                    (None, Some(RGB_STATE_INFLATION_ALLOWANCE)) => Assignment::InflationRight(0),
-                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
-                        Assignment::LinkRight
-                    }
-                    (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
-                    (None, None) => Assignment::Any,
-                    (_, _) => {
-                        return Err(Error::InvalidInvoice {
-                            details: s!("invalid assignment"),
-                        });
-                    }
-                }
-            }
-            Some(AssetSchema::Bfa) => {
-                match (decoded.assignment_state, assignment_name.as_deref()) {
-                    (Some(InvoiceState::Amount(v)), Some(RGB_STATE_ASSET_OWNER)) => {
-                        Assignment::Fungible(v.value())
-                    }
-                    (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
-                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
-                        Assignment::LinkRight
-                    }
-                    (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
-                    (None, None) => Assignment::Any,
-                    (_, _) => {
-                        return Err(Error::InvalidInvoice {
-                            details: s!("invalid assignment"),
-                        });
-                    }
-                }
-            }
-        };
-        let recipient_id = decoded.beneficiary.to_string();
-        let transport_endpoints: Vec<String> =
-            decoded.transports.iter().map(|t| t.to_string()).collect();
-
-        let layer_1 = decoded.beneficiary.layer1();
-        let network = match layer_1 {
-            Layer1::Bitcoin => decoded.beneficiary.chain_network().try_into().unwrap(),
-            _ => {
-                return Err(Error::UnsupportedLayer1 {
-                    layer_1: layer_1.to_string(),
-                });
-            }
-        };
-
-        let invoice_data = InvoiceData {
-            recipient_id,
-            asset_schema,
-            asset_id,
-            assignment,
-            assignment_name,
-            expiration_timestamp: decoded.expiry.map(|t| t as u64),
-            transport_endpoints,
-            network,
-            public_key: decoded.public_key,
-            encryption: Encryption::from(decoded.encryption),
-            unknown_query_params: decoded.unknown_query.into_iter().collect(),
-        };
-
-        Ok(Invoice {
-            invoice_string,
-            invoice_data,
-        })
-    }
-
-    /// Return the data associated with this [`Invoice`].
-    pub fn invoice_data(&self) -> InvoiceData {
-        self.invoice_data.clone()
-    }
-
-    /// Return the string associated with this [`Invoice`].
-    pub fn invoice_string(&self) -> String {
-        self.invoice_string.clone()
-    }
-}
-
-/// The data of an RGB invoice.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct InvoiceData {
-    /// ID of the receive operation (blinded UTXO or Bitcoin script)
-    pub recipient_id: String,
-    /// RGB schema
-    pub asset_schema: Option<AssetSchema>,
-    /// RGB asset ID
-    pub asset_id: Option<String>,
-    /// RGB assignment
-    pub assignment: Assignment,
-    /// RGB assignment name
-    pub assignment_name: Option<String>,
-    /// Bitcoin network
-    pub network: BitcoinNetwork,
-    /// Invoice expiration
-    pub expiration_timestamp: Option<u64>,
-    /// Transport endpoints
-    pub transport_endpoints: Vec<String>,
-    /// Recipient's Ed25519 public key (hex-encoded), from the invoice `pk` field (if present)
-    pub public_key: Option<String>,
-    /// Consignment/media encryption preference, from the invoice `enc` field
-    pub encryption: Encryption,
-    /// Unknown query parameters carried by the invoice
-    pub unknown_query_params: HashMap<String, String>,
-}
-
 /// Data for operations that require the wallet to be online.
 ///
 /// Methods not requiring an `Online` object don't need network access and can be performed
@@ -792,43 +592,12 @@ pub struct Online {
     pub indexer_url: String,
 }
 
-/// Bitcoin transaction outpoint.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
-pub struct Outpoint {
-    /// ID of the transaction
-    pub txid: String,
-    /// Output index
-    pub vout: u32,
-}
-
-impl fmt::Display for Outpoint {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "{}:{}", self.txid, self.vout)
-    }
-}
-
-impl From<OutPoint> for Outpoint {
-    fn from(x: OutPoint) -> Outpoint {
-        Outpoint {
-            txid: x.txid.to_string(),
-            vout: x.vout,
-        }
-    }
-}
-
 impl From<DbTxo> for Outpoint {
     fn from(x: DbTxo) -> Outpoint {
         Outpoint {
             txid: x.txid,
             vout: x.vout,
         }
-    }
-}
-
-impl From<Outpoint> for OutPoint {
-    fn from(x: Outpoint) -> OutPoint {
-        OutPoint::from_str(&x.to_string()).expect("outpoint should be parsable")
     }
 }
 
@@ -873,6 +642,20 @@ pub struct ReceivedMint {
     pub evm_chain_id: u64,
     /// Address of the asset's bridge contract, where the lock has to be made
     pub bridge_contract: String,
+}
+
+/// The mint locks a received consignment waits for, saved once it is validated as far as it can
+/// be without them.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub(crate) struct PendingMintLocks {
+    /// SHA-256 digest (hex) of the consignment waiting for the locks
+    pub(crate) consignment_digest: String,
+    /// EIP-155 chain ID of the EVM chain the bridge contract lives on
+    pub(crate) evm_chain_id: u64,
+    /// Address of the bridge contract that records the locks
+    pub(crate) bridge_contract: EvmAddress,
+    /// The claims of the mints whose locks are not finalized yet
+    pub(crate) claims: Vec<Claim>,
 }
 
 /// The information needed to receive RGB assets in witness mode.
@@ -957,6 +740,56 @@ pub enum TransactionType {
     Incoming,
 }
 
+/// Information about a PSBT input for inspection.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PsbtInputInfo {
+    /// The outpoint being spent
+    pub outpoint: Outpoint,
+    /// The amount in satoshis
+    pub amount_sat: u64,
+    /// Whether this input belongs to the wallet's descriptors
+    pub is_mine: bool,
+}
+
+/// Information about a PSBT output for inspection.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PsbtOutputInfo {
+    /// The output address (if parseable)
+    pub address: Option<String>,
+    /// The output script pubkey (hex encoded)
+    pub script_pubkey_hex: String,
+    /// The amount in satoshis
+    pub amount_sat: u64,
+    /// Whether this is an OP_RETURN output
+    pub is_op_return: bool,
+    /// Whether this is an output that will belong to the wallet
+    pub is_mine: bool,
+}
+
+/// Inspection results for a PSBT.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct PsbtInspection {
+    /// Transaction ID
+    pub txid: String,
+    /// List of inputs
+    pub inputs: Vec<PsbtInputInfo>,
+    /// List of outputs
+    pub outputs: Vec<PsbtOutputInfo>,
+    /// Total input amount in satoshis
+    pub total_input_sat: u64,
+    /// Total output amount in satoshis
+    pub total_output_sat: u64,
+    /// Calculated fee in satoshis
+    pub fee_sat: u64,
+    /// Number of signatures present
+    pub signature_count: u16,
+    /// Transaction size in virtual bytes
+    pub size_vbytes: u64,
+}
+
 /// A begun vanilla operation that is not ended or aborted.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -967,16 +800,26 @@ pub struct PendingVanillaTx {
     pub r#type: WalletTransactionType,
 }
 
-/// An asset filter for listing transfers.
+/// An asset filter.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub enum AssetFilter {
-    /// Match transfers of any asset, including those not connected to one
-    Any,
-    /// Match only transfers not connected to a specific asset
-    NoAsset,
-    /// Match only transfers of the asset with the given ID
+    /// Match any or no asset
+    AnyOrNone,
+    /// Match no asset
+    None,
+    /// Match the asset with the given ID
     Id(String),
+}
+
+/// Which transfers to list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TransferScope {
+    /// All transfers
+    All,
+    /// Transfers committed by the on-chain transaction with the given TXID
+    Txid(String),
+    /// Transfers belonging to the batch transfer with the given index
+    BatchTransfer(i32),
 }
 
 /// Proxy data of a received consignment, saved until the transfer ends.
@@ -988,6 +831,8 @@ pub(crate) struct ReceivedConsignmentMeta {
     pub(crate) sender_pubkey: String,
     pub(crate) consignment_hash: String,
     pub(crate) batch: bool,
+    /// History TXs that must reach the safe height before the ACK
+    pub(crate) unsafe_txids: BTreeSet<String>,
 }
 
 /// An RGB transfer.
@@ -1016,8 +861,8 @@ pub struct Transfer {
     pub recipient_id: Option<String>,
     /// UTXO of an incoming transfer
     pub receive_utxo: Option<Outpoint>,
-    /// Change UTXO of an outgoing transfer
-    pub change_utxo: Option<Outpoint>,
+    /// UTXOs receiving the RGB change of an outgoing transfer, as it can be spread over several
+    pub change_utxos: Vec<Outpoint>,
     /// Expiration of the transfer
     pub expiration_timestamp: Option<u64>,
     /// Transport endpoints for the transfer
@@ -1028,6 +873,8 @@ pub struct Transfer {
     pub invoice_string: Option<String>,
     /// Consignment path
     pub consignment_path: Option<String>,
+    /// Unsigned PSBT (BIP-174 bytes) produced by the `_begin` step, when available
+    pub psbt: Option<Vec<u8>>,
     /// Hex-encoded 32-byte reason of a burn transfer, if any
     pub burn_reason: Option<String>,
 }
@@ -1051,12 +898,13 @@ impl Transfer {
             txid: td.txid,
             recipient_id: x.recipient_id.clone(),
             receive_utxo: td.receive_utxo,
-            change_utxo: td.change_utxo,
+            change_utxos: td.change_utxos,
             expiration_timestamp: td.expiration.map(|t| t as u64),
             transport_endpoints,
             sender_transport_endpoint,
             invoice_string: x.invoice_string.clone(),
             consignment_path: td.consignment_path,
+            psbt: td.psbt,
             burn_reason: x.burn_reason.clone(),
         }
     }
@@ -1156,6 +1004,10 @@ pub struct Utxo {
     pub colorable: bool,
     /// Defines if the UTXO already exists (TX that creates it has been broadcasted)
     pub exists: bool,
+    /// Derivation index of the UTXO's script pubkey. `None` if the transaction creating the UTXO
+    /// is not known to the underlying BDK wallet, which is the case while the UTXO does not yet
+    /// exist on-chain and for outputs that do not belong to this wallet.
+    pub derivation_index: Option<u32>,
 }
 
 impl From<DbTxo> for Utxo {
@@ -1168,6 +1020,7 @@ impl From<DbTxo> for Utxo {
                 .expect("DB should contain a valid u64 value"),
             colorable: true,
             exists: x.exists,
+            derivation_index: None,
         }
     }
 }
@@ -1179,12 +1032,13 @@ impl From<LocalOutput> for Utxo {
             btc_amount: x.txout.value.to_sat(),
             colorable: false,
             exists: true,
+            derivation_index: Some(x.derivation_index),
         }
     }
 }
 
 /// Data that defines a [`Wallet`].
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
 pub struct WalletData {
     /// Directory where the wallet directory is stored
@@ -1196,17 +1050,6 @@ pub struct WalletData {
     /// The max number of RGB allocations allowed per UTXO
     #[serde(deserialize_with = "from_str_or_number_mandatory")]
     pub max_allocations_per_utxo: u32,
-    /// Wallet account-level xPub for the vanilla-side of the wallet
-    pub account_xpub_vanilla: String,
-    /// Wallet account-level xPub for the colored-side of the wallet
-    pub account_xpub_colored: String,
-    /// Wallet mnemonic phrase
-    pub mnemonic: Option<Zeroizing<String>>,
-    /// Wallet master fingerprint
-    pub master_fingerprint: String,
-    /// Keychain index for the vanilla-side of the wallet (default: 0)
-    #[serde(deserialize_with = "from_str_or_number_optional")]
-    pub vanilla_keychain: Option<u8>,
     /// List of schemas the wallet should support (when issuing, sending and receiving). Empty list
     /// means the wallet should support all the schemas rgb-lib supports.
     pub supported_schemas: Vec<AssetSchema>,
@@ -1214,23 +1057,211 @@ pub struct WalletData {
     /// Default: `false`
     #[serde(default)]
     pub reuse_addresses: bool,
+    /// When `false`, a mainnet wallet that supports IFA or BFA fails with
+    /// [`crate::Error::CannotUseSchemaOnMainnet`]. When `true`, it is created and a warning is logged.
+    /// Default: `false`
+    #[serde(default)]
+    pub allow_reckless_schemas: bool,
 }
 
-impl std::fmt::Debug for WalletData {
+/// Keys for the singlesig wallet.
+#[derive(Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct SinglesigKeys {
+    /// Wallet account-level xPub for the vanilla side of the wallet
+    pub account_xpub_vanilla: String,
+    /// Wallet account-level xPub for the colored side of the wallet
+    pub account_xpub_colored: String,
+    /// Keychain index for the vanilla-side of the wallet (default: 0)
+    #[serde(deserialize_with = "from_str_or_number_optional")]
+    pub vanilla_keychain: Option<u8>,
+    /// Wallet master fingerprint
+    pub master_fingerprint: String,
+    /// Witness version these keys were derived with
+    pub witness_version: WitnessVersion,
+    /// Wallet mnemonic phrase
+    pub mnemonic: Option<Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for SinglesigKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WalletData")
-            .field("data_dir", &self.data_dir)
-            .field("bitcoin_network", &self.bitcoin_network)
-            .field("database_type", &self.database_type)
-            .field("max_allocations_per_utxo", &self.max_allocations_per_utxo)
+        f.debug_struct("SinglesigKeys")
             .field("account_xpub_vanilla", &self.account_xpub_vanilla)
             .field("account_xpub_colored", &self.account_xpub_colored)
-            .field("mnemonic", &self.mnemonic.as_ref().map(|_| crate::REDACTED))
-            .field("master_fingerprint", &self.master_fingerprint)
             .field("vanilla_keychain", &self.vanilla_keychain)
-            .field("supported_schemas", &self.supported_schemas)
-            .field("reuse_addresses", &self.reuse_addresses)
+            .field("master_fingerprint", &self.master_fingerprint)
+            .field("witness_version", &self.witness_version)
+            .field("mnemonic", &self.mnemonic.as_ref().map(|_| crate::REDACTED))
             .finish()
+    }
+}
+
+impl SinglesigKeys {
+    pub(crate) fn build_descriptors(
+        &self,
+        bitcoin_network: BitcoinNetwork,
+    ) -> Result<(WalletDescriptors, bool), Error> {
+        let bdk_network = BdkNetwork::from(bitcoin_network);
+        let xpub_rgb = str_to_xpub(&self.account_xpub_colored, bdk_network)?;
+        let xpub_btc = str_to_xpub(&self.account_xpub_vanilla, bdk_network)?;
+        let ((colored, vanilla), watch_only) = if let Some(mnemonic) = &self.mnemonic {
+            let descs = get_descriptors(
+                bitcoin_network,
+                mnemonic,
+                self.vanilla_keychain,
+                xpub_btc,
+                xpub_rgb,
+                self.witness_version,
+            )?;
+            // check master fingerprint derived from mnemonic matches provided one
+            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.as_str())?;
+            let master_xprv = Xpriv::new_master(bitcoin_network, &mnemonic.to_seed("")).unwrap();
+            let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
+            if master_xpub.fingerprint()
+                != Fingerprint::from_str(&self.master_fingerprint)
+                    .map_err(|_| Error::InvalidFingerprint)?
+            {
+                return Err(Error::FingerprintMismatch);
+            }
+            (descs, false)
+        } else {
+            let descs = get_descriptors_from_xpubs(
+                bitcoin_network,
+                &self.master_fingerprint,
+                xpub_rgb,
+                xpub_btc,
+                self.vanilla_keychain,
+                self.witness_version,
+            )?;
+            (descs, true)
+        };
+        Ok((WalletDescriptors { colored, vanilla }, watch_only))
+    }
+
+    /// Create a new [`SinglesigKeys`] from a [`crate::keys::Keys`] object.
+    pub fn from_keys(keys: &crate::keys::Keys, vanilla_keychain: Option<u8>) -> Self {
+        Self {
+            mnemonic: Some(keys.mnemonic.clone()),
+            ..Self::from_keys_no_mnemonic(keys, vanilla_keychain)
+        }
+    }
+
+    /// Create a new [`SinglesigKeys`] from a [`crate::keys::Keys`] object without a mnemonic.
+    pub fn from_keys_no_mnemonic(keys: &crate::keys::Keys, vanilla_keychain: Option<u8>) -> Self {
+        Self {
+            account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
+            account_xpub_colored: keys.account_xpub_colored.clone(),
+            vanilla_keychain,
+            master_fingerprint: keys.master_fingerprint.clone(),
+            witness_version: keys.witness_version,
+            mnemonic: None,
+        }
+    }
+}
+
+/// Descriptors for an RGB wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct WalletDescriptors {
+    /// Colored descriptor
+    pub colored: String,
+    /// Vanilla descriptor
+    pub vanilla: String,
+}
+
+// The non-secret settings and keys of a wallet, saved with each snapshot and backup.
+// The mnemonic is never stored here.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct WalletManifest {
+    pub(crate) bitcoin_network: BitcoinNetwork,
+    pub(crate) database_type: DatabaseType,
+    pub(crate) max_allocations_per_utxo: u32,
+    pub(crate) supported_schemas: Vec<AssetSchema>,
+    pub(crate) reuse_addresses: bool,
+    pub(crate) allow_reckless_schemas: bool,
+    pub(crate) account_xpub_vanilla: String,
+    pub(crate) account_xpub_colored: String,
+    pub(crate) vanilla_keychain: u8,
+    pub(crate) master_fingerprint: String,
+    pub(crate) witness_version: WitnessVersion,
+}
+
+impl WalletManifest {
+    pub(crate) fn new(wallet_data: &WalletData, keys: &SinglesigKeys) -> Self {
+        Self {
+            bitcoin_network: wallet_data.bitcoin_network,
+            database_type: wallet_data.database_type.clone(),
+            max_allocations_per_utxo: wallet_data.max_allocations_per_utxo,
+            supported_schemas: wallet_data.supported_schemas.clone(),
+            reuse_addresses: wallet_data.reuse_addresses,
+            allow_reckless_schemas: wallet_data.allow_reckless_schemas,
+            account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
+            account_xpub_colored: keys.account_xpub_colored.clone(),
+            vanilla_keychain: keys.vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
+            master_fingerprint: keys.master_fingerprint.clone(),
+            witness_version: keys.witness_version,
+        }
+    }
+
+    // Fail if wallet_data or keys disagree with the settings fixed at wallet creation.
+    pub(crate) fn check_settings_unchanged(
+        &self,
+        wallet_data: &WalletData,
+        keys: &SinglesigKeys,
+    ) -> Result<(), Error> {
+        let requested = Self::new(wallet_data, keys);
+
+        if self.bitcoin_network != requested.bitcoin_network {
+            return Err(Error::BitcoinNetworkMismatch);
+        }
+
+        macro_rules! check {
+            ($($field:ident),+ $(,)?) => {
+                $(if self.$field != requested.$field {
+                    return Err(Error::WalletSettingMismatch {
+                        setting: stringify!($field).to_string(),
+                        expected: format!("{:?}", self.$field),
+                        provided: format!("{:?}", requested.$field),
+                    });
+                })+
+            };
+        }
+
+        // The witness version comes before the xPubs it derives.
+        check!(
+            master_fingerprint,
+            witness_version,
+            vanilla_keychain,
+            account_xpub_colored,
+            account_xpub_vanilla,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn into_parts(
+        self,
+        data_dir: String,
+        mnemonic: Option<Zeroizing<String>>,
+    ) -> (WalletData, SinglesigKeys) {
+        (
+            WalletData {
+                data_dir,
+                bitcoin_network: self.bitcoin_network,
+                database_type: self.database_type,
+                max_allocations_per_utxo: self.max_allocations_per_utxo,
+                supported_schemas: self.supported_schemas,
+                reuse_addresses: self.reuse_addresses,
+                allow_reckless_schemas: self.allow_reckless_schemas,
+            },
+            SinglesigKeys {
+                account_xpub_vanilla: self.account_xpub_vanilla,
+                account_xpub_colored: self.account_xpub_colored,
+                vanilla_keychain: Some(self.vanilla_keychain),
+                master_fingerprint: self.master_fingerprint,
+                witness_version: self.witness_version,
+                mnemonic,
+            },
+        )
     }
 }
 
@@ -1272,6 +1303,8 @@ pub(crate) type RgbLibDb = crate::database::memory_db::InMemoryDb;
 /// method.
 pub struct Wallet {
     pub(crate) wallet_data: WalletData,
+    /// Keys the wallet was created with. The mnemonic is missing for a watch-only wallet.
+    pub(crate) keys: SinglesigKeys,
     pub(crate) logger: Logger,
     pub(crate) _logger_guard: LoggerGuard,
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
@@ -1294,6 +1327,9 @@ pub struct Wallet {
     /// Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
+    /// Validated copy of each received consignment, kept for settlement. Key: recipient_id
+    #[cfg(feature = "esplora")]
+    pub(crate) received_valid_consignments: HashMap<String, ValidTransfer>,
     /// Proxy data of each received consignment. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
@@ -1302,6 +1338,13 @@ pub struct Wallet {
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
     /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
+    /// Media bytes keyed by hex digest (replaces the media directory on wasm32).
+    pub(crate) media: HashMap<String, Vec<u8>>,
+    /// Mint locks a received consignment waits for, keyed by recipient_id
+    pub(crate) pending_mint_locks: HashMap<String, PendingMintLocks>,
+    /// TXs this wallet broadcast in the running operation. A failed operation keeps them in BDK.
+    #[cfg(feature = "esplora")]
+    pub(crate) broadcast_txs: Vec<BdkTransaction>,
     pub(crate) idb_queue: std::rc::Rc<super::idb_store::SaveQueue>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Random id of this object in stored snapshots.
@@ -1310,7 +1353,8 @@ pub struct Wallet {
     pub(crate) idb_loaded: Option<(u64, u64)>,
     /// Persistent in-memory RGB stock.
     pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<crate::utils::MemStock>>>,
-    pub(crate) vss_client: Option<super::vss::VssBackupClient>,
+    pub(crate) backup_store: Option<std::rc::Rc<super::backup_store::BackupTarget>>,
+    pub(crate) backup_versions: std::cell::RefCell<HashMap<String, i64>>,
     pub(crate) last_vss_backup_error: std::cell::RefCell<Option<String>>,
 }
 
@@ -1319,75 +1363,84 @@ impl Wallet {
     ///
     /// The returned wallet is ready for use only after the IndexedDB read and snapshot
     /// restoration complete. IndexedDB and snapshot decoding failures are returned to the caller.
+    /// A snapshot saved with another fingerprint, witness version, vanilla keychain or account xPub gives
+    /// [`Error::WalletSettingMismatch`]. Other settings come from `wallet_data` and are saved
+    /// with the next save.
     /// It asks the browser to keep the storage. A refusal does not fail the call.
-    pub async fn restore(wallet_data: WalletData) -> Result<Self, Error> {
-        let mut wallet = Self::new(wallet_data)?;
+    pub async fn restore(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
+        let wallet = Self::new(wallet_data, keys)?;
         let snapshot = super::idb_store::load_snapshot(&wallet.idb_key())
             .await
             .map_err(|details| Error::Persistence { details })?;
-        if let Some(snapshot) = snapshot {
-            wallet.idb_loaded = Some((snapshot.writer, snapshot.sequence));
-            wallet
-                .idb_sequence
-                .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
-            wallet.restore_from_snapshot(snapshot)?;
-        }
-        super::idb_store::request_persistent_storage();
-        Ok(wallet)
+        wallet.apply_snapshot(snapshot)
     }
 
-    /// Create a new RGB wallet based on the provided [`WalletData`].
+    /// Load a saved wallet, identified by its data directory, network and master fingerprint.
     ///
-    /// It does not load IndexedDB. It cannot save over a stored snapshot; use [`Wallet::restore`] for that.
+    /// The settings come from the last save. Pass the `mnemonic` to load a wallet able to sign,
+    /// or `None` to load it watch-only. A wallet that was never saved cannot be loaded.
+    pub async fn load(
+        data_dir: &str,
+        bitcoin_network: BitcoinNetwork,
+        master_fingerprint: &str,
+        mnemonic: Option<String>,
+    ) -> Result<Self, Error> {
+        let key = idb_key_for(
+            &PathBuf::from(data_dir).join(master_fingerprint),
+            bitcoin_network,
+        );
+        let snapshot = super::idb_store::load_snapshot(&key)
+            .await
+            .map_err(|details| Error::Persistence { details })?
+            .ok_or(Error::InexistentWalletManifest { path: key })?;
+        if snapshot.manifest.master_fingerprint != master_fingerprint {
+            return Err(Error::FingerprintMismatch);
+        }
+        let (wallet_data, keys) = snapshot
+            .manifest
+            .clone()
+            .into_parts(data_dir.to_string(), mnemonic.map(Zeroizing::new));
+        Self::new(wallet_data, keys)?.apply_snapshot(Some(snapshot))
+    }
+
+    fn apply_snapshot(
+        mut self,
+        snapshot: Option<super::idb_store::WalletSnapshot>,
+    ) -> Result<Self, Error> {
+        if let Some(snapshot) = snapshot {
+            self.idb_loaded = Some((snapshot.writer, snapshot.sequence));
+            self.idb_sequence
+                .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
+            self.restore_from_snapshot(snapshot)?;
+        }
+        super::idb_store::request_persistent_storage();
+        Ok(self)
+    }
+
+    /// Create a new RGB wallet based on the provided [`WalletData`] and [`SinglesigKeys`].
+    ///
+    /// It does not load IndexedDB. It cannot save over a stored snapshot; use [`Wallet::restore`]
+    /// or [`Wallet::load`] for that.
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
-    pub fn new(wallet_data: WalletData) -> Result<Self, Error> {
+    pub fn new(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
         let wdata = wallet_data.clone();
 
-        // wallet account xPubs
+        let (descs, watch_only) = keys.build_descriptors(wdata.bitcoin_network)?;
         let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
-        let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
-        let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
+        if wdata.max_allocations_per_utxo == 0 {
+            return Err(Error::NoMaxAllocationsPerUtxo);
+        }
 
         // wallet directory and file logging setup
-        let data_dir_path = PathBuf::from(&wdata.data_dir);
-        if let Some(mnemonic) = &wdata.mnemonic {
-            // check master fingerprint derived from mnemonic matches provided one
-            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic.as_str())?;
-            let master_xprv =
-                Xpriv::new_master(wdata.bitcoin_network, &mnemonic.to_seed("")).unwrap();
-            let master_xpub = Xpub::from_priv(&Secp256k1::new(), &master_xprv);
-            let master_fingerprint = master_xpub.fingerprint();
-            if master_fingerprint
-                != Fingerprint::from_str(&wdata.master_fingerprint)
-                    .map_err(|_| Error::InvalidFingerprint)?
-            {
-                return Err(Error::FingerprintMismatch);
-            }
-        }
-        let wallet_dir = data_dir_path.join(&wdata.master_fingerprint);
+        let wallet_dir = PathBuf::from(&wdata.data_dir).join(&keys.master_fingerprint);
         let (logger, _logger_guard) = setup_logger(&wallet_dir, None)?;
         info!(logger.clone(), "New wallet in '{:?}'", wallet_dir);
 
         // BDK setup
-        let (desc_colored, desc_vanilla, watch_only) = if let Some(mnemonic) = wdata.mnemonic {
-            let (desc_colored, desc_vanilla) = get_descriptors(
-                wdata.bitcoin_network,
-                &mnemonic,
-                wdata.vanilla_keychain,
-                xpub_btc,
-                xpub_rgb,
-            )?;
-            (desc_colored, desc_vanilla, false)
-        } else {
-            let (desc_colored, desc_vanilla) = get_descriptors_from_xpubs(
-                wdata.bitcoin_network,
-                &wdata.master_fingerprint,
-                xpub_rgb,
-                xpub_btc,
-                wdata.vanilla_keychain,
-            )?;
-            (desc_colored, desc_vanilla, true)
-        };
+        let WalletDescriptors {
+            colored: desc_colored,
+            vanilla: desc_vanilla,
+        } = descs;
         let chain_net: ChainNet = wdata.bitcoin_network.into();
         let wallet_params = BdkWallet::load()
             .descriptor(KeychainKind::External, Some(desc_colored.clone()))
@@ -1414,12 +1467,18 @@ impl Wallet {
         if supported_schemas.is_empty() {
             return Err(Error::NoSupportedSchemas);
         }
-        if wdata.bitcoin_network == BitcoinNetwork::Mainnet {
-            if supported_schemas.contains(&AssetSchema::Ifa) {
-                return Err(Error::CannotUseIfaOnMainnet);
+        if wdata.bitcoin_network == BitcoinNetwork::Mainnet
+            && let Some(schema) = supported_schemas.iter().find(|s| !s.allowed_on_mainnet())
+        {
+            if !wdata.allow_reckless_schemas {
+                return Err(Error::CannotUseSchemaOnMainnet {
+                    asset_schema: *schema,
+                });
             }
-            if supported_schemas.contains(&AssetSchema::Bfa) {
-                return Err(Error::CannotUseBfaOnMainnet);
+            let msg = format!("Reckless schema {schema} allowed on mainnet");
+            warn!(logger, "{msg}");
+            if cfg!(target_arch = "wasm32") {
+                web_sys::console::warn_1(&msg.into());
             }
         }
         let mut runtime = load_rgb_runtime(wallet_dir.clone())?;
@@ -1445,6 +1504,7 @@ impl Wallet {
         info!(logger, "New wallet completed");
         Ok(Wallet {
             wallet_data,
+            keys,
             logger,
             _logger_guard,
             watch_only,
@@ -1461,10 +1521,16 @@ impl Wallet {
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
             #[cfg(feature = "esplora")]
+            received_valid_consignments: HashMap::new(),
+            #[cfg(feature = "esplora")]
             received_consignment_meta: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            media: HashMap::new(),
+            pending_mint_locks: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            broadcast_txs: Vec::new(),
             idb_queue: Default::default(),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer,
@@ -1473,7 +1539,8 @@ impl Wallet {
                 let stock = std::mem::take(&mut runtime.stock);
                 std::rc::Rc::new(std::cell::RefCell::new(Some(stock)))
             },
-            vss_client: None,
+            backup_store: None,
+            backup_versions: std::cell::RefCell::new(HashMap::new()),
             last_vss_backup_error: std::cell::RefCell::new(None),
         })
     }
@@ -1505,6 +1572,19 @@ impl Wallet {
     /// Return the data that defines the wallet.
     pub fn get_wallet_data(&self) -> WalletData {
         self.wallet_data.clone()
+    }
+
+    /// Return the bitcoin keys of the wallet.
+    pub fn get_keys(&self) -> SinglesigKeys {
+        self.keys.clone()
+    }
+
+    /// Return the descriptors of the wallet.
+    pub fn get_descriptors(&self) -> WalletDescriptors {
+        self.keys
+            .build_descriptors(self.bitcoin_network())
+            .expect("already succeeded at wallet creation")
+            .0
     }
 
     /// Return the wallet directory.
@@ -1546,6 +1626,35 @@ impl Wallet {
         if !self.supports_schema(asset_schema) {
             return Err(Error::UnsupportedSchema {
                 asset_schema: *asset_schema,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_linked_contract_known(
+        &self,
+        contract_id: &ContractId,
+    ) -> Result<DbAsset, Error> {
+        self.database
+            .get_asset(contract_id.to_string())?
+            .ok_or_else(|| Error::UnknownLinkedContract {
+                contract_id: contract_id.to_string(),
+            })
+    }
+
+    /// Check that a new asset can link from this contract.
+    fn check_linked_from_contract(&self, linked_from_contract: &ContractId) -> Result<(), Error> {
+        let linked_from = self.check_linked_contract_known(linked_from_contract)?;
+        if !linked_from.schema.supports_link() {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: linked_from.id,
+                details: format!("schema {} doesn't support links", linked_from.schema),
+            });
+        }
+        if let Some(linked_to_contract) = linked_from.linked_to_contract {
+            return Err(Error::InvalidLinkedContract {
+                contract_id: linked_from.id,
+                details: format!("it's already linked to contract {linked_to_contract}"),
             });
         }
         Ok(())
@@ -1604,7 +1713,16 @@ impl Wallet {
         mut_unspents
             .iter_mut()
             .for_each(|u| u.rgb_allocations.retain(|a| !a.status.failed()));
-        let max_allocs = max_allocations.unwrap_or(self.max_allocations_per_utxo() - 1);
+        let max_allocs = max_allocations.unwrap_or_else(|| {
+            // a UTXO cannot get more allocations than it can hold and still be spent
+            let max_per_utxo = Ord::min(
+                self.max_allocations_per_utxo(),
+                u32::try_from(max_utxo_asset_allocations()).unwrap_or(u32::MAX),
+            );
+            max_per_utxo
+                .checked_sub(1)
+                .expect("max allocations per UTXO must be greater than 0")
+        });
         let reserved = self.get_reserved_outpoints()?;
         Ok(mut_unspents
             .iter()
@@ -1637,7 +1755,8 @@ impl Wallet {
 
 impl Wallet {
     /// Return the inputs of the transfers that can still fail (Initiated, waiting for the
-    /// counterparty or for the broadcast), and of the inflations that are begun and not expired.
+    /// counterparty or for the broadcast), and of the begun operations with no saved transfer,
+    /// until they expire.
     pub(crate) fn get_reserved_outpoints(&self) -> Result<Vec<Outpoint>, Error> {
         let now = now().unix_timestamp();
         let waiting: HashMap<String, bool> = self
@@ -1902,6 +2021,8 @@ impl Wallet {
         text: RicardianContract,
         media: Option<Attachment>,
     ) -> ContractTerms {
+        #[cfg(test)]
+        let media = media.or_else(|| MOCK_ISSUE_MEDIA.take());
         ContractTerms { text, media }
     }
 
@@ -1932,6 +2053,18 @@ impl Wallet {
         })
     }
 
+    pub(crate) fn get_asset_medias(&self, media_idx: Option<i32>) -> Result<HashSet<Media>, Error> {
+        let mut asset_medias = HashSet::new();
+        if let Some(media_idx) = media_idx {
+            let db_media = self
+                .database
+                .get_media(media_idx)?
+                .expect("asset media row exists");
+            asset_medias.insert(Media::from_db_media(&db_media, self.get_media_dir()));
+        }
+        Ok(asset_medias)
+    }
+
     pub(crate) fn add_asset_to_db(
         &self,
         asset_id: String,
@@ -1957,7 +2090,8 @@ impl Wallet {
             precision: ActiveValue::Set(asset_data.precision),
             ticker: ActiveValue::Set(asset_data.ticker),
             timestamp: ActiveValue::Set(timestamp),
-            reject_list_url: ActiveValue::Set(asset_data.reject_list_url),
+            bridge_location: ActiveValue::Set(asset_data.bridge_location),
+            reject_list: ActiveValue::Set(asset_data.reject_list),
             linked_from_contract: ActiveValue::Set(asset_data.linked_from_contract),
             linked_to_contract: ActiveValue::Set(None),
         };
@@ -1995,6 +2129,18 @@ impl Wallet {
     /// If `amounts` contains more than 1 element, each one will be issued as a separate allocation
     /// for the same asset (on a separate UTXO that needs to be already available).
     pub fn issue_asset_nia(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+    ) -> Result<AssetNIA, Error> {
+        let cp = self.shared_checkpoint("issue_asset_nia");
+        let res = self._issue_asset_nia(ticker, name, precision, amounts);
+        self.commit_shared(cp, res)
+    }
+
+    fn _issue_asset_nia(
         &self,
         ticker: String,
         name: String,
@@ -2085,7 +2231,8 @@ impl Wallet {
             initial_supply: settled,
             max_supply: None,
             known_circulating_supply: None,
-            reject_list_url: None,
+            bridge_location: None,
+            reject_list: None,
             linked_from_contract: None,
         };
         let asset = self.add_asset_to_db(
@@ -2130,7 +2277,6 @@ impl Wallet {
         let asset = AssetNIA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.queue_save()?;
 
         info!(self.logger, "Issue asset NIA completed");
         Ok(asset)
@@ -2153,8 +2299,10 @@ impl Wallet {
     #[cfg_attr(feature = "esplora", doc = "[`link`](Wallet::link)).")]
     #[cfg_attr(not(feature = "esplora"), doc = "`link`).")]
     ///
-    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
-    /// the one it replaces).
+    /// The optional `linked_from_contract` is the ID of the contract this is linked from. The wallet
+    /// needs to know it, to check it can link to the contract being issued: its schema needs to
+    /// support links and it needs to be unlinked. Set `skip_contract_checks` to skip these checks
+    /// and link from a contract the wallet cannot check, e.g. one it doesn't know.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
@@ -2166,6 +2314,35 @@ impl Wallet {
         reject_list_url: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
+    ) -> Result<AssetIFA, Error> {
+        let cp = self.shared_checkpoint("issue_asset_ifa");
+        let res = self._issue_asset_ifa(
+            ticker,
+            name,
+            precision,
+            amounts,
+            inflation_amounts,
+            reject_list_url,
+            link_right,
+            linked_from_contract,
+            skip_contract_checks,
+        );
+        self.commit_shared(cp, res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn _issue_asset_ifa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+        inflation_amounts: Vec<u64>,
+        reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetIFA, Error> {
         info!(
             self.logger,
@@ -2187,6 +2364,11 @@ impl Wallet {
                     .map_err(|_| Error::InvalidContractId { contract_id })
             })
             .transpose()?;
+        if let Some(linked_from_contract) = &linked_from_contract
+            && !skip_contract_checks
+        {
+            self.check_linked_from_contract(linked_from_contract)?;
+        }
 
         let settled = self._get_total_issue_amount(&amounts, true)?;
         let inflation_amt = self.get_total_inflation_amount(&inflation_amounts, settled)?;
@@ -2313,7 +2495,8 @@ impl Wallet {
             initial_supply: settled,
             max_supply: Some(max_supply),
             known_circulating_supply: Some(settled),
-            reject_list_url,
+            bridge_location: None,
+            reject_list: reject_list_url.map(RgbRejectListInfo::Url),
             linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
         let asset = self.add_asset_to_db(
@@ -2378,7 +2561,6 @@ impl Wallet {
         let asset = AssetIFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.queue_save()?;
 
         info!(self.logger, "Issue asset IFA completed");
         Ok(asset)
@@ -2398,8 +2580,10 @@ impl Wallet {
     #[cfg_attr(feature = "esplora", doc = "[`link`](Wallet::link)).")]
     #[cfg_attr(not(feature = "esplora"), doc = "`link`).")]
     ///
-    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
-    /// the one it replaces).
+    /// The optional `linked_from_contract` is the ID of the contract this is linked from. The wallet
+    /// needs to know it, to check it can link to the contract being issued: its schema needs to
+    /// support links and it needs to be unlinked. Set `skip_contract_checks` to skip these checks
+    /// and link from a contract the wallet cannot check, e.g. one it doesn't know.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_bfa(
         &self,
@@ -2412,6 +2596,37 @@ impl Wallet {
         reject_list_address: Option<String>,
         link_right: bool,
         linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
+    ) -> Result<AssetBFA, Error> {
+        let cp = self.shared_checkpoint("issue_asset_bfa");
+        let res = self._issue_asset_bfa(
+            ticker,
+            name,
+            precision,
+            mint_rights,
+            chain_id,
+            contract_address,
+            reject_list_address,
+            link_right,
+            linked_from_contract,
+            skip_contract_checks,
+        );
+        self.commit_shared(cp, res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn _issue_asset_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+        skip_contract_checks: bool,
     ) -> Result<AssetBFA, Error> {
         info!(
             self.logger,
@@ -2432,6 +2647,11 @@ impl Wallet {
                     .map_err(|_| Error::InvalidContractId { contract_id })
             })
             .transpose()?;
+        if let Some(linked_from_contract) = &linked_from_contract
+            && !skip_contract_checks
+        {
+            self.check_linked_from_contract(linked_from_contract)?;
+        }
 
         if mint_rights == 0 {
             return Err(Error::NoMintRights);
@@ -2459,6 +2679,11 @@ impl Wallet {
         let bfa_name = self._check_name(name.clone())?;
         let bfa_precision = self._check_precision(precision)?;
 
+        let bridge_location = BridgeLocation::Evm(EvmContract {
+            chain_id,
+            address: self._check_contract_address(contract_address)?,
+        });
+
         let mut builder = ContractBuilder::with(
             Identity::default(),
             BridgedFungibleAsset::schema_rules(),
@@ -2472,23 +2697,19 @@ impl Wallet {
         .expect("invalid precision")
         .add_global_state("terms", terms)
         .expect("invalid terms")
-        .add_global_state(
-            RGB_GLOBAL_BRIDGE_LOCATION,
-            BridgeLocation::Evm(EvmContract {
-                chain_id,
-                address: self._check_contract_address(contract_address)?,
-            }),
-        )
+        .add_global_state(RGB_GLOBAL_BRIDGE_LOCATION, bridge_location.clone())
         .expect("invalid bridgeLocation");
-        if let Some(reject_list_address) = reject_list_address {
+        let reject_list = reject_list_address
+            .map(|address| {
+                Ok::<_, Error>(RejectListLocation::Evm(EvmContract {
+                    chain_id,
+                    address: self._check_contract_address(address)?,
+                }))
+            })
+            .transpose()?;
+        if let Some(reject_list) = reject_list.clone() {
             builder = builder
-                .add_global_state(
-                    RGB_GLOBAL_REJECT_LIST,
-                    RejectListLocation::Evm(EvmContract {
-                        chain_id,
-                        address: self._check_contract_address(reject_list_address)?,
-                    }),
-                )
+                .add_global_state(RGB_GLOBAL_REJECT_LIST, reject_list)
                 .expect("invalid rejectList");
         }
 
@@ -2536,7 +2757,8 @@ impl Wallet {
             initial_supply: 0,
             max_supply: None,
             known_circulating_supply: None,
-            reject_list_url: None,
+            bridge_location: Some(bridge_location.into()),
+            reject_list: reject_list.map(RgbRejectListInfo::from),
             linked_from_contract: linked_from_contract.map(|c| c.to_string()),
         };
         let asset = self.add_asset_to_db(
@@ -2591,7 +2813,6 @@ impl Wallet {
         let asset = AssetBFA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
         self.update_backup_info(false)?;
-        self.queue_save()?;
 
         info!(self.logger, "Issue asset BFA completed");
         Ok(asset)
@@ -2640,6 +2861,208 @@ impl Wallet {
         Ok(psbt.to_string())
     }
 
+    /// Inspect a PSBT to return its information.
+    pub fn inspect_psbt(&self, psbt: String) -> Result<PsbtInspection, Error> {
+        info!(self.logger, "Inspecting PSBT...");
+        let psbt = Psbt::from_str(&psbt)?;
+
+        let mut inputs = Vec::new();
+        let mut total_input_sat = 0u64;
+        for (psbt_input, input) in psbt.inputs.iter().zip(psbt.unsigned_tx.input.iter()) {
+            let witness_utxo =
+                psbt_input
+                    .witness_utxo
+                    .as_ref()
+                    .ok_or_else(|| Error::PsbtInspection {
+                        details: s!("cannot inspect non-segwit PSBT"),
+                    })?;
+            let amount_sat = witness_utxo.value.to_sat();
+            let is_mine = self.bdk_wallet.is_mine(witness_utxo.script_pubkey.clone());
+            total_input_sat = total_input_sat
+                .checked_add(amount_sat)
+                .expect("should never overflow");
+            inputs.push(PsbtInputInfo {
+                outpoint: Outpoint {
+                    txid: input.previous_output.txid.to_string(),
+                    vout: input.previous_output.vout,
+                },
+                amount_sat,
+                is_mine,
+            });
+        }
+
+        let mut outputs = Vec::new();
+        let mut total_output_sat = 0u64;
+        let network = BdkNetwork::from(self.bitcoin_network());
+        for output in psbt.unsigned_tx.output.iter() {
+            let amount_sat = output.value.to_sat();
+            total_output_sat = total_output_sat
+                .checked_add(amount_sat)
+                .expect("should never overflow");
+            let is_op_return = output.script_pubkey.is_op_return();
+            let address = if !is_op_return {
+                BdkAddress::from_script(&output.script_pubkey, network)
+                    .ok()
+                    .map(|addr| addr.to_string())
+            } else {
+                None
+            };
+            let is_mine = self.bdk_wallet.is_mine(output.script_pubkey.clone());
+            outputs.push(PsbtOutputInfo {
+                address,
+                script_pubkey_hex: output.script_pubkey.to_hex_string(),
+                amount_sat,
+                is_op_return,
+                is_mine,
+            });
+        }
+
+        let mut signature_count = 0u16;
+        for input in psbt.inputs.iter() {
+            let partial_sigs_count = u16::try_from(input.partial_sigs.len())
+                .map_err(|_| Error::TooManySignaturesInPsbt)?;
+            let tap_script_sigs_count = u16::try_from(input.tap_script_sigs.len())
+                .map_err(|_| Error::TooManySignaturesInPsbt)?;
+            signature_count = signature_count
+                .checked_add(partial_sigs_count)
+                .and_then(|s| s.checked_add(tap_script_sigs_count))
+                .ok_or(Error::TooManySignaturesInPsbt)?;
+        }
+
+        let inspection = PsbtInspection {
+            txid: psbt.unsigned_tx.compute_txid().to_string(),
+            inputs,
+            outputs,
+            total_input_sat,
+            total_output_sat,
+            fee_sat: total_input_sat.saturating_sub(total_output_sat),
+            signature_count,
+            size_vbytes: psbt.unsigned_tx.vsize() as u64,
+        };
+        info!(self.logger, "PSBT inspection completed");
+        Ok(inspection)
+    }
+
+    /// Inspect a PSBT and fascia with wallet ownership and schema details.
+    pub fn inspect_fascia(
+        &self,
+        psbt: String,
+        fascia: &[u8],
+        entropy: Option<u64>,
+    ) -> Result<RgbInspection, Error> {
+        info!(self.logger, "Inspecting fascia...");
+        let psbt = Psbt::from_str(&psbt)?;
+        let fascia = parse_fascia(fascia)?;
+
+        // verify all PSBT inputs belong to this wallet
+        for psbt_input in psbt.inputs.iter() {
+            let script_pubkey = psbt_input
+                .witness_utxo
+                .as_ref()
+                .ok_or_else(|| Error::RgbInspection {
+                    details: s!("RGB-related PSBTs require segwit"),
+                })?
+                .script_pubkey
+                .clone();
+            if !self.bdk_wallet.is_mine(script_pubkey) {
+                return Err(Error::RgbInspection {
+                    details: s!("found a PSBT input that does not belong to this wallet"),
+                });
+            }
+        }
+
+        let runtime = self.rgb_runtime()?;
+        let prev_outputs: Vec<OutPoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect();
+        let is_revealed_seal_ours = |txid: TxPtr, vout: u32| -> bool {
+            if txid == TxPtr::WitnessTx {
+                psbt.unsigned_tx
+                    .output
+                    .get(vout as usize)
+                    .map(|output| self.bdk_wallet.is_mine(output.script_pubkey.clone()))
+                    .unwrap_or(false)
+            } else {
+                let outpoint = Outpoint {
+                    txid: txid.to_string(),
+                    vout,
+                };
+                self.database.get_txo(&outpoint).unwrap_or(None).is_some()
+            }
+        };
+        let inspection = fascia_inspection(
+            &psbt,
+            &fascia,
+            entropy,
+            |contract_id, bundle, witness_tx| {
+                // collect the RGB inputs allocated in stock to the spent outputs
+                let mut stock_inputs = HashMap::new();
+                if let Ok(ass_map) =
+                    runtime.contract_assignments_for(contract_id, prev_outputs.iter().copied())
+                {
+                    for (explicit_seal, opout_state_map) in ass_map {
+                        let outpoint = explicit_seal.to_outpoint();
+                        for (opout, state) in opout_state_map {
+                            let assignment = Assignment::from_opout_and_state(opout, &state);
+                            stock_inputs.insert(opout, (outpoint, assignment));
+                        }
+                    }
+                }
+
+                // the bundle must spend all the stock inputs, else they are lost
+                let bundle_input_opouts: HashSet<_> = bundle
+                    .known_transitions
+                    .iter()
+                    .flat_map(|KnownTransition { transition, .. }| transition.inputs())
+                    .collect();
+                let extra_in_stock: Vec<_> = stock_inputs
+                    .keys()
+                    .filter(|opout| !bundle_input_opouts.contains(opout))
+                    .collect();
+                if !extra_in_stock.is_empty() {
+                    return Err(Error::RgbInspection {
+                        details: format!(
+                            "bundle for contract {contract_id}: stock contains {} input(s) not declared in bundle (malformed transfer?): {extra_in_stock:?}",
+                            extra_in_stock.len(),
+                        ),
+                    });
+                }
+
+                let chain_net = runtime.genesis(contract_id)?.chain_net;
+                let asset_schema = AssetSchema::get_from_contract_id(contract_id, &runtime)?;
+                let is_ours = |seal: &BuilderSeal<GraphSeal>| {
+                    Some(match seal {
+                        BuilderSeal::Revealed(seal) => {
+                            is_revealed_seal_ours(seal.txid, seal.vout.into_u32())
+                        }
+                        BuilderSeal::Concealed(seal) => runtime
+                            .stock
+                            .as_store()
+                            .seal_of_secret(*seal)
+                            .unwrap_or(None)
+                            .is_some(),
+                    })
+                };
+                bundle_info(
+                    contract_id,
+                    Some(asset_schema),
+                    chain_net,
+                    bundle,
+                    witness_tx,
+                    true,
+                    |opout| stock_inputs.get(&opout).cloned(),
+                    is_ours,
+                    |_| None,
+                )
+            },
+        )?;
+        info!(self.logger, "Fascia inspection completed");
+        Ok(inspection)
+    }
+
     fn _delete_batch_transfer(
         &self,
         batch_transfer: &DbBatchTransfer,
@@ -2678,6 +3101,19 @@ impl Wallet {
     ///
     /// Eligible transfers are the ones in status [`TransferStatus::Failed`].
     pub fn delete_transfers(
+        &self,
+        batch_transfer_idx: Option<i32>,
+        no_asset_only: bool,
+    ) -> Result<bool, Error> {
+        let cp = self.shared_checkpoint("delete_transfers");
+        let res = self._delete_transfers(batch_transfer_idx, no_asset_only);
+        if matches!(res, Ok(false)) {
+            return Ok(false);
+        }
+        self.commit_shared(cp, res)
+    }
+
+    fn _delete_transfers(
         &self,
         batch_transfer_idx: Option<i32>,
         no_asset_only: bool,
@@ -2744,7 +3180,6 @@ impl Wallet {
 
         if transfers_changed {
             self.update_backup_info(false)?;
-            self.queue_save()?;
         }
 
         info!(self.logger, "Delete transfer completed");
@@ -2783,6 +3218,30 @@ impl Wallet {
         Ok(self.received_mints.get(&recipient_id).cloned())
     }
 
+    /// Return the consignment of the burn of `asset_id` with TXID `txid`. It proves the burn with
+    /// the signed transaction and the full history. The wallet keeps it once the burn is ended.
+    ///
+    /// Fails with [`Error::UnknownTransfer`] if the wallet has no ended burn of the asset with
+    /// that TXID.
+    pub fn get_burn_consignment(&self, asset_id: String, txid: String) -> Result<Vec<u8>, Error> {
+        info!(self.logger, "Getting burn consignment...");
+        let transfers = self.list_transfers(
+            AssetFilter::Id(asset_id.clone()),
+            TransferScope::Txid(txid.clone()),
+        )?;
+        if !transfers.iter().any(|t| t.kind == TransferKind::Burn) {
+            return Err(Error::UnknownTransfer { txid });
+        }
+        let bytes = self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.consignment_bytes.get(&asset_id))
+            .cloned()
+            .ok_or(Error::UnknownTransfer { txid })?;
+        info!(self.logger, "Get burn consignment completed");
+        Ok(bytes)
+    }
+
     /// Return the [`Metadata`] of the RGB asset with the given ID.
     pub fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, Error> {
         info!(self.logger, "Getting metadata for asset '{}'...", asset_id);
@@ -2812,7 +3271,8 @@ impl Wallet {
             precision: asset.precision,
             ticker: asset.ticker,
             details: asset.details,
-            reject_list_url: asset.reject_list_url,
+            bridge_location: asset.bridge_location,
+            reject_list: asset.reject_list,
             linked_from_contract: asset.linked_from_contract,
             linked_to_contract: asset.linked_to_contract,
         })
@@ -2830,14 +3290,15 @@ impl Wallet {
     }
 
     /// Return the [`BtcBalance`] of the internal Bitcoin wallets.
-    pub fn get_btc_balance(
+    pub async fn get_btc_balance(
         &mut self,
         online: Option<Online>,
         skip_sync: bool,
     ) -> Result<BtcBalance, Error> {
         info!(self.logger, "Getting BTC balance...");
 
-        self.sync_if_requested(online, skip_sync)?;
+        self.sync_if_requested(online, skip_sync, "get_btc_balance")
+            .await?;
 
         let mut vanilla = self._get_btc_balance(KeychainKind::Internal)?;
         let reserved = self.get_reserved_vanilla_outpoints()?;
@@ -2948,10 +3409,11 @@ impl Wallet {
         Ok(Assets { nia, ifa, bfa })
     }
 
-    pub(crate) fn sync_if_requested(
+    pub(crate) async fn sync_if_requested(
         &mut self,
         #[cfg_attr(not(feature = "esplora"), allow(unused_variables))] online: Option<Online>,
         skip_sync: bool,
+        #[cfg_attr(not(feature = "esplora"), allow(unused_variables))] op: &'static str,
     ) -> Result<(), Error> {
         if !skip_sync {
             #[cfg(not(feature = "esplora"))]
@@ -2963,21 +3425,28 @@ impl Wallet {
                 } else {
                     return Err(Error::OnlineNeeded);
                 }
-                return Err(Error::Offline);
+                let cp = self.checkpoint(op);
+                let res = async {
+                    self.fast_sync(true).await?;
+                    self.fast_sync(false).await
+                }
+                .await;
+                self.commit(cp, res, |_| false).await?;
             }
         }
         Ok(())
     }
 
     /// List the Bitcoin [`Transaction`]s known to the wallet.
-    pub fn list_transactions(
+    pub async fn list_transactions(
         &mut self,
         online: Option<Online>,
         skip_sync: bool,
     ) -> Result<Vec<Transaction>, Error> {
         info!(self.logger, "Listing transactions...");
 
-        self.sync_if_requested(online, skip_sync)?;
+        self.sync_if_requested(online, skip_sync, "list_transactions")
+            .await?;
 
         let mut create_utxos_txids = vec![];
         let mut drain_txids = vec![];
@@ -3072,22 +3541,22 @@ impl Wallet {
         Ok(pending)
     }
 
-    /// Fail the begun vanilla operation with the given TXID and release its inputs.
+    /// Abort the begun vanilla operation with the given TXID: delete it and release its inputs.
     pub fn abort_pending_vanilla_tx(&self, txid: String) -> Result<(), Error> {
+        let cp = self.shared_checkpoint("abort_pending_vanilla_tx");
+        let res = self._abort_pending_vanilla_tx(txid);
+        self.commit_shared(cp, res)
+    }
+
+    fn _abort_pending_vanilla_tx(&self, txid: String) -> Result<(), Error> {
         info!(self.logger, "Aborting pending vanilla TX {}...", txid);
         let row = self
             .database
             .get_wallet_transaction_by_txid(&txid)?
             .filter(|w| w.status == TransferStatus::Initiated)
             .ok_or(Error::CannotAbortPendingVanillaTx)?;
-        self.database
-            .update_wallet_transaction(DbWalletTransactionActMod {
-                idx: ActiveValue::Set(row.idx),
-                status: ActiveValue::Set(TransferStatus::Failed),
-                ..Default::default()
-            })?;
+        self.database.del_wallet_transaction(row.idx)?;
         self.update_backup_info(false)?;
-        self.queue_save()?;
         info!(self.logger, "Abort pending vanilla TX completed");
         Ok(())
     }
@@ -3178,8 +3647,8 @@ impl Wallet {
             }
             _ => None,
         };
-        let change_utxo = match kind {
-            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => None,
+        let change_utxos = match kind {
+            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => vec![],
             TransferKind::Send
             | TransferKind::Inflation
             | TransferKind::Burn
@@ -3189,15 +3658,14 @@ impl Wallet {
                     .filter(|c| c.r#type == ColoringType::Change)
                     .map(|c| c.txo_idx)
                     .collect();
-                transfer_txos
+                let mut change_txos: Vec<DbTxo> = transfer_txos
                     .into_iter()
                     .filter(|t| change_txo_idx.contains(&t.idx))
-                    .map(|t| t.outpoint())
-                    .collect::<Vec<Outpoint>>()
-                    .first()
-                    .cloned()
+                    .collect();
+                change_txos.sort_by_key(|t| t.idx);
+                change_txos.into_iter().map(|t| t.outpoint()).collect()
             }
-            TransferKind::Issuance => None,
+            TransferKind::Issuance => vec![],
         };
 
         let consignment_path = match (&kind, batch_transfer.status) {
@@ -3225,6 +3693,8 @@ impl Wallet {
         }
         .map(|p| p.to_string_lossy().to_string());
 
+        let psbt = batch_transfer.unsigned_psbt.clone();
+
         Ok(TransferData {
             kind,
             status: batch_transfer.status,
@@ -3232,52 +3702,61 @@ impl Wallet {
             assignments,
             txid: batch_transfer.txid.clone(),
             receive_utxo,
-            change_utxo,
+            change_utxos,
             created_at: batch_transfer.created_at,
             updated_at: batch_transfer.updated_at,
             expiration: batch_transfer.expiration,
             consignment_path,
+            psbt,
         })
     }
 
-    /// List the RGB [`Transfer`]s known to the wallet.
+    /// List the RGB [`Transfer`]s known to the wallet, filtered by `asset_filter` and `scope`.
     ///
-    /// `filter` selects transfers by asset. When a `txid` is provided, restrict the result to the
-    /// transfers committed by the on-chain transaction with that ID; an unknown `txid` yields an
-    /// empty list.
+    /// An unknown TXID yields an empty list, while an unknown batch transfer index returns
+    /// [`Error::BatchTransferNotFound`].
     pub fn list_transfers(
         &self,
-        filter: AssetFilter,
-        txid: Option<String>,
+        asset_filter: AssetFilter,
+        scope: TransferScope,
     ) -> Result<Vec<Transfer>, Error> {
         info!(
             self.logger,
-            "Listing transfers for filter '{:?}' and txid '{:?}'...", filter, txid
+            "Listing transfers for filter '{:?}' and scope '{:?}'...", asset_filter, scope
         );
-        if let AssetFilter::Id(asset_id) = &filter {
+        if let AssetFilter::Id(asset_id) = &asset_filter {
             self.database.check_asset_exists(asset_id.clone())?;
         }
         let db_data = self.database.get_db_data(false)?;
-        let batch_transfer_idx = match &txid {
-            Some(txid) => match db_data
-                .batch_transfers
-                .iter()
-                .find(|b| b.txid.as_deref() == Some(txid))
-            {
-                Some(batch_transfer) => Some(batch_transfer.idx),
-                None => return Ok(vec![]),
-            },
-            None => None,
+        let batch_transfer_idxs: Option<Vec<i32>> = match &scope {
+            TransferScope::All => None,
+            TransferScope::Txid(txid) => Some(
+                db_data
+                    .batch_transfers
+                    .iter()
+                    .filter(|b| b.txid.as_deref() == Some(txid))
+                    .map(|b| b.idx)
+                    .collect(),
+            ),
+            TransferScope::BatchTransfer(idx) => {
+                self.database
+                    .get_batch_transfer_or_fail(*idx, &db_data.batch_transfers)?;
+                Some(vec![*idx])
+            }
         };
         let asset_transfer_ids: Vec<i32> = db_data
             .asset_transfers
             .iter()
-            .filter(|t| match &filter {
-                AssetFilter::Any => true,
-                AssetFilter::NoAsset => t.asset_id.is_none(),
+            .filter(|t| match &asset_filter {
+                AssetFilter::AnyOrNone => true,
+                AssetFilter::None => t.asset_id.is_none(),
                 AssetFilter::Id(asset_id) => t.asset_id.as_ref() == Some(asset_id),
             })
-            .filter(|t| batch_transfer_idx.is_none_or(|idx| t.batch_transfer_idx == idx))
+            .filter(|t| {
+                batch_transfer_idxs
+                    .as_ref()
+                    .is_none_or(|idxs| idxs.contains(&t.batch_transfer_idx))
+            })
             .filter(|t| t.user_driven)
             .map(|t| t.idx)
             .collect();
@@ -3321,7 +3800,7 @@ impl Wallet {
     ///
     /// If `settled` is true only show settled RGB allocations, if false also show pending RGB
     /// allocations.
-    pub fn list_unspents(
+    pub async fn list_unspents(
         &mut self,
         online: Option<Online>,
         settled_only: bool,
@@ -3329,7 +3808,8 @@ impl Wallet {
     ) -> Result<Vec<Unspent>, Error> {
         info!(self.logger, "Listing unspents...");
 
-        self.sync_if_requested(online, skip_sync)?;
+        self.sync_if_requested(online, skip_sync, "list_unspents")
+            .await?;
 
         let db_data = self.database.get_db_data(false)?;
 
@@ -3394,6 +3874,14 @@ impl Wallet {
                 .for_each(|u| u.rgb_allocations.retain(|a| a.settled));
         }
 
+        let spk_index = self.bdk_wallet.spk_index();
+        for unspent in unspents.iter_mut() {
+            if let Some(((KeychainKind::External, derivation_index), _)) =
+                spk_index.txout(BdkOutPoint::from(unspent.utxo.outpoint.clone()))
+            {
+                unspent.utxo.derivation_index = Some(derivation_index);
+            }
+        }
         let mut internal_unspents: Vec<Unspent> =
             self.internal_unspents().map(Unspent::from).collect();
 
@@ -3441,6 +3929,20 @@ impl Wallet {
                             .iter()
                             .any(|a| !a.incoming && a.status.waiting_counterparty()))
                     });
+                    // A UTXO holds at most one mint right of an asset.
+                    if let (Assignment::MintRight, Some(aid)) = (&assignment, &asset_id) {
+                        let invoiced = self.database.get_mint_right_invoice_utxos(aid)?;
+                        unspents.retain(|u| {
+                            !invoiced.contains(&u.utxo.outpoint())
+                                && !u.rgb_allocations.iter().any(|a| {
+                                    a.incoming
+                                        && !a.txo_spent
+                                        && !a.status.failed()
+                                        && a.asset_id.as_deref() == Some(aid.as_str())
+                                        && a.assignment == Assignment::MintRight
+                                })
+                        });
+                    }
                     let utxo = self.get_utxo(&[], Some(&unspents), true, None)?;
                     let unblinded_utxo = utxo.outpoint();
                     debug!(
@@ -3531,6 +4033,11 @@ impl Wallet {
                 (Assignment::LinkRight, Some(AssetSchema::Ifa) | Some(AssetSchema::Bfa)) => {
                     invoice_builder = invoice_builder.set_void();
                     invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_LINK_RIGHT);
+                    assignment
+                }
+                (Assignment::MintRight, Some(AssetSchema::Bfa)) => {
+                    invoice_builder = invoice_builder.set_void();
+                    invoice_builder = invoice_builder.set_assignment_name(RGB_STATE_MINT_RIGHT);
                     assignment
                 }
                 (Assignment::Any, _) => Assignment::Any,
@@ -3707,6 +4214,10 @@ impl Wallet {
     /// An optional amount can be specified, which will be embedded in the invoice. It will not be
     /// checked when accepting the transfer.
     ///
+    /// A UTXO holds at most one mint right of an asset. An [`Assignment::MintRight`] invoice blinds
+    /// a UTXO that holds no mint right and is not due to receive one. The wallet refuses a transfer
+    /// that pays a mint right to a UTXO that holds one.
+    ///
     /// An expiration UTC timestamp must be specified, which will set the expiration of the
     /// invoice and the transfer.
     ///
@@ -3737,6 +4248,32 @@ impl Wallet {
         min_confirmations: u8,
         encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
+        let cp = self.checkpoint("blind_receive");
+        let res = self
+            ._blind_receive(
+                online,
+                asset_id,
+                assignment,
+                expiration_timestamp,
+                transport_endpoints,
+                min_confirmations,
+                encryption,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn _blind_receive(
+        &mut self,
+        online: Option<Online>,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
             "Receiving via blinded UTXO for asset '{:?}' with expiration '{}'...",
@@ -3758,7 +4295,6 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Blind receive completed");
         Ok(ReceiveData {
@@ -3808,6 +4344,32 @@ impl Wallet {
         min_confirmations: u8,
         encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
+        let cp = self.checkpoint("witness_receive");
+        let res = self
+            ._witness_receive(
+                online,
+                asset_id,
+                assignment,
+                expiration_timestamp,
+                transport_endpoints,
+                min_confirmations,
+                encryption,
+            )
+            .await;
+        self.commit(cp, res, |_| false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn _witness_receive(
+        &mut self,
+        online: Option<Online>,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
             "Receiving via witness TX for asset '{:?}' with expiration '{}'...",
@@ -3829,7 +4391,6 @@ impl Wallet {
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
 
         self.update_backup_info(false)?;
-        self.flush().await?;
 
         info!(self.logger, "Witness receive completed");
         Ok(ReceiveData {
@@ -3865,13 +4426,18 @@ impl Wallet {
 
     /// Return a new Bitcoin address from the vanilla wallet.
     pub fn get_address(&mut self) -> Result<String, Error> {
+        let cp = self.checkpoint("get_address");
+        let res = self._get_address();
+        self.commit_queued(cp, res)
+    }
+
+    fn _get_address(&mut self) -> Result<String, Error> {
         info!(self.logger, "Getting address...");
         let address = self._get_new_address(KeychainKind::Internal)?;
 
         if !self.wallet_data.reuse_addresses {
             self.update_backup_info(false)?;
         }
-        self.queue_save()?;
 
         info!(self.logger, "Get address completed");
         Ok(address.to_string())
@@ -3882,6 +4448,12 @@ impl Wallet {
     /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
     /// index so subsequent address generation returns a fresh address.
     pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
+        let cp = self.checkpoint("rotate_address");
+        let res = self._rotate_address(keychain);
+        self.commit_queued(cp, res)
+    }
+
+    fn _rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
         if !self.wallet_data.reuse_addresses {
             return Err(Error::AddressReuseDisabled);
         }
@@ -3896,10 +4468,40 @@ impl Wallet {
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         let address = self.bdk_wallet.peek_address(keychain, new_index).address;
 
-        self.queue_save()?;
-
         Ok(address.to_string())
     }
+}
+
+/// The state an operation on `&self` can change.
+pub(crate) struct SharedCheckpoint {
+    op: &'static str,
+    database: RgbLibDb,
+    stock: Option<MemRgbStore>,
+}
+
+/// The wallet state an operation can change, restored when the operation fails.
+pub(crate) struct Checkpoint {
+    shared: SharedCheckpoint,
+    bdk_changeset: ChangeSet,
+    #[cfg(feature = "esplora")]
+    transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
+    #[cfg(feature = "esplora")]
+    received_consignments: HashMap<String, Vec<u8>>,
+    #[cfg(feature = "esplora")]
+    received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
+    #[cfg(feature = "esplora")]
+    received_signed_txs: HashMap<String, Vec<u8>>,
+    received_mints: HashMap<String, ReceivedMint>,
+    media: HashMap<String, Vec<u8>>,
+    pending_mint_locks: HashMap<String, PendingMintLocks>,
+    reuse_address_index: HashMap<KeychainKind, u32>,
+}
+
+fn idb_key_for(wallet_dir: &Path, bitcoin_network: BitcoinNetwork) -> String {
+    wallet_dir
+        .join(bitcoin_network.to_string())
+        .to_string_lossy()
+        .to_string()
 }
 
 /// IndexedDB persistence: save wallet state after mutations.
@@ -3910,63 +4512,46 @@ impl Wallet {
     ) -> Result<Option<DbBackupInfo>, Error> {
         use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 
-        let now_str = {
-            #[cfg(target_arch = "wasm32")]
-            let ms = js_sys::Date::now() as i64;
-            #[cfg(not(target_arch = "wasm32"))]
-            let ms = (now().unix_timestamp_nanos() / 1_000_000) as i64;
-            let secs = ms / 1000;
-            let nanos = ((ms % 1000) * 1_000_000) as u32;
-            let dt = time::OffsetDateTime::from_unix_timestamp(secs)
-                .unwrap()
-                .replace_nanosecond(nanos)
-                .unwrap();
-            dt.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default()
-        };
-
         let existing = self.database.get_backup_info()?;
-        if doing_backup {
-            if let Some(_info) = existing {
-                let mut act = DbBackupInfoActMod {
-                    last_backup_timestamp: ActiveValue::Set(now_str),
-                    ..Default::default()
-                };
-                let updated = self.database.update_backup_info(&mut act)?;
-                Ok(Some(updated))
+        #[cfg(not(target_arch = "wasm32"))]
+        let time = now().unix_timestamp_nanos();
+        // The browser clock counts milliseconds. Each time comes after the last saved time.
+        #[cfg(target_arch = "wasm32")]
+        let time = {
+            use super::backup::parse_backup_timestamp;
+            let last = existing.as_ref().map_or(0, |i| {
+                parse_backup_timestamp(&i.last_backup_timestamp)
+                    .max(parse_backup_timestamp(&i.last_operation_timestamp))
+            });
+            (js_sys::Date::now() as i128 * 1_000_000).max(last + 1)
+        };
+        let timestamp = ActiveValue::Set(time.to_string());
+
+        if existing.is_some() {
+            let mut act = DbBackupInfoActMod::default();
+            if doing_backup {
+                act.last_backup_timestamp = timestamp;
             } else {
-                let act = DbBackupInfoActMod {
-                    last_backup_timestamp: ActiveValue::Set(now_str.clone()),
-                    last_operation_timestamp: ActiveValue::Set(now_str),
-                    ..Default::default()
-                };
-                self.database.set_backup_info(act)?;
-                Ok(self.database.get_backup_info()?)
+                act.last_operation_timestamp = timestamp;
             }
-        } else if let Some(_info) = existing {
-            let mut act = DbBackupInfoActMod {
-                last_operation_timestamp: ActiveValue::Set(now_str),
-                ..Default::default()
-            };
-            let updated = self.database.update_backup_info(&mut act)?;
-            Ok(Some(updated))
-        } else {
-            let act = DbBackupInfoActMod {
-                last_backup_timestamp: ActiveValue::Set(String::new()),
-                last_operation_timestamp: ActiveValue::Set(now_str),
-                ..Default::default()
-            };
-            self.database.set_backup_info(act)?;
-            Ok(self.database.get_backup_info()?)
+            return Ok(Some(self.database.update_backup_info(&mut act)?));
         }
+        let (last_backup_timestamp, last_operation_timestamp) = if doing_backup {
+            (timestamp, ActiveValue::Set(s!("0")))
+        } else {
+            (ActiveValue::Set(s!("0")), timestamp)
+        };
+        self.database.set_backup_info(DbBackupInfoActMod {
+            last_backup_timestamp,
+            last_operation_timestamp,
+            ..Default::default()
+        })?;
+        Ok(self.database.get_backup_info()?)
     }
 
     /// Return the IndexedDB key of this wallet: its directory and its network.
     pub fn idb_key(&self) -> String {
-        self.wallet_dir
-            .join(self.wallet_data.bitcoin_network.to_string())
-            .to_string_lossy()
-            .to_string()
+        idb_key_for(&self.wallet_dir, self.wallet_data.bitcoin_network)
     }
 
     /// Return the error of the last failed IndexedDB save, until a save commits.
@@ -4022,8 +4607,12 @@ impl Wallet {
             received_consignment_meta: self.received_consignment_meta.clone(),
             received_signed_txs: self.received_signed_txs.clone(),
             received_mints: self.received_mints.clone(),
+            media: self.media.clone(),
+            pending_mint_locks: self.pending_mint_locks.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
+            manifest: WalletManifest::new(&self.wallet_data, &self.keys),
+            backup_versions: self.backup_versions.borrow().clone(),
         })
     }
 
@@ -4046,65 +4635,22 @@ impl Wallet {
     }
 
     /// Restore wallet state from an IndexedDB snapshot.
+    /// It refuses a snapshot of other fixed settings with [`Error::WalletSettingMismatch`].
     /// It changes nothing when it fails.
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
     pub fn restore_from_snapshot(
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
+        snapshot
+            .manifest
+            .check_settings_unchanged(&self.wallet_data, &self.keys)?;
         let stock = super::idb_store::deserialize_stock(&snapshot.rgb_store)
             .map_err(|details| Error::Internal { details })?;
 
         // Load the BDK wallet from the changeset into a new store
         if let Some(changeset) = snapshot.bdk_changeset {
-            let mut bdk_database: BdkPersister = super::memory_store::MemoryStore::new();
-            bdk_database.set_data(Some(changeset));
-
-            // Reconstruct descriptors (same logic as Wallet::new)
-            let wdata = &self.wallet_data;
-            let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
-            let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, bdk_network)?;
-            let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, bdk_network)?;
-
-            let (desc_colored, desc_vanilla) = if let Some(mnemonic) = &wdata.mnemonic {
-                get_descriptors(
-                    wdata.bitcoin_network,
-                    mnemonic,
-                    wdata.vanilla_keychain,
-                    xpub_btc,
-                    xpub_rgb,
-                )?
-            } else {
-                get_descriptors_from_xpubs(
-                    wdata.bitcoin_network,
-                    &wdata.master_fingerprint,
-                    xpub_rgb,
-                    xpub_btc,
-                    wdata.vanilla_keychain,
-                )?
-            };
-
-            let chain_net: ChainNet = wdata.bitcoin_network.into();
-            let wallet_params = BdkWallet::load()
-                .descriptor(KeychainKind::External, Some(desc_colored))
-                .descriptor(KeychainKind::Internal, Some(desc_vanilla))
-                .check_genesis_hash(BlockHash::from_byte_array(
-                    chain_net.chain_hash().to_bytes(),
-                ));
-
-            let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database) {
-                Ok(Some(wallet)) => wallet,
-                Ok(None) => {
-                    return Err(Error::Persistence {
-                        details: s!("persisted BDK changeset did not contain a loadable wallet"),
-                    });
-                }
-                Err(error) => {
-                    return Err(Error::Persistence {
-                        details: format!("failed to load persisted BDK wallet: {error}"),
-                    });
-                }
-            };
+            let (bdk_database, bdk_wallet) = self.load_bdk(changeset)?;
             // All parts are valid. Nothing below can fail.
             self.bdk_database = bdk_database;
             self.bdk_wallet = bdk_wallet;
@@ -4119,13 +4665,192 @@ impl Wallet {
         self.received_consignment_meta = snapshot.received_consignment_meta;
         self.received_signed_txs = snapshot.received_signed_txs;
         self.received_mints = snapshot.received_mints;
+        self.media = snapshot.media;
+        self.pending_mint_locks = snapshot.pending_mint_locks;
 
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
 
         *self.rgb_stock.borrow_mut() = Some(stock);
+        *self.backup_versions.borrow_mut() = snapshot.backup_versions;
 
         Ok(())
+    }
+
+    /// Load a BDK wallet from `changeset` into a new store.
+    fn load_bdk(
+        &self,
+        changeset: ChangeSet,
+    ) -> Result<(BdkPersister, PersistedWallet<BdkPersister>), Error> {
+        let mut bdk_database: BdkPersister = super::memory_store::MemoryStore::new();
+        bdk_database.set_data(Some(changeset));
+
+        let wdata = &self.wallet_data;
+        let WalletDescriptors {
+            colored: desc_colored,
+            vanilla: desc_vanilla,
+        } = self.keys.build_descriptors(wdata.bitcoin_network)?.0;
+
+        let chain_net: ChainNet = wdata.bitcoin_network.into();
+        let wallet_params = BdkWallet::load()
+            .descriptor(KeychainKind::External, Some(desc_colored))
+            .descriptor(KeychainKind::Internal, Some(desc_vanilla))
+            .check_genesis_hash(BlockHash::from_byte_array(
+                chain_net.chain_hash().to_bytes(),
+            ));
+
+        let bdk_wallet = match wallet_params.load_wallet(&mut bdk_database) {
+            Ok(Some(wallet)) => wallet,
+            Ok(None) => {
+                return Err(Error::Persistence {
+                    details: s!("persisted BDK changeset did not contain a loadable wallet"),
+                });
+            }
+            Err(error) => {
+                return Err(Error::Persistence {
+                    details: format!("failed to load persisted BDK wallet: {error}"),
+                });
+            }
+        };
+        Ok((bdk_database, bdk_wallet))
+    }
+
+    /// Return the BDK changeset with the staged changes.
+    pub(crate) fn bdk_changeset(&self) -> ChangeSet {
+        let mut changeset = self.bdk_database.get_data().clone().unwrap_or_default();
+        if let Some(staged) = self.bdk_wallet.staged() {
+            changeset.merge(staged.clone());
+        }
+        changeset
+    }
+
+    pub(crate) fn shared_checkpoint(&self, op: &'static str) -> SharedCheckpoint {
+        SharedCheckpoint {
+            op,
+            database: (*self.database).clone(),
+            stock: self
+                .rgb_stock
+                .borrow()
+                .as_ref()
+                .map(|s| s.as_store().clone()),
+        }
+    }
+
+    pub(crate) fn checkpoint(&mut self, op: &'static str) -> Checkpoint {
+        #[cfg(feature = "esplora")]
+        self.broadcast_txs.clear();
+        Checkpoint {
+            shared: self.shared_checkpoint(op),
+            bdk_changeset: self.bdk_changeset(),
+            #[cfg(feature = "esplora")]
+            transfer_artifacts: self.transfer_artifacts.clone(),
+            #[cfg(feature = "esplora")]
+            received_consignments: self.received_consignments.clone(),
+            #[cfg(feature = "esplora")]
+            received_consignment_meta: self.received_consignment_meta.clone(),
+            #[cfg(feature = "esplora")]
+            received_signed_txs: self.received_signed_txs.clone(),
+            received_mints: self.received_mints.clone(),
+            media: self.media.clone(),
+            pending_mint_locks: self.pending_mint_locks.clone(),
+            reuse_address_index: self.reuse_address_index.clone(),
+        }
+    }
+
+    pub(crate) fn rollback_shared(&self, cp: SharedCheckpoint) {
+        self.database.restore(cp.database);
+        *self.rgb_stock.borrow_mut() = cp.stock.map(Stock::with);
+    }
+
+    fn rollback(&mut self, cp: Checkpoint) {
+        let op = cp.shared.op;
+        self.rollback_shared(cp.shared);
+        #[cfg(feature = "esplora")]
+        {
+            self.transfer_artifacts = cp.transfer_artifacts;
+            self.received_consignments = cp.received_consignments;
+            self.received_consignment_meta = cp.received_consignment_meta;
+            self.received_signed_txs = cp.received_signed_txs;
+        }
+        self.received_mints = cp.received_mints;
+        self.media = cp.media;
+        self.pending_mint_locks = cp.pending_mint_locks;
+        self.reuse_address_index = cp.reuse_address_index;
+        #[cfg(feature = "esplora")]
+        if !self.broadcast_txs.is_empty() {
+            // a broadcast TX stays in BDK, as its change can pay an address revealed here
+            let last_seen = (now().unix_timestamp() as u64).saturating_add(1);
+            let txs = self.broadcast_txs.iter().cloned().map(|tx| (tx, last_seen));
+            self.bdk_wallet.apply_unconfirmed_txs(txs);
+            if let Err(e) = self.bdk_wallet.persist(&mut self.bdk_database) {
+                error!(self.logger, "Cannot keep the TXs broadcast in {op}: {e}");
+            }
+            return;
+        }
+        if self.bdk_changeset() != cp.bdk_changeset {
+            match self.load_bdk(cp.bdk_changeset) {
+                Ok((bdk_database, bdk_wallet)) => {
+                    self.bdk_database = bdk_database;
+                    self.bdk_wallet = bdk_wallet;
+                }
+                Err(e) => error!(self.logger, "Cannot restore BDK after {op}: {e}"),
+            }
+        }
+    }
+
+    /// End an operation: save its result, or restore `cp` when it fails with an error not kept.
+    pub(crate) async fn commit<T>(
+        &mut self,
+        cp: Checkpoint,
+        res: Result<T, Error>,
+        keep: fn(&Error) -> bool,
+    ) -> Result<T, Error> {
+        let res = res.and_then(|v| fault_point(cp.shared.op).map(|()| v));
+        let res = match res {
+            Err(e) if keep(&e) => Err(e),
+            _ if crate::abort::fired() => Err(Error::Aborted),
+            res => res,
+        };
+        match res {
+            Err(e) if !keep(&e) => {
+                self.rollback(cp);
+                Err(e)
+            }
+            res => {
+                self.flush().await?;
+                res
+            }
+        }
+    }
+
+    /// End an operation as [`commit`](Wallet::commit) does, with a queued save.
+    pub(crate) fn commit_queued<T>(
+        &mut self,
+        cp: Checkpoint,
+        res: Result<T, Error>,
+    ) -> Result<T, Error> {
+        let res = res.and_then(|v| fault_point(cp.shared.op).map(|()| v));
+        if res.is_err() {
+            self.rollback(cp);
+            return res;
+        }
+        self.queue_save()?;
+        res
+    }
+
+    /// End an operation on `&self` as [`commit_queued`](Wallet::commit_queued) does.
+    pub(crate) fn commit_shared<T>(
+        &self,
+        cp: SharedCheckpoint,
+        res: Result<T, Error>,
+    ) -> Result<T, Error> {
+        let res = res.and_then(|v| fault_point(cp.op).map(|()| v));
+        if res.is_err() {
+            self.rollback_shared(cp);
+            return res;
+        }
+        self.queue_save()?;
+        res
     }
 }
 
@@ -4133,7 +4858,22 @@ impl Wallet {
 pub(crate) mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
-    use crate::utils::{get_descriptors, str_to_xpub};
+
+    pub(crate) fn pending_mint_locks() -> PendingMintLocks {
+        PendingMintLocks {
+            consignment_digest: "digest".to_owned(),
+            evm_chain_id: 3,
+            bridge_contract: "0x1111111111111111111111111111111111111111"
+                .parse::<EvmAddress>()
+                .unwrap(),
+            claims: vec![Claim::Lock {
+                opid: OpId::from([1u8; 32]),
+                witness_id: "22".repeat(32).parse::<RgbTxid>().unwrap(),
+                amount: 1,
+                before_block: 2,
+            }],
+        }
+    }
 
     /// Helper: build a minimal Wallet for native tests.
     ///
@@ -4141,21 +4881,30 @@ pub(crate) mod address_reuse_tests {
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
     pub(crate) fn make_test_wallet(reuse: bool) -> Wallet {
-        make_test_wallet_with_keys(generate_keys(BitcoinNetwork::Regtest), reuse)
+        make_test_wallet_with_keys(
+            generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot),
+            reuse,
+        )
     }
 
     pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys, reuse: bool) -> Wallet {
-        let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
-        let xpub_rgb = str_to_xpub(&keys.account_xpub_colored, bdk_network).unwrap();
-        let xpub_btc = str_to_xpub(&keys.account_xpub_vanilla, bdk_network).unwrap();
-        let (desc_colored, desc_vanilla) = get_descriptors(
-            BitcoinNetwork::Regtest,
-            &keys.mnemonic,
-            None,
-            xpub_btc,
-            xpub_rgb,
-        )
-        .unwrap();
+        make_test_wallet_with_singlesig_keys(SinglesigKeys::from_keys(&keys, None), reuse)
+    }
+
+    pub(crate) fn make_test_wallet_with_singlesig_keys(keys: SinglesigKeys, reuse: bool) -> Wallet {
+        make_test_wallet_on_network(keys, reuse, BitcoinNetwork::Regtest)
+    }
+
+    pub(crate) fn make_test_wallet_on_network(
+        keys: SinglesigKeys,
+        reuse: bool,
+        bitcoin_network: BitcoinNetwork,
+    ) -> Wallet {
+        let bdk_network = BdkNetwork::from(bitcoin_network);
+        let WalletDescriptors {
+            colored: desc_colored,
+            vanilla: desc_vanilla,
+        } = keys.build_descriptors(bitcoin_network).unwrap().0;
         let mut bdk_database: BdkPersister = super::super::memory_store::MemoryStore::new();
         let bdk_wallet = BdkWallet::create(desc_colored.clone(), desc_vanilla.clone())
             .network(bdk_network)
@@ -4171,16 +4920,12 @@ pub(crate) mod address_reuse_tests {
 
         let wd = WalletData {
             data_dir: ":memory:".to_string(),
-            bitcoin_network: BitcoinNetwork::Regtest,
+            bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
-            account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
-            account_xpub_colored: keys.account_xpub_colored.clone(),
-            mnemonic: Some(keys.mnemonic.clone()),
-            master_fingerprint: keys.master_fingerprint.clone(),
-            vanilla_keychain: None,
             supported_schemas: vec![AssetSchema::Nia],
             reuse_addresses: reuse,
+            allow_reckless_schemas: false,
         };
 
         let drain = slog::Discard;
@@ -4188,6 +4933,7 @@ pub(crate) mod address_reuse_tests {
 
         Wallet {
             wallet_data: wd,
+            keys,
             logger,
             _logger_guard: (),
             watch_only: false,
@@ -4204,18 +4950,103 @@ pub(crate) mod address_reuse_tests {
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
             #[cfg(feature = "esplora")]
+            received_valid_consignments: HashMap::new(),
+            #[cfg(feature = "esplora")]
             received_consignment_meta: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_signed_txs: HashMap::new(),
             received_mints: HashMap::new(),
+            media: HashMap::new(),
+            pending_mint_locks: HashMap::new(),
+            #[cfg(feature = "esplora")]
+            broadcast_txs: Vec::new(),
             idb_queue: Default::default(),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer: 0,
             idb_loaded: None,
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            vss_client: None,
+            backup_store: None,
+            backup_versions: std::cell::RefCell::new(HashMap::new()),
             last_vss_backup_error: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Return all the state an operation can change.
+    pub(crate) fn state(wallet: &Wallet) -> serde_json::Value {
+        serde_json::json!({
+            "db": &*wallet.database,
+            "bdk": wallet.bdk_changeset(),
+            "stock": wallet
+                .rgb_stock
+                .borrow()
+                .as_ref()
+                .map(super::super::idb_store::serialize_stock),
+            "transfer_artifacts": wallet.transfer_artifacts,
+            "received_consignments": wallet.received_consignments,
+            "received_consignment_meta": wallet.received_consignment_meta,
+            "received_signed_txs": wallet.received_signed_txs,
+            "received_mints": wallet.received_mints,
+            "media": wallet.media,
+            "pending_mint_locks": wallet.pending_mint_locks,
+            "reuse_address_index": wallet.reuse_address_index,
+        })
+    }
+
+    /// Fail `call` at `fault` and check that it changed nothing but BDK for its broadcasts.
+    /// Return the txids it broadcast.
+    pub(crate) async fn assert_no_partial_change<T>(
+        wallet: &mut Wallet,
+        fault: &'static str,
+        broadcasts: usize,
+        call: impl AsyncFnOnce(&mut Wallet) -> Result<T, Error>,
+    ) -> Vec<String> {
+        let mut before = state(wallet);
+        crate::utils::FAULT.with(|f| f.set(Some(fault)));
+        let res = call(wallet).await;
+        crate::utils::FAULT.with(|f| f.set(None));
+        assert_eq!(
+            res.err(),
+            Some(Error::Internal {
+                details: format!("fault injected in {fault}")
+            })
+        );
+        assert_eq!(wallet.broadcast_txs.len(), broadcasts);
+        let mut after = state(wallet);
+        if broadcasts > 0 {
+            before["bdk"].take();
+            after["bdk"].take();
+            for tx in &wallet.broadcast_txs {
+                assert!(wallet.bdk_wallet.get_tx(tx.compute_txid()).is_some());
+            }
+        }
+        assert_eq!(after, before);
+        wallet
+            .broadcast_txs
+            .iter()
+            .map(|tx| tx.compute_txid().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn get_address_is_atomic() {
+        let mut wallet = make_test_wallet(false);
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "get_address",
+            0,
+            async |w| w.get_address(),
+        ));
+    }
+
+    #[test]
+    fn rotate_address_is_atomic() {
+        let mut wallet = make_test_wallet(true);
+        block_on(assert_no_partial_change(
+            &mut wallet,
+            "rotate_address",
+            0,
+            async |w| w.rotate_address(KeychainKind::Internal),
+        ));
     }
 
     #[test]
@@ -4278,9 +5109,346 @@ mod debug_tests {
 
     #[test]
     fn debug_hides_wallet_mnemonic() {
-        let wd = make_test_wallet(false).get_wallet_data();
-        let phrase = wd.mnemonic.clone().unwrap();
-        assert!(!format!("{wd:?}").contains(phrase.as_str()));
+        let keys = make_test_wallet(false).get_keys();
+        let phrase = keys.mnemonic.clone().unwrap();
+        assert!(!format!("{keys:?}").contains(phrase.as_str()));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod mainnet_schema_tests {
+    use super::*;
+    use crate::keys::generate_keys;
+    use AssetSchema::{Bfa, Ifa, Nia};
+
+    fn mainnet_schema_wallet_data(
+        network: BitcoinNetwork,
+        schemas: Vec<AssetSchema>,
+        reckless: bool,
+    ) -> (WalletData, SinglesigKeys) {
+        let keys = generate_keys(network, WitnessVersion::Taproot);
+        let wd = WalletData {
+            data_dir: s!(":memory:"),
+            bitcoin_network: network,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: reckless,
+        };
+        (wd, SinglesigKeys::from_keys(&keys, None))
+    }
+
+    #[test]
+    fn new_refuses_zero_max_allocations_per_utxo() {
+        let (mut wd, keys) = mainnet_schema_wallet_data(BitcoinNetwork::Regtest, vec![Nia], false);
+        wd.max_allocations_per_utxo = 0;
+        assert!(matches!(
+            Wallet::new(wd, keys),
+            Err(Error::NoMaxAllocationsPerUtxo)
+        ));
+    }
+
+    #[test]
+    fn mainnet_schema_refuses_ifa_and_bfa() {
+        for expected in [Ifa, Bfa] {
+            let (wd, keys) =
+                mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, expected], false);
+            assert!(matches!(
+                Wallet::new(wd, keys),
+                Err(Error::CannotUseSchemaOnMainnet { asset_schema }) if asset_schema == expected
+            ));
+        }
+        let (wd, keys) = mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia], false);
+        assert!(Wallet::new(wd, keys).is_ok());
+    }
+
+    #[test]
+    fn mainnet_schema_reckless_allowed() {
+        let (wd, keys) =
+            mainnet_schema_wallet_data(BitcoinNetwork::Mainnet, vec![Nia, Ifa, Bfa], true);
+        let wallet = Wallet::new(wd, keys).unwrap();
+        assert!(wallet.get_wallet_data().allow_reckless_schemas);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod keys_and_settings_tests {
+    use super::*;
+    use crate::keys::{Keys, WitnessVersion, generate_keys, restore_keys};
+
+    const NET: BitcoinNetwork = BitcoinNetwork::Regtest;
+
+    fn wallet_data() -> WalletData {
+        WalletData {
+            data_dir: s!(":memory:"),
+            bitcoin_network: NET,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: vec![AssetSchema::Nia],
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        }
+    }
+
+    fn new_err(keys: SinglesigKeys) -> Error {
+        Wallet::new(wallet_data(), keys).err().unwrap()
+    }
+
+    // Return the expected and provided values of a mismatch of `setting`.
+    fn mismatch(res: Result<(), Error>, setting: &str) -> (String, String) {
+        match res {
+            Err(Error::WalletSettingMismatch {
+                setting: s,
+                expected,
+                provided,
+            }) if s == setting => (expected, provided),
+            other => panic!("expected a {setting} mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_descriptors_success() {
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
+        let signing = SinglesigKeys::from_keys(&keys, None);
+        let wallet = Wallet::new(wallet_data(), signing.clone()).unwrap();
+        let descs = wallet.get_descriptors();
+        assert_eq!(signing.build_descriptors(NET).unwrap().0, descs);
+        assert!(descs.colored.contains("tprv") && descs.vanilla.contains("tprv"));
+
+        let watch_only = SinglesigKeys::from_keys_no_mnemonic(&keys, None);
+        let wo_descs = Wallet::new(wallet_data(), watch_only)
+            .unwrap()
+            .get_descriptors();
+        for desc in [&wo_descs.colored, &wo_descs.vanilla] {
+            assert!(desc.contains("tpub") && !desc.contains("tprv"), "{desc}");
+        }
+        assert_ne!(wo_descs, descs);
+    }
+
+    #[test]
+    fn keys_need_witness_version() {
+        let field = if cfg!(feature = "camel_case") {
+            "witnessVersion"
+        } else {
+            "witness_version"
+        };
+        let missing = format!("missing field `{field}`");
+        let keys = generate_keys(NET, WitnessVersion::SegWitV0);
+
+        let mut v = serde_json::to_value(&keys).unwrap();
+        v.as_object_mut().unwrap().remove(field).unwrap();
+        let err = serde_json::from_value::<Keys>(v).unwrap_err();
+        assert_eq!(err.to_string(), missing);
+
+        let mut v = serde_json::to_value(SinglesigKeys::from_keys(&keys, None)).unwrap();
+        v.as_object_mut().unwrap().remove(field).unwrap();
+        let err = serde_json::from_value::<SinglesigKeys>(v).unwrap_err();
+        assert_eq!(err.to_string(), missing);
+    }
+
+    #[test]
+    fn segwit_v0_wallet_success() {
+        let keys = generate_keys(NET, WitnessVersion::SegWitV0);
+        let mut addresses = vec![];
+        for sk in [
+            SinglesigKeys::from_keys(&keys, None),
+            SinglesigKeys::from_keys_no_mnemonic(&keys, None),
+        ] {
+            let mut wallet = Wallet::new(wallet_data(), sk).unwrap();
+            for (keychain, path) in [
+                (KeychainKind::External, "m/84'/827167'/0'/0"),
+                (KeychainKind::Internal, "m/84'/1'/0'/0"),
+            ] {
+                let bdk_wallet::miniscript::Descriptor::Wpkh(w) =
+                    wallet.bdk_wallet.public_descriptor(keychain)
+                else {
+                    panic!("expected a wpkh descriptor");
+                };
+                assert_eq!(
+                    w.as_inner().full_derivation_path().unwrap(),
+                    DerivationPath::from_str(path).unwrap()
+                );
+            }
+            addresses.push(wallet.get_address().unwrap());
+        }
+        assert_eq!(addresses[0], addresses[1]);
+        let address = BdkAddress::from_str(&addresses[0]).unwrap();
+        assert!(address.assume_checked().script_pubkey().is_p2wpkh());
+    }
+
+    #[test]
+    fn new_fail() {
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
+        let other = generate_keys(NET, WitnessVersion::Taproot);
+        let signing = SinglesigKeys::from_keys(&keys, None);
+
+        // invalid colored xPub
+        for xpub in ["", "l1iI0"] {
+            let err = new_err(SinglesigKeys {
+                account_xpub_colored: xpub.to_string(),
+                ..signing.clone()
+            });
+            assert!(matches!(err, Error::InvalidPubkey { .. }), "{err:?}");
+        }
+
+        // invalid mnemonic
+        let err = new_err(SinglesigKeys {
+            mnemonic: Some(Zeroizing::new(s!(""))),
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::InvalidMnemonic { .. }), "{err:?}");
+
+        // xPub not derived from the mnemonic
+        let err = new_err(SinglesigKeys {
+            account_xpub_colored: other.xpub.clone(),
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
+
+        // Taproot xPubs with the SegWitV0 witness version
+        let err = new_err(SinglesigKeys {
+            witness_version: WitnessVersion::SegWitV0,
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
+
+        // invalid fingerprint, signing and watch-only
+        for keys in [
+            signing.clone(),
+            SinglesigKeys::from_keys_no_mnemonic(&keys, None),
+        ] {
+            let err = new_err(SinglesigKeys {
+                master_fingerprint: s!("invalid"),
+                ..keys
+            });
+            assert!(matches!(err, Error::InvalidFingerprint), "{err:?}");
+        }
+
+        // fingerprint not derived from the mnemonic
+        let err = new_err(SinglesigKeys {
+            master_fingerprint: s!("badbadff"),
+            ..signing.clone()
+        });
+        assert!(matches!(err, Error::FingerprintMismatch), "{err:?}");
+
+        // mnemonic of another wallet: the keys are checked before the fingerprint
+        let err = new_err(SinglesigKeys {
+            mnemonic: Some(other.mnemonic.clone()),
+            ..signing
+        });
+        assert!(matches!(err, Error::InvalidBitcoinKeys), "{err:?}");
+    }
+
+    #[test]
+    fn settings_check_refuses_fixed_settings() {
+        let wd = wallet_data();
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
+        let sk = SinglesigKeys::from_keys(&keys, None);
+        let manifest = WalletManifest::new(&wd, &sk);
+        let check = |wd: &WalletData, sk: &SinglesigKeys| manifest.check_settings_unchanged(wd, sk);
+
+        let testnet = WalletData {
+            bitcoin_network: BitcoinNetwork::Testnet,
+            ..wallet_data()
+        };
+        assert!(matches!(
+            check(&testnet, &sk),
+            Err(Error::BitcoinNetworkMismatch)
+        ));
+
+        // all keys change: the fingerprint is reported first
+        let other = SinglesigKeys::from_keys_no_mnemonic(
+            &generate_keys(NET, WitnessVersion::Taproot),
+            None,
+        );
+        mismatch(check(&wd, &other), "master_fingerprint");
+
+        // other witness version: it is reported before the xPubs
+        let segwit = SinglesigKeys::from_keys(
+            &restore_keys(NET, keys.mnemonic.to_string(), WitnessVersion::SegWitV0).unwrap(),
+            None,
+        );
+        let (expected, provided) = mismatch(check(&wd, &segwit), "witness_version");
+        assert_eq!(
+            (expected.as_str(), provided.as_str()),
+            ("Taproot", "SegWitV0")
+        );
+
+        let keychain = SinglesigKeys::from_keys(&keys, Some(2));
+        let (expected, provided) = mismatch(check(&wd, &keychain), "vanilla_keychain");
+        assert_eq!((expected.as_str(), provided.as_str()), ("0", "2"));
+
+        let colored = SinglesigKeys {
+            account_xpub_colored: other.account_xpub_colored.clone(),
+            ..sk.clone()
+        };
+        mismatch(check(&wd, &colored), "account_xpub_colored");
+
+        let vanilla = SinglesigKeys {
+            account_xpub_vanilla: other.account_xpub_vanilla,
+            ..sk
+        };
+        mismatch(check(&wd, &vanilla), "account_xpub_vanilla");
+    }
+
+    #[test]
+    fn settings_check_allows_mutable_settings() {
+        let wd = wallet_data();
+        let keys = generate_keys(NET, WitnessVersion::Taproot);
+        let manifest = WalletManifest::new(&wd, &SinglesigKeys::from_keys(&keys, None));
+
+        manifest
+            .check_settings_unchanged(&wd, &SinglesigKeys::from_keys(&keys, Some(0)))
+            .unwrap();
+        manifest
+            .check_settings_unchanged(&wd, &SinglesigKeys::from_keys_no_mnemonic(&keys, None))
+            .unwrap();
+        let changed = WalletData {
+            data_dir: s!("other"),
+            max_allocations_per_utxo: 1,
+            supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
+            reuse_addresses: true,
+            allow_reckless_schemas: true,
+            ..wallet_data()
+        };
+        manifest
+            .check_settings_unchanged(&changed, &SinglesigKeys::from_keys(&keys, None))
+            .unwrap();
+    }
+
+    #[test]
+    fn manifest_round_trip() {
+        let keys = generate_keys(NET, WitnessVersion::SegWitV0);
+        let wd = WalletData {
+            max_allocations_per_utxo: 1,
+            supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
+            reuse_addresses: true,
+            allow_reckless_schemas: true,
+            ..wallet_data()
+        };
+        let sk = SinglesigKeys::from_keys(&keys, Some(2));
+        let json = serde_json::to_string(&WalletManifest::new(&wd, &sk)).unwrap();
+        assert!(!json.contains(keys.mnemonic.as_str()));
+
+        let manifest: WalletManifest = serde_json::from_str(&json).unwrap();
+        let (got_wd, got_sk) = manifest.into_parts(s!("dir"), Some(keys.mnemonic.clone()));
+        let expected_wd = WalletData {
+            data_dir: s!("dir"),
+            ..wd.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&got_wd).unwrap(),
+            serde_json::to_value(&expected_wd).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&got_sk).unwrap(),
+            serde_json::to_value(&sk).unwrap()
+        );
+
+        let (_, got_sk) = WalletManifest::new(&wd, &SinglesigKeys::from_keys(&keys, None))
+            .into_parts(s!("dir"), None);
+        assert_eq!(got_sk.vanilla_keychain, Some(0));
     }
 }
 
@@ -4410,6 +5578,164 @@ mod receive_expiration_tests {
                 ("foo".to_string(), "bar".to_string()),
                 ("baz".to_string(), "qux".to_string()),
             ])
+        );
+    }
+}
+
+#[cfg(test)]
+mod available_allocations_tests {
+    use super::address_reuse_tests::make_test_wallet;
+    use super::*;
+
+    fn unspent(vout: u32, allocations: usize, pending_blinded: u32) -> LocalUnspent {
+        LocalUnspent {
+            utxo: DbTxo {
+                idx: vout as i32 + 1,
+                txid: "33".repeat(32),
+                vout,
+                btc_amount: s!("1000"),
+                spent: false,
+                exists: true,
+                pending_witness: false,
+            },
+            rgb_allocations: vec![
+                LocalRgbAllocation {
+                    asset_id: Some(s!("asset")),
+                    assignment: Assignment::Fungible(1),
+                    status: TransferStatus::Settled,
+                    incoming: true,
+                    txo_spent: false,
+                };
+                allocations
+            ],
+            pending_blinded,
+        }
+    }
+
+    #[test]
+    fn available_allocations_capped_by_the_bundle_limit() {
+        let mut wallet = make_test_wallet(false);
+        wallet.wallet_data.max_allocations_per_utxo = u32::MAX;
+        let max = MAX_UTXO_ASSET_ALLOCATIONS;
+        let mut unspents = vec![
+            unspent(0, max - 1, 0),
+            unspent(1, max, 0),
+            unspent(2, max - 1, 1),
+        ];
+        let available = |wallet: &Wallet, unspents: &[LocalUnspent], max_allocations| {
+            wallet
+                .get_available_allocations(unspents.to_vec(), &[], max_allocations)
+                .unwrap()
+                .iter()
+                .map(|u| u.utxo.vout)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(available(&wallet, &unspents, None), vec![0]);
+        // an explicit maximum is not capped
+        assert_eq!(available(&wallet, &unspents, Some(u32::MAX)), vec![0, 1, 2]);
+        // the lower limit wins
+        wallet.wallet_data.max_allocations_per_utxo = 5;
+        unspents.push(unspent(3, 4, 0));
+        assert_eq!(available(&wallet, &unspents, None), vec![3]);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod inspect_psbt_tests {
+    //! Expected values come from rgb-lib inspect_psbt at 4d87b372.
+    use super::*;
+    use bdk_wallet::bitcoin::{TapLeafHash, hashes::Hash};
+    use serde_json::Value;
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/inspection/",
+                $name
+            ))
+        };
+    }
+
+    fn wallet(keys: &str) -> Wallet {
+        address_reuse_tests::make_test_wallet_with_singlesig_keys(
+            serde_json::from_str(keys).unwrap(),
+            false,
+        )
+    }
+
+    fn matches_rgb_lib(w: &Wallet, psbt: &str, expected: &str) -> PsbtInspection {
+        let res = w.inspect_psbt(psbt.trim().to_string()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&res).unwrap(),
+            serde_json::from_str::<Value>(expected).unwrap()
+        );
+        res
+    }
+
+    #[test]
+    fn create_utxos_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        matches_rgb_lib(
+            &w,
+            fixture!("psbt_create_utxos.psbt"),
+            fixture!("psbt_create_utxos.json"),
+        );
+
+        // a key-path signature is not counted: same result as the unsigned PSBT
+        matches_rgb_lib(
+            &w,
+            fixture!("psbt_create_utxos_signed.psbt"),
+            fixture!("psbt_create_utxos.json"),
+        );
+
+        // a script-path signature is counted
+        let mut psbt = Psbt::from_str(fixture!("psbt_create_utxos_signed.psbt").trim()).unwrap();
+        let input = &mut psbt.inputs[0];
+        let sig = input.tap_key_sig.unwrap();
+        let key = input.tap_internal_key.unwrap();
+        input
+            .tap_script_sigs
+            .insert((key, TapLeafHash::from_byte_array([0; 32])), sig);
+        let res = w.inspect_psbt(psbt.to_string()).unwrap();
+        assert_eq!(res.signature_count, 1);
+    }
+
+    #[test]
+    fn signed_p2wpkh_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_p2wpkh.json"));
+        matches_rgb_lib(
+            &w,
+            fixture!("psbt_p2wpkh_signed.psbt"),
+            fixture!("psbt_p2wpkh_signed.json"),
+        );
+    }
+
+    #[test]
+    fn send_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        matches_rgb_lib(&w, fixture!("psbt_send.psbt"), fixture!("psbt_send.json"));
+    }
+
+    #[test]
+    fn edge_matches_rgb_lib() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        // a foreign input, an output without address, outputs above inputs (fee 0)
+        matches_rgb_lib(&w, fixture!("psbt_edge.psbt"), fixture!("psbt_edge.json"));
+    }
+
+    #[test]
+    fn inspect_psbt_errors() {
+        let w = wallet(fixture!("psbt_keys_taproot.json"));
+        let res = w.inspect_psbt(s!("not a psbt"));
+        assert!(matches!(res, Err(Error::InvalidPsbt { .. })), "{res:?}");
+
+        let mut psbt = Psbt::from_str(fixture!("psbt_create_utxos.psbt").trim()).unwrap();
+        psbt.inputs[0].witness_utxo = None;
+        let res = w.inspect_psbt(psbt.to_string());
+        assert!(
+            matches!(&res, Err(Error::PsbtInspection { details }) if details == "cannot inspect non-segwit PSBT"),
+            "{res:?}"
         );
     }
 }

@@ -1,0 +1,57 @@
+{
+  "txid": "e18817c75ed9024795ed5852202f17929e86aaf418d1692adc60ab53fee4af7e",
+  "close_method": "opretFirst",
+  "commitment_hex": "5f5a0b3baee127994d11a6b5c48738ea6038758fccf8447a8e50851b72c3e3f6",
+  "operations": [
+    {
+      "asset_id": "rgb:dIl42KAj-JW9JFQ4-dv0Jjsz-_cY~XFa-3QuizwT-EB~WycQ",
+      "committed_transition_count": 1,
+      "committed_input_count": 1,
+      "transitions": [
+        {
+          "type": "TransferInflation",
+          "opid": "37d7a661f0ba8dc616cb6916e9fd6008da0df5331ccb15c561829c6eae2fc54d",
+          "inputs": [
+            {
+              "opout": {
+                "opid": "748978d8a023256f49150e1dbf4263b33f9c63f5c56b742e8b3c13101fd6c9c4",
+                "assignment_type": "InflationRight",
+                "index": 0
+              },
+              "vin": null,
+              "assignment": null
+            }
+          ],
+          "outputs": [
+            {
+              "txid": "e18817c75ed9024795ed5852202f17929e86aaf418d1692adc60ab53fee4af7e",
+              "vout": 1,
+              "blinding": 4674502467970177520,
+              "assignment": {
+                "InflationRight": 300
+              },
+              "is_concealed": false,
+              "recipient_id": null,
+              "is_ours": null,
+              "is_terminal": null
+            },
+            {
+              "txid": null,
+              "vout": null,
+              "blinding": null,
+              "assignment": {
+                "InflationRight": 100
+              },
+              "is_concealed": true,
+              "recipient_id": "bcrt:utxob:FXRwAOGr-~kxe0VP-1RSpFiI-wbSWdmw-EhY6t0U-407~tLq-oeno6",
+              "is_ours": null,
+              "is_terminal": null
+            }
+          ],
+          "globals": [],
+          "metadata": []
+        }
+      ]
+    }
+  ]
+}

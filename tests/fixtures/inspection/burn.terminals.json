@@ -1,0 +1,136 @@
+{
+  "consignment_id": "rgb:csg:TByg0oKD-fmk0evO-SEjk_Om-d5Xr16T-Pjqw9Va-9s_7uEk#banjo-avatar-tobacco",
+  "version": 1,
+  "is_transfer": true,
+  "asset_id": "rgb:kdK_az2H-aYfsQb4-6zsy_HA-L~aC5sV-nJWtfZG-3Vri2Do",
+  "asset_schema": "Ifa",
+  "genesis": {
+    "chain_net": "bcrt",
+    "timestamp": 1795089192,
+    "issuer": "ssi:anonymous",
+    "name": "asset name",
+    "ticker": "TICKER",
+    "details": null,
+    "precision": 7,
+    "issued_supply": 666,
+    "max_supply": 1066,
+    "linked_from_contract": null,
+    "bridge_location": null,
+    "reject_list": null,
+    "media": [],
+    "outputs": [
+      {
+        "txid": "e65988eb494991148296f6c3d2c79d7765672967cbab0148f9a670a52f0f1917",
+        "vout": 0,
+        "blinding": 13166783924983728837,
+        "assignment": {
+          "Fungible": 666
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      },
+      {
+        "txid": "3107769923084855e800134d40c38b9ffc9a842d6335bb98e6e6e93e9404a390",
+        "vout": 5,
+        "blinding": 4000529290337113500,
+        "assignment": {
+          "InflationRight": 400
+        },
+        "is_concealed": false,
+        "recipient_id": null,
+        "is_ours": null,
+        "is_terminal": false
+      }
+    ]
+  },
+  "witnesses": [
+    {
+      "txid": "8e57d74d103761ffa18b5d30d059442201a0a3a30c3dc27f8be9934670daffbc",
+      "close_method": "opretFirst",
+      "commitment_hex": "3c047e949aa1970c92008b65799c989293821477c3cc0631312593a0b41eb73b",
+      "operations": [
+        {
+          "asset_id": "rgb:kdK_az2H-aYfsQb4-6zsy_HA-L~aC5sV-nJWtfZG-3Vri2Do",
+          "committed_transition_count": 2,
+          "committed_input_count": 2,
+          "transitions": [
+            {
+              "type": "Transfer",
+              "opid": "a391bbcb31442ab704e95bd1525dcbaabd9a4babfdc868bc87e9b8b8b6f156b1",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "91d2be6b3d876987ec41be3aceccbe1c02ff682e6c567256b5f646dd5ae2d83a",
+                    "assignment_type": "Asset",
+                    "index": 0
+                  },
+                  "vin": 0,
+                  "assignment": {
+                    "Fungible": 666
+                  }
+                }
+              ],
+              "outputs": [
+                {
+                  "txid": "8e57d74d103761ffa18b5d30d059442201a0a3a30c3dc27f8be9934670daffbc",
+                  "vout": 1,
+                  "blinding": 4523464862943819165,
+                  "assignment": {
+                    "Fungible": 467
+                  },
+                  "is_concealed": false,
+                  "recipient_id": null,
+                  "is_ours": null,
+                  "is_terminal": false
+                },
+                {
+                  "txid": "e65988eb494991148296f6c3d2c79d7765672967cbab0148f9a670a52f0f1917",
+                  "vout": 0,
+                  "blinding": 2248398014649017551,
+                  "assignment": {
+                    "Fungible": 199
+                  },
+                  "is_concealed": false,
+                  "recipient_id": null,
+                  "is_ours": null,
+                  "is_terminal": false
+                }
+              ],
+              "globals": [],
+              "metadata": []
+            },
+            {
+              "type": "Burn",
+              "opid": "bd4a02d547272029f6c8a45e31fc97f273496c0ceac3b741e7563c35d7065484",
+              "inputs": [
+                {
+                  "opout": {
+                    "opid": "a391bbcb31442ab704e95bd1525dcbaabd9a4babfdc868bc87e9b8b8b6f156b1",
+                    "assignment_type": "Asset",
+                    "index": 1
+                  },
+                  "vin": 0,
+                  "assignment": {
+                    "Fungible": 199
+                  }
+                }
+              ],
+              "outputs": [],
+              "globals": [
+                {
+                  "BurnedAsset": 199
+                },
+                {
+                  "BurnReason": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+                }
+              ],
+              "metadata": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

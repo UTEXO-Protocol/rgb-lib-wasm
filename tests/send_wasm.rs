@@ -1,5 +1,6 @@
 use std::{collections::HashMap, str::FromStr};
 
+use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -8,30 +9,36 @@ mod utils;
 
 use rgb_lib_wasm::bitcoin::psbt::Psbt;
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, Outpoint, Recipient, SendBeginResult, Transfer, Wallet,
-    WalletData,
+    AssetFilter, DatabaseType, Online, Outpoint, Recipient, SendBeginResult, SinglesigKeys,
+    Transfer, TransferScope, Wallet, WalletData,
 };
 use rgb_lib_wasm::{
     AssetSchema, Assignment, BitcoinNetwork, Encryption, Error, TransferKind, TransferStatus,
-    generate_keys,
+    WitnessVersion, generate_keys,
 };
 use utils::*;
 
-fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
-    let keys = generate_keys(BitcoinNetwork::Regtest);
-    WalletData {
-        data_dir: "/tmp/rgb_send".to_string(),
-        bitcoin_network: BitcoinNetwork::Regtest,
-        database_type: DatabaseType::Sqlite,
-        max_allocations_per_utxo: 5,
-        account_xpub_vanilla: keys.account_xpub_vanilla,
-        account_xpub_colored: keys.account_xpub_colored,
-        mnemonic: Some(keys.mnemonic),
-        master_fingerprint: keys.master_fingerprint,
-        vanilla_keychain: None,
-        supported_schemas: schemas,
-        reuse_addresses: false,
-    }
+// the maximum the wallet accepts
+const MAX_EXPIRATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+const DOWN: &str = "rpc://127.0.0.1:1/json-rpc";
+
+fn test_wallet_data(
+    schemas: Vec<AssetSchema>,
+    witness_version: WitnessVersion,
+) -> (WalletData, SinglesigKeys) {
+    let keys = generate_keys(BitcoinNetwork::Regtest, witness_version);
+    (
+        WalletData {
+            data_dir: "/tmp/rgb_send".to_string(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: schemas,
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
 }
 
 async fn create_utxos(
@@ -42,13 +49,13 @@ async fn create_utxos(
     size: Option<u32>,
 ) {
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), up_to, num, size, 1, true)
+        .create_utxos_begin(online.clone(), up_to, false, num, size, 1, true, false)
         .await
         .unwrap();
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     let txid = txid_of(&signed);
     wallet
-        .create_utxos_end(online.clone(), signed, true)
+        .create_utxos_end(online.clone(), signed)
         .await
         .unwrap();
     // A block can miss the TX before it reaches the mining node: mine until it confirms.
@@ -62,17 +69,26 @@ async fn create_utxos(
         }
         sleep_ms(500).await;
     }
-    wallet.sync(online.clone()).await.unwrap();
+    full_sync(wallet, &online).await;
 }
 
 async fn new_wallet() -> (Wallet, Online) {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    new_wallet_as(WitnessVersion::Taproot).await
+}
+
+async fn new_wallet_as(witness_version: WitnessVersion) -> (Wallet, Online) {
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia], witness_version);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let online = wallet.go_online(go_online_options(false)).await.unwrap();
     (wallet, online)
 }
 
 async fn sender() -> (Wallet, Online) {
-    let (mut wallet, online) = new_wallet().await;
+    sender_as(WitnessVersion::Taproot).await
+}
+
+async fn sender_as(witness_version: WitnessVersion) -> (Wallet, Online) {
+    let (mut wallet, online) = new_wallet_as(witness_version).await;
     fund_and_sync(&mut wallet, &online, "1.0").await;
     create_utxos(&mut wallet, &online, true, Some(10), None).await;
     (wallet, online)
@@ -154,11 +170,21 @@ async fn begin_dry(
     map: HashMap<String, Vec<Recipient>>,
     expiration: u64,
 ) -> Result<SendBeginResult, Error> {
+    begin_dry_as(wallet, online, map, false, expiration).await
+}
+
+async fn begin_dry_as(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    donation: bool,
+    expiration: u64,
+) -> Result<SendBeginResult, Error> {
     wallet
         .send_begin(
             online.clone(),
             map,
-            false,
+            donation,
             1,
             1,
             expiration,
@@ -171,14 +197,14 @@ async fn begin_dry(
 
 async fn end(wallet: &mut Wallet, online: &Online, signed: &str) -> Result<(String, i32), Error> {
     wallet
-        .send_end(online.clone(), signed.to_string(), false)
+        .send_end(online.clone(), signed.to_string())
         .await
         .map(|r| (r.txid, r.batch_transfer_idx))
 }
 
 fn sends(wallet: &Wallet, txid: &str) -> Vec<Transfer> {
     wallet
-        .list_transfers(AssetFilter::Any, None)
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
         .unwrap()
         .into_iter()
         .filter(|t| t.kind == TransferKind::Send && t.txid.as_deref() == Some(txid))
@@ -217,7 +243,7 @@ async fn begin_end() {
     assert!(!wallet.backup_info().unwrap());
     let (mut saved, saved_online) = saved_wallet(&wallet).await;
     assert_eq!(
-        saved.send_btc_end(saved_online, dry_signed, true).await,
+        saved.send_btc_end(saved_online, dry_signed).await,
         Err(Error::WrongOperation { txid: txid.clone() })
     );
 
@@ -235,19 +261,42 @@ async fn begin_end() {
     .recipient_id;
     let early = recipient(&early_rid, 34, None, PROXY_URL);
     let latest = early.expiration_timestamp.unwrap() - 600;
-    let two = HashMap::from([(
+    let mut two = HashMap::from([(
         asset_id.clone(),
         vec![recipient(&rid, 66, None, PROXY_URL), early],
     )]);
+    for r in two.get_mut(&asset_id).unwrap() {
+        r.transport_endpoints.insert(0, DOWN.to_string());
+    }
+    spy_rpc();
+    clear_rpc_hooks();
     assert!(
         begin_dry(&mut wallet, &online, two.clone(), latest)
             .await
             .is_ok()
     );
+    // each distinct proxy gets one call, also a proxy that is down
+    assert_eq!(rpc_count("server.info"), 2);
     assert!(matches!(
         begin_dry(&mut wallet, &online, two, latest + 1).await,
         Err(Error::InvalidExpiration)
     ));
+    // the operation expires at least the clock-skew margin and at most the maximum from now
+    assert!(matches!(
+        begin_dry(&mut wallet, &online, map.clone(), now_secs() + 240).await,
+        Err(Error::InvalidExpiration)
+    ));
+    // a donation has no invoice bound, only the maximum
+    let far = now_secs() + MAX_EXPIRATION_SECS;
+    assert!(matches!(
+        begin_dry_as(&mut wallet, &online, map.clone(), true, far + 60).await,
+        Err(Error::InvalidExpiration)
+    ));
+    assert!(
+        begin_dry_as(&mut wallet, &online, map.clone(), true, far - 60)
+            .await
+            .is_ok()
+    );
 
     sleep_ms(1100).await;
     let (res, signed, txid) = begin(&mut wallet, &online, map.clone(), false, false).await;
@@ -279,7 +328,7 @@ async fn begin_end() {
     assert!(!res.details.fascia.is_empty());
 
     let ended = wallet
-        .send_end(online.clone(), signed.to_string(), false)
+        .send_end(online.clone(), signed.to_string())
         .await
         .unwrap();
     assert_eq!((ended.txid, ended.batch_transfer_idx), (txid.clone(), idx));
@@ -352,11 +401,15 @@ async fn send_end_retry_after_post_failure() {
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, false).await;
     let idx = res.batch_transfer_idx.unwrap();
+    assert!(wallet.send_consignment_bytes(&txid, &asset_id).is_none());
     fail_posts(":3010", true);
     assert!(matches!(
         end(&mut wallet, &online, &signed).await,
         Err(Error::Proxy { .. })
     ));
+    // the failed end keeps the consignment it built
+    let built = wallet.send_consignment_bytes(&txid, &asset_id);
+    assert!(built.is_some());
     let saved = sends(&wallet, &txid);
     assert_eq!(saved.len(), 2);
     assert!(
@@ -364,10 +417,12 @@ async fn send_end_retry_after_post_failure() {
             .iter()
             .all(|t| t.status == TransferStatus::Initiated && t.batch_transfer_idx == idx)
     );
-    // a reload keeps the used flag of the post that succeeded, so the retry skips its proxy
+    // a reload keeps the built consignment and the used flag of the post that succeeded,
+    // so the retry skips its proxy
     let (reloaded, online) = saved_wallet(&wallet).await;
     drop(wallet);
     let mut wallet = reloaded;
+    assert_eq!(wallet.send_consignment_bytes(&txid, &asset_id), built);
     fail_posts(":3000", true);
     assert_eq!(
         end(&mut wallet, &online, &signed).await,
@@ -414,6 +469,23 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
         ],
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, dry_run).await;
+    if !dry_run {
+        // the blinded receive of the wallet itself is ours
+        let inspection = wallet
+            .inspect_fascia(
+                res.psbt.clone(),
+                &res.details.fascia,
+                Some(res.details.entropy),
+            )
+            .unwrap();
+        let concealed: Vec<_> = inspection.operations[0].transitions[0]
+            .outputs
+            .iter()
+            .filter(|o| o.is_concealed)
+            .map(|o| (o.assignment.clone(), o.is_ours))
+            .collect();
+        assert_eq!(concealed, vec![(Assignment::Fungible(66), Some(true))]);
+    }
     fail_posts(":3010", true);
     assert!(matches!(
         end(&mut wallet, &online, &signed).await,
@@ -435,7 +507,9 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
     if let Some(begin_idx) = res.batch_transfer_idx {
         assert_eq!(idx, begin_idx);
     }
-    let transfers = wallet.list_transfers(AssetFilter::Any, None).unwrap();
+    let transfers = wallet
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+        .unwrap();
     assert_eq!(transfers.len(), 5);
     let count = |k: TransferKind| transfers.iter().filter(|t| t.kind == k).count();
     assert_eq!(count(TransferKind::Issuance), 1);
@@ -446,6 +520,12 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
         sends(&wallet, &txid)
             .iter()
             .all(|t| t.status == TransferStatus::WaitingCounterparty)
+    );
+    let begin_psbt = Psbt::from_str(&res.psbt).unwrap().serialize();
+    assert!(
+        sends(&wallet, &txid)
+            .iter()
+            .all(|t| t.psbt.as_ref() == Some(&begin_psbt))
     );
     let r1_transfer = transfers
         .iter()
@@ -470,18 +550,19 @@ async fn send_extra_allocations_no_dry_run_impl(donation: bool) {
     create_utxos(&mut wallet, &online, false, Some(1), None).await;
     let asset_a = issue(&wallet, "TSTA", 1000);
     let asset_b = issue(&wallet, "TSTB", 2000);
-    let colorable = |w: &mut Wallet| {
+    let colorable = async |w: &mut Wallet| {
         w.list_unspents(None, false, true)
+            .await
             .unwrap()
             .into_iter()
             .filter(|u| u.utxo.colorable)
             .collect::<Vec<_>>()
     };
-    let unspents = colorable(&mut wallet);
+    let unspents = colorable(&mut wallet).await;
     assert_eq!(unspents.len(), 1);
     assert_eq!(unspents[0].rgb_allocations.len(), 2);
     create_utxos(&mut wallet, &online, false, Some(1), None).await;
-    assert_eq!(colorable(&mut wallet).len(), 2);
+    assert_eq!(colorable(&mut wallet).await.len(), 2);
 
     let (mut rcv, rcv_online) = sender().await;
     let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
@@ -493,7 +574,7 @@ async fn send_extra_allocations_no_dry_run_impl(donation: bool) {
     assert_eq!(saved[0].status, TransferStatus::Initiated);
     assert!(
         wallet
-            .list_transfers(AssetFilter::Id(asset_b.clone()), None)
+            .list_transfers(AssetFilter::Id(asset_b.clone()), TransferScope::All)
             .unwrap()
             .iter()
             .all(|t| t.kind != TransferKind::Send)
@@ -519,7 +600,7 @@ async fn send_extra_allocations_no_dry_run_impl(donation: bool) {
     assert_eq!(balance(&wallet, &asset_a), 934);
     assert_eq!(balance(&rcv, &asset_a), 66);
     assert_eq!(balance(&wallet, &asset_b), 2000);
-    assert!(colorable(&mut wallet).iter().any(|u| {
+    assert!(colorable(&mut wallet).await.iter().any(|u| {
         u.rgb_allocations
             .iter()
             .any(|a| a.asset_id.as_deref() == Some(asset_b.as_str()) && a.settled)
@@ -673,9 +754,10 @@ async fn batch_donation_success() {
 }
 
 // Settled amount of an asset on each colorable UTXO that holds some.
-fn amounts(wallet: &mut Wallet, asset_id: &str) -> Vec<(Outpoint, u64)> {
+async fn amounts(wallet: &mut Wallet, asset_id: &str) -> Vec<(Outpoint, u64)> {
     wallet
         .list_unspents(None, false, true)
+        .await
         .unwrap()
         .into_iter()
         .filter(|u| u.utxo.colorable)
@@ -726,10 +808,13 @@ async fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
     settle(&mut wallet, &online, &[rid.clone()]).await;
     settle(&mut rcv, &rcv_online, &[rid]).await;
 
-    let mut x = amounts(&mut wallet, &asset_x);
+    let mut x = amounts(&mut wallet, &asset_x).await;
     x.sort_by_key(|(_, n)| *n);
     assert_eq!(x.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![10, 934]);
-    assert_eq!(amounts(&mut wallet, &asset_y), vec![(x[1].0.clone(), 2000)]);
+    assert_eq!(
+        amounts(&mut wallet, &asset_y).await,
+        vec![(x[1].0.clone(), 2000)]
+    );
     assert_eq!(balance(&wallet, &asset_x), 944);
     assert_eq!(balance(&wallet, &asset_y), 2000);
 
@@ -755,6 +840,32 @@ async fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+/// Shift the clock the wallet reads (`Date.now`) by `secs` seconds. Zero restores it.
+fn shift_clock(secs: i64) {
+    js_sys::Function::new_with_args(
+        "secs",
+        "if (!globalThis.__rgbDateNow) globalThis.__rgbDateNow = Date.now;
+        const real = globalThis.__rgbDateNow;
+        Date.now = secs === 0 ? real : () => real.call(Date) + secs * 1000;",
+    )
+    .call1(&JsValue::NULL, &JsValue::from_f64(secs as f64))
+    .unwrap();
+}
+
+/// Begin a send that expires at `expiration`, under the clock-skew margin from now.
+/// The wallet clock runs the margin behind during the begin, so the begin accepts it.
+async fn begin_short(
+    wallet: &mut Wallet,
+    online: &Online,
+    map: HashMap<String, Vec<Recipient>>,
+    expiration: u64,
+) -> (SendBeginResult, String, String) {
+    shift_clock(-300);
+    let res = begin_with(wallet, online, map, false, false, expiration).await;
+    shift_clock(0);
+    res
 }
 
 async fn sleep_until(timestamp: u64) {
@@ -810,10 +921,10 @@ fn txid_of(signed: &str) -> String {
 async fn settled_send(encryption: Encryption) {
     let (mut wallet, online, mut rcv, rcv_online, asset_id, rid, signed, _) =
         pending_send(Some(encryption)).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
     let plaintext = wallet
         .send_consignment_bytes(&txid_of(&signed), &asset_id)
         .unwrap();
-    end(&mut wallet, &online, &signed).await.unwrap();
     rpc_hook(
         PROXY_URL,
         "consignment.get",
@@ -937,7 +1048,7 @@ async fn recipient_operation_expired() {
         ],
     )]);
     let expiration = now_secs() + 20;
-    let (_, signed, _) = begin_with(&mut wallet, &online, map, false, false, expiration).await;
+    let (_, signed, _) = begin_short(&mut wallet, &online, map, expiration).await;
     end(&mut wallet, &online, &signed).await.unwrap();
 
     // recipient 1 ACKs, recipient 2 never does, so the TX is not released
@@ -970,15 +1081,8 @@ async fn send_end_after_expiration() {
         vec![recipient(&other_rid, 66, None, PROXY_URL)],
     )]);
     let other_expiration = now_secs() + 10;
-    let (_, other_signed, _) = begin_with(
-        &mut other,
-        &other_online,
-        other_map,
-        false,
-        false,
-        other_expiration,
-    )
-    .await;
+    let (_, other_signed, _) =
+        begin_short(&mut other, &other_online, other_map, other_expiration).await;
     sleep_until(other_expiration + 1).await;
     assert!(matches!(
         end(&mut other, &other_online, &other_signed).await,
@@ -986,7 +1090,7 @@ async fn send_end_after_expiration() {
     ));
 
     let expiration = now_secs() + 10;
-    let (_, signed, txid) = begin_with(&mut wallet, &online2, map, false, false, expiration).await;
+    let (_, signed, txid) = begin_short(&mut wallet, &online2, map, expiration).await;
     // the operation is registered on the sender proxy, then the post fails
     rpc_fail(PROXY_URL, "consignment.post");
     assert!(matches!(
@@ -1050,7 +1154,7 @@ async fn fail_after_recipient_ack_refused() {
     let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
     let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
     let expiration = now_secs() + 20;
-    let (res, signed, _) = begin_with(&mut wallet, &online, map, false, false, expiration).await;
+    let (res, signed, _) = begin_short(&mut wallet, &online, map, expiration).await;
     let idx = res.batch_transfer_idx.unwrap();
     end(&mut wallet, &online, &signed).await.unwrap();
     refresh(&mut rcv, &rcv_online).await;
@@ -1150,7 +1254,11 @@ async fn invoice_not_reserved_fail() {
         begin_dry(&mut wallet, &online, map, exp).await,
         Err(Error::InvoiceExpired)
     ));
-    let map = with(|r| r.expiration_timestamp = Some(default_send_expiration() + 100));
+    // the checks that need no network come before any proxy call
+    let map = with(|r| {
+        r.transport_endpoints = vec![DOWN.to_string()];
+        r.expiration_timestamp = Some(default_send_expiration() + 100);
+    });
     assert!(matches!(
         begin_dry(&mut wallet, &online, map, exp).await,
         Err(Error::InvalidExpiration)
@@ -1188,7 +1296,8 @@ async fn invoice_not_reserved_fail() {
 
 #[wasm_bindgen_test]
 async fn proxy_auth() {
-    let mut wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let (wd, keys) = test_wallet_data(vec![AssetSchema::Nia], WitnessVersion::Taproot);
+    let mut wallet = Wallet::new(wd, keys).unwrap();
     let endpoint = transport_endpoint(PROXY_AUTH_URL);
     let mut options = go_online_options(false);
     let online = wallet.go_online(options.clone()).await.unwrap();
@@ -1390,4 +1499,71 @@ async fn proxy_draining() {
     let res = end(&mut wallet, &online, &signed).await;
     clear_rpc_hooks();
     assert!(matches!(res, Err(Error::ProxyDraining)));
+}
+
+#[wasm_bindgen_test]
+async fn p2wpkh_send_receive_nia() {
+    let (mut wallet, online) = sender_as(WitnessVersion::SegWitV0).await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender_as(WitnessVersion::SegWitV0).await;
+    let b = blind(&mut rcv, &rcv_online, 40, PROXY_URL).await;
+    let w = witness_rcv(
+        &mut rcv,
+        &rcv_online,
+        None,
+        Assignment::Fungible(26),
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap()
+    .recipient_id;
+    let map = HashMap::from([(
+        asset_id.clone(),
+        vec![
+            recipient(&b, 40, None, PROXY_URL),
+            recipient(&w, 26, Some(1000), PROXY_URL),
+        ],
+    )]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+
+    refresh(&mut rcv, &rcv_online).await;
+    refresh(&mut wallet, &online).await;
+    let ids = [b, w];
+    settle(&mut rcv, &rcv_online, &ids).await;
+    settle(&mut wallet, &online, &ids).await;
+    assert_eq!(balance(&rcv, &asset_id), 66);
+    assert_eq!(balance(&wallet, &asset_id), 934);
+}
+
+#[wasm_bindgen_test]
+async fn cross_type_p2tr_to_p2wpkh() {
+    let (mut wallet, online) = sender().await;
+    let asset_id = issue(&wallet, "TST", 1000);
+    let (mut rcv, rcv_online) = sender_as(WitnessVersion::SegWitV0).await;
+
+    // P2TR to P2WPKH
+    let rid = blind(&mut rcv, &rcv_online, 66, PROXY_URL).await;
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 66, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut wallet, &online, map, false, false).await;
+    end(&mut wallet, &online, &signed).await.unwrap();
+    refresh(&mut rcv, &rcv_online).await;
+    refresh(&mut wallet, &online).await;
+    settle(&mut rcv, &rcv_online, &[rid.clone()]).await;
+    settle(&mut wallet, &online, &[rid]).await;
+    assert_eq!(balance(&wallet, &asset_id), 934);
+    assert_eq!(balance(&rcv, &asset_id), 66);
+
+    // P2WPKH back to P2TR
+    let rid = blind(&mut wallet, &online, 10, PROXY_URL).await;
+    let map = HashMap::from([(asset_id.clone(), vec![recipient(&rid, 10, None, PROXY_URL)])]);
+    let (_, signed, _) = begin(&mut rcv, &rcv_online, map, false, false).await;
+    end(&mut rcv, &rcv_online, &signed).await.unwrap();
+    refresh(&mut wallet, &online).await;
+    refresh(&mut rcv, &rcv_online).await;
+    settle(&mut wallet, &online, &[rid.clone()]).await;
+    settle(&mut rcv, &rcv_online, &[rid]).await;
+    assert_eq!(balance(&wallet, &asset_id), 944);
+    assert_eq!(balance(&rcv, &asset_id), 56);
 }

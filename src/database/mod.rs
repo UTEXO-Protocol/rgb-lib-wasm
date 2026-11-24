@@ -282,11 +282,12 @@ pub(crate) struct TransferData {
     pub(crate) assignments: Vec<Assignment>,
     pub(crate) txid: Option<String>,
     pub(crate) receive_utxo: Option<Outpoint>,
-    pub(crate) change_utxo: Option<Outpoint>,
+    pub(crate) change_utxos: Vec<Outpoint>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
     pub(crate) expiration: Option<i64>,
     pub(crate) consignment_path: Option<String>,
+    pub(crate) psbt: Option<Vec<u8>>,
 }
 
 pub(crate) mod enums;
