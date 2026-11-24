@@ -13,12 +13,10 @@ use super::vss::{
     BACKUP_BUFFER_LEN_DECRYPT, BACKUP_NONCE_LENGTH, BACKUP_SALT_LENGTH, VssEncryptionMetadata,
     decrypt_data, encrypt_data,
 };
-use crate::Error;
+use crate::{BitcoinNetwork, Error};
 
 /// Namespace of the wallet backup.
 pub const BACKUP_NAMESPACE: &str = "backup";
-/// Key of the wallet backup.
-pub const BACKUP_KEY: &str = "wallet";
 /// Maximum size, in bytes, of a backup blob.
 pub const MAX_BACKUP_LEN: usize = 256 * 1024 * 1024;
 /// Maximum number of keys that `list` accepts.
@@ -27,6 +25,11 @@ pub const MAX_LIST_KEYS: usize = 10_000;
 pub const MAX_LIST_PAGES: usize = 1_000;
 /// Maximum length, in bytes, of a key.
 pub const MAX_KEY_LEN: usize = 1024;
+
+/// Return the key of a wallet backup. It holds the fingerprint and the network, no secret and no xpub.
+pub fn backup_key(master_fingerprint: &str, bitcoin_network: BitcoinNetwork) -> String {
+    format!("wallet/{master_fingerprint}/{bitcoin_network}")
+}
 
 const BLOB_VERSION: u8 = 1;
 const BLOB_HEADER_LEN: usize = 1 + BACKUP_SALT_LENGTH + BACKUP_NONCE_LENGTH;

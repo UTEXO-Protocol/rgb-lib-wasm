@@ -4892,11 +4892,19 @@ pub(crate) mod address_reuse_tests {
     }
 
     pub(crate) fn make_test_wallet_with_singlesig_keys(keys: SinglesigKeys, reuse: bool) -> Wallet {
-        let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
+        make_test_wallet_on_network(keys, reuse, BitcoinNetwork::Regtest)
+    }
+
+    pub(crate) fn make_test_wallet_on_network(
+        keys: SinglesigKeys,
+        reuse: bool,
+        bitcoin_network: BitcoinNetwork,
+    ) -> Wallet {
+        let bdk_network = BdkNetwork::from(bitcoin_network);
         let WalletDescriptors {
             colored: desc_colored,
             vanilla: desc_vanilla,
-        } = keys.build_descriptors(BitcoinNetwork::Regtest).unwrap().0;
+        } = keys.build_descriptors(bitcoin_network).unwrap().0;
         let mut bdk_database: BdkPersister = super::super::memory_store::MemoryStore::new();
         let bdk_wallet = BdkWallet::create(desc_colored.clone(), desc_vanilla.clone())
             .network(bdk_network)
@@ -4912,7 +4920,7 @@ pub(crate) mod address_reuse_tests {
 
         let wd = WalletData {
             data_dir: ":memory:".to_string(),
-            bitcoin_network: BitcoinNetwork::Regtest,
+            bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia],
