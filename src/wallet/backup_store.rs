@@ -1,6 +1,5 @@
 //! Backup store: the key-value interface that the wallet backup goes through.
 
-use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -20,8 +19,6 @@ use crate::Error;
 pub const BACKUP_NAMESPACE: &str = "backup";
 /// Key of the wallet backup.
 pub const BACKUP_KEY: &str = "wallet";
-/// Key that the versioned-write probe uses. It holds only random bytes.
-pub const PROBE_KEY: &str = "probe";
 /// Maximum size, in bytes, of a backup blob.
 pub const MAX_BACKUP_LEN: usize = 256 * 1024 * 1024;
 /// Maximum number of keys that `list` accepts.
@@ -33,7 +30,6 @@ pub const MAX_KEY_LEN: usize = 1024;
 
 const BLOB_VERSION: u8 = 1;
 const BLOB_HEADER_LEN: usize = 1 + BACKUP_SALT_LENGTH + BACKUP_NONCE_LENGTH;
-const PROBE_LEN: usize = 32;
 
 /// A value and its version, as a store returns it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,19 +89,7 @@ pub(crate) struct BackupTarget {
     pub(crate) store: Box<dyn KvStore>,
     pub(crate) id: String,
     pub(crate) key: SecretKey,
-    pub(crate) verified: Cell<bool>,
     pub(crate) lock: tokio::sync::Mutex<()>,
-}
-
-impl BackupTarget {
-    /// Probe the store once. Call it with the lock held.
-    pub(crate) async fn ensure_verified(&self) -> Result<(), Error> {
-        if !self.verified.get() {
-            probe_versioned_writes(&*self.store).await?;
-            self.verified.set(true);
-        }
-        Ok(())
-    }
 }
 
 /// Accept a new version only when it is greater than the expected one.
@@ -124,55 +108,6 @@ fn fill_random(buf: &mut [u8]) -> Result<(), Error> {
     getrandom::getrandom(buf).map_err(|e| Error::Internal {
         details: format!("RNG unavailable: {e}"),
     })
-}
-
-fn probe_bytes() -> Result<Vec<u8>, Error> {
-    let mut buf = vec![0u8; PROBE_LEN];
-    fill_random(&mut buf)?;
-    Ok(buf)
-}
-
-fn refused() -> Error {
-    Error::VssError {
-        details: "backup store does not support versioned writes".to_string(),
-    }
-}
-
-/// Check that a store honours expected versions. Write only random bytes to [`PROBE_KEY`].
-/// A store written to lie on purpose can pass this check.
-pub async fn probe_versioned_writes(store: &dyn KvStore) -> Result<(), Error> {
-    let (ns, key) = (BACKUP_NAMESPACE, PROBE_KEY);
-    let expect_conflict = |res: Result<i64, Error>| match res {
-        Err(Error::VssVersionConflict { .. }) => Ok(()),
-        Ok(_) => Err(refused()),
-        Err(e) => Err(e),
-    };
-    let res: Result<(), Error> = async {
-        let base = match store.read(ns, key).await? {
-            Some(cur) => cur.version,
-            None => check_new_version(store.write(ns, key, probe_bytes()?, None).await?, None)
-                .map_err(|_| refused())?,
-        };
-        expect_conflict(store.write(ns, key, probe_bytes()?, None).await)?;
-        let next = base.checked_add(1).ok_or_else(refused)?;
-        expect_conflict(store.write(ns, key, probe_bytes()?, Some(next)).await)?;
-        let value = probe_bytes()?;
-        let v2 = check_new_version(
-            store.write(ns, key, value.clone(), Some(base)).await?,
-            Some(base),
-        )
-        .map_err(|_| refused())?;
-        match store.read(ns, key).await? {
-            Some(read) if read.version == v2 && read.value == value => {}
-            _ => return Err(refused()),
-        }
-        store.remove(ns, key, Some(v2)).await
-    }
-    .await;
-    if res.is_err() {
-        let _ = store.remove(ns, key, None).await;
-    }
-    res
 }
 
 fn encryption_metadata(salt: &[u8], nonce: &[u8]) -> VssEncryptionMetadata {

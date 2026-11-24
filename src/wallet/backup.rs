@@ -220,7 +220,6 @@ impl super::Wallet {
     }
 }
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use bdk_wallet::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
@@ -232,18 +231,11 @@ use super::backup_store::{
 use super::vss::{VssBackupConfig, VssBackupInfo, VssStore};
 
 impl super::Wallet {
-    fn set_backup_target(
-        &mut self,
-        store: Box<dyn KvStore>,
-        id: String,
-        key: SecretKey,
-        verified: bool,
-    ) {
+    fn set_backup_target(&mut self, store: Box<dyn KvStore>, id: String, key: SecretKey) {
         self.backup_store = Some(Rc::new(BackupTarget {
             store,
             id,
             key,
-            verified: Cell::new(verified),
             lock: tokio::sync::Mutex::new(()),
         }));
     }
@@ -255,16 +247,11 @@ impl super::Wallet {
             "vss",
             &[&config.server_url, &config.store_id, &pubkey.to_string()],
         );
-        self.set_backup_target(
-            Box::new(VssStore::new(config)),
-            id,
-            config.signing_key,
-            true,
-        );
+        self.set_backup_target(Box::new(VssStore::new(config)), id, config.signing_key);
     }
 
-    /// Configure an app backup store. `store_id` names the store on this device. The library
-    /// probes versioned writes on the first call and refuses a store that fails.
+    /// Configure an app backup store. `store_id` names the store on this device. The store must
+    /// honour expected versions: the library relies on it to never overwrite a newer backup.
     pub fn configure_backup_store(
         &mut self,
         store: Box<dyn KvStore>,
@@ -272,7 +259,7 @@ impl super::Wallet {
         encryption_key: SecretKey,
     ) {
         let id = store_label("app", &[store_id]);
-        self.set_backup_target(store, id, encryption_key, false);
+        self.set_backup_target(store, id, encryption_key);
     }
 
     /// Disable the backup store.
@@ -291,7 +278,6 @@ impl super::Wallet {
     pub async fn vss_backup(&self) -> Result<i64, Error> {
         let target = self.backup_target()?;
         let _guard = target.lock.lock().await;
-        target.ensure_verified().await?;
 
         let payload_json = self.serialize_backup_payload()?;
         let blob = encode_backup_blob(&payload_json, &self.keys.master_fingerprint, &target.key)?;
@@ -348,7 +334,6 @@ impl super::Wallet {
     pub async fn vss_restore_backup(&mut self) -> Result<(), Error> {
         let target = self.backup_target()?;
         let _guard = target.lock.lock().await;
-        target.ensure_verified().await?;
 
         let stored = target
             .store
@@ -373,7 +358,6 @@ impl super::Wallet {
     pub async fn vss_backup_info(&self) -> Result<VssBackupInfo, Error> {
         let target = self.backup_target()?;
         let _guard = target.lock.lock().await;
-        target.ensure_verified().await?;
         let server_version = target
             .store
             .read(BACKUP_NAMESPACE, BACKUP_KEY)

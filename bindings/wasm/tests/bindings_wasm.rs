@@ -6,8 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, rand::rngs::OsRng};
 use rgb_lib_wasm::wallet::backup_store::{
-    BACKUP_KEY, BACKUP_NAMESPACE, JsKvStore, KvStore, PROBE_KEY, StoredValue, decode_backup_blob,
-    probe_versioned_writes,
+    BACKUP_KEY, BACKUP_NAMESPACE, JsKvStore, KvStore, StoredValue, decode_backup_blob,
 };
 use rgb_lib_wasm::wallet::vss::{VssBackupConfig, VssStore};
 use rgb_lib_wasm::wallet::{
@@ -1568,8 +1567,6 @@ async fn kv_contract(store: &dyn KvStore) {
     store.remove(ns, "b", None).await.unwrap();
     store.remove(ns, "c", None).await.unwrap();
     assert!(store.list(ns).await.unwrap().is_empty());
-    probe_versioned_writes(store).await.unwrap();
-    assert_eq!(store.read(BACKUP_NAMESPACE, PROBE_KEY).await.unwrap(), None);
 }
 
 #[wasm_bindgen_test]
@@ -1610,10 +1607,7 @@ async fn backup_store_backup_and_restore() {
 
     let calls = run_on(
         store,
-        "return s.calls.every(c => c[1] === 'backup' && \
-         (c[2] === 'wallet' || c[2] === 'probe')) && \
-         s.calls.filter(c => c[0] === 'write' && c[2] === 'probe') \
-         .every(c => c[4] === 32);",
+        "return s.calls.every(c => c[1] === 'backup' && c[2] === 'wallet');",
     );
     assert_eq!(calls, JsValue::TRUE);
     let blob = dest.stored().await.unwrap().value;
@@ -1713,42 +1707,6 @@ fn backup_store_refuses_incomplete_store() {
         .configure_backup_store(store.unchecked_into(), "x", &key_hex)
         .unwrap_err());
     assert!(e.contains("backup store has no list method"), "{e}");
-}
-
-#[wasm_bindgen_test]
-async fn backup_store_refuses_unversioned_writes() {
-    for mode in ["ignoreExpected", "createOverwrites", "noVersion"] {
-        let dest = Dest::new(true);
-        let store = dest.memory.clone().unwrap();
-        run_on(
-            &store,
-            &format!(
-                "s.mode = '{mode}'; \
-                 s.data.set('backup/wallet', {{value: new Uint8Array([7, 7, 7]), version: 1}});"
-            ),
-        );
-        let wallet = wallet();
-        dest.configure(&wallet);
-        let errors = [
-            err(wallet.vss_backup().await.unwrap_err()),
-            err(wallet.vss_restore_backup().await.unwrap_err()),
-            err(wallet.vss_backup_info().await.unwrap_err()),
-        ];
-        for e in errors {
-            assert!(
-                e.contains("does not support versioned writes"),
-                "{mode}: {e}"
-            );
-        }
-        let intact = run_on(
-            &store,
-            "const e = s.data.get('backup/wallet'); \
-             return e.version === 1 && e.value.join() === '7,7,7' && \
-             !s.data.has('backup/probe') && \
-             !s.calls.some(c => c[0] === 'write' && c[2] === 'wallet');",
-        );
-        assert_eq!(intact, JsValue::TRUE, "{mode}");
-    }
 }
 
 #[wasm_bindgen_test]
