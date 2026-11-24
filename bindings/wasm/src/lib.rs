@@ -183,6 +183,7 @@ pub struct WasmWallet {
 impl WasmWallet {
     /// Create a new RGB wallet from a JSON-encoded WalletData and SinglesigKeys.
     /// It does not load IndexedDB and cannot save over a stored snapshot; use `create()`.
+    /// It takes no lock.
     #[wasm_bindgen(constructor)]
     pub fn new(wallet_data_json: &str, keys_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
@@ -199,6 +200,8 @@ impl WasmWallet {
     ///
     /// Like `new()`, but asynchronously checks IndexedDB for a previously saved
     /// snapshot and restores it, so wallet state survives page refreshes.
+    /// Fails with `The wallet is open elsewhere` while the same wallet is open in another tab or object.
+    /// `free()` closes the wallet and releases its lock.
     #[wasm_bindgen(js_name = "create")]
     pub async fn create(wallet_data_json: &str, keys_json: &str) -> Result<WasmWallet, JsValue> {
         let wd: WalletData = serde_json::from_str(wallet_data_json)
@@ -215,6 +218,8 @@ impl WasmWallet {
 
     /// Load a saved wallet with its saved settings.
     /// A null `mnemonic` loads it watch-only.
+    /// Fails with `The wallet is open elsewhere` while the same wallet is open in another tab or object.
+    /// `free()` closes the wallet and releases its lock.
     #[wasm_bindgen(js_name = "load")]
     pub async fn load(
         data_dir: &str,
