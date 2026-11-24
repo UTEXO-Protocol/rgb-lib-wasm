@@ -337,6 +337,28 @@ await wallet.vssRestoreBackup();
 wallet.disableVssBackup();
 ```
 
+#### Own backup store
+
+An app can keep the backup in its own store instead of VSS. The store is a plain object with four
+methods, each of which may return a promise:
+
+```js
+wallet.configureBackupStore(store, 'my-store', encryptionKeyHex);
+await wallet.vssBackup();
+```
+
+- `read(namespace, key)` returns `{ value, version }`, or `null` when the key is absent.
+- `write(namespace, key, value, expectedVersion?)` returns the new version: greater than
+  `expectedVersion`, or 1 or more for a create. Without
+  `expectedVersion` it creates the key. It throws an error with `code: 'CONFLICT'` when the key
+  exists, or when the stored version is not `expectedVersion`.
+- `remove(namespace, key, version?)` removes the key, only at `version` when it is set.
+- `list(namespace)` returns the keys of the namespace.
+
+The store receives only encrypted data. On the first call the library writes random bytes to
+`backup/probe` and refuses a store without versioned writes. On a conflict, call
+`vssRestoreBackup()` to take the stored backup; the library never overwrites it.
+
 ### Transfer management
 
 ```javascript
@@ -492,7 +514,8 @@ To protect a wallet:
 | `restoreBackup(bytes, password)` | no | Restore from encrypted backup |
 | `backupInfo()` | no | Check if backup is needed |
 | `configureVssBackup(url, storeId, keyHex)` | no | Configure VSS cloud backup |
-| `disableVssBackup()` | no | Disable VSS cloud backup |
+| `configureBackupStore(store, storeId, keyHex)` | no | Configure an own backup store |
+| `disableVssBackup()` | no | Disable the backup store |
 | `vssBackup()` | yes | Upload backup to VSS server |
 | `ensureInitialBackup()` | yes | Upload a VSS backup if the wallet has changes |
 | `vssRestoreBackup()` | yes | Restore from VSS server |
