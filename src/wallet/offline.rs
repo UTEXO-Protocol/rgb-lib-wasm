@@ -4822,6 +4822,11 @@ impl Wallet {
         keep: fn(&Error) -> bool,
     ) -> Result<T, Error> {
         let res = res.and_then(|v| fault_point(cp.shared.op).map(|()| v));
+        let res = match res {
+            Err(e) if keep(&e) => Err(e),
+            _ if crate::abort::fired() => Err(Error::Aborted),
+            res => res,
+        };
         match res {
             Err(e) if !keep(&e) => {
                 self.rollback(cp);

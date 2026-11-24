@@ -8,6 +8,10 @@ use super::*;
 /// The error variants returned by functions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Deserialize, Serialize)]
 pub enum Error {
+    /// The call stopped because its abort signal fired
+    #[error("Aborted")]
+    Aborted,
+
     /// Address rotation called when reuse_addresses is false
     #[error("Address reuse is not enabled")]
     AddressReuseDisabled,
@@ -920,6 +924,9 @@ pub enum Error {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
+    #[error("Aborted")]
+    Aborted,
+
     #[cfg(feature = "esplora")]
     #[error("Esplora async error: {0}")]
     EsploraAsync(String),
@@ -1025,9 +1032,24 @@ impl From<bdk_wallet::bitcoin::psbt::PsbtParseError> for Error {
 
 impl From<IndexerError> for Error {
     fn from(e: IndexerError) -> Self {
-        Error::Indexer {
-            details: e.to_string(),
+        match e {
+            IndexerError::Aborted => Error::Aborted,
+            e => Error::Indexer {
+                details: e.to_string(),
+            },
         }
+    }
+}
+
+impl From<crate::abort::Aborted> for Error {
+    fn from(_: crate::abort::Aborted) -> Self {
+        Error::Aborted
+    }
+}
+
+impl From<crate::abort::Aborted> for IndexerError {
+    fn from(_: crate::abort::Aborted) -> Self {
+        IndexerError::Aborted
     }
 }
 

@@ -33,6 +33,7 @@
 #[cfg(all(test, target_arch = "wasm32"))]
 extern crate self as rgb_lib_wasm;
 
+pub(crate) mod abort;
 pub(crate) mod api;
 pub(crate) mod database;
 pub(crate) mod encryption;
@@ -42,6 +43,7 @@ pub mod no_wallet;
 pub mod utils;
 pub mod wallet;
 
+pub use abort::{AbortController, AbortSignal};
 pub use bdk_wallet;
 pub use bdk_wallet::bitcoin;
 pub use rgbinvoice::RgbTransport;

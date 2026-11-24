@@ -512,9 +512,20 @@ impl ProxyClient {
         method: &str,
         params: Option<P>,
     ) -> Result<JsonRpcResponse<R>, Error> {
-        answer(self.json_request(method, params))
-            .await
-            .map_err(CallFailure::into_error)
+        crate::abort::race(async {
+            answer(self.json_request(method, params))
+                .await
+                .map_err(CallFailure::into_error)
+        })
+        .await
+    }
+
+    async fn write_call<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<P>,
+    ) -> Result<JsonRpcResponse<R>, Error> {
+        crate::abort::write(self.call(method, params)).await
     }
 
     async fn lookup_call<P: Serialize, R: serde::de::DeserializeOwned>(
@@ -522,9 +533,12 @@ impl ProxyClient {
         method: &str,
         params: Option<P>,
     ) -> Result<JsonRpcResponse<R>, Error> {
-        answer(self.json_request(method, params))
-            .await
-            .map_err(|f| f.into_lookup_error(&self.base_url))
+        crate::abort::race(async {
+            answer(self.json_request(method, params))
+                .await
+                .map_err(|f| f.into_lookup_error(&self.base_url))
+        })
+        .await
     }
 
     async fn call_multipart<R: serde::de::DeserializeOwned>(
@@ -544,7 +558,7 @@ impl ProxyClient {
             .post(&self.base_url)
             .timeout(Duration::from_secs(READ_WRITE_TIMEOUT))
             .multipart(form);
-        answer(req).await.map_err(CallFailure::into_error)
+        crate::abort::write(async { answer(req).await.map_err(CallFailure::into_error) }).await
     }
 
     pub(crate) async fn get_info(&self) -> Result<JsonRpcResponse<ServerInfoResponse>, Error> {
@@ -571,7 +585,7 @@ impl ProxyClient {
         recipient_pk: &str,
         signature: Option<String>,
     ) -> Result<JsonRpcResponse<bool>, Error> {
-        self.call(
+        self.write_call(
             "invoice.prepare",
             Some(PrepareInvoiceParams {
                 invoice_id: invoice_id.to_string(),
@@ -679,7 +693,7 @@ impl ProxyClient {
         transfer_id: &str,
         signature: &str,
     ) -> Result<JsonRpcResponse<bool>, Error> {
-        self.call(
+        self.write_call(
             "transfer.retrieved",
             Some(TransferRetrievedParams {
                 transfer_id: transfer_id.to_string(),
@@ -736,7 +750,7 @@ impl ProxyClient {
         ack: bool,
         signature: &str,
     ) -> Result<JsonRpcResponse<PostAckResponse>, Error> {
-        self.call(
+        self.write_call(
             "ack.post",
             Some(PostAckParams {
                 transfer_id: transfer_id.to_string(),
@@ -769,7 +783,7 @@ impl ProxyClient {
         transfer_ids: &[String],
         signature: &str,
     ) -> Result<JsonRpcResponse<bool>, Error> {
-        self.call(
+        self.write_call(
             "ack.clean",
             Some(CleanAckParams {
                 transfer_ids: transfer_ids.to_vec(),
