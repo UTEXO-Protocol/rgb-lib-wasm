@@ -355,8 +355,8 @@ await wallet.vssBackup();
 - `remove(namespace, key, version?)` removes the key, only at `version` when it is set.
 - `list(namespace)` returns the keys of the namespace.
 
-The store receives only encrypted data. On the first call the library writes random bytes to
-`backup/probe` and refuses a store without versioned writes. On a conflict, call
+The store receives only encrypted data. It must honour expected versions: the library relies on
+them to never overwrite a newer backup. On a conflict, call
 `vssRestoreBackup()` to take the stored backup; the library never overwrites it.
 
 ### Transfer management

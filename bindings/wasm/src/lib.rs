@@ -126,7 +126,6 @@ const BACKUP_STORE_TS: &'static str = r#"
  *   Without `version` it removes the key, and an absent key is not an error.
  * - `list` returns the keys of the namespace.
  * To signal a conflict, throw an object with `code` equal to "CONFLICT".
- * The library writes random bytes to key "probe" of namespace "backup" to check versioned writes.
  */
 export interface BackupStore {
     read(namespace: string, key: string): { value: Uint8Array; version: number } | null | Promise<{ value: Uint8Array; version: number } | null>;
