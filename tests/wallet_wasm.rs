@@ -1041,6 +1041,7 @@ async fn config_watch_only_toggle_success() {
     )
     .unwrap();
     assert_eq!(loaded.get_descriptors(), watch_only.get_descriptors());
+    drop(loaded);
     let loaded = Wallet::load(&wd.data_dir, Regtest, fp, mnemonic(&keys))
         .await
         .unwrap();
