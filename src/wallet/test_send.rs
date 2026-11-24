@@ -7,7 +7,10 @@ use super::online::{
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
-use crate::no_wallet::{SpvProofFill, WitnessWithoutProof, fill_spv_proofs};
+use crate::no_wallet::inspection::tests::fascia_with_bumped_nonce;
+use crate::no_wallet::{
+    RgbTransitionInfo, SpvProofFill, WitnessWithoutProof, fill_spv_proofs, inspect_fascia,
+};
 use crate::utils::{INDEXER_SYNCS, TRANSITION_BUILDERS_LOADED};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
@@ -17,11 +20,13 @@ use crate::wallet::{
     WalletData,
 };
 use crate::{
-    AssetSchema, Assignment, Attachment, Bytes32, Encryption, Error, MediaType, RgbTransfer,
-    SpvProof, TransferKind, TransferStatus, WitnessBundle, sha256_digest,
+    AssetSchema, Assignment, Attachment, BitcoinNetwork, Bytes32, Encryption, Error, MediaType,
+    RgbTransfer, SpvProof, TransferKind, TransferStatus, TypeOfTransition, WitnessBundle,
+    sha256_digest,
 };
 use amplify::ByteArray;
 use amplify::confinement::Confined;
+use bdk_wallet::bitcoin::absolute::LockTime;
 use bdk_wallet::bitcoin::psbt::Psbt;
 use bdk_wallet::bitcoin::psbt::raw::ProprietaryKey;
 use bdk_wallet::bitcoin::{
@@ -1830,4 +1835,198 @@ async fn unsafe_history_donation_resumes() {
         TransferStatus::Settled
     );
     assert_eq!(balance(&r, &asset_id).settled, 99);
+}
+
+#[wasm_bindgen_test]
+async fn inspect_fascia_with_and_without_wallet() {
+    let (mut a, a_online) = nia_wallet(3).await;
+    let (mut b, b_online) = nia_wallet(2).await;
+    let asset_id = issue(&a, vec![1000]);
+    let issued: Vec<_> = a
+        .list_unspents(None, false, true)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|u| {
+            u.rgb_allocations
+                .iter()
+                .any(|al| al.asset_id.as_deref() == Some(asset_id.as_str()))
+        })
+        .collect();
+    assert_eq!(issued.len(), 1);
+    let issued_outpoint = OutPoint::from(issued[0].utxo.outpoint.clone());
+
+    let blind = blind_rcv(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    let witness = witness_rcv(
+        &mut b,
+        &b_online,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![transport_endpoint(PROXY_URL)],
+    )
+    .await
+    .unwrap();
+    let recipients = vec![
+        recipient(&blind.recipient_id, 66, None, PROXY_URL),
+        recipient(&witness.recipient_id, 77, Some(1000), PROXY_URL),
+    ];
+    let begin = a
+        .send_begin(
+            a_online.clone(),
+            HashMap::from([(asset_id.clone(), recipients)]),
+            false,
+            1,
+            1,
+            default_send_expiration(),
+            Some(transport_endpoint(PROXY_URL)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let fascia = &begin.details.fascia;
+    let entropy = begin.details.entropy;
+
+    let wallet_inspection = a
+        .inspect_fascia(begin.psbt.clone(), fascia, Some(entropy))
+        .unwrap();
+    let inspection = inspect_fascia(
+        begin.psbt.clone(),
+        fascia,
+        Some(entropy),
+        BitcoinNetwork::Regtest,
+    )
+    .unwrap();
+    assert_eq!(inspection.txid, wallet_inspection.txid);
+    assert_eq!(inspection.close_method, wallet_inspection.close_method);
+    assert_eq!(inspection.commitment_hex, wallet_inspection.commitment_hex);
+    assert_eq!(inspection.operations.len(), 1);
+    let operation = &inspection.operations[0];
+    let wallet_operation = &wallet_inspection.operations[0];
+    assert_eq!(operation.asset_id, asset_id);
+    assert_eq!(
+        operation.committed_transition_count,
+        wallet_operation.committed_transition_count
+    );
+    assert_eq!(
+        operation.committed_input_count,
+        wallet_operation.committed_input_count
+    );
+    assert_eq!(operation.transitions.len(), 1);
+    let transition = &operation.transitions[0];
+    let wallet_transition = &wallet_operation.transitions[0];
+    assert_eq!(transition.r#type, TypeOfTransition::Transfer);
+    assert_eq!(transition.opid, wallet_transition.opid);
+    assert_eq!(transition.globals, wallet_transition.globals);
+    assert_eq!(transition.metadata, wallet_transition.metadata);
+
+    // without a wallet, the inputs report only their opout
+    let opouts: Vec<_> = transition.inputs.iter().map(|i| &i.opout).collect();
+    let wallet_opouts: Vec<_> = wallet_transition.inputs.iter().map(|i| &i.opout).collect();
+    assert_eq!(opouts, wallet_opouts);
+    assert!(
+        transition
+            .inputs
+            .iter()
+            .all(|i| i.vin.is_none() && i.assignment.is_none())
+    );
+    let psbt = Psbt::from_str(&begin.psbt).unwrap();
+    let vin = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .position(|i| i.previous_output == issued_outpoint)
+        .unwrap() as u32;
+    assert_eq!(wallet_transition.inputs.len(), 1);
+    assert_eq!(wallet_transition.inputs[0].vin, Some(vin));
+    assert_eq!(
+        wallet_transition.inputs[0].assignment,
+        Some(Assignment::Fungible(1000))
+    );
+
+    // without a wallet, the outputs do not report ownership
+    let outputs = |transition: &RgbTransitionInfo| -> Vec<_> {
+        transition
+            .outputs
+            .iter()
+            .map(|o| {
+                (
+                    o.txid.clone(),
+                    o.vout,
+                    o.blinding,
+                    o.assignment.clone(),
+                    o.is_concealed,
+                    o.recipient_id.clone(),
+                    o.is_terminal,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(transition.outputs.len(), 3);
+    assert!(transition.outputs.iter().all(|o| o.is_ours.is_none()));
+    assert_eq!(outputs(transition), outputs(wallet_transition));
+    let mut ours: Vec<_> = wallet_transition
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_concealed, o.is_ours))
+        .collect();
+    ours.sort();
+    assert_eq!(
+        ours,
+        vec![
+            (Assignment::Fungible(66), true, Some(false)),
+            (Assignment::Fungible(77), false, Some(false)),
+            (Assignment::Fungible(857), false, Some(true)),
+        ]
+    );
+
+    // the blinded receive reports its recipient ID
+    let concealed: Vec<_> = transition
+        .outputs
+        .iter()
+        .filter(|o| o.is_concealed)
+        .collect();
+    assert_eq!(concealed.len(), 1);
+    assert_eq!(
+        concealed[0].recipient_id.as_deref(),
+        Some(blind.recipient_id.as_str())
+    );
+    assert_eq!(concealed[0].assignment, Assignment::Fungible(66));
+
+    let assert_error = |result: Result<_, Error>, text: &str| {
+        assert!(
+            matches!(&result, Err(Error::RgbInspection { details }) if details.contains(text)),
+            "{result:?}"
+        );
+    };
+
+    // a given entropy must be the one the fascia carries
+    let text = format!("built with entropy {entropy}, not the given");
+    let wrong = Some(entropy.wrapping_add(1));
+    assert_error(a.inspect_fascia(begin.psbt.clone(), fascia, wrong), &text);
+
+    // the PSBT must be the one of the fascia witness
+    let mut other_psbt = psbt.clone();
+    let lock_time = other_psbt.unsigned_tx.lock_time.to_consensus_u32();
+    other_psbt.unsigned_tx.lock_time = LockTime::from_consensus(lock_time.wrapping_add(1));
+    let other_psbt = other_psbt.to_string();
+    let text = "does not match PSBT TXID";
+    assert_error(a.inspect_fascia(other_psbt, fascia, Some(entropy)), text);
+
+    // a transition not committed by its bundle
+    let tampered = fascia_with_bumped_nonce(fascia);
+    assert_error(
+        a.inspect_fascia(begin.psbt.clone(), &tampered, Some(entropy)),
+        "is not committed",
+    );
 }

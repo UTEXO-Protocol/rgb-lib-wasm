@@ -395,6 +395,10 @@ pub enum Error {
         details: String,
     },
 
+    /// The fascia is invalid
+    #[error("Invalid fascia")]
+    InvalidFascia,
+
     /// The provided file path is invalid
     #[error("Invalid file path: {file_path}")]
     InvalidFilePath {

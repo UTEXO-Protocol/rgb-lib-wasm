@@ -1,0 +1,81 @@
+{
+  "txid": "d2120318027a28c76918370c5e688432b00fa39f9b62f600595e5482889b5577",
+  "close_method": "opretFirst",
+  "commitment_hex": "68059638ab5985ab25b47279886bba24511bd003e1f2dcd449b0138ea72ab8f8",
+  "operations": [
+    {
+      "asset_id": "rgb:ZXsMuQVB-gxcdN6t-enipkTA-OfL8Dw~-gBG8NN~-7MOqJDk",
+      "committed_transition_count": 2,
+      "committed_input_count": 2,
+      "transitions": [
+        {
+          "type": "Transfer",
+          "opid": "8456c29bdb72f843852d542ca2d0e65941768ab8dc875bbe9b224d7704c6e3a2",
+          "inputs": [
+            {
+              "opout": {
+                "opid": "657b0cb9054183171d37ab5e9e2a644c039f2fc0f0fe0046f0d37fecc3aa2439",
+                "assignment_type": "Asset",
+                "index": 0
+              },
+              "vin": null,
+              "assignment": null
+            }
+          ],
+          "outputs": [
+            {
+              "txid": "d2120318027a28c76918370c5e688432b00fa39f9b62f600595e5482889b5577",
+              "vout": 1,
+              "blinding": 2647254560379219285,
+              "assignment": {
+                "Fungible": 600
+              },
+              "is_concealed": false,
+              "recipient_id": null,
+              "is_ours": null,
+              "is_terminal": null
+            },
+            {
+              "txid": "d4ba796ae9c64e49d5691cfef02d91aec114409a64f8c1ab9a473a6287dad1b6",
+              "vout": 3,
+              "blinding": 3014349254309924011,
+              "assignment": {
+                "Fungible": 66
+              },
+              "is_concealed": false,
+              "recipient_id": null,
+              "is_ours": null,
+              "is_terminal": null
+            }
+          ],
+          "globals": [],
+          "metadata": []
+        },
+        {
+          "type": "Burn",
+          "opid": "b62cb21edefcfee9518b016bcf9ebedf2ce91e19956b65b7a26bf6ea7fd24a51",
+          "inputs": [
+            {
+              "opout": {
+                "opid": "8456c29bdb72f843852d542ca2d0e65941768ab8dc875bbe9b224d7704c6e3a2",
+                "assignment_type": "Asset",
+                "index": 1
+              },
+              "vin": 0,
+              "assignment": {
+                "Fungible": 66
+              }
+            }
+          ],
+          "outputs": [],
+          "globals": [
+            {
+              "BurnedAsset": 66
+            }
+          ],
+          "metadata": []
+        }
+      ]
+    }
+  ]
+}

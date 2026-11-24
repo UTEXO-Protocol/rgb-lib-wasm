@@ -469,6 +469,23 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
         ],
     )]);
     let (res, signed, txid) = begin(&mut wallet, &online, map, false, dry_run).await;
+    if !dry_run {
+        // the blinded receive of the wallet itself is ours
+        let inspection = wallet
+            .inspect_fascia(
+                res.psbt.clone(),
+                &res.details.fascia,
+                Some(res.details.entropy),
+            )
+            .unwrap();
+        let concealed: Vec<_> = inspection.operations[0].transitions[0]
+            .outputs
+            .iter()
+            .filter(|o| o.is_concealed)
+            .map(|o| (o.assignment.clone(), o.is_ours))
+            .collect();
+        assert_eq!(concealed, vec![(Assignment::Fungible(66), Some(true))]);
+    }
     fail_posts(":3010", true);
     assert!(matches!(
         end(&mut wallet, &online, &signed).await,

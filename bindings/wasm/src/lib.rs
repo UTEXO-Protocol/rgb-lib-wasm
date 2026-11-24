@@ -552,6 +552,23 @@ impl WasmWallet {
         )
     }
 
+    /// Inspect a PSBT and the fascia (`details.fascia` of a `*Begin` result) this wallet built. Returns an RgbInspection object.
+    #[wasm_bindgen(js_name = "inspectFascia")]
+    pub fn inspect_fascia(
+        &self,
+        psbt: &str,
+        fascia: &[u8],
+        entropy: Option<u64>,
+    ) -> Result<JsValue, JsValue> {
+        to_js(
+            &self
+                .inner
+                .borrow()
+                .inspect_fascia(psbt.to_string(), fascia, entropy)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        )
+    }
+
     /// Blind an UTXO to receive RGB assets. Returns ReceiveData as a JS object.
     ///
     /// `online_js` is the Online object returned by `goOnline` (the wallet reserves the invoice on
@@ -1618,6 +1635,23 @@ pub fn inspect_consignment(
             .map_err(|e| JsValue::from_str(&format!("Invalid bundle filter: {e}")))?;
     let inspection = rgb_lib_wasm::no_wallet::inspect_consignment(consignment_bytes, bundle_filter)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&inspection)
+}
+
+/// Inspect a PSBT and the fascia of its RGB operation without a wallet.
+#[wasm_bindgen(js_name = "inspectFascia")]
+pub fn inspect_fascia(
+    psbt: &str,
+    fascia: &[u8],
+    entropy: Option<u64>,
+    network: &str,
+) -> Result<JsValue, JsValue> {
+    let bitcoin_network = network
+        .parse::<rgb_lib_wasm::BitcoinNetwork>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let inspection =
+        rgb_lib_wasm::no_wallet::inspect_fascia(psbt.to_string(), fascia, entropy, bitcoin_network)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
     to_js(&inspection)
 }
 
