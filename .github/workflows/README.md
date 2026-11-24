@@ -6,6 +6,8 @@ Runs formatting, clippy, cargo check, docs, native tests, wasm-pack tests, and i
 
 - **Trigger**: push/PR to `dev` / `stage` / `master`
 - **What it does**: fmt → clippy → check → doc → native tests → wasm tests → integration tests (Docker)
+- **Integration tests**: parallel jobs, one per test group, each with its own regtest stack. The check `Integration tests (Firefox + regtest)` reports their combined result. They are skipped on a pull request that touches only `*.md` files or `LICENSE`; a push always runs them
+- **Regtest images**: the images that compose builds are cached, keyed on the files under `tests/` that define them. esplora is pinned by digest in `tests/esplora/Dockerfile.notor`
 
 ## release.yml — Production Release
 
