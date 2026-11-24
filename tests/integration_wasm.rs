@@ -1531,7 +1531,7 @@ async fn test_full_wallet_flow() {
     let (saved, _) = saved_wallet(&wallet).await;
     assert_eq!(saved.backup_info(), wallet.backup_info());
     drop(saved);
-    wallet.configure_vss_backup(&fresh_config);
+    wallet.configure_vss_backup(&vss_config);
     let info_err = wallet.vss_backup_info().await.unwrap();
     assert!(
         info_err.last_backup_error.is_some(),
