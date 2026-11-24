@@ -85,17 +85,58 @@ jobs:
       - name: Run indexer registry tests
         run: 'wasm-pack test --headless --firefox --release --lib -- no_store_fetch_browser'
 
-  integration-tests:
-    name: Integration tests (Firefox + regtest)
+  changes:
+    name: Changes
     runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      # Only a pull request can skip the regtest jobs
+      - id: filter
+        name: Detect code changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ] && FILES=$(git diff --no-renames --name-only HEAD^1 HEAD) && [ -n "$FILES" ] \
+            && ! echo "$FILES" | grep -q -v -E '\.md$|^LICENSE$'; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  integration-tests:
+    name: Integration tests (Firefox + regtest, ${{ matrix.group }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [receive-check, send, mint, lib, wallet]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ matrix.group == 'wallet' }}
       - name: Install wasm-pack
         run: cargo install wasm-pack@0.14.0
+
+      - name: Cache regtest images
+        id: regtest-images
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/regtest-images.tar
+          key: regtest-images-${{ runner.os }}-${{ hashFiles('tests/docker-compose.ci.yml', 'tests/esplora/**', 'tests/regtest-helper/**', 'tests/vss-server/**') }}
+
+      - name: Load regtest images
+        if: steps.regtest-images.outputs.cache-hit == 'true'
+        run: docker load -i "$RUNNER_TEMP/regtest-images.tar"
 
       - name: Start regtest services
         working-directory: tests
@@ -160,32 +201,42 @@ jobs:
             sleep 1
           done
 
+      - name: Export regtest images
+        if: steps.regtest-images.outputs.cache-hit != 'true' && matrix.group == 'wallet'
+        run: docker save -o "$RUNNER_TEMP/regtest-images.tar" tests-esplora tests-regtest-helper tests-vss-server
+
       - name: Run wallet tests
+        if: matrix.group == 'wallet'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release -- --test wallet_wasm
 
       - name: Run binding tests
+        if: matrix.group == 'wallet'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release bindings/wasm --test bindings_wasm
 
       - name: Run integration tests
+        if: matrix.group == 'wallet'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 300
         run: wasm-pack test --headless --firefox --release --test integration_wasm
 
       - name: Run receive tests
+        if: matrix.group == 'send'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 600
         run: wasm-pack test --headless --firefox --release --test receive_wasm
 
       - name: Run persistence tests
+        if: matrix.group == 'wallet'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: wasm-pack test --headless --firefox --release --test persistence_wasm
 
       - name: Run send tests
+        if: matrix.group == 'send'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 3600
         run: wasm-pack test --headless --firefox --release --test send_wasm
@@ -193,33 +244,40 @@ jobs:
       # The BFA lib browser tests run one test file per Firefox session, so a session holds
       # only a part of the suite in memory
       - name: Run BFA tests
+        if: matrix.group == 'mint'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_bfa::'
 
       - name: Run BFA burn tests
+        if: matrix.group == 'lib'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_burn::'
 
       - name: Run BFA mint tests
+        if: matrix.group == 'mint'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 3600
         run: 'wasm-pack test --headless --firefox --release --lib -- test_mint::'
 
       - name: Run receive check tests
+        if: matrix.group == 'receive-check'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
       - name: Run import tests
+        if: matrix.group == 'lib'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_import::'
       - name: Run link tests
+        if: matrix.group == 'lib'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_link::'
       - name: Run vanilla tests
+        if: matrix.group == 'lib'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_vanilla::'
@@ -228,3 +286,12 @@ jobs:
         if: always()
         working-directory: tests
         run: docker compose -f docker-compose.ci.yml down
+
+  integration-tests-result:
+    name: Integration tests (Firefox + regtest)
+    needs: [changes, integration-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check integration tests
+        run: test "${{ needs.integration-tests.result }}" = success || test "${{ needs.integration-tests.result }}:${{ needs.changes.outputs.code }}" = skipped:false
