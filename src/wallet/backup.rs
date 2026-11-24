@@ -206,6 +206,7 @@ impl super::Wallet {
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
             manifest: payload.manifest,
+            backup_versions: self.backup_versions.borrow().clone(),
         };
         self.restore_from_snapshot(snapshot)
     }
@@ -219,41 +220,114 @@ impl super::Wallet {
     }
 }
 
-use super::vss::{VssBackupClient, VssBackupConfig, VssBackupInfo};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use bdk_wallet::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+use super::backup_store::{
+    BACKUP_KEY, BACKUP_NAMESPACE, BackupTarget, KvStore, check_new_version, decode_backup_blob,
+    encode_backup_blob, store_label,
+};
+use super::vss::{VssBackupConfig, VssBackupInfo, VssStore};
 
 impl super::Wallet {
+    fn set_backup_target(
+        &mut self,
+        store: Box<dyn KvStore>,
+        id: String,
+        key: SecretKey,
+        verified: bool,
+    ) {
+        self.backup_store = Some(Rc::new(BackupTarget {
+            store,
+            id,
+            key,
+            verified: Cell::new(verified),
+            lock: tokio::sync::Mutex::new(()),
+        }));
+    }
+
     /// Configure VSS backup for this wallet.
     pub fn configure_vss_backup(&mut self, config: &VssBackupConfig) {
-        self.vss_client = Some(VssBackupClient::new(config));
+        let pubkey = PublicKey::from_secret_key(&Secp256k1::signing_only(), &config.signing_key);
+        let id = store_label(
+            "vss",
+            &[&config.server_url, &config.store_id, &pubkey.to_string()],
+        );
+        self.set_backup_target(
+            Box::new(VssStore::new(config)),
+            id,
+            config.signing_key,
+            true,
+        );
     }
 
-    /// Disable VSS backup.
+    /// Configure an app backup store. `store_id` names the store on this device. The library
+    /// probes versioned writes on the first call and refuses a store that fails.
+    pub fn configure_backup_store(
+        &mut self,
+        store: Box<dyn KvStore>,
+        store_id: &str,
+        encryption_key: SecretKey,
+    ) {
+        let id = store_label("app", &[store_id]);
+        self.set_backup_target(store, id, encryption_key, false);
+    }
+
+    /// Disable the backup store.
     pub fn disable_vss_backup(&mut self) {
-        self.vss_client = None;
+        self.backup_store = None;
     }
 
-    /// Upload an encrypted backup to the configured VSS server.
-    /// The wallet must have a VSS client configured via configure_vss_backup().
-    pub async fn vss_backup(&self) -> Result<i64, Error> {
-        let client = self.vss_client.as_ref().ok_or(Error::Internal {
+    fn backup_target(&self) -> Result<Rc<BackupTarget>, Error> {
+        self.backup_store.clone().ok_or(Error::Internal {
             details: s!("VSS backup not configured"),
-        })?;
+        })
+    }
+
+    /// Upload an encrypted backup to the configured backup store. Return the store version.
+    /// A write over a version that this wallet did not see fails with a conflict.
+    pub async fn vss_backup(&self) -> Result<i64, Error> {
+        let target = self.backup_target()?;
+        let _guard = target.lock.lock().await;
+        target.ensure_verified().await?;
 
         let payload_json = self.serialize_backup_payload()?;
-        let fingerprint = self.keys.master_fingerprint.clone();
+        let blob = encode_backup_blob(&payload_json, &self.keys.master_fingerprint, &target.key)?;
 
         self.update_backup_info(true)?;
-        let res = match client.upload_backup(&payload_json, &fingerprint).await {
+        let expected = self.backup_versions.borrow().get(&target.id).copied();
+        let store = &target.store;
+        let mut res = store
+            .write(BACKUP_NAMESPACE, BACKUP_KEY, blob.clone(), expected)
+            .await
+            .and_then(|v| check_new_version(v, expected));
+        if matches!(res, Err(Error::VssVersionConflict { .. })) && expected.is_some() {
+            // Create the key again only when the store lost it.
+            match store.read(BACKUP_NAMESPACE, BACKUP_KEY).await {
+                Ok(None) => {
+                    res = store
+                        .write(BACKUP_NAMESPACE, BACKUP_KEY, blob, None)
+                        .await
+                        .and_then(|v| check_new_version(v, None));
+                }
+                Ok(Some(_)) => {}
+                Err(e) => res = Err(e),
+            }
+        }
+        match &res {
             Ok(version) => {
+                self.backup_versions
+                    .borrow_mut()
+                    .insert(target.id.clone(), *version);
                 *self.last_vss_backup_error.borrow_mut() = None;
-                Ok(version)
             }
             Err(e) => {
                 let _ = self.update_backup_info(false);
                 *self.last_vss_backup_error.borrow_mut() = Some(e.to_string());
-                Err(e)
             }
-        };
+        }
         self.flush().await?;
         res
     }
@@ -262,28 +336,31 @@ impl super::Wallet {
     /// `configure_vss_backup` so enabling backups never leaves an empty store.
     /// Returns the new server version, or `None` when no upload was needed.
     pub async fn ensure_initial_backup(&self) -> Result<Option<i64>, Error> {
-        if self.vss_client.is_none() {
-            return Err(Error::Internal {
-                details: s!("VSS backup not configured"),
-            });
-        }
+        self.backup_target()?;
         if self.database.get_backup_info()?.is_some() && !self.backup_info()? {
             return Ok(None);
         }
         self.vss_backup().await.map(Some)
     }
 
-    /// Download and restore wallet state from VSS server.
+    /// Download and restore wallet state from the configured backup store.
     /// A restore that fails changes nothing. When only the save fails, the restored state stays in memory and the call returns a persistence error.
     pub async fn vss_restore_backup(&mut self) -> Result<(), Error> {
-        let client = self.vss_client.as_ref().ok_or(Error::Internal {
-            details: s!("VSS backup not configured"),
-        })?;
+        let target = self.backup_target()?;
+        let _guard = target.lock.lock().await;
+        target.ensure_verified().await?;
 
-        let payload_json = client
-            .download_backup(&self.keys.master_fingerprint)
-            .await?;
+        let stored = target
+            .store
+            .read(BACKUP_NAMESPACE, BACKUP_KEY)
+            .await?
+            .ok_or(Error::VssBackupNotFound)?;
+        let payload_json =
+            decode_backup_blob(&stored.value, &self.keys.master_fingerprint, &target.key)?;
         self.restore_payload(&payload_json)?;
+        self.backup_versions
+            .borrow_mut()
+            .insert(target.id.clone(), stored.version);
 
         // Persist restored state to IndexedDB so it survives page reloads
         self.flush().await?;
@@ -292,12 +369,16 @@ impl super::Wallet {
         Ok(())
     }
 
-    /// Query VSS backup status.
+    /// Query the backup status of the configured backup store.
     pub async fn vss_backup_info(&self) -> Result<VssBackupInfo, Error> {
-        let client = self.vss_client.as_ref().ok_or(Error::Internal {
-            details: s!("VSS backup not configured"),
-        })?;
-        let server_version = client.get_backup_version().await?;
+        let target = self.backup_target()?;
+        let _guard = target.lock.lock().await;
+        target.ensure_verified().await?;
+        let server_version = target
+            .store
+            .read(BACKUP_NAMESPACE, BACKUP_KEY)
+            .await?
+            .map(|r| r.version);
         let backup_required = self.backup_info()?;
 
         Ok(VssBackupInfo {

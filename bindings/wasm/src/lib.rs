@@ -112,6 +112,53 @@ impl Drop for JsAbort {
     }
 }
 
+#[wasm_bindgen(typescript_custom_section)]
+const BACKUP_STORE_TS: &'static str = r#"
+/**
+ * A versioned key-value store for the wallet backup. Each method may return a promise.
+ * - A version is a safe integer of 1 or more.
+ * - `read` returns null when the key is absent.
+ * - `write` without `expectedVersion` creates the key and fails with a conflict when the key exists.
+ * - `write` with `expectedVersion` writes only when the stored version is equal to it. Otherwise it
+ *   fails with a conflict, also when the key is absent. It returns the new version: greater than
+ *   `expectedVersion`, or 1 or more for a create. The library refuses any other numbering.
+ * - `remove` with `version` removes only that version and fails with a conflict otherwise.
+ *   Without `version` it removes the key, and an absent key is not an error.
+ * - `list` returns the keys of the namespace.
+ * To signal a conflict, throw an object with `code` equal to "CONFLICT".
+ * The library writes random bytes to key "probe" of namespace "backup" to check versioned writes.
+ */
+export interface BackupStore {
+    read(namespace: string, key: string): { value: Uint8Array; version: number } | null | Promise<{ value: Uint8Array; version: number } | null>;
+    write(namespace: string, key: string, value: Uint8Array, expectedVersion?: number): number | Promise<number>;
+    remove(namespace: string, key: string, version?: number): void | Promise<void>;
+    list(namespace: string): string[] | Promise<string[]>;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// JS backup store object (see the `BackupStore` TypeScript interface).
+    #[wasm_bindgen(typescript_type = "BackupStore")]
+    pub type JsBackupStore;
+}
+
+/// Parse a 32-byte secret key in hex.
+fn parse_key_hex(
+    key_hex: &str,
+) -> Result<rgb_lib_wasm::bdk_wallet::bitcoin::secp256k1::SecretKey, JsValue> {
+    if key_hex.len() != 64 {
+        return Err(JsValue::from_str(&format!(
+            "key must be exactly 64 hex chars (32 bytes), got {}",
+            key_hex.len()
+        )));
+    }
+    let key_bytes =
+        hex::decode(key_hex).map_err(|e| JsValue::from_str(&format!("Invalid key hex: {e}")))?;
+    rgb_lib_wasm::bdk_wallet::bitcoin::secp256k1::SecretKey::from_slice(&key_bytes)
+        .map_err(|e| JsValue::from_str(&format!("Invalid key: {e}")))
+}
+
 /// Mirror of the BDK sign options: a missing field keeps the BDK default.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1582,17 +1629,7 @@ impl WasmWallet {
         store_id: &str,
         signing_key_hex: &str,
     ) -> Result<(), JsValue> {
-        if signing_key_hex.len() != 64 {
-            return Err(JsValue::from_str(&format!(
-                "signing_key_hex must be exactly 64 hex chars (32 bytes), got {}",
-                signing_key_hex.len()
-            )));
-        }
-        let key_bytes = hex::decode(signing_key_hex)
-            .map_err(|e| JsValue::from_str(&format!("Invalid signing key hex: {e}")))?;
-        let signing_key =
-            rgb_lib_wasm::bdk_wallet::bitcoin::secp256k1::SecretKey::from_slice(&key_bytes)
-                .map_err(|e| JsValue::from_str(&format!("Invalid signing key: {e}")))?;
+        let signing_key = parse_key_hex(signing_key_hex)?;
         let config = rgb_lib_wasm::wallet::vss::VssBackupConfig::new(
             server_url.to_string(),
             store_id.to_string(),
@@ -1602,13 +1639,40 @@ impl WasmWallet {
         Ok(())
     }
 
-    /// Disable VSS (cloud) backup.
+    /// Configure an app backup store (see the `BackupStore` TypeScript interface).
+    ///
+    /// `storeId` names the store on this device. Use another `storeId` for another store.
+    /// `encryptionKeyHex` is the 32-byte encryption key as a hex string (64 hex chars).
+    /// The store receives only encrypted data.
+    /// The library checks versioned writes on the first call and refuses a store that fails.
+    /// A store written to lie on purpose can pass this check.
+    ///
+    /// **Security note:** The key crosses the JS/WASM boundary as a string, as in
+    /// `configureVssBackup`.
+    #[wasm_bindgen(js_name = "configureBackupStore")]
+    pub fn configure_backup_store(
+        &self,
+        store: JsBackupStore,
+        store_id: &str,
+        encryption_key_hex: &str,
+    ) -> Result<(), JsValue> {
+        let key = parse_key_hex(encryption_key_hex)?;
+        let store = rgb_lib_wasm::wallet::backup_store::JsKvStore::new(store.into())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.inner
+            .borrow_mut()
+            .configure_backup_store(Box::new(store), store_id, key);
+        Ok(())
+    }
+
+    /// Disable the configured backup store (VSS or the app's).
     #[wasm_bindgen(js_name = "disableVssBackup")]
     pub fn disable_vss_backup(&self) {
         self.inner.borrow_mut().disable_vss_backup();
     }
 
-    /// Upload an encrypted backup to the configured VSS server. Returns the server version.
+    /// Upload an encrypted backup to the configured backup store (VSS or the app's).
+    /// Returns the store version.
     #[wasm_bindgen(js_name = "vssBackup")]
     pub async fn vss_backup(&self) -> Result<JsValue, JsValue> {
         let wallet = self.inner.borrow();
@@ -1631,7 +1695,7 @@ impl WasmWallet {
         Ok(version.map_or(JsValue::NULL, |v| JsValue::from_f64(v as f64)))
     }
 
-    /// Download and restore wallet state from VSS server.
+    /// Download and restore wallet state from the configured backup store (VSS or the app's).
     #[wasm_bindgen(js_name = "vssRestoreBackup")]
     pub async fn vss_restore_backup(&self) -> Result<(), JsValue> {
         self.inner
@@ -1641,7 +1705,8 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Query VSS backup status. Returns { backup_exists, server_version, backup_required }.
+    /// Query the status of the configured backup store (VSS or the app's).
+    /// Returns { backup_exists, server_version, backup_required }.
     #[wasm_bindgen(js_name = "vssBackupInfo")]
     pub async fn vss_backup_info(&self) -> Result<JsValue, JsValue> {
         let wallet = self.inner.borrow();

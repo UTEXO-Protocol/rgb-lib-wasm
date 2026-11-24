@@ -4,8 +4,15 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+use rgb_lib_wasm::bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, rand::rngs::OsRng};
+use rgb_lib_wasm::wallet::backup_store::{
+    BACKUP_KEY, BACKUP_NAMESPACE, JsKvStore, KvStore, PROBE_KEY, StoredValue, decode_backup_blob,
+    probe_versioned_writes,
+};
+use rgb_lib_wasm::wallet::vss::{VssBackupConfig, VssStore};
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, ReceiveData, SinglesigKeys, WalletData, WalletDescriptors,
+    AssetFilter, DatabaseType, Online, ReceiveData, SinglesigKeys, TransferScope, WalletData,
+    WalletDescriptors,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{
@@ -1448,4 +1455,413 @@ async fn signal_refuses_a_fake_signal() {
         .await;
     stub_restore();
     res.unwrap();
+}
+
+const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
+
+/// A memory store that follows the `BackupStore` contract. `mode` breaks versioned writes.
+const MEMORY_STORE_JS: &str = r#"(() => {
+    const s = { data: new Map(), calls: [], active: 0, maxActive: 0, delayMs: 0, mode: 'ok' };
+    const conflict = () => Object.assign(new Error('version conflict'), { code: 'CONFLICT' });
+    const run = async (call, f) => {
+        s.calls.push(call);
+        s.active += 1;
+        s.maxActive = Math.max(s.maxActive, s.active);
+        try {
+            if (s.delayMs) await new Promise(r => setTimeout(r, s.delayMs));
+            return f();
+        } finally {
+            s.active -= 1;
+        }
+    };
+    s.read = (ns, key) => run(['read', ns, key], () => {
+        const e = s.data.get(ns + '/' + key);
+        return e ? { value: e.value.slice(), version: e.version } : null;
+    });
+    s.write = (ns, key, value, expected) => run(['write', ns, key, expected, value.length], () => {
+        const k = ns + '/' + key;
+        const cur = s.data.get(k);
+        let ok;
+        if (s.mode === 'ignoreExpected') ok = true;
+        else if (expected === undefined) ok = !cur || s.mode === 'createOverwrites';
+        else ok = !!cur && cur.version === expected;
+        if (!ok) throw conflict();
+        const version = (cur ? cur.version : 0) + 1;
+        s.data.set(k, { value: value.slice(), version });
+        return s.mode === 'noVersion' ? undefined : version;
+    });
+    s.remove = (ns, key, version) => run(['remove', ns, key, version], () => {
+        const k = ns + '/' + key;
+        const cur = s.data.get(k);
+        if (version !== undefined && (!cur || cur.version !== version)) throw conflict();
+        s.data.delete(k);
+    });
+    s.list = ns => run(['list', ns], () =>
+        [...s.data.keys()].filter(k => k.startsWith(ns + '/')).map(k => k.slice(ns.length + 1)));
+    return s;
+})()"#;
+
+fn memory_store() -> JsValue {
+    js_sys::eval(MEMORY_STORE_JS).unwrap()
+}
+
+fn run_on(target: &JsValue, body: &str) -> JsValue {
+    js_sys::Function::new_with_args("s", body)
+        .call1(&JsValue::NULL, target)
+        .unwrap()
+}
+
+/// A backup destination: a memory store from JS, or a VSS store.
+struct Dest {
+    memory: Option<JsValue>,
+    store_id: String,
+    key: SecretKey,
+}
+
+impl Dest {
+    fn new(memory: bool) -> Self {
+        let (key, pubkey) = Secp256k1::new().generate_keypair(&mut OsRng);
+        Self {
+            memory: memory.then(memory_store),
+            store_id: format!("kv-{pubkey}"),
+            key,
+        }
+    }
+
+    fn both() -> [Self; 2] {
+        [Self::new(true), Self::new(false)]
+    }
+
+    fn vss_config(&self) -> VssBackupConfig {
+        VssBackupConfig::new(VSS_SERVER_URL.to_string(), self.store_id.clone(), self.key)
+    }
+
+    fn configure(&self, wallet: &WasmWallet) {
+        let key_hex = hex::encode(self.key.secret_bytes());
+        match &self.memory {
+            Some(store) => wallet
+                .configure_backup_store(store.clone().unchecked_into(), &self.store_id, &key_hex)
+                .unwrap(),
+            None => wallet
+                .configure_vss_backup(VSS_SERVER_URL, &self.store_id, &key_hex)
+                .unwrap(),
+        }
+    }
+
+    fn raw(&self) -> Box<dyn KvStore> {
+        match &self.memory {
+            Some(store) => Box::new(JsKvStore::new(store.clone()).unwrap()),
+            None => Box::new(VssStore::new(&self.vss_config())),
+        }
+    }
+
+    async fn stored(&self) -> Option<StoredValue> {
+        self.raw().read(BACKUP_NAMESPACE, BACKUP_KEY).await.unwrap()
+    }
+}
+
+/// Two wallet objects with the same keys and their own data dirs.
+async fn wallet_pair() -> (WasmWallet, WasmWallet, SinglesigKeys) {
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let mut data: WalletData = serde_json::from_str(&wd).unwrap();
+    let mut make = async |n: u8| {
+        data.data_dir = format!("/tmp/rgb_kv-{n}-{}", js_sys::Date::now());
+        let wd = serde_json::to_string(&data).unwrap();
+        WasmWallet::create(&wd, &keys).await.unwrap()
+    };
+    let (a, b) = (make(0).await, make(1).await);
+    (a, b, serde_json::from_str(&keys).unwrap())
+}
+
+fn version(v: JsValue) -> i64 {
+    v.as_f64()
+        .map(|n| n as i64)
+        .unwrap_or_else(|| i64::try_from(v).unwrap())
+}
+
+async fn kv_contract(store: &dyn KvStore) {
+    let ns = "contract";
+    let conflict = |r: Result<i64, rgb_lib_wasm::Error>| {
+        assert!(
+            matches!(r, Err(rgb_lib_wasm::Error::VssVersionConflict { .. })),
+            "{r:?}"
+        )
+    };
+    let read = async |k| store.read(ns, k).await.unwrap();
+    assert_eq!(read("a").await, None);
+    assert!(store.list(ns).await.unwrap().is_empty());
+    conflict(store.write(ns, "a", vec![1], Some(1)).await);
+    assert!(matches!(
+        store.remove(ns, "a", Some(1)).await,
+        Err(rgb_lib_wasm::Error::VssVersionConflict { .. })
+    ));
+    assert_eq!(read("a").await, None);
+    let v1 = store.write(ns, "a", vec![1], None).await.unwrap();
+    assert!(v1 >= 1);
+    let first = Some(StoredValue {
+        value: vec![1],
+        version: v1,
+    });
+    assert_eq!(read("a").await, first);
+    conflict(store.write(ns, "a", vec![2], None).await);
+    assert_eq!(read("a").await, first);
+    conflict(store.write(ns, "a", vec![2], Some(v1 + 1)).await);
+    assert_eq!(read("a").await, first);
+    let big = vec![9; 64 * 1024];
+    let v2 = store.write(ns, "a", big.clone(), Some(v1)).await.unwrap();
+    assert!(v2 > v1);
+    assert_eq!(
+        read("a").await,
+        Some(StoredValue {
+            value: big,
+            version: v2
+        })
+    );
+    store.write(ns, "b", vec![], None).await.unwrap();
+    store.write(ns, "c", vec![3], None).await.unwrap();
+    let mut keys = store.list(ns).await.unwrap();
+    keys.sort();
+    assert_eq!(keys, ["a", "b", "c"]);
+    assert!(store.list("other").await.unwrap().is_empty());
+    assert!(matches!(
+        store.remove(ns, "a", Some(v1)).await,
+        Err(rgb_lib_wasm::Error::VssVersionConflict { .. })
+    ));
+    assert!(read("a").await.is_some());
+    store.remove(ns, "a", Some(v2)).await.unwrap();
+    assert_eq!(read("a").await, None);
+    store.remove(ns, "b", None).await.unwrap();
+    store.remove(ns, "b", None).await.unwrap();
+    store.remove(ns, "c", None).await.unwrap();
+    assert!(store.list(ns).await.unwrap().is_empty());
+    probe_versioned_writes(store).await.unwrap();
+    assert_eq!(store.read(BACKUP_NAMESPACE, PROBE_KEY).await.unwrap(), None);
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_contract() {
+    kv_contract(&JsKvStore::new(memory_store()).unwrap()).await;
+    let vss = Dest::new(false);
+    kv_contract(&VssStore::new(&vss.vss_config()).with_list_page_size(1)).await;
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_backup_and_restore() {
+    let dest = Dest::new(true);
+    let store = dest.memory.as_ref().unwrap();
+    let (a, b, keys) = wallet_pair().await;
+    let online = online(&a).await;
+    let exp = JsValue::from(now_secs() + 100_000);
+    let receive = a
+        .witness_receive(online, None, any(), exp, endpoints(), 1, None)
+        .await
+        .unwrap();
+    let recipient_id: String = prop(&receive, "recipientId").as_string().unwrap();
+    dest.configure(&a);
+    let v = version(a.vss_backup().await.unwrap());
+    assert!(v >= 1);
+
+    dest.configure(&b);
+    b.vss_restore_backup().await.unwrap();
+    let filter = serde_wasm_bindgen::to_value(&AssetFilter::AnyOrNone).unwrap();
+    let scope = serde_wasm_bindgen::to_value(&TransferScope::All).unwrap();
+    let transfers = b.list_transfers(filter, scope).unwrap();
+    let found = js_sys::Function::new_with_args("t, r", "return t.some(x => x.recipientId === r);")
+        .call2(&JsValue::NULL, &transfers, &recipient_id.as_str().into())
+        .unwrap();
+    assert_eq!(found, JsValue::TRUE);
+    let info = b.vss_backup_info().await.unwrap();
+    assert_eq!(prop(&info, "backup_exists"), JsValue::TRUE);
+    assert_eq!(version(prop(&info, "server_version")), v);
+
+    let calls = run_on(
+        store,
+        "return s.calls.every(c => c[1] === 'backup' && \
+         (c[2] === 'wallet' || c[2] === 'probe')) && \
+         s.calls.filter(c => c[0] === 'write' && c[2] === 'probe') \
+         .every(c => c[4] === 32);",
+    );
+    assert_eq!(calls, JsValue::TRUE);
+    let blob = dest.stored().await.unwrap().value;
+    for needle in [
+        keys.master_fingerprint.as_str(),
+        &recipient_id,
+        &keys.account_xpub_colored,
+        &keys.account_xpub_vanilla,
+    ] {
+        let needle = needle.as_bytes();
+        assert!(!blob.windows(needle.len()).any(|w| w == needle));
+    }
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_conflict_overwrites_nothing() {
+    for dest in Dest::both() {
+        let (a, b, _) = wallet_pair().await;
+        dest.configure(&a);
+        dest.configure(&b);
+        let v1 = version(a.vss_backup().await.unwrap());
+        let s1 = dest.stored().await;
+        let e = err(b.vss_backup().await.unwrap_err());
+        assert!(e.starts_with("VSS version conflict"), "{e}");
+        assert_eq!(dest.stored().await, s1);
+
+        b.vss_restore_backup().await.unwrap();
+        let v2 = version(b.vss_backup().await.unwrap());
+        assert!(v2 > v1);
+        let s2 = dest.stored().await;
+        let e = err(a.vss_backup().await.unwrap_err());
+        assert!(e.starts_with("VSS version conflict"), "{e}");
+        assert_eq!(dest.stored().await, s2);
+    }
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_recreates_lost_backup() {
+    for dest in Dest::both() {
+        let (a, _, keys) = wallet_pair().await;
+        dest.configure(&a);
+        a.vss_backup().await.unwrap();
+        match &dest.memory {
+            Some(store) => {
+                run_on(store, "s.data.clear();");
+            }
+            None => dest
+                .raw()
+                .remove(BACKUP_NAMESPACE, BACKUP_KEY, None)
+                .await
+                .unwrap(),
+        }
+        let v = version(a.vss_backup().await.unwrap());
+        assert!(v >= 1);
+        let blob = dest.stored().await.unwrap().value;
+        decode_backup_blob(&blob, &keys.master_fingerprint, &dest.key).unwrap();
+        assert!(version(a.vss_backup().await.unwrap()) > v);
+    }
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_version_survives_reload() {
+    let dest = Dest::new(true);
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let mut data: WalletData = serde_json::from_str(&wd).unwrap();
+    data.data_dir = format!("/tmp/rgb_kv_reload-{}", js_sys::Date::now());
+    let wd = serde_json::to_string(&data).unwrap();
+    let wallet = WasmWallet::create(&wd, &keys).await.unwrap();
+    dest.configure(&wallet);
+    let v1 = version(wallet.vss_backup().await.unwrap());
+    wallet.flush().await.unwrap();
+    drop(wallet);
+
+    let wallet = WasmWallet::create(&wd, &keys).await.unwrap();
+    dest.configure(&wallet);
+    assert!(version(wallet.vss_backup().await.unwrap()) > v1);
+    let key_hex = hex::encode(dest.key.secret_bytes());
+    let store = dest.memory.clone().unwrap().unchecked_into();
+    wallet
+        .configure_backup_store(store, "other", &key_hex)
+        .unwrap();
+    let e = err(wallet.vss_backup().await.unwrap_err());
+    assert!(e.starts_with("VSS version conflict"), "{e}");
+}
+
+#[wasm_bindgen_test]
+fn backup_store_refuses_incomplete_store() {
+    let wallet = wallet();
+    let key_hex = "11".repeat(32);
+    assert!(
+        wallet
+            .configure_backup_store(JsValue::NULL.unchecked_into(), "x", &key_hex)
+            .is_err()
+    );
+    let store = js_sys::eval("({read() {}, write() {}, remove() {}})").unwrap();
+    let e = err(wallet
+        .configure_backup_store(store.unchecked_into(), "x", &key_hex)
+        .unwrap_err());
+    assert!(e.contains("backup store has no list method"), "{e}");
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_refuses_unversioned_writes() {
+    for mode in ["ignoreExpected", "createOverwrites", "noVersion"] {
+        let dest = Dest::new(true);
+        let store = dest.memory.clone().unwrap();
+        run_on(
+            &store,
+            &format!(
+                "s.mode = '{mode}'; \
+                 s.data.set('backup/wallet', {{value: new Uint8Array([7, 7, 7]), version: 1}});"
+            ),
+        );
+        let wallet = wallet();
+        dest.configure(&wallet);
+        let errors = [
+            err(wallet.vss_backup().await.unwrap_err()),
+            err(wallet.vss_restore_backup().await.unwrap_err()),
+            err(wallet.vss_backup_info().await.unwrap_err()),
+        ];
+        for e in errors {
+            assert!(
+                e.contains("does not support versioned writes"),
+                "{mode}: {e}"
+            );
+        }
+        let intact = run_on(
+            &store,
+            "const e = s.data.get('backup/wallet'); \
+             return e.version === 1 && e.value.join() === '7,7,7' && \
+             !s.data.has('backup/probe') && \
+             !s.calls.some(c => c[0] === 'write' && c[2] === 'wallet');",
+        );
+        assert_eq!(intact, JsValue::TRUE, "{mode}");
+    }
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_read_is_untrusted() {
+    for bad in [
+        "5",
+        "({value: 'x', version: 1})",
+        "({value: new Uint8Array(100), version: 0})",
+        "({value: new Uint8Array(100), version: 1.5})",
+        "({value: new Uint8Array(100), version: 2 ** 53})",
+    ] {
+        let store = js_sys::eval(&format!(
+            "({{read() {{ return {bad}; }}, write() {{}}, remove() {{}}, list() {{}}}})"
+        ))
+        .unwrap();
+        let store = JsKvStore::new(store).unwrap();
+        assert!(
+            store.read(BACKUP_NAMESPACE, BACKUP_KEY).await.is_err(),
+            "{bad}"
+        );
+    }
+    for list in [
+        "'a'",
+        "[1]",
+        "Array.from({length: 10001}, (_, i) => 'k' + i)",
+    ] {
+        let store = js_sys::eval(&format!(
+            "({{read() {{}}, write() {{}}, remove() {{}}, list() {{ return {list}; }}}})"
+        ))
+        .unwrap();
+        let store = JsKvStore::new(store).unwrap();
+        assert!(store.list(BACKUP_NAMESPACE).await.is_err(), "{list}");
+    }
+}
+
+#[wasm_bindgen_test]
+async fn backup_store_calls_are_serialized() {
+    let dest = Dest::new(true);
+    let store = dest.memory.clone().unwrap();
+    run_on(&store, "s.delayMs = 50;");
+    let wallet = std::rc::Rc::new(wallet());
+    dest.configure(&wallet);
+    let w1 = wallet.clone();
+    let backup = wasm_bindgen_futures::future_to_promise(async move { w1.vss_backup().await });
+    let w2 = wallet.clone();
+    let info = wasm_bindgen_futures::future_to_promise(async move { w2.vss_backup_info().await });
+    let all = js_sys::Promise::all(&js_sys::Array::of2(&backup, &info));
+    wasm_bindgen_futures::JsFuture::from(all).await.unwrap();
+    assert_eq!(prop(&store, "maxActive"), JsValue::from(1));
 }

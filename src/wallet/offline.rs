@@ -1355,7 +1355,8 @@ pub struct Wallet {
     pub(crate) _web_lock: Option<super::web_lock::WebLock>,
     /// Persistent in-memory RGB stock.
     pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<crate::utils::MemStock>>>,
-    pub(crate) vss_client: Option<super::vss::VssBackupClient>,
+    pub(crate) backup_store: Option<std::rc::Rc<super::backup_store::BackupTarget>>,
+    pub(crate) backup_versions: std::cell::RefCell<HashMap<String, i64>>,
     pub(crate) last_vss_backup_error: std::cell::RefCell<Option<String>>,
 }
 
@@ -1558,7 +1559,8 @@ impl Wallet {
                 let stock = std::mem::take(&mut runtime.stock);
                 std::rc::Rc::new(std::cell::RefCell::new(Some(stock)))
             },
-            vss_client: None,
+            backup_store: None,
+            backup_versions: std::cell::RefCell::new(HashMap::new()),
             last_vss_backup_error: std::cell::RefCell::new(None),
         })
     }
@@ -4630,6 +4632,7 @@ impl Wallet {
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
             manifest: WalletManifest::new(&self.wallet_data, &self.keys),
+            backup_versions: self.backup_versions.borrow().clone(),
         })
     }
 
@@ -4689,6 +4692,7 @@ impl Wallet {
         self.reuse_address_index = snapshot.reuse_address_index;
 
         *self.rgb_stock.borrow_mut() = Some(stock);
+        *self.backup_versions.borrow_mut() = snapshot.backup_versions;
 
         Ok(())
     }
@@ -4974,7 +4978,8 @@ pub(crate) mod address_reuse_tests {
             idb_loaded: None,
             _web_lock: None,
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            vss_client: None,
+            backup_store: None,
+            backup_versions: std::cell::RefCell::new(HashMap::new()),
             last_vss_backup_error: std::cell::RefCell::new(None),
         }
     }
