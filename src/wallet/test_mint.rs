@@ -10,6 +10,7 @@ use crate::no_wallet::{
 };
 use crate::wallet::offline::MOCK_ISSUE_MEDIA;
 use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, state};
+use crate::wallet::online::assert_aborted_restores;
 use crate::wallet::online::{
     MOCK_MINT_KEPT_AMOUNT, RECEIVED_CONSIGNMENT_VALIDATIONS, paying_mint_opid, unsupported_claims,
 };
@@ -1831,6 +1832,19 @@ async fn bfa_mint_is_atomic() {
     .await
     .unwrap();
     let before_block = evm_block_number().await + 1000;
+    // the proxy keeps the reservation of an aborted mint's invoice, so the abort uses its own
+    let aborted_rcv = mint_rcv(&mut b, &b_online).await;
+    assert_aborted_restores(&mut a, "mint_begin", &async |w| {
+        mint_begin_before(
+            w,
+            &a_online,
+            &asset_id,
+            mint_recipient(&aborted_rcv, MINT_AMOUNT),
+            before_block,
+        )
+        .await
+    })
+    .await;
     let res = mint_begin_before(
         &mut a,
         &a_online,

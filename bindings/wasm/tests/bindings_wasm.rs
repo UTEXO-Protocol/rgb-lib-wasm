@@ -9,8 +9,8 @@ use rgb_lib_wasm::wallet::{
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{
-    WasmInvoice, WasmWallet, check_indexer_url, fill_spv_proofs, inspect_consignment,
-    inspect_fascia, max_expiration_secs,
+    JsAbortSignal, WasmInvoice, WasmWallet, check_indexer_url, fill_spv_proofs,
+    inspect_consignment, inspect_fascia, max_expiration_secs,
 };
 
 fn wallet() -> WasmWallet {
@@ -62,7 +62,7 @@ async fn online(wallet: &WasmWallet) -> JsValue {
         "vanillaSyncLookback":20}"#,
     )
     .unwrap();
-    wallet.go_online(options).await.unwrap()
+    wallet.go_online(options, None).await.unwrap()
 }
 
 async fn full_sync(wallet: &WasmWallet, online: &JsValue) {
@@ -71,7 +71,7 @@ async fn full_sync(wallet: &WasmWallet, online: &JsValue) {
         r#"{"keychain":{"Vanilla":{"lookback":20}},"strategy":"FullSync"}"#,
     ] {
         let options = js_sys::JSON::parse(options).unwrap();
-        wallet.sync(online.clone(), options).await.unwrap();
+        wallet.sync(online.clone(), options, None).await.unwrap();
     }
 }
 
@@ -169,7 +169,7 @@ async fn go_online_reads_options_object() {
         "proxyAuthKeys":{}}"#,
     )
     .unwrap();
-    let e = err(wallet.go_online(options).await.unwrap_err());
+    let e = err(wallet.go_online(options, None).await.unwrap_err());
     assert!(e.contains("failedWitnessReceiveGraceSecs"), "{e}");
 
     let options = js_sys::JSON::parse(
@@ -177,7 +177,7 @@ async fn go_online_reads_options_object() {
         "failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{}}"#,
     )
     .unwrap();
-    let e = err(wallet.go_online(options).await.unwrap_err());
+    let e = err(wallet.go_online(options, None).await.unwrap_err());
     assert!(e.contains("vanillaSyncLookback"), "{e}");
 
     let options = js_sys::JSON::parse(
@@ -186,7 +186,7 @@ async fn go_online_reads_options_object() {
         "vanillaSyncLookback":20}"#,
     )
     .unwrap();
-    let e = err(wallet.go_online(options).await.unwrap_err());
+    let e = err(wallet.go_online(options, None).await.unwrap_err());
     assert!(e.starts_with("Invalid proxy authentication key"), "{e}");
 
     let options = |chain_id: &str| {
@@ -197,8 +197,8 @@ async fn go_online_reads_options_object() {
         ))
         .unwrap()
     };
-    wallet.go_online(options("31337")).await.unwrap();
-    let e = err(wallet.go_online(options("1")).await.unwrap_err());
+    wallet.go_online(options("31337"), None).await.unwrap();
+    let e = err(wallet.go_online(options("1"), None).await.unwrap_err());
     assert!(e.starts_with("EVM chain ID mismatch"), "{e}");
 }
 
@@ -634,7 +634,17 @@ async fn funded_wallet(supported_schemas: Vec<AssetSchema>) -> (WasmWallet, JsVa
     esplora_synced().await;
     full_sync(&wallet, &online).await;
     let unsigned = wallet
-        .create_utxos_begin(online.clone(), true, false, Some(5), None, 1, true, false)
+        .create_utxos_begin(
+            online.clone(),
+            true,
+            false,
+            Some(5),
+            None,
+            1,
+            true,
+            false,
+            None,
+        )
         .await
         .unwrap();
     let signed = wallet.sign_psbt(&unsigned, None).unwrap();
@@ -725,7 +735,7 @@ async fn inflate_begin_returns_result_object() {
     let amounts = || serde_wasm_bindgen::to_value(&vec![50u64]).unwrap();
 
     let res = wallet
-        .inflate_begin(online.clone(), &asset_id, amounts(), 1, 1, true)
+        .inflate_begin(online.clone(), &asset_id, amounts(), 1, 1, true, None)
         .await
         .unwrap();
     assert!(prop(&res, "psbt").is_string());
@@ -737,7 +747,7 @@ async fn inflate_begin_returns_result_object() {
     assert!(prop(&details, "entropy").is_bigint());
 
     let res = wallet
-        .inflate_begin(online.clone(), &asset_id, amounts(), 1, 1, false)
+        .inflate_begin(online.clone(), &asset_id, amounts(), 1, 1, false, None)
         .await
         .unwrap();
     assert!(prop(&res, "batchTransferIdx").as_f64().is_some());
@@ -838,7 +848,7 @@ async fn listing_sync_and_send_end_take_js_values() {
     }
 
     let e = err(wallet
-        .sync(online.clone(), JsValue::from_str("bogus"))
+        .sync(online.clone(), JsValue::from_str("bogus"), None)
         .await
         .unwrap_err());
     assert!(e.starts_with("Invalid sync options"), "{e}");
@@ -847,7 +857,7 @@ async fn listing_sync_and_send_end_take_js_values() {
         r#"{"keychain":"Colored","strategy":"FullScan"}"#,
     ] {
         let options = js_sys::JSON::parse(options).unwrap();
-        wallet.sync(online.clone(), options).await.unwrap();
+        wallet.sync(online.clone(), options, None).await.unwrap();
     }
 
     let e = err(wallet
@@ -1069,6 +1079,7 @@ async fn create_utxos_exact_partial_funds() {
             1,
             true,
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -1102,6 +1113,7 @@ async fn create_utxos_exact_short_by_fee() {
             1,
             true,
             false,
+            None,
         )
         .await
         .unwrap_err();
@@ -1175,7 +1187,7 @@ async fn refresh_reports_proxy_failures_to_js() {
 
     let res = js_sys::Map::from(
         wallet
-            .refresh(online, None, js_sys::Array::new().into(), true)
+            .refresh(online, None, js_sys::Array::new().into(), true, None)
             .await
             .unwrap(),
     );
@@ -1227,4 +1239,213 @@ async fn refresh_reports_proxy_failures_to_js() {
             );
         }
     }
+}
+
+const ABORT_URL: &str = "http://abort.invalid/api";
+
+// Serve `ABORT_URL` from a stub that counts requests. With `stall`, it answers only on abort.
+fn abort_stub(stall: bool) {
+    js_sys::eval(&format!(
+        r#"globalThis.__origFetch = globalThis.__origFetch || globalThis.fetch;
+        globalThis.__stub = {{ count: 0, aborts: 0, stall: {stall} }};
+        globalThis.fetch = function (input, init) {{
+            const u = input instanceof Request ? input.url : String(input);
+            if (!u.startsWith('{ABORT_URL}')) return globalThis.__origFetch(input, init);
+            const s = globalThis.__stub;
+            s.count++;
+            const signal = (init && init.signal) || (input instanceof Request ? input.signal : null);
+            if (s.stall) return new Promise((_, rej) => signal && signal.addEventListener('abort',
+                () => {{ s.aborts++; rej(signal.reason); }}, {{ once: true }}));
+            let body = '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206';
+            if (u.endsWith('/blocks')) body = JSON.stringify([{{ id: body, height: 0, version: 1,
+                timestamp: 1296688602, tx_count: 1, size: 285, weight: 1140,
+                merkle_root: '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b',
+                previousblockhash: null, mediantime: 1296688602, nonce: 2, bits: 545259519,
+                difficulty: 0 }}]);
+            else if (u.includes('/scripthash/')) body = '[]';
+            const resp = new Response(body, {{ status: 200 }});
+            return Promise.resolve(Object.defineProperty(resp, 'url', {{ value: u }}));
+        }};"#
+    ))
+    .unwrap();
+}
+
+fn stub_restore() {
+    js_sys::eval("globalThis.fetch = globalThis.__origFetch;").unwrap();
+}
+
+fn stub_set_stall(stall: bool) {
+    js_sys::eval(&format!("globalThis.__stub.stall = {stall};")).unwrap();
+}
+
+fn stub_count(key: &str) -> f64 {
+    js_sys::eval(&format!("globalThis.__stub.{key}"))
+        .unwrap()
+        .as_f64()
+        .unwrap()
+}
+
+fn js_signal(code: &str) -> Option<JsAbortSignal> {
+    Some(js_sys::eval(code).unwrap().unchecked_into())
+}
+
+fn abort_options() -> JsValue {
+    js_sys::JSON::parse(&format!(
+        r#"{{"indexerConfig":{{"Esplora":{{"url":"{ABORT_URL}"}}}},
+        "skipConsistencyCheck":true,"failedWitnessReceiveGraceSecs":604800,"proxyAuthKeys":{{}},
+        "vanillaSyncLookback":20}}"#
+    ))
+    .unwrap()
+}
+
+fn full_scan() -> JsValue {
+    js_sys::JSON::parse(r#"{"keychain":"Colored","strategy":"FullScan"}"#).unwrap()
+}
+
+#[wasm_bindgen_test]
+async fn signal_abort_controller_stops_go_online_in_flight() {
+    abort_stub(true);
+    let wallet = wallet();
+    let signal = js_signal(
+        "(() => { const c = new AbortController(); setTimeout(() => c.abort(), 300); \
+         return c.signal; })()",
+    );
+    let start = js_sys::Date::now();
+    let res = wallet.go_online(abort_options(), signal).await;
+    assert_eq!(err(res.unwrap_err()), "Aborted");
+    assert!(js_sys::Date::now() - start < 5000.0);
+    assert!(stub_count("aborts") >= 1.0);
+    // the borrow is released
+    wallet.get_wallet_data().unwrap();
+    stub_set_stall(false);
+    let res = wallet.go_online(abort_options(), None).await;
+    stub_restore();
+    res.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn signal_timeout_stops_sync() {
+    abort_stub(false);
+    let wallet = wallet();
+    let online = wallet.go_online(abort_options(), None).await.unwrap();
+    stub_set_stall(true);
+    let res = wallet
+        .sync(
+            online.clone(),
+            full_scan(),
+            js_signal("AbortSignal.timeout(300)"),
+        )
+        .await;
+    assert_eq!(err(res.unwrap_err()), "Aborted");
+    stub_set_stall(false);
+    let res = wallet.sync(online, full_scan(), None).await;
+    stub_restore();
+    res.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn signal_already_aborted_stops_every_call() {
+    use rgb_lib_wasm::{Encryption, wallet::Recipient};
+    abort_stub(false);
+    let wallet = wallet();
+    let online = serde_wasm_bindgen::to_value(&Online {
+        id: 1,
+        indexer_url: ABORT_URL.to_string(),
+    })
+    .unwrap();
+    let recipient = serde_wasm_bindgen::to_value(&Recipient {
+        recipient_id: "id".to_string(),
+        witness_data: None,
+        assignment: Assignment::Fungible(1),
+        transport_endpoints: vec![],
+        public_key: None,
+        encryption: Encryption::Optional,
+        expiration_timestamp: None,
+    })
+    .unwrap();
+    let fired = || js_signal("AbortSignal.abort()");
+    let o = || online.clone();
+    let empty = || JsValue::from(js_sys::Object::new());
+    let amounts = || JsValue::from(js_sys::Array::of1(&JsValue::from(1)));
+    let errs = vec![
+        wallet.go_online(abort_options(), fired()).await.err(),
+        wallet.sync(o(), full_scan(), fired()).await.err(),
+        wallet
+            .refresh(o(), None, js_sys::Array::new().into(), false, fired())
+            .await
+            .err(),
+        wallet
+            .create_utxos_begin(o(), false, false, None, None, 1, false, false, fired())
+            .await
+            .err(),
+        wallet
+            .send_begin(
+                o(),
+                empty(),
+                false,
+                1,
+                1,
+                0.into(),
+                None,
+                None,
+                false,
+                fired(),
+            )
+            .await
+            .err(),
+        wallet
+            .send_btc_begin(o(), "addr", 1000, 1, false, false, fired())
+            .await
+            .err(),
+        wallet
+            .drain_to_begin(o(), "addr", 1, false, fired())
+            .await
+            .err(),
+        wallet
+            .inflate_begin(o(), "id", amounts(), 1, 1, false, fired())
+            .await
+            .err(),
+        wallet
+            .burn_begin(o(), "id", 1, None, 1, 1, false, fired())
+            .await
+            .err(),
+        wallet
+            .link_begin(o(), "id", "id", 1, 1, false, false, fired())
+            .await
+            .err(),
+        wallet
+            .mint_begin(o(), "id", recipient, 1, 1, 1, "rpc://x", fired())
+            .await
+            .err(),
+    ];
+    let count = stub_count("count");
+    stub_restore();
+    for e in errs {
+        assert_eq!(e.map(err).as_deref(), Some("Aborted"));
+    }
+    assert_eq!(count, 0.0);
+}
+
+#[wasm_bindgen_test]
+async fn signal_refuses_a_fake_signal() {
+    abort_stub(false);
+    let wallet = wallet();
+    let online = wallet.go_online(abort_options(), None).await.unwrap();
+    for fake in ["({})", "Object.create(AbortSignal.prototype)"] {
+        let res = wallet
+            .refresh(
+                online.clone(),
+                None,
+                js_sys::Array::new().into(),
+                true,
+                js_signal(fake),
+            )
+            .await;
+        assert_eq!(err(res.unwrap_err()), "Invalid AbortSignal");
+    }
+    let res = wallet
+        .refresh(online, None, js_sys::Array::new().into(), true, None)
+        .await;
+    stub_restore();
+    res.unwrap();
 }

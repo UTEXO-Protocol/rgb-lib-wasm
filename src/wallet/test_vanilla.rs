@@ -5,6 +5,7 @@ use super::test_bfa::{funded_wallet, wallet_data};
 use crate::database::DbWalletTransaction;
 use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::online::assert_abort_restores;
 use crate::wallet::vss::VssBackupConfig;
 use crate::wallet::{
     Online, Outpoint, PendingVanillaTx, SyncKeychain, SyncOptions, SyncStrategy, TransactionType,
@@ -458,8 +459,22 @@ async fn vanilla_operations_are_atomic() {
     })
     .await;
 
+    // an aborted begin restores the wallet and can run again
+    let psbt = assert_abort_restores(&mut w, "create_utxos_begin", async |w| {
+        create_begin(w, &online).await
+    })
+    .await;
+    w.abort_pending_vanilla_tx(txid_of(&psbt)).unwrap();
+    let psbt = assert_abort_restores(&mut w, "send_btc_begin", async |w| {
+        send_begin(w, &online).await
+    })
+    .await;
+    w.abort_pending_vanilla_tx(txid_of(&psbt)).unwrap();
     // an end that fails after its broadcast keeps the TX and can run again
-    let psbt = drain_begin(&mut w, &online).await.unwrap();
+    let psbt = assert_abort_restores(&mut w, "drain_to_begin", async |w| {
+        drain_begin(w, &online).await
+    })
+    .await;
     let signed = w.sign_psbt(psbt.clone(), None).unwrap();
     let txids = assert_no_partial_change(&mut w, "drain_to_end", 1, async |w| {
         w.drain_to_end(online.clone(), signed.clone()).await

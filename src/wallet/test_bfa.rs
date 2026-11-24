@@ -874,7 +874,8 @@ async fn bfa_reject_list_url() {
     ));
 }
 
-/// A stalled EVM node or reject list server fails the call after the time limit.
+/// A stalled EVM node or reject list server fails the call after the time limit, or when the
+/// caller aborts it.
 #[wasm_bindgen_test]
 async fn bfa_stalled_evm_and_reject_list_time_out() {
     use crate::api::evm::EvmClient;
@@ -914,6 +915,34 @@ async fn bfa_stalled_evm_and_reject_list_time_out() {
     )
     .await;
     let list_ms = js_sys::Date::now() - start;
+    // the caller aborts a stalled request after 100 ms
+    async fn abort_soon<T>(
+        fut: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> (Result<T, Error>, f64) {
+        let c = crate::AbortController::new();
+        let start = js_sys::Date::now();
+        let mut timer = std::pin::pin!(sleep_ms(100));
+        let mut call = std::pin::pin!(crate::abort::scope(
+            Some(c.signal()),
+            crate::abort::race(fut)
+        ));
+        let res = std::future::poll_fn(|cx| {
+            if !c.signal().aborted() && timer.as_mut().poll(cx).is_ready() {
+                c.abort();
+            }
+            call.as_mut().poll(cx)
+        })
+        .await;
+        (res, js_sys::Date::now() - start)
+    }
+    let (evm_cut, evm_cut_ms) =
+        abort_soon(EvmClient::new("http://stall.invalid/evm").chain_id()).await;
+    let (list_cut, list_cut_ms) = abort_soon(
+        RejectListClient::new("http://stall.invalid/list")
+            .unwrap()
+            .get_reject_list(),
+    )
+    .await;
     let aborts = run_js(
         "const g = globalThis;
         g.fetch = g.__stallFetch;
@@ -935,7 +964,18 @@ async fn bfa_stalled_evm_and_reject_list_time_out() {
         list_ms >= 0.9 * f64::from(ms),
         "get_reject_list after {list_ms} ms"
     );
-    assert_eq!(aborts, 2.0);
+    assert_eq!(evm_cut.err(), Some(Error::Aborted));
+    assert_eq!(list_cut.err(), Some(Error::Aborted));
+    assert!(
+        evm_cut_ms < 0.5 * f64::from(ms),
+        "chain_id after {evm_cut_ms} ms"
+    );
+    assert!(
+        list_cut_ms < 0.5 * f64::from(ms),
+        "get_reject_list after {list_cut_ms} ms"
+    );
+    // each cut fetch is aborted too
+    assert_eq!(aborts, 4.0);
 }
 
 #[wasm_bindgen_test]

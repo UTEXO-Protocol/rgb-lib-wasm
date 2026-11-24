@@ -10,6 +10,7 @@ use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 use crate::no_wallet::inspection::tests::{conceal_split, tampered_fascia};
 use crate::utils::INDEXER_SYNCS;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::online::assert_abort_restores;
 use crate::wallet::{
     AssetFilter, Online, Outpoint, Recipient, SinglesigKeys, Transfer, TransferScope, Wallet,
     WalletData,
@@ -919,11 +920,12 @@ async fn inflate_and_burn_are_atomic() {
             .await
     })
     .await;
-    let unsigned = wallet
-        .inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
-        .await
-        .unwrap()
-        .psbt;
+    let unsigned = assert_abort_restores(&mut wallet, "inflate_begin", async |w| {
+        w.inflate_begin(online.clone(), asset_id.clone(), vec![50], 1, 1, false)
+            .await
+    })
+    .await
+    .psbt;
     let signed = wallet.sign_psbt(unsigned, None).unwrap();
     assert_no_partial_change(&mut wallet, "inflate_end", 1, async |w| {
         w.inflate_end(online.clone(), signed.clone()).await
@@ -937,10 +939,11 @@ async fn inflate_and_burn_are_atomic() {
             .await
     })
     .await;
-    let begin = wallet
-        .burn_begin(online.clone(), asset_id.clone(), 10, None, 1, 1, false)
-        .await
-        .unwrap();
+    let begin = assert_abort_restores(&mut wallet, "burn_begin", async |w| {
+        w.burn_begin(online.clone(), asset_id.clone(), 10, None, 1, 1, false)
+            .await
+    })
+    .await;
     let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
     assert_no_partial_change(&mut wallet, "burn_end", 1, async |w| {
         w.burn_end(online.clone(), signed.clone()).await
