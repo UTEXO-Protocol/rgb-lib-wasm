@@ -3,6 +3,7 @@
 //! This module defines the [`Wallet`] related modules.
 
 pub(crate) mod backup;
+pub mod backup_store;
 pub mod idb_store;
 pub(crate) mod memory_store;
 pub(crate) mod offline;

@@ -42,7 +42,6 @@ impl RejectListClient {
     /// every opout. A body larger than [`MAX_REJECT_LIST_SIZE`] is refused.
     #[cfg(target_arch = "wasm32")]
     pub(crate) async fn get_reject_list(&self) -> Result<String, Error> {
-        use wasm_bindgen::JsCast;
         // abort the fetch when the caller drops this future
         struct AbortOnDrop(web_sys::AbortController);
         impl Drop for AbortOnDrop {
@@ -64,26 +63,9 @@ impl RejectListClient {
         if !resp.ok() {
             return Err(Self::status_err(resp.status()));
         }
-        let mut body = vec![];
-        if let Some(stream) = resp.body() {
-            let reader: web_sys::ReadableStreamDefaultReader = stream.get_reader().unchecked_into();
-            let js_err = |e: wasm_bindgen::JsValue| Self::req_err(format!("{e:?}"));
-            // read one byte past the bound to tell a body of the maximum size from a longer one
-            while body.len() as u64 <= MAX_REJECT_LIST_SIZE {
-                let chunk = wasm_bindgen_futures::JsFuture::from(reader.read())
-                    .await
-                    .map_err(js_err)?;
-                if js_sys::Reflect::get(&chunk, &"done".into())
-                    .map_err(js_err)?
-                    .is_truthy()
-                {
-                    break;
-                }
-                let value = js_sys::Reflect::get(&chunk, &"value".into()).map_err(js_err)?;
-                body.extend(js_sys::Uint8Array::new(&value).to_vec());
-            }
-            let _ = reader.cancel();
-        }
+        let body = crate::utils::read_body_limited(resp.body(), MAX_REJECT_LIST_SIZE)
+            .await
+            .map_err(Self::req_err)?;
         Self::checked_body(body)
     }
 

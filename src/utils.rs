@@ -26,6 +26,39 @@ pub(crate) const INDEXER_RETRIES: u8 = 3;
 #[cfg(feature = "esplora")]
 pub(crate) const INDEXER_PARALLEL_REQUESTS: usize = 5;
 
+/// Read a response body up to one byte past `limit`, so a caller can refuse a longer body.
+pub(crate) async fn read_body_limited(
+    body: Option<web_sys::ReadableStream>,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+    let mut buf = vec![];
+    let Some(stream) = body else {
+        return Ok(buf);
+    };
+    let reader: web_sys::ReadableStreamDefaultReader = stream.get_reader().unchecked_into();
+    let js_err = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    while buf.len() as u64 <= limit {
+        let chunk = wasm_bindgen_futures::JsFuture::from(reader.read())
+            .await
+            .map_err(js_err)?;
+        if js_sys::Reflect::get(&chunk, &"done".into())
+            .map_err(js_err)?
+            .is_truthy()
+        {
+            break;
+        }
+        let value = js_sys::Uint8Array::new(
+            &js_sys::Reflect::get(&chunk, &"value".into()).map_err(js_err)?,
+        );
+        let room = limit + 1 - buf.len() as u64;
+        let take = u64::from(value.length()).min(room) as u32;
+        buf.extend(value.subarray(0, take).to_vec());
+    }
+    let _ = reader.cancel();
+    Ok(buf)
+}
+
 // test probe: count the transition builders loaded from the stock
 #[cfg(test)]
 thread_local! {
@@ -1872,6 +1905,36 @@ mod tests {
                 out.as_string().unwrap(),
                 "5,no-store,no-store,POST,tx,true,true,false,TimeoutError,AbortError"
             );
+        }
+
+        // A chunk n holds n bytes of value n. Chunk 0 ends the stream. Else the stream stays open.
+        #[wasm_bindgen_test]
+        async fn body_read_stops_past_limit() {
+            use super::super::read_body_limited;
+            use wasm_bindgen::JsCast;
+            for (chunks, want, cancelled) in [
+                ("[4, 0]", vec![4; 4], false),
+                ("[10]", vec![10; 5], true),
+                ("[2, 2, 2, 2, 2]", vec![2; 5], true),
+            ] {
+                let s = js(&format!(
+                    "const s = {{ cancelled: false }}; const c = {chunks}; \
+                     s.stream = new ReadableStream({{ \
+                       pull(ctl) {{ const n = c.shift(); \
+                         if (n === undefined) return new Promise(() => {{}}); \
+                         if (n === 0) ctl.close(); else ctl.enqueue(new Uint8Array(n).fill(n)); }}, \
+                       cancel() {{ s.cancelled = true; }} }}); \
+                     return s;"
+                ))
+                .await;
+                let stream = js_sys::Reflect::get(&s, &"stream".into()).unwrap();
+                let got = read_body_limited(Some(stream.unchecked_into()), 4)
+                    .await
+                    .unwrap();
+                assert_eq!(got, want, "{chunks}");
+                let flag = js_sys::Reflect::get(&s, &"cancelled".into()).unwrap();
+                assert_eq!(flag.as_bool(), Some(cancelled), "{chunks}");
+            }
         }
     }
 

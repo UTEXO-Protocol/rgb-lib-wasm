@@ -1,6 +1,6 @@
 //! VSS (Versioned Storage Service) cloud backup module.
 //!
-//! Implements a WASM-compatible VSS client using reqwest + prost,
+//! Implements a WASM-compatible VSS client using fetch + prost,
 //! since upstream vss-client-ng depends on bitreq/tokio::net which
 //! cannot compile to wasm32-unknown-unknown.
 
@@ -18,9 +18,11 @@ use prost::Message as ProstMessage; // trait (for .decode() etc.)
 use serde::{Deserialize, Serialize};
 use sha2::Sha256 as HkdfSha256;
 
+use super::backup_store::{
+    KvStore, MAX_BACKUP_LEN, MAX_KEY_LEN, MAX_LIST_KEYS, MAX_LIST_PAGES, StoreFuture, StoredValue,
+};
 use crate::Error;
 use crate::encryption::chunk_nonce;
-use crate::error::InternalError;
 
 // --- Protobuf types (matching vss-server proto) ---
 
@@ -61,6 +63,39 @@ pub struct KeyValue {
     pub version: i64,
     #[prost(bytes = "vec", tag = "3")]
     pub value: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeleteObjectRequest {
+    #[prost(string, tag = "1")]
+    pub store_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub key_value: Option<KeyValue>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeleteObjectResponse {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListKeyVersionsRequest {
+    #[prost(string, tag = "1")]
+    pub store_id: String,
+    #[prost(string, optional, tag = "2")]
+    pub key_prefix: Option<String>,
+    #[prost(int32, optional, tag = "3")]
+    pub page_size: Option<i32>,
+    #[prost(string, optional, tag = "4")]
+    pub page_token: Option<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListKeyVersionsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub key_versions: Vec<KeyValue>,
+    #[prost(string, optional, tag = "2")]
+    pub next_page_token: Option<String>,
+    #[prost(int64, optional, tag = "3")]
+    pub global_version: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -163,11 +198,13 @@ fn build_auth_token(secret_key: &SecretKey, secp_ctx: &Secp256k1<SignOnly>) -> S
 
 const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 
+/// Maximum size, in bytes, of a VSS response body.
+const MAX_VSS_BODY: u64 = MAX_BACKUP_LEN as u64 + 4096;
+
 pub struct WasmVssClient {
     base_url: String,
     signing_key: SecretKey,
     secp_ctx: Secp256k1<SignOnly>,
-    http: reqwest::Client,
 }
 
 impl WasmVssClient {
@@ -176,7 +213,6 @@ impl WasmVssClient {
             base_url,
             signing_key,
             secp_ctx: Secp256k1::signing_only(),
-            http: reqwest::Client::new(),
         }
     }
 
@@ -189,25 +225,27 @@ impl WasmVssClient {
         let body = request.encode_to_vec();
         let auth_token = build_auth_token(&self.signing_key, &self.secp_ctx);
 
-        let resp = self
-            .http
-            .post(&url)
+        let http_err = |e: gloo_net::Error| VssError::Internal(format!("HTTP error: {e}"));
+        // VSS uses the indexer timeout.
+        let signal =
+            web_sys::AbortSignal::timeout_with_u32(u32::from(crate::utils::INDEXER_TIMEOUT) * 1000);
+        let resp = gloo_net::http::Request::post(&url)
             .header("content-type", APPLICATION_OCTET_STREAM)
-            .header("Authorization", auth_token)
-            .body(body)
-            // VSS uses the indexer timeout.
-            .timeout(std::time::Duration::from_secs(
-                crate::utils::INDEXER_TIMEOUT.into(),
-            ))
+            .header("Authorization", &auth_token)
+            .abort_signal(Some(&signal))
+            .body(js_sys::Uint8Array::from(&body[..]))
+            .map_err(http_err)?
             .send()
             .await
-            .map_err(|e| VssError::Internal(format!("HTTP error: {e}")))?;
+            .map_err(http_err)?;
 
-        let status = resp.status().as_u16();
-        let resp_bytes = resp
-            .bytes()
+        let status = resp.status();
+        let resp_bytes = crate::utils::read_body_limited(resp.body(), MAX_VSS_BODY)
             .await
             .map_err(|e| VssError::Internal(format!("Read body error: {e}")))?;
+        if resp_bytes.len() as u64 > MAX_VSS_BODY {
+            return Err(VssError::Internal("response too large".to_string()));
+        }
 
         if status == 200 {
             T::decode(resp_bytes.as_ref())
@@ -252,13 +290,27 @@ impl WasmVssClient {
         };
         self.put_object(&request).await
     }
+
+    pub async fn delete_object(
+        &self,
+        request: &DeleteObjectRequest,
+    ) -> Result<DeleteObjectResponse, VssError> {
+        self.post_request(request, "deleteObject").await
+    }
+
+    pub async fn list_key_versions(
+        &self,
+        request: &ListKeyVersionsRequest,
+    ) -> Result<ListKeyVersionsResponse, VssError> {
+        self.post_request(request, "listKeyVersions").await
+    }
 }
 
 // --- Encryption (matches upstream vss.rs) ---
 
 /// 239 bytes plaintext + 16-byte AEAD tag = 255 bytes per encrypted chunk
 const BACKUP_BUFFER_LEN_ENCRYPT: usize = 239;
-const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
+pub(crate) const BACKUP_BUFFER_LEN_DECRYPT: usize = BACKUP_BUFFER_LEN_ENCRYPT + 16;
 const BACKUP_KEY_LENGTH: usize = 32;
 /// 19-byte nonce prefix for chunked XChaCha20Poly1305.
 ///
@@ -269,7 +321,6 @@ pub const BACKUP_NONCE_LENGTH: usize = 19;
 /// HKDF salt length used by [`encrypt_data`]/[`decrypt_data`]. Public for the same
 /// reason as [`BACKUP_NONCE_LENGTH`].
 pub const BACKUP_SALT_LENGTH: usize = 32;
-const VSS_BACKUP_VERSION: u8 = 1;
 
 const HKDF_INFO: &[u8] = b"rgb-lib-vss-backup-encryption-v1";
 
@@ -281,22 +332,6 @@ pub struct VssEncryptionMetadata {
 }
 
 impl VssEncryptionMetadata {
-    fn new() -> Result<Self, Error> {
-        let mut salt = [0u8; BACKUP_SALT_LENGTH];
-        let mut nonce = [0u8; BACKUP_NONCE_LENGTH];
-        getrandom::getrandom(&mut salt).map_err(|e| Error::Internal {
-            details: format!("RNG unavailable: {e}"),
-        })?;
-        getrandom::getrandom(&mut nonce).map_err(|e| Error::Internal {
-            details: format!("RNG unavailable: {e}"),
-        })?;
-        Ok(Self {
-            salt: hex::encode(salt),
-            nonce: hex::encode(nonce),
-            version: VSS_BACKUP_VERSION,
-        })
-    }
-
     fn nonce_bytes(&self) -> Result<[u8; BACKUP_NONCE_LENGTH], Error> {
         let bytes = hex::decode(&self.nonce).map_err(|e| Error::Internal {
             details: format!("Invalid nonce hex: {e}"),
@@ -387,22 +422,6 @@ pub fn decrypt_data(
     Ok(decrypted)
 }
 
-// --- VSS Backup Keys ---
-
-const BACKUP_KEY_DATA: &str = "backup/data";
-const BACKUP_KEY_METADATA: &str = "backup/metadata";
-const BACKUP_KEY_MANIFEST: &str = "backup/manifest";
-const BACKUP_KEY_FINGERPRINT: &str = "backup/fingerprint";
-
-/// Backup manifest stored on the VSS server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupManifest {
-    pub chunk_count: usize,
-    pub total_size: usize,
-    pub encrypted: bool,
-    pub version: u8,
-}
-
 /// Configuration for VSS backup.
 #[derive(Clone)]
 pub struct VssBackupConfig {
@@ -431,187 +450,188 @@ pub struct VssBackupInfo {
     pub last_backup_error: Option<String>,
 }
 
-/// WASM-compatible VSS backup client.
-pub struct VssBackupClient {
+/// The VSS adapter of [`KvStore`]. It stores `namespace/key` in one VSS store.
+pub struct VssStore {
     client: WasmVssClient,
     store_id: String,
-    signing_key: SecretKey,
+    page_size: Option<i32>,
 }
 
-impl VssBackupClient {
+impl VssStore {
     pub fn new(config: &VssBackupConfig) -> Self {
         Self {
             client: WasmVssClient::new(config.server_url.clone(), config.signing_key),
             store_id: config.store_id.clone(),
-            signing_key: config.signing_key,
+            page_size: None,
         }
     }
 
-    async fn get_current_version(&self, key: &str) -> Result<Option<i64>, Error> {
-        let request = GetObjectRequest {
-            store_id: self.store_id.clone(),
-            key: key.to_string(),
-        };
-        match self.client.get_object(&request).await {
-            Ok(resp) => Ok(resp.value.map(|kv| kv.version)),
-            Err(VssError::NoSuchKey(_)) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Upload encrypted backup data to VSS server. Returns the new version.
-    pub async fn upload_backup(&self, plaintext: &[u8], fingerprint: &str) -> Result<i64, Error> {
-        let metadata = VssEncryptionMetadata::new()?;
-        let encrypted = encrypt_data(plaintext, &self.signing_key, &metadata, None)?;
-
-        let data_version = self
-            .get_current_version(BACKUP_KEY_DATA)
-            .await?
-            .unwrap_or(0);
-        let manifest_version = self
-            .get_current_version(BACKUP_KEY_MANIFEST)
-            .await?
-            .unwrap_or(0);
-        let fingerprint_version = self
-            .get_current_version(BACKUP_KEY_FINGERPRINT)
-            .await?
-            .unwrap_or(0);
-        let metadata_version = self
-            .get_current_version(BACKUP_KEY_METADATA)
-            .await?
-            .unwrap_or(0);
-
-        let manifest = BackupManifest {
-            chunk_count: 1,
-            total_size: encrypted.len(),
-            encrypted: true,
-            version: VSS_BACKUP_VERSION,
-        };
-        let manifest_json = serde_json::to_vec(&manifest).map_err(InternalError::from)?;
-        let metadata_json = serde_json::to_vec(&metadata).map_err(InternalError::from)?;
-
-        let request = PutObjectRequest {
-            store_id: self.store_id.clone(),
-            global_version: None,
-            transaction_items: vec![
-                KeyValue {
-                    key: BACKUP_KEY_DATA.to_string(),
-                    version: data_version,
-                    value: encrypted,
-                },
-                KeyValue {
-                    key: BACKUP_KEY_MANIFEST.to_string(),
-                    version: manifest_version,
-                    value: manifest_json,
-                },
-                KeyValue {
-                    key: BACKUP_KEY_FINGERPRINT.to_string(),
-                    version: fingerprint_version,
-                    value: fingerprint.as_bytes().to_vec(),
-                },
-                KeyValue {
-                    key: BACKUP_KEY_METADATA.to_string(),
-                    version: metadata_version,
-                    value: metadata_json,
-                },
-            ],
-            delete_items: vec![],
-        };
-
-        self.client
-            .put_object(&request)
-            .await
-            .map_err(Error::from)?;
-
-        Ok(data_version + 1)
-    }
-
-    async fn get_value(&self, key: &str) -> Result<Vec<u8>, Error> {
-        let request = GetObjectRequest {
-            store_id: self.store_id.clone(),
-            key: key.to_string(),
-        };
-        let resp = self.client.get_object(&request).await?;
-        resp.value
-            .map(|kv| kv.value)
-            .ok_or(Error::VssBackupNotFound)
-    }
-
-    /// Download, check and decrypt the backup of the wallet with this fingerprint.
-    pub async fn download_backup(&self, fingerprint: &str) -> Result<Vec<u8>, Error> {
-        let manifest_bytes = self.get_value(BACKUP_KEY_MANIFEST).await?;
-        let manifest: BackupManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|e| Error::Internal {
-                details: format!("Failed to parse manifest: {e}"),
-            })?;
-        if manifest.version != VSS_BACKUP_VERSION {
-            return Err(Error::UnsupportedBackupVersion {
-                version: manifest.version.to_string(),
-            });
-        }
-        if !manifest.encrypted || manifest.chunk_count != 1 {
-            return Err(Error::InvalidBackup);
-        }
-        if self.get_value(BACKUP_KEY_FINGERPRINT).await? != fingerprint.as_bytes() {
-            return Err(Error::FingerprintMismatch);
-        }
-        let raw_data = self.get_value(BACKUP_KEY_DATA).await?;
-        if raw_data.len() != manifest.total_size {
-            return Err(Error::InvalidBackup);
-        }
-        let meta_bytes = self.get_value(BACKUP_KEY_METADATA).await?;
-        let enc_metadata: VssEncryptionMetadata =
-            serde_json::from_slice(&meta_bytes).map_err(|e| Error::Internal {
-                details: format!("Failed to parse encryption metadata: {e}"),
-            })?;
-        decrypt_data(&raw_data, &self.signing_key, &enc_metadata, None)
-    }
-
-    /// Get the server-side backup version, or None if no backup exists.
-    pub async fn get_backup_version(&self) -> Result<Option<i64>, Error> {
-        self.get_current_version(BACKUP_KEY_MANIFEST).await
-    }
-
-    /// Delete backup data from VSS server.
-    pub async fn delete_backup(&self) -> Result<(), Error> {
-        let keys = [
-            BACKUP_KEY_DATA,
-            BACKUP_KEY_MANIFEST,
-            BACKUP_KEY_METADATA,
-            BACKUP_KEY_FINGERPRINT,
-        ];
-        let mut delete_items = Vec::new();
-        for key in keys {
-            if let Some(version) = self.get_current_version(key).await? {
-                delete_items.push(KeyValue {
-                    key: key.to_string(),
-                    version,
-                    value: vec![],
-                });
-            }
-        }
-        if delete_items.is_empty() {
-            return Ok(());
-        }
-        let request = PutObjectRequest {
-            store_id: self.store_id.clone(),
-            global_version: None,
-            transaction_items: vec![],
-            delete_items,
-        };
-        self.client
-            .put_object(&request)
-            .await
-            .map_err(Error::from)?;
-        Ok(())
+    /// Set the page size of `list` calls.
+    pub fn with_list_page_size(mut self, size: i32) -> Self {
+        self.page_size = Some(size);
+        self
     }
 }
 
+fn vss_store_err(details: &str) -> Error {
+    Error::VssError {
+        details: details.to_string(),
+    }
+}
+
+fn vss_key(ns: &str, key: &str) -> Result<String, Error> {
+    if ns.is_empty() || ns.contains('/') || key.is_empty() || ns.len() + key.len() > MAX_KEY_LEN {
+        return Err(vss_store_err("invalid namespace or key"));
+    }
+    Ok(format!("{ns}/{key}"))
+}
+
+impl KvStore for VssStore {
+    fn read<'a>(
+        &'a self,
+        namespace: &'a str,
+        key: &'a str,
+    ) -> StoreFuture<'a, Option<StoredValue>> {
+        Box::pin(async move {
+            let key = vss_key(namespace, key)?;
+            let request = GetObjectRequest {
+                store_id: self.store_id.clone(),
+                key: key.clone(),
+            };
+            let kv = match self.client.get_object(&request).await {
+                Ok(GetObjectResponse { value: Some(kv) }) => kv,
+                Ok(GetObjectResponse { value: None }) | Err(VssError::NoSuchKey(_)) => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if kv.key != key || kv.version < 1 || kv.value.len() > MAX_BACKUP_LEN {
+                return Err(vss_store_err("VSS returned an invalid object"));
+            }
+            Ok(Some(StoredValue {
+                value: kv.value,
+                version: kv.version,
+            }))
+        })
+    }
+
+    fn write<'a>(
+        &'a self,
+        namespace: &'a str,
+        key: &'a str,
+        value: Vec<u8>,
+        expected_version: Option<i64>,
+    ) -> StoreFuture<'a, i64> {
+        Box::pin(async move {
+            let key = vss_key(namespace, key)?;
+            if expected_version.is_some_and(|v| v < 1) {
+                return Err(vss_store_err("invalid expected version"));
+            }
+            let request = PutObjectRequest {
+                store_id: self.store_id.clone(),
+                global_version: None,
+                transaction_items: vec![KeyValue {
+                    key,
+                    version: expected_version.unwrap_or(0),
+                    value,
+                }],
+                delete_items: vec![],
+            };
+            self.client.put_object(&request).await?;
+            match expected_version {
+                None => Ok(1),
+                Some(v) => v
+                    .checked_add(1)
+                    .ok_or_else(|| vss_store_err("backup store version overflow")),
+            }
+        })
+    }
+
+    fn remove<'a>(
+        &'a self,
+        namespace: &'a str,
+        key: &'a str,
+        version: Option<i64>,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            let key = vss_key(namespace, key)?;
+            match version {
+                Some(v) => {
+                    self.client.remove_object(&self.store_id, &key, v).await?;
+                }
+                None => {
+                    let request = DeleteObjectRequest {
+                        store_id: self.store_id.clone(),
+                        key_value: Some(KeyValue {
+                            key,
+                            version: -1,
+                            value: vec![],
+                        }),
+                    };
+                    self.client.delete_object(&request).await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn list<'a>(&'a self, namespace: &'a str) -> StoreFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            let prefix = vss_key(namespace, "x")?;
+            let prefix = &prefix[..prefix.len() - 1];
+            let mut keys = vec![];
+            let mut count = 0usize;
+            let mut page_token = None;
+            for _ in 0..MAX_LIST_PAGES {
+                let request = ListKeyVersionsRequest {
+                    store_id: self.store_id.clone(),
+                    key_prefix: Some(prefix.to_string()),
+                    page_size: self.page_size,
+                    page_token,
+                };
+                let resp = self.client.list_key_versions(&request).await?;
+                count += resp.key_versions.len();
+                if count > MAX_LIST_KEYS {
+                    return Err(vss_store_err("backup store list has too many keys"));
+                }
+                keys.extend(
+                    resp.key_versions
+                        .into_iter()
+                        .filter_map(|kv| kv.key.strip_prefix(prefix).map(str::to_string)),
+                );
+                match resp.next_page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => return Ok(keys),
+                }
+            }
+            Err(vss_store_err("backup store list has too many pages"))
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use bdk_wallet::bitcoin::secp256k1::rand::rngs::OsRng;
 
+    const VSS_BACKUP_VERSION: u8 = 1;
+
+    impl VssEncryptionMetadata {
+        fn new() -> Result<Self, Error> {
+            let mut salt = [0u8; BACKUP_SALT_LENGTH];
+            let mut nonce = [0u8; BACKUP_NONCE_LENGTH];
+            getrandom::getrandom(&mut salt).map_err(|e| Error::Internal {
+                details: format!("RNG unavailable: {e}"),
+            })?;
+            getrandom::getrandom(&mut nonce).map_err(|e| Error::Internal {
+                details: format!("RNG unavailable: {e}"),
+            })?;
+            Ok(Self {
+                salt: hex::encode(salt),
+                nonce: hex::encode(nonce),
+                version: VSS_BACKUP_VERSION,
+            })
+        }
+    }
     fn test_signing_key() -> SecretKey {
         let secp = Secp256k1::new();
         let (sk, _) = secp.generate_keypair(&mut OsRng);

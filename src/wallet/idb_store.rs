@@ -50,6 +50,8 @@ pub struct WalletSnapshot {
     pub reuse_address_index: HashMap<KeychainKind, u32>,
     /// Settings and public keys of the wallet.
     pub(crate) manifest: super::WalletManifest,
+    /// Version that the wallet last wrote or restored, per store label.
+    pub(crate) backup_versions: HashMap<String, i64>,
 }
 
 #[wasm_bindgen]
@@ -259,6 +261,7 @@ pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> 
 mod tests {
     use super::*;
     use crate::BTreeSet;
+    use crate::wallet::backup_store::store_label;
     use rgbstd::containers::ConsignmentExt;
     use rgbstd::contract::IssuerWrapper;
     use schemata::NonInflatableAsset;
@@ -376,6 +379,7 @@ mod tests {
             rgb_store: s,
             reuse_address_index: HashMap::new(),
             manifest: super::super::WalletManifest::new(&w.wallet_data, &w.keys),
+            backup_versions: HashMap::from([(store_label("vss", &["x", "y", "z"]), 7)]),
         };
 
         // JSON round-trip (what IndexedDB does)
@@ -405,6 +409,7 @@ mod tests {
             restored_snapshot.received_signed_txs,
             snapshot.received_signed_txs
         );
+        assert_eq!(restored_snapshot.backup_versions, snapshot.backup_versions);
         assert_eq!(restored_snapshot.received_mints, snapshot.received_mints);
         assert_eq!(
             restored_snapshot.pending_mint_locks,
