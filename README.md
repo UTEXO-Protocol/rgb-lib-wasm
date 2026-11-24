@@ -347,6 +347,18 @@ const deleted = wallet.deleteTransfers(null, false);
 
 `refresh` returns a `Map` from batch transfer index to `{ updatedStatus, failure }`. A pending receive whose proxies answered with no transfer has no `failure`. When a proxy lookup fails and no other proxy has the transfer, `failure` names the kind: `ProxyUnreachable`, `ProxyTimeout`, `ProxyHttpError` (with a number `status`), `ProxyJsonRpcError` (with a number `code`) or `ProxyInvalidResponse`. Each kind has the proxy `endpoint`, and all except `ProxyHttpError` have `details`. For example: `{ ProxyTimeout: { endpoint, details } }`. The receive stays pending with its keys, and the next `refresh` tries again. A consignment that is not valid is refused, and its transfer becomes `Failed`.
 
+### Stopping a call
+
+```javascript
+const controller = new AbortController();
+await wallet.sync(online, { keychain: 'Colored', strategy: 'FullScan' }, controller.signal);
+await wallet.refresh(online, null, [], false, AbortSignal.timeout(30000));
+```
+
+- `goOnline`, `sync`, `refresh` and the `*Begin` calls take an `AbortSignal` as their last argument. When it fires, the call stops its requests.
+- The promise rejects with `"Aborted"` after the wallet is restored. The wallet can make the call again.
+- A `refresh` that already broadcast a TX or wrote to a proxy keeps that change, as a failure at that point does.
+
 ### Utilities
 
 ```javascript
@@ -434,10 +446,10 @@ To protect a wallet:
 | `listTransactions(online?, skipSync)` | yes | List Bitcoin transactions, and begun vanilla operations with `pending: true`, after a sync unless `skipSync` |
 | `listPendingVanillaTxs()` | no | List begun vanilla operations that are not ended or aborted |
 | `abortPendingVanillaTx(txid)` | no | Abort a begun vanilla operation: delete it and release its inputs |
-| `goOnline(onlineOptions)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. `vanillaSyncLookback` is how many vanilla addresses before the last used one a `FastSync` checks. |
-| `sync(online, {keychain, strategy})` | yes | Sync one keychain (`"Colored"` or `{Vanilla: {lookback}}`) with the indexer, by `"FullScan"`, `"FullSync"` or `"FastSync"` |
+| `goOnline(onlineOptions, signal?)` | yes | Connect to an Esplora indexer. The optional `evmChains` option maps an EVM chain ID to `{rpcUrl, minMintLockBlocks, maxMintLockBlocks}`, for BFA. Unless `skipConsistencyCheck` is true, it checks the wallet's data against the RGB stock and a full scan, and fails on a mismatch. `failedWitnessReceiveGraceSecs` is how long, in seconds, the script of a failed witness receive stays tracked; a payment to it becomes an ordinary UTXO. `vanillaSyncLookback` is how many vanilla addresses before the last used one a `FastSync` checks. |
+| `sync(online, {keychain, strategy}, signal?)` | yes | Sync one keychain (`"Colored"` or `{Vanilla: {lookback}}`) with the indexer, by `"FullScan"`, `"FullSync"` or `"FastSync"` |
 | `createUtxos(online, upTo, exact, num?, size?, feeRate, skipSync)` | yes | Create colored UTXOs, signing with the wallet keys |
-| `createUtxosBegin(online, upTo, exact, num?, size?, feeRate, skipSync, dryRun)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
+| `createUtxosBegin(online, upTo, exact, num?, size?, feeRate, skipSync, dryRun, signal?)` | yes | Prepare PSBT to create colored UTXOs, reserve its inputs unless dryRun |
 | `createUtxosEnd(online, psbt)` | yes | Broadcast UTXO creation PSBT |
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
 | `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
@@ -445,30 +457,30 @@ To protect a wallet:
 | `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
 | `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
 | `send(online, recipientMap, donation, feeRate, minConf, expiration, senderEndpoint?)` | yes | Send RGB assets, signing with the wallet keys |
-| `sendBegin(...)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
+| `sendBegin(..., signal?)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
 | `sendEnd(online, psbt)` | yes | Broadcast RGB send PSBT |
 | `sendBtc(online, addr, amount, feeRate, skipSync)` | yes | Send BTC, signing with the wallet keys |
-| `sendBtcBegin(...)` | yes | Prepare BTC send PSBT, reserve its inputs unless dryRun |
+| `sendBtcBegin(..., signal?)` | yes | Prepare BTC send PSBT, reserve its inputs unless dryRun |
 | `sendBtcEnd(online, psbt)` | yes | Broadcast BTC send PSBT |
 | `getFeeEstimation(online, blocks)` | yes | Estimate fee rate for target blocks |
 | `drainTo(online, addr, feeRate)` | yes | Drain all wallet funds, signing with the wallet keys |
-| `drainToBegin(online, addr, feeRate, dryRun)` | yes | Prepare drain PSBT, reserve its inputs unless dryRun |
+| `drainToBegin(online, addr, feeRate, dryRun, signal?)` | yes | Prepare drain PSBT, reserve its inputs unless dryRun |
 | `drainToEnd(online, psbt)` | yes | Broadcast drain PSBT |
 | `inflate(online, assetId, amounts, feeRate, minConf)` | yes | Inflate an IFA asset, signing with the wallet keys |
-| `inflateBegin(online, assetId, amounts, feeRate, minConf, dryRun)` | yes | Prepare IFA inflation PSBT, save it as Initiated unless dryRun |
+| `inflateBegin(online, assetId, amounts, feeRate, minConf, dryRun, signal?)` | yes | Prepare IFA inflation PSBT, save it as Initiated unless dryRun |
 | `inflateEnd(online, psbt)` | yes | Broadcast IFA inflation PSBT |
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
-| `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
+| `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun, signal?)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
 | `getBurnConsignment(assetId, txid)` | no | Return the consignment of an ended burn (bytes), which proves it with its history |
 | `link(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
-| `linkBegin(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks, dryRun)` | yes | Prepare link PSBT |
+| `linkBegin(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks, dryRun, signal?)` | yes | Prepare link PSBT |
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
-| `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
+| `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint, signal?)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
 | `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
-| `refresh(online, assetId?, filter, skipSync)` | yes | Refresh pending transfers and settle ended vanilla operations |
+| `refresh(online, assetId?, filter, skipSync, signal?)` | yes | Refresh pending transfers and settle ended vanilla operations |
 | `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
 | `deleteTransfers(batchIdx?, noAssetOnly)` | no | Delete failed transfers |
