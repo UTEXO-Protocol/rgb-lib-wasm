@@ -216,14 +216,22 @@ async fn test_one_seed_on_two_networks_in_one_data_dir() {
     );
     let testnet = WalletData {
         bitcoin_network: BitcoinNetwork::Testnet,
+        max_allocations_per_utxo: 3,
         ..regtest.clone()
     };
+    let fp = &keys.master_fingerprint;
 
     let mut wallet = Wallet::new(regtest.clone(), sk.clone()).unwrap();
     let regtest_addr = wallet.get_address().unwrap();
     assert!(regtest_addr.starts_with("bcrt1"));
     wallet.flush().await.unwrap();
     drop(wallet);
+    let load = Wallet::load(&regtest.data_dir, BitcoinNetwork::Testnet, fp, None).await;
+    assert!(
+        matches!(load, Err(Error::InexistentWalletManifest { .. })),
+        "{:?}",
+        load.err()
+    );
 
     let mut wallet = Wallet::restore(testnet.clone(), sk.clone()).await.unwrap();
     let testnet_addr = wallet.get_address().unwrap();
@@ -234,9 +242,18 @@ async fn test_one_seed_on_two_networks_in_one_data_dir() {
     let mut wallet = Wallet::restore(testnet, sk.clone()).await.unwrap();
     let addr = wallet.get_address().unwrap();
     assert!(addr.starts_with("tb1") && addr != testnet_addr);
-    let mut wallet = Wallet::restore(regtest, sk).await.unwrap();
+    drop(wallet);
+    let mut wallet = Wallet::restore(regtest.clone(), sk).await.unwrap();
     let addr = wallet.get_address().unwrap();
     assert!(addr.starts_with("bcrt1") && addr != regtest_addr);
+    drop(wallet);
+
+    for (network, max) in [(BitcoinNetwork::Regtest, 5), (BitcoinNetwork::Testnet, 3)] {
+        let wallet = Wallet::load(&regtest.data_dir, network, fp, None).await;
+        let data = wallet.unwrap().get_wallet_data();
+        assert_eq!(data.bitcoin_network, network);
+        assert_eq!(data.max_allocations_per_utxo, max);
+    }
 }
 
 /// Test: Address reuse pinned index survives page reload.

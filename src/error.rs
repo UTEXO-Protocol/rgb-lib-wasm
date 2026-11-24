@@ -27,6 +27,15 @@ pub enum Error {
         asset_id: String,
     },
 
+    /// The backup is for another bitcoin network than the wallet
+    #[error("Backup network {backup_network} does not match the wallet network {wallet_network}")]
+    BackupNetworkMismatch {
+        /// The network of the backup
+        backup_network: BitcoinNetwork,
+        /// The network of the wallet
+        wallet_network: BitcoinNetwork,
+    },
+
     /// The requested batch transfer was not found
     #[error("Batch transfer with idx {idx} not found")]
     BatchTransferNotFound {

@@ -6,7 +6,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, rand::rngs::OsRng};
 use rgb_lib_wasm::wallet::backup_store::{
-    BACKUP_KEY, BACKUP_NAMESPACE, JsKvStore, KvStore, StoredValue, decode_backup_blob,
+    BACKUP_NAMESPACE, JsKvStore, KvStore, StoredValue, backup_key, decode_backup_blob,
 };
 use rgb_lib_wasm::wallet::vss::{VssBackupConfig, VssStore};
 use rgb_lib_wasm::wallet::{
@@ -1488,8 +1488,9 @@ impl Dest {
         }
     }
 
-    async fn stored(&self) -> Option<StoredValue> {
-        self.raw().read(BACKUP_NAMESPACE, BACKUP_KEY).await.unwrap()
+    async fn stored(&self, fingerprint: &str) -> Option<StoredValue> {
+        let key = backup_key(fingerprint, BitcoinNetwork::Regtest);
+        self.raw().read(BACKUP_NAMESPACE, &key).await.unwrap()
     }
 }
 
@@ -1605,12 +1606,13 @@ async fn backup_store_backup_and_restore() {
     assert_eq!(prop(&info, "backup_exists"), JsValue::TRUE);
     assert_eq!(version(prop(&info, "server_version")), v);
 
+    let key = backup_key(&keys.master_fingerprint, BitcoinNetwork::Regtest);
     let calls = run_on(
         store,
-        "return s.calls.every(c => c[1] === 'backup' && c[2] === 'wallet');",
+        &format!("return s.calls.every(c => c[1] === 'backup' && c[2] === '{key}');"),
     );
     assert_eq!(calls, JsValue::TRUE);
-    let blob = dest.stored().await.unwrap().value;
+    let blob = dest.stored(&keys.master_fingerprint).await.unwrap().value;
     for needle in [
         keys.master_fingerprint.as_str(),
         &recipient_id,
@@ -1625,22 +1627,22 @@ async fn backup_store_backup_and_restore() {
 #[wasm_bindgen_test]
 async fn backup_store_conflict_overwrites_nothing() {
     for dest in Dest::both() {
-        let (a, b, _) = wallet_pair().await;
+        let (a, b, keys) = wallet_pair().await;
         dest.configure(&a);
         dest.configure(&b);
         let v1 = version(a.vss_backup().await.unwrap());
-        let s1 = dest.stored().await;
+        let s1 = dest.stored(&keys.master_fingerprint).await;
         let e = err(b.vss_backup().await.unwrap_err());
         assert!(e.starts_with("VSS version conflict"), "{e}");
-        assert_eq!(dest.stored().await, s1);
+        assert_eq!(dest.stored(&keys.master_fingerprint).await, s1);
 
         b.vss_restore_backup().await.unwrap();
         let v2 = version(b.vss_backup().await.unwrap());
         assert!(v2 > v1);
-        let s2 = dest.stored().await;
+        let s2 = dest.stored(&keys.master_fingerprint).await;
         let e = err(a.vss_backup().await.unwrap_err());
         assert!(e.starts_with("VSS version conflict"), "{e}");
-        assert_eq!(dest.stored().await, s2);
+        assert_eq!(dest.stored(&keys.master_fingerprint).await, s2);
     }
 }
 
@@ -1656,13 +1658,17 @@ async fn backup_store_recreates_lost_backup() {
             }
             None => dest
                 .raw()
-                .remove(BACKUP_NAMESPACE, BACKUP_KEY, None)
+                .remove(
+                    BACKUP_NAMESPACE,
+                    &backup_key(&keys.master_fingerprint, BitcoinNetwork::Regtest),
+                    None,
+                )
                 .await
                 .unwrap(),
         }
         let v = version(a.vss_backup().await.unwrap());
         assert!(v >= 1);
-        let blob = dest.stored().await.unwrap().value;
+        let blob = dest.stored(&keys.master_fingerprint).await.unwrap().value;
         decode_backup_blob(&blob, &keys.master_fingerprint, &dest.key).unwrap();
         assert!(version(a.vss_backup().await.unwrap()) > v);
     }
@@ -1724,7 +1730,7 @@ async fn backup_store_read_is_untrusted() {
         .unwrap();
         let store = JsKvStore::new(store).unwrap();
         assert!(
-            store.read(BACKUP_NAMESPACE, BACKUP_KEY).await.is_err(),
+            store.read(BACKUP_NAMESPACE, "wallet").await.is_err(),
             "{bad}"
         );
     }

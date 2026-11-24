@@ -126,6 +126,7 @@ const BACKUP_STORE_TS: &'static str = r#"
  *   Without `version` it removes the key, and an absent key is not an error.
  * - `list` returns the keys of the namespace.
  * To signal a conflict, throw an object with `code` equal to "CONFLICT".
+ * The library keeps each wallet backup at key "wallet/<fingerprint>/<network>" of namespace "backup".
  */
 export interface BackupStore {
     read(namespace: string, key: string): { value: Uint8Array; version: number } | null | Promise<{ value: Uint8Array; version: number } | null>;

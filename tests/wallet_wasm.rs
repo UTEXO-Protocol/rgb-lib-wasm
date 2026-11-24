@@ -6,7 +6,7 @@ mod utils;
 
 use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey, rand::rngs::OsRng};
 use rgb_lib_wasm::wallet::backup_store::{
-    BACKUP_KEY, BACKUP_NAMESPACE, KvStore, decode_backup_blob, encode_backup_blob,
+    BACKUP_NAMESPACE, KvStore, backup_key, decode_backup_blob, encode_backup_blob,
 };
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
 use rgb_lib_wasm::wallet::vss::{VssBackupConfig, VssStore};
@@ -633,22 +633,25 @@ impl VssFixture {
         }
     }
 
-    async fn blob(&self) -> Vec<u8> {
-        let stored = self.store.read(BACKUP_NAMESPACE, BACKUP_KEY).await;
+    async fn blob(&self, fingerprint: &str) -> Vec<u8> {
+        let key = backup_key(fingerprint, BitcoinNetwork::Regtest);
+        let stored = self.store.read(BACKUP_NAMESPACE, &key).await;
         stored.unwrap().unwrap().value
     }
 
-    async fn put(&self, blob: Vec<u8>) {
-        let stored = self.store.read(BACKUP_NAMESPACE, BACKUP_KEY).await;
+    async fn put(&self, fingerprint: &str, blob: Vec<u8>) {
+        let key = backup_key(fingerprint, BitcoinNetwork::Regtest);
+        let stored = self.store.read(BACKUP_NAMESPACE, &key).await;
         let version = stored.unwrap().unwrap().version;
         self.store
-            .write(BACKUP_NAMESPACE, BACKUP_KEY, blob, Some(version))
+            .write(BACKUP_NAMESPACE, &key, blob, Some(version))
             .await
             .unwrap();
     }
 
     async fn payload(&self, fingerprint: &str) -> serde_json::Value {
-        let plain = decode_backup_blob(&self.blob().await, fingerprint, &self.key).unwrap();
+        let plain =
+            decode_backup_blob(&self.blob(fingerprint).await, fingerprint, &self.key).unwrap();
         serde_json::from_slice(&plain).unwrap()
     }
 }
@@ -699,7 +702,7 @@ async fn test_vss_restore_refuses_other_wallet_state() {
     let fingerprint = a.get_keys().master_fingerprint;
     let plain = serde_json::to_vec(&payload).unwrap();
     let blob = encode_backup_blob(&plain, &fingerprint, &store_a.key).unwrap();
-    store_a.put(blob).await;
+    store_a.put(&fingerprint, blob).await;
 
     let result = a.vss_restore_backup().await;
     assert!(result.is_err(), "restore of a tampered store succeeded");
@@ -713,7 +716,7 @@ async fn test_vss_restore_refuses_unencrypted_data() {
     let mut blob = vec![1];
     blob.extend([0; 51]);
     blob.extend(serde_json::to_vec(&payload).unwrap());
-    store.put(blob).await;
+    store.put(&wallet.get_keys().master_fingerprint, blob).await;
     let err = wallet.vss_restore_backup().await.unwrap_err();
     assert!(
         matches!(err, Error::VssError { .. } | Error::InvalidBackup),
@@ -728,7 +731,10 @@ async fn test_vss_restore_refuses_other_fingerprint() {
     let other = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot).master_fingerprint;
     let plain = serde_json::to_vec(&payload).unwrap();
     store
-        .put(encode_backup_blob(&plain, &other, &store.key).unwrap())
+        .put(
+            &wallet.get_keys().master_fingerprint,
+            encode_backup_blob(&plain, &other, &store.key).unwrap(),
+        )
         .await;
     let err = wallet.vss_restore_backup().await.unwrap_err();
     assert!(matches!(err, Error::FingerprintMismatch), "{err:?}");
