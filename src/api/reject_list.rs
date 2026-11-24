@@ -43,11 +43,21 @@ impl RejectListClient {
     #[cfg(target_arch = "wasm32")]
     pub(crate) async fn get_reject_list(&self) -> Result<String, Error> {
         use wasm_bindgen::JsCast;
+        // abort the fetch when the caller drops this future
+        struct AbortOnDrop(web_sys::AbortController);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let guard = AbortOnDrop(
+            web_sys::AbortController::new().map_err(|e| Self::req_err(format!("{e:?}")))?,
+        );
+        let timeout = web_sys::AbortSignal::timeout_with_u32(CLIENT_TIMEOUT.as_millis() as u32);
+        let signal = web_sys::AbortSignal::any(&js_sys::Array::of2(&timeout, &guard.0.signal()));
         let resp = gloo_net::http::Request::get(&self.base_url)
             .redirect(web_sys::RequestRedirect::Error)
-            .abort_signal(Some(&web_sys::AbortSignal::timeout_with_u32(
-                CLIENT_TIMEOUT.as_millis() as u32,
-            )))
+            .abort_signal(Some(&signal))
             .send()
             .await
             .map_err(Self::req_err)?;

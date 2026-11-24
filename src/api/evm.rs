@@ -326,16 +326,19 @@ impl EvmClient {
             params,
             id: 1,
         };
-        let resp: RpcResponse<R> = self
-            .post(&body)
-            .await?
-            .json()
-            .await
-            .map_err(Self::req_err)?;
-        Ok(match resp.error {
-            Some(err) => Err(err),
-            None => Ok(resp.result),
+        crate::abort::race(async {
+            let resp: RpcResponse<R> = self
+                .post(&body)
+                .await?
+                .json()
+                .await
+                .map_err(Self::req_err)?;
+            Ok(match resp.error {
+                Some(err) => Err(err),
+                None => Ok(resp.result),
+            })
         })
+        .await
     }
 
     /// EIP-155 chain ID of the chain the node is on (`eth_chainId`).

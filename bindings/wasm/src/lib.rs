@@ -51,6 +51,67 @@ extern "C" {
     pub type JsSignOptions;
 }
 
+#[wasm_bindgen]
+extern "C" {
+    /// A JS `AbortSignal`.
+    #[wasm_bindgen(typescript_type = "AbortSignal")]
+    pub type JsAbortSignal;
+}
+
+#[wasm_bindgen(inline_js = r#"
+export function listen_abort(signal, fire) {
+    if (!(signal instanceof AbortSignal)) throw new TypeError("not an AbortSignal");
+    if (signal.aborted) {
+        fire();
+        return () => {};
+    }
+    signal.addEventListener("abort", fire, { once: true });
+    return () => signal.removeEventListener("abort", fire);
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(catch)]
+    fn listen_abort(
+        signal: &JsAbortSignal,
+        fire: &Closure<dyn FnMut()>,
+    ) -> Result<js_sys::Function, JsValue>;
+}
+
+/// A JS `AbortSignal` linked to a wallet signal. Drop removes the listener.
+struct JsAbort {
+    signal: rgb_lib_wasm::AbortSignal,
+    remove: js_sys::Function,
+    _fire: Closure<dyn FnMut()>,
+}
+
+impl JsAbort {
+    fn new(signal: Option<JsAbortSignal>) -> Result<Option<Self>, JsValue> {
+        let Some(js_signal) = signal else {
+            return Ok(None);
+        };
+        let controller = rgb_lib_wasm::AbortController::new();
+        let signal = controller.signal();
+        let fire = Closure::new(move || controller.abort());
+        let remove = listen_abort(&js_signal, &fire)
+            .map_err(|_| JsValue::from_str("Invalid AbortSignal"))?;
+        Ok(Some(Self {
+            signal,
+            remove,
+            _fire: fire,
+        }))
+    }
+
+    fn signal(abort: &Option<Self>) -> Option<rgb_lib_wasm::AbortSignal> {
+        abort.as_ref().map(|a| a.signal.clone())
+    }
+}
+
+impl Drop for JsAbort {
+    fn drop(&mut self) {
+        let _ = self.remove.call0(&JsValue::NULL);
+    }
+}
+
 /// Mirror of the BDK sign options: a missing field keeps the BDK default.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -705,12 +766,19 @@ impl WasmWallet {
     /// Go online: connect to an indexer. Takes the online options as a JS object and returns
     /// Online data as a JS object.
     #[wasm_bindgen(js_name = "goOnline")]
-    pub async fn go_online(&self, online_options: JsValue) -> Result<JsValue, JsValue> {
+    pub async fn go_online(
+        &self,
+        online_options: JsValue,
+        signal: Option<JsAbortSignal>,
+    ) -> Result<JsValue, JsValue> {
         let online_options: OnlineOptions = serde_wasm_bindgen::from_value(online_options)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         let online = wallet
-            .go_online(online_options)
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.go_online(online_options).await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&online)
@@ -718,14 +786,22 @@ impl WasmWallet {
 
     /// Sync one keychain (`{keychain: "Colored" | {Vanilla: {lookback}}, strategy: "FullScan" |
     /// "FullSync" | "FastSync"}`). Call once per keychain to sync both.
-    pub async fn sync(&self, online_js: JsValue, options_js: JsValue) -> Result<(), JsValue> {
+    pub async fn sync(
+        &self,
+        online_js: JsValue,
+        options_js: JsValue,
+        signal: Option<JsAbortSignal>,
+    ) -> Result<(), JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let options: SyncOptions = serde_wasm_bindgen::from_value(options_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid sync options: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .sync(online, options)
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.sync(online, options).await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -771,14 +847,19 @@ impl WasmWallet {
         fee_rate: u64,
         skip_sync: bool,
         dry_run: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .create_utxos_begin(
-                online, up_to, exact, num, size, fee_rate, skip_sync, dry_run,
-            )
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.create_utxos_begin(
+                    online, up_to, exact, num, size, fee_rate, skip_sync, dry_run,
+                )
+                .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -859,6 +940,7 @@ impl WasmWallet {
         sender_transport_endpoint: Option<String>,
         lock_time: Option<u32>,
         dry_run: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<JsValue, JsValue> {
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
         let online: Online = serde_wasm_bindgen::from_value(online_js)
@@ -866,19 +948,23 @@ impl WasmWallet {
         let recipient_map: HashMap<String, Vec<Recipient>> =
             serde_wasm_bindgen::from_value(recipient_map_js)
                 .map_err(|e| JsValue::from_str(&format!("Invalid recipient map: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
-            .send_begin(
-                online,
-                recipient_map,
-                donation,
-                fee_rate,
-                min_confirmations,
-                expiration_timestamp,
-                sender_transport_endpoint,
-                lock_time,
-                dry_run,
-            )
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.send_begin(
+                    online,
+                    recipient_map,
+                    donation,
+                    fee_rate,
+                    min_confirmations,
+                    expiration_timestamp,
+                    sender_transport_endpoint,
+                    lock_time,
+                    dry_run,
+                )
+                .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)
@@ -923,6 +1009,7 @@ impl WasmWallet {
     /// Send BTC (begin): prepare a PSBT. Returns the unsigned PSBT string.
     /// If `dry_run` is true, the wallet reserves no inputs and records no pending operation.
     #[wasm_bindgen(js_name = "sendBtcBegin")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_btc_begin(
         &self,
         online_js: JsValue,
@@ -931,19 +1018,24 @@ impl WasmWallet {
         fee_rate: u64,
         skip_sync: bool,
         dry_run: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .send_btc_begin(
-                online,
-                address.to_string(),
-                amount,
-                fee_rate,
-                skip_sync,
-                dry_run,
-            )
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.send_btc_begin(
+                    online,
+                    address.to_string(),
+                    amount,
+                    fee_rate,
+                    skip_sync,
+                    dry_run,
+                )
+                .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -973,14 +1065,18 @@ impl WasmWallet {
         asset_id: Option<String>,
         filter_js: JsValue,
         skip_sync: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let filter: Vec<RefreshFilter> = serde_wasm_bindgen::from_value(filter_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid filter: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
-            .refresh(online, asset_id, filter, skip_sync)
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.refresh(online, asset_id, filter, skip_sync).await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)
@@ -1066,12 +1162,17 @@ impl WasmWallet {
         address: &str,
         fee_rate: u64,
         dry_run: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<String, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         wallet
-            .drain_to_begin(online, address.to_string(), fee_rate, dry_run)
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.drain_to_begin(online, address.to_string(), fee_rate, dry_run)
+                    .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -1138,21 +1239,26 @@ impl WasmWallet {
         fee_rate: u64,
         min_confirmations: u8,
         dry_run: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let inflation_amounts: Vec<u64> = serde_wasm_bindgen::from_value(inflation_amounts_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid inflation_amounts array: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
-            .inflate_begin(
-                online,
-                asset_id.to_string(),
-                inflation_amounts,
-                fee_rate,
-                min_confirmations,
-                dry_run,
-            )
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.inflate_begin(
+                    online,
+                    asset_id.to_string(),
+                    inflation_amounts,
+                    fee_rate,
+                    min_confirmations,
+                    dry_run,
+                )
+                .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)
@@ -1218,20 +1324,25 @@ impl WasmWallet {
         fee_rate: u64,
         min_confirmations: u8,
         dry_run: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
-            .burn_begin(
-                online,
-                asset_id.to_string(),
-                amount,
-                burn_reason,
-                fee_rate,
-                min_confirmations,
-                dry_run,
-            )
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.burn_begin(
+                    online,
+                    asset_id.to_string(),
+                    amount,
+                    burn_reason,
+                    fee_rate,
+                    min_confirmations,
+                    dry_run,
+                )
+                .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)
@@ -1305,20 +1416,25 @@ impl WasmWallet {
         min_confirmations: u8,
         skip_contract_checks: bool,
         dry_run: bool,
+        signal: Option<JsAbortSignal>,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
-            .link_begin(
-                online,
-                asset_id.to_string(),
-                linked_to_contract.to_string(),
-                fee_rate,
-                min_confirmations,
-                skip_contract_checks,
-                dry_run,
-            )
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.link_begin(
+                    online,
+                    asset_id.to_string(),
+                    linked_to_contract.to_string(),
+                    fee_rate,
+                    min_confirmations,
+                    skip_contract_checks,
+                    dry_run,
+                )
+                .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)
@@ -1344,6 +1460,7 @@ impl WasmWallet {
 
     /// Begin a BFA mint. Returns a MintBeginResult object.
     #[wasm_bindgen(js_name = "mintBegin")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn mint_begin(
         &self,
         online_js: JsValue,
@@ -1353,22 +1470,27 @@ impl WasmWallet {
         fee_rate: u64,
         min_confirmations: u8,
         sender_transport_endpoint: &str,
+        signal: Option<JsAbortSignal>,
     ) -> Result<JsValue, JsValue> {
         let online: Online = serde_wasm_bindgen::from_value(online_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
         let recipient: Recipient = serde_wasm_bindgen::from_value(recipient_js)
             .map_err(|e| JsValue::from_str(&format!("Invalid Recipient object: {e}")))?;
+        let abort = JsAbort::new(signal)?;
         let mut wallet = self.inner.borrow_mut();
         let result = wallet
-            .mint_begin(
-                online,
-                asset_id.to_string(),
-                recipient,
-                before_block,
-                fee_rate,
-                min_confirmations,
-                sender_transport_endpoint.to_string(),
-            )
+            .with_abort(JsAbort::signal(&abort), async move |w| {
+                w.mint_begin(
+                    online,
+                    asset_id.to_string(),
+                    recipient,
+                    before_block,
+                    fee_rate,
+                    min_confirmations,
+                    sender_transport_endpoint.to_string(),
+                )
+                .await
+            })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&result)

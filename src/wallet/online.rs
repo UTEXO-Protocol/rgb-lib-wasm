@@ -1183,12 +1183,15 @@ pub(crate) enum Indexer {
 
 impl Indexer {
     pub(crate) async fn block_hash(&self, height: usize) -> Result<String, IndexerError> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => {
-                let hash = client.get_block_hash(height as u32).await?;
-                hash.to_string()
-            }
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => {
+                    let hash = client.get_block_hash(height as u32).await?;
+                    hash.to_string()
+                }
+            })
         })
+        .await
     }
 
     pub(crate) async fn broadcast(&self, tx: &BdkTransaction) -> Result<(), IndexerError> {
@@ -1201,101 +1204,112 @@ impl Indexer {
     }
 
     pub(crate) async fn fee_estimation(&self, blocks: u16) -> Result<f64, Error> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => {
-                let estimate_map = client
-                    .get_fee_estimates()
-                    .await
-                    .map_err(IndexerError::from)?; // in sat/vB
-                if estimate_map.is_empty() {
-                    return Err(Error::CannotEstimateFees);
-                }
-                // map needs to be sorted for interpolation to work
-                let estimate_map = BTreeMap::from_iter(estimate_map);
-                match estimate_map.get(&blocks) {
-                    Some(estimate) => *estimate,
-                    None => {
-                        // find the two closest keys
-                        let mut lower_key = None;
-                        let mut upper_key = None;
-                        for k in estimate_map.keys() {
-                            match k.cmp(&blocks) {
-                                Ordering::Less => {
-                                    lower_key = Some(k);
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => {
+                    let estimate_map = client
+                        .get_fee_estimates()
+                        .await
+                        .map_err(IndexerError::from)?; // in sat/vB
+                    if estimate_map.is_empty() {
+                        return Err(Error::CannotEstimateFees);
+                    }
+                    // map needs to be sorted for interpolation to work
+                    let estimate_map = BTreeMap::from_iter(estimate_map);
+                    match estimate_map.get(&blocks) {
+                        Some(estimate) => *estimate,
+                        None => {
+                            // find the two closest keys
+                            let mut lower_key = None;
+                            let mut upper_key = None;
+                            for k in estimate_map.keys() {
+                                match k.cmp(&blocks) {
+                                    Ordering::Less => {
+                                        lower_key = Some(k);
+                                    }
+                                    Ordering::Greater => {
+                                        upper_key = Some(k);
+                                        break;
+                                    }
+                                    _ => unreachable!("already handled"),
                                 }
-                                Ordering::Greater => {
-                                    upper_key = Some(k);
-                                    break;
+                            }
+                            // use linear interpolation formula
+                            match (lower_key, upper_key) {
+                                (Some(x1), Some(x2)) => {
+                                    let y1 = estimate_map[x1];
+                                    let y2 = estimate_map[x2];
+                                    y1 + (blocks as f64 - *x1 as f64) / (*x2 as f64 - *x1 as f64)
+                                        * (y2 - y1)
                                 }
-                                _ => unreachable!("already handled"),
-                            }
-                        }
-                        // use linear interpolation formula
-                        match (lower_key, upper_key) {
-                            (Some(x1), Some(x2)) => {
-                                let y1 = estimate_map[x1];
-                                let y2 = estimate_map[x2];
-                                y1 + (blocks as f64 - *x1 as f64) / (*x2 as f64 - *x1 as f64)
-                                    * (y2 - y1)
-                            }
-                            _ => {
-                                return Err(Error::Internal {
-                                    details: s!("esplora map doesn't contain the expected keys"),
-                                });
+                                _ => {
+                                    return Err(Error::Internal {
+                                        details: s!(
+                                            "esplora map doesn't contain the expected keys"
+                                        ),
+                                    });
+                                }
                             }
                         }
                     }
                 }
-            }
+            })
         })
+        .await
     }
 
     pub(crate) async fn full_scan<K: Ord + Clone + Send, R: Into<FullScanRequest<K>> + Send>(
         &self,
         request: R,
     ) -> Result<FullScanResponse<K>, IndexerError> {
-        match self {
-            Indexer::EsploraAsync(client) => {
-                use bdk_esplora::EsploraAsyncExt;
-                client
-                    .full_scan(request, INDEXER_STOP_GAP, INDEXER_PARALLEL_REQUESTS)
-                    .await
-                    .map_err(|e| IndexerError::EsploraAsync(e.to_string()))
+        crate::abort::race(async move {
+            match self {
+                Indexer::EsploraAsync(client) => {
+                    use bdk_esplora::EsploraAsyncExt;
+                    client
+                        .full_scan(request, INDEXER_STOP_GAP, INDEXER_PARALLEL_REQUESTS)
+                        .await
+                        .map_err(|e| IndexerError::EsploraAsync(e.to_string()))
+                }
             }
-        }
+        })
+        .await
     }
 
     pub(crate) async fn get_tx_confirmations(&self, txid: &str) -> Result<Option<u64>, Error> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => {
-                let txid = Txid::from_str(txid).unwrap();
-                let tx_status = client
-                    .get_tx_status(&txid)
-                    .await
-                    .map_err(IndexerError::from)?;
-                if let Some(tx_height) = tx_status.block_height {
-                    let height = client.get_height().await.map_err(IndexerError::from)?;
-                    // a TX height above the tip means an inconsistent indexer
-                    let blocks_since = height.checked_sub(tx_height).ok_or_else(|| {
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => {
+                    let txid = Txid::from_str(txid).unwrap();
+                    let tx_status = client
+                        .get_tx_status(&txid)
+                        .await
+                        .map_err(IndexerError::from)?;
+                    if let Some(tx_height) = tx_status.block_height {
+                        let height = client.get_height().await.map_err(IndexerError::from)?;
+                        // a TX height above the tip means an inconsistent indexer
+                        let blocks_since = height.checked_sub(tx_height).ok_or_else(|| {
                         Error::Indexer {
                             details: s!(
                                 "indexer reported a transaction height greater than the chain tip"
                             ),
                         }
                     })?;
-                    Some(u64::from(blocks_since) + 1)
-                } else if client
-                    .get_tx(&txid)
-                    .await
-                    .map_err(IndexerError::from)?
-                    .is_none()
-                {
-                    None
-                } else {
-                    Some(0)
+                        Some(u64::from(blocks_since) + 1)
+                    } else if client
+                        .get_tx(&txid)
+                        .await
+                        .map_err(IndexerError::from)?
+                        .is_none()
+                    {
+                        None
+                    } else {
+                        Some(0)
+                    }
                 }
-            }
+            })
         })
+        .await
     }
 
     /// Whether a confirmed TX spends the output at `outpoint`.
@@ -1303,78 +1317,96 @@ impl Indexer {
         &self,
         outpoint: &BdkOutPoint,
     ) -> Result<bool, Error> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => client
-                .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
-                .await
-                .map_err(IndexerError::from)?
-                .is_some_and(|s| s.spent && s.status.is_some_and(|ts| ts.confirmed)),
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => client
+                    .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+                    .await
+                    .map_err(IndexerError::from)?
+                    .is_some_and(|s| s.spent && s.status.is_some_and(|ts| ts.confirmed)),
+            })
         })
+        .await
     }
 
     pub(crate) async fn get_latest_block_height(&self) -> Result<u32, Error> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => {
-                client.get_height().await.map_err(IndexerError::from)?
-            }
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => {
+                    client.get_height().await.map_err(IndexerError::from)?
+                }
+            })
         })
+        .await
     }
 
     pub(crate) async fn get_tx_height(&self, txid: &str) -> Result<Option<u32>, Error> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => {
-                let txid = Txid::from_str(txid).unwrap();
-                let tx_status = client
-                    .get_tx_status(&txid)
-                    .await
-                    .map_err(IndexerError::from)?;
-                tx_status.block_height
-            }
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => {
+                    let txid = Txid::from_str(txid).unwrap();
+                    let tx_status = client
+                        .get_tx_status(&txid)
+                        .await
+                        .map_err(IndexerError::from)?;
+                    tx_status.block_height
+                }
+            })
         })
+        .await
     }
 
     pub(crate) async fn get_tx_with_status(
         &self,
         txid: &Txid,
     ) -> Result<Option<(BdkTransaction, Option<u32>, Option<u64>)>, Error> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => {
-                let tx = client.get_tx(txid).await.map_err(IndexerError::from)?;
-                if let Some(tx) = tx {
-                    let status = client
-                        .get_tx_status(txid)
-                        .await
-                        .map_err(IndexerError::from)?;
-                    Some((tx, status.block_height, status.block_time))
-                } else {
-                    None
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => {
+                    let tx = client.get_tx(txid).await.map_err(IndexerError::from)?;
+                    if let Some(tx) = tx {
+                        let status = client
+                            .get_tx_status(txid)
+                            .await
+                            .map_err(IndexerError::from)?;
+                        Some((tx, status.block_height, status.block_time))
+                    } else {
+                        None
+                    }
                 }
-            }
+            })
         })
+        .await
     }
 
     pub(crate) async fn get_block_header(&self, height: NonZeroU32) -> Result<BlockHeader, Error> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => {
-                let hash = client
-                    .get_block_hash(height.get())
-                    .await
-                    .map_err(IndexerError::from)?;
-                client
-                    .get_header_by_hash(&hash)
-                    .await
-                    .map_err(IndexerError::from)?
-            }
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => {
+                    let hash = client
+                        .get_block_hash(height.get())
+                        .await
+                        .map_err(IndexerError::from)?;
+                    client
+                        .get_header_by_hash(&hash)
+                        .await
+                        .map_err(IndexerError::from)?
+                }
+            })
         })
+        .await
     }
 
     pub(crate) async fn get_merkle_proof(
         &self,
         txid: &Txid,
     ) -> Result<Option<esplora_client::MerkleProof>, IndexerError> {
-        Ok(match self {
-            Indexer::EsploraAsync(client) => client.get_merkle_proof(txid).await?,
+        crate::abort::race(async move {
+            Ok(match self {
+                Indexer::EsploraAsync(client) => client.get_merkle_proof(txid).await?,
+            })
         })
+        .await
     }
 
     pub(crate) async fn get_spv_proof(&self, txid: &Txid) -> Result<Option<SpvProof>, Error> {
@@ -1397,15 +1429,18 @@ impl Indexer {
         &self,
         request: impl Into<SyncRequest<I>> + Send,
     ) -> Result<SyncResponse, IndexerError> {
-        match self {
-            Indexer::EsploraAsync(client) => {
-                use bdk_esplora::EsploraAsyncExt;
-                client
-                    .sync(request, INDEXER_PARALLEL_REQUESTS)
-                    .await
-                    .map_err(|e| IndexerError::EsploraAsync(e.to_string()))
+        crate::abort::race(async move {
+            match self {
+                Indexer::EsploraAsync(client) => {
+                    use bdk_esplora::EsploraAsyncExt;
+                    client
+                        .sync(request, INDEXER_PARALLEL_REQUESTS)
+                        .await
+                        .map_err(|e| IndexerError::EsploraAsync(e.to_string()))
+                }
             }
-        }
+        })
+        .await
     }
 }
 
@@ -1786,13 +1821,16 @@ impl Wallet {
         &self,
         headers: &mut HashMap<NonZeroU32, Option<BlockHeader>>,
         height: NonZeroU32,
-    ) -> Option<BlockHeader> {
+    ) -> Result<Option<BlockHeader>, Error> {
         if let Some(header) = headers.get(&height) {
-            return *header;
+            return Ok(*header);
         }
-        let header = self.indexer().get_block_header(height).await.ok();
+        let header = match self.indexer().get_block_header(height).await {
+            Err(Error::Aborted) => return Err(Error::Aborted),
+            res => res.ok(),
+        };
         headers.insert(height, header);
-        header
+        Ok(header)
     }
 
     /// Add an SPV proof to each mined history witness of the consignment and store it.
@@ -1819,6 +1857,7 @@ impl Wallet {
                     proofs.insert(id, proof);
                 }
                 Ok(None) => {}
+                Err(Error::Aborted) => return Err(Error::Aborted),
                 Err(e) => debug!(self.logger, "Cannot get SPV proof for {id}: {e}"),
             }
         }
@@ -1843,7 +1882,7 @@ impl Wallet {
         for bw in consignment.bundled_witnesses() {
             let id = bw.witness_id();
             let proven = match &bw.spv_proof {
-                Some(proof) => match self.memo_header(&mut headers, proof.block_height).await {
+                Some(proof) => match self.memo_header(&mut headers, proof.block_height).await? {
                     Some(header) => matches!(proof.verified_pos(id, &header, layer1), Ok(Some(_))),
                     None => false,
                 },
@@ -3178,6 +3217,24 @@ impl Wallet {
         Ok((online, online_data))
     }
 
+    /// Run `call` with `signal`. When the signal fires, the call stops and returns
+    /// [`Error::Aborted`]. Use it for go_online, sync, refresh and the *_begin calls. The call ends
+    /// as a failure at that point.
+    pub async fn with_abort<T>(
+        &mut self,
+        signal: Option<AbortSignal>,
+        call: impl AsyncFnOnce(&mut Wallet) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if signal.as_ref().is_some_and(AbortSignal::aborted) {
+            return Err(Error::Aborted);
+        }
+        let fired = signal.clone();
+        match crate::abort::scope(signal, call(self)).await {
+            Err(_) if fired.is_some_and(|s| s.aborted()) => Err(Error::Aborted),
+            res => res,
+        }
+    }
+
     /// Return the existing or freshly generated set of wallet [`Online`] data (wasm32 async).
     ///
     /// See [`OnlineOptions`] for details on the available options.
@@ -3575,9 +3632,10 @@ impl Wallet {
     }
 
     async fn _broadcast_tx(&self, tx: BdkTransaction) -> Result<BdkTransaction, Error> {
+        crate::abort::check()?;
         let txid = tx.compute_txid().to_string();
         let indexer = self.indexer();
-        match indexer.broadcast(&tx).await {
+        match crate::abort::write(indexer.broadcast(&tx)).await {
             Ok(_) => {
                 debug!(self.logger, "Broadcasted TX with ID '{}'", txid);
                 Ok(tx)
@@ -3591,8 +3649,13 @@ impl Wallet {
                             return Err(Error::MaxFeeExceeded { txid: txid.clone() });
                         }
                     }
+                    // a cut broadcast may have reached the indexer
+                    IndexerError::Aborted => {}
                 }
-                if indexer.get_tx_confirmations(&txid).await?.is_none() {
+                if crate::abort::shield(indexer.get_tx_confirmations(&txid))
+                    .await?
+                    .is_none()
+                {
                     return Err(Error::FailedBroadcast {
                         details: e.to_string(),
                     });
@@ -4840,9 +4903,8 @@ impl Wallet {
                 return Ok(evm_client.reject_list_entries(address).await?.decisions());
             }
         };
-        let list = RejectListClient::new(reject_list_url)?
-            .get_reject_list()
-            .await?;
+        let list =
+            crate::abort::race(RejectListClient::new(reject_list_url)?.get_reject_list()).await?;
         // trim each line and skip empty ones, count the invalid ones and warn once
         let mut opout_map = HashMap::new();
         let mut invalid = 0;
@@ -7726,7 +7788,9 @@ impl Wallet {
         self.check_online(online)?;
         let cp = self.checkpoint("refresh");
         let res = self._refresh(asset_id, filter, skip_sync).await;
-        self.commit(cp, res, |_| false).await
+        // an aborted refresh keeps what its writes did
+        self.commit(cp, res, |e| *e == Error::Aborted && crate::abort::wrote())
+            .await
     }
 
     async fn _refresh(
@@ -7755,10 +7819,17 @@ impl Wallet {
             let mut failure = None;
             let mut updated_status = None;
             let savepoint = self._transfer_savepoint();
-            match self
+            let writes = crate::abort::writes();
+            let res = self
                 ._refresh_transfer_async(&transfer, &mut db_data, &filter, skip_sync)
-                .await
-            {
+                .await;
+            // an aborted transfer that wrote nothing is restored
+            let res = if crate::abort::fired() && crate::abort::writes() == writes {
+                Err(Error::Aborted)
+            } else {
+                res
+            };
+            match res {
                 Ok(Some(updated_transfer)) => updated_status = Some(updated_transfer.status),
                 Err(e) => {
                     // this error means the refresh failed the batch on purpose
@@ -7778,11 +7849,17 @@ impl Wallet {
                     failure,
                 },
             );
+            if crate::abort::fired() {
+                break;
+            }
         }
 
         if asset_id.is_none() {
             // settle the ended vanilla operations whose TX has a confirmation
             for row in self.database.iter_wallet_transactions()? {
+                if crate::abort::fired() {
+                    break;
+                }
                 if row.status != TransferStatus::WaitingConfirmations {
                     continue;
                 }
@@ -8756,7 +8833,10 @@ impl Wallet {
         let mut difficulty = 0;
         for _ in 0..MAX_POW_ATTEMPTS {
             let pow_timestamp = now().unix_timestamp().to_string();
-            let pow_nonce = solve_pow_nonce(&data.transfer_id, &pow_timestamp, difficulty).await;
+            let pow_nonce = crate::abort::race(async {
+                Ok::<_, Error>(solve_pow_nonce(&data.transfer_id, &pow_timestamp, difficulty).await)
+            })
+            .await?;
             let res = proxy_client
                 .post_consignment(data, consignment, &pow_timestamp, &pow_nonce)
                 .await?;
@@ -11141,6 +11221,10 @@ fn add_inflation(known_circulating_supply: &str, inflation: u64) -> u64 {
 #[cfg(test)]
 const REGTEST_GENESIS_INFO: &[u8] = br#"[{"id":"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206","height":0,"version":1,"timestamp":1296688602,"tx_count":1,"size":285,"weight":1140,"merkle_root":"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b","previousblockhash":null,"mediantime":1296688602,"nonce":2,"bits":545259519,"difficulty":0}]"#;
 
+// The regtest genesis hash.
+#[cfg(test)]
+const GENESIS_HASH: &[u8] = b"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
+
 // Serve an esplora: `route` maps a request path to a status line and a body.
 #[cfg(test)]
 pub(crate) fn fake_esplora(
@@ -11173,7 +11257,7 @@ mod go_online_tests {
     const PROXY_ENDPOINT: &str = "rpc://127.0.0.1:3000/json-rpc";
     const PROXY_URL: &str = "http://127.0.0.1:3000/json-rpc";
 
-    fn options(url: &str, keys: &[(&str, &str)]) -> OnlineOptions {
+    pub(super) fn options(url: &str, keys: &[(&str, &str)]) -> OnlineOptions {
         OnlineOptions {
             indexer_config: IndexerConfig::Esplora {
                 url: url.to_string(),
@@ -11329,6 +11413,61 @@ mod go_online_tests {
         };
         assert_eq!(go_online(&mut wallet, checked.clone()), Err(err.clone()));
         assert_eq!(go_online(&mut wallet, checked), Err(err));
+    }
+
+    #[test]
+    fn abort_stops_the_genesis_request_in_flight() {
+        let mut wallet = make_test_wallet(false);
+        let c = Arc::new(crate::AbortController::new());
+        let fire = c.clone();
+        let url = fake_esplora(move |_: &str| {
+            fire.abort();
+            std::thread::sleep(Duration::from_secs(5));
+            ("200 OK", GENESIS_HASH.to_vec())
+        });
+        let start = std::time::Instant::now();
+        let res = block_on(wallet.with_abort(Some(c.signal()), async |w| {
+            w.go_online(options(&url, &[])).await
+        }));
+        assert_eq!(res, Err(Error::Aborted));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(wallet.online_data.is_none());
+
+        let url = fake_esplora(|_: &str| ("200 OK", GENESIS_HASH.to_vec()));
+        assert!(go_online(&mut wallet, options(&url, &[])).is_ok());
+    }
+
+    #[test]
+    fn abort_in_the_consistency_scan_restores_state() {
+        use crate::wallet::offline::address_reuse_tests::state;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let mut wallet = make_test_wallet(false);
+        let c = Arc::new(crate::AbortController::new());
+        let fire = c.clone();
+        let scans = AtomicUsize::new(0);
+        let url = fake_esplora(move |path: &str| match path {
+            "/blocks" => ("200 OK", REGTEST_GENESIS_INFO.to_vec()),
+            p if p.starts_with("/scripthash/") => {
+                if scans.fetch_add(1, SeqCst) == 3 {
+                    fire.abort();
+                }
+                ("200 OK", b"[]".to_vec())
+            }
+            _ => ("200 OK", GENESIS_HASH.to_vec()),
+        });
+        let checked = OnlineOptions {
+            skip_consistency_check: false,
+            ..options(&url, &[])
+        };
+        let before = state(&wallet);
+        let res = block_on(wallet.with_abort(Some(c.signal()), async |w| {
+            w.go_online(checked.clone()).await
+        }));
+        assert_eq!(res, Err(Error::Aborted));
+        assert_eq!(state(&wallet), before);
+        let res = go_online(&mut wallet, checked);
+        assert!(res.is_ok(), "{res:?}");
     }
 
     #[test]
@@ -11546,7 +11685,7 @@ mod send_end_tests {
         setup_at(INDEXER_URL)
     }
 
-    fn setup_at(url: &str) -> (Wallet, Online) {
+    pub(super) fn setup_at(url: &str) -> (Wallet, Online) {
         let mut wallet = make_test_wallet(false);
         wallet.online_data = Some(OnlineData::for_test(url));
         let online = Online {
@@ -11569,7 +11708,7 @@ mod send_end_tests {
         bdk_wallet::bitcoin::consensus::serialize(&Psbt::from_str(psbt).unwrap().unsigned_tx)
     }
 
-    fn dummy_psbt() -> (String, String) {
+    pub(super) fn dummy_psbt() -> (String, String) {
         dummy_psbt_to(ScriptBuf::new())
     }
 
@@ -12251,7 +12390,7 @@ mod send_end_tests {
         }
     }
 
-    fn seed_vanilla(
+    pub(super) fn seed_vanilla(
         wallet: &Wallet,
         txid: &str,
         r#type: WalletTransactionType,
@@ -16313,6 +16452,156 @@ mod send_end_tests {
         assert_eq!(index(&unknown_txid, 0, true), None);
         assert_eq!(index(&txid, 2, false), Some(i0.index));
     }
+
+    // An outgoing batch of an RGB send that waits for the ACK of its proxy recipient. The TX
+    // spends the TXO `01..01:0`.
+    fn seed_rgb_send(wallet: &mut Wallet, proxy: &str) -> i32 {
+        let (psbt, txid) = dummy_psbt();
+        let idx = seed_outgoing(
+            wallet,
+            &txid,
+            TransferStatus::WaitingCounterparty,
+            Some(now().unix_timestamp() + 1000),
+            None,
+            proxy,
+            None,
+        );
+        wallet.transfer_artifacts.insert(
+            txid,
+            TransferArtifacts {
+                signed_tx: Some(raw_tx(&psbt)),
+                ..artifacts(BTreeMap::new())
+            },
+        );
+        seed_txo(wallet, &"01".repeat(32), 0);
+        idx
+    }
+
+    #[test]
+    fn abort_before_a_write_restores_the_refresh_of_an_rgb_send() {
+        let c = Arc::new(crate::AbortController::new());
+        let cut = Arc::new(crate::AbortController::new());
+        let fire_cut = cut.clone();
+        let broadcast = cut.signal();
+        let unknown = esplora_route(None);
+        let known = esplora_route(Some(raw_tx(&dummy_psbt().0)));
+        // the signal fires at the broadcast, which reaches the indexer
+        let url = fake_esplora(move |path| match path {
+            "/tx" => {
+                fire_cut.abort();
+                ("200 OK", vec![])
+            }
+            _ if broadcast.aborted() => known(path),
+            _ => unknown(path),
+        });
+        let (mut wallet, online) = setup_at(&url);
+        let mut server = mockito::Server::new();
+        let body = ack_get_body(RECIPIENT_SEED, true);
+        let fire = c.clone();
+        // the proxy ACKs and the signal fires as it answers
+        let _ack = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!("ack.get")))
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                fire.abort();
+                body.clone().into_bytes()
+            })
+            .create();
+        let idx = seed_rgb_send(&mut wallet, &server.url());
+        let before = state(&wallet);
+
+        let res = block_on(wallet.with_abort(Some(c.signal()), async |w| {
+            w.refresh(online.clone(), None, vec![], true).await
+        }));
+
+        assert_eq!(res.err(), Some(Error::Aborted));
+        assert_eq!(state(&wallet), before);
+        assert_eq!(status(&wallet, idx), TransferStatus::WaitingCounterparty);
+        assert!(wallet.broadcast_txs.is_empty());
+        // the call runs on to the broadcast, and the transfer that broadcast keeps its own result
+        let res = block_on(crate::abort::scope(
+            Some(cut.signal()),
+            wallet._refresh(None, vec![], true),
+        ))
+        .unwrap();
+        assert!(cut.signal().aborted());
+        assert_eq!(wallet.broadcast_txs.len(), 1);
+        assert!(res[&idx].failure.is_some());
+        assert_ne!(res[&idx].failure, Some(Error::Aborted));
+    }
+
+    // The refresh refuses a receive and posts its NACK, then aborts on the next transfer.
+    #[test]
+    fn abort_after_a_write_keeps_the_refresh_of_an_rgb_send() {
+        let c = Arc::new(crate::AbortController::new());
+        let (mut wallet, online) = setup();
+        let mut post = mockito::Server::new();
+        let _post = rpc_mock(
+            &mut post,
+            "ack.post",
+            r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#,
+        );
+        let receive =
+            seed_receive_with_consignment(&mut wallet, &post.url(), now().unix_timestamp() + 3600);
+        // a witness receive, whose consignment cannot be parsed
+        let rid = recipient_id_from_script_buf(new_script(&mut wallet), BitcoinNetwork::Regtest);
+        let mut transfer: DbTransferActMod = batch_transfer_row(&wallet, receive).into();
+        transfer.recipient_type = ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
+        transfer.recipient_id = ActiveValue::Set(Some(rid.clone()));
+        wallet.database.update_transfer(&mut transfer).unwrap();
+        let consignment = wallet.received_consignments.remove("recipient").unwrap();
+        wallet
+            .received_consignments
+            .insert(rid.clone(), consignment);
+        let meta = wallet
+            .received_consignment_meta
+            .remove("recipient")
+            .unwrap();
+        wallet.received_consignment_meta.insert(rid, meta);
+        let mut get = mockito::Server::new();
+        let fire = c.clone();
+        let _get = get
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!("ack.get")))
+            .with_body_from_request(move |_| {
+                fire.abort();
+                ACK_GET_EMPTY.as_bytes().to_vec()
+            })
+            .create();
+        let send = seed_rgb_send(&mut wallet, &get.url());
+
+        let res = block_on(wallet.with_abort(Some(c.signal()), async |w| {
+            w.refresh(online.clone(), None, vec![], true).await
+        }));
+
+        assert_eq!(res.err(), Some(Error::Aborted));
+        assert_eq!(status(&wallet, receive), TransferStatus::Failed);
+        assert_eq!(status(&wallet, send), TransferStatus::WaitingCounterparty);
+    }
+
+    #[test]
+    fn abort_after_a_transfer_that_wrote_nothing_restores_it() {
+        let (mut wallet, _) = setup();
+        let idx = seed_batch(
+            &wallet,
+            "t",
+            TransferStatus::WaitingCounterparty,
+            false,
+            None,
+        );
+        let c = crate::AbortController::new();
+        c.abort();
+
+        let res = block_on(crate::abort::scope(
+            Some(c.signal()),
+            wallet._refresh(None, vec![], true),
+        ))
+        .unwrap();
+
+        assert_eq!(res[&idx].failure, Some(Error::Aborted));
+        assert_eq!(res[&idx].updated_status, None);
+    }
 }
 
 #[cfg(test)]
@@ -17525,5 +17814,319 @@ mod sync_options_tests {
             .update_db_colored_txos_from_bdk(true, &HashMap::new())
             .unwrap();
         assert!(wallet.database.get_txo(&outpoint).unwrap().is_some());
+    }
+}
+
+/// Abort `call` at `point`, after its work. Check that the call restores all the state.
+#[cfg(test)]
+pub(crate) async fn assert_aborted_restores<T>(
+    wallet: &mut Wallet,
+    point: &'static str,
+    call: &impl AsyncFn(&mut Wallet) -> Result<T, Error>,
+) {
+    let before = crate::wallet::offline::address_reuse_tests::state(wallet);
+    let controller = std::rc::Rc::new(crate::AbortController::new());
+    crate::utils::ABORT_AT.with_borrow_mut(|a| *a = Some((point, controller.clone())));
+    let res = wallet
+        .with_abort(Some(controller.signal()), async |w| call(w).await)
+        .await;
+    crate::utils::ABORT_AT.with_borrow_mut(|a| *a = None);
+    assert_eq!(res.err(), Some(Error::Aborted));
+    assert_eq!(
+        crate::wallet::offline::address_reuse_tests::state(wallet),
+        before
+    );
+}
+
+/// Abort `call` as [`assert_aborted_restores`] does, then run it again without a signal and
+/// return its result.
+#[cfg(test)]
+pub(crate) async fn assert_abort_restores<T>(
+    wallet: &mut Wallet,
+    point: &'static str,
+    call: impl AsyncFn(&mut Wallet) -> Result<T, Error>,
+) -> T {
+    assert_aborted_restores(wallet, point, &call).await;
+    call(wallet).await.unwrap()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod abort_tests {
+    use super::go_online_tests::options;
+    use super::send_end_tests::{dummy_psbt, seed_vanilla, setup_at};
+    use super::*;
+    use crate::AbortController;
+    use crate::wallet::offline::address_reuse_tests::{make_test_wallet, state};
+    use std::{
+        future::poll_fn,
+        pin::pin,
+        sync::atomic::{AtomicUsize, Ordering::SeqCst},
+        task::Poll,
+        time::Instant,
+    };
+
+    fn fired_signal() -> AbortSignal {
+        let c = AbortController::new();
+        c.abort();
+        c.signal()
+    }
+
+    // Serve an esplora that counts its requests.
+    fn counted(
+        route: impl Fn(&str, usize) -> (&'static str, Vec<u8>) + Send + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let n = count.clone();
+        let url = fake_esplora(move |path: &str| route(path, n.fetch_add(1, SeqCst)));
+        (url, count)
+    }
+
+    fn scan_route(path: &str) -> (&'static str, Vec<u8>) {
+        match path {
+            "/blocks" => ("200 OK", REGTEST_GENESIS_INFO.to_vec()),
+            p if p.starts_with("/scripthash/") => ("200 OK", b"[]".to_vec()),
+            _ => ("200 OK", GENESIS_HASH.to_vec()),
+        }
+    }
+
+    const FULL_SCAN: SyncOptions = SyncOptions {
+        keychain: SyncKeychain::Colored,
+        strategy: SyncStrategy::FullScan,
+    };
+
+    #[test]
+    fn aborted_signal_stops_every_call_before_any_request() {
+        let (url, count) = counted(|_, _| ("200 OK", GENESIS_HASH.to_vec()));
+        let (mut w, online) = setup_at(&url);
+        let before = state(&w);
+        let res = block_on(w.with_abort(Some(fired_signal()), async |w| {
+            w.sync(online.clone(), FULL_SCAN).await
+        }));
+        assert_eq!(res.err(), Some(Error::Aborted));
+        assert_eq!(count.load(SeqCst), 0);
+        assert_eq!(state(&w), before);
+    }
+
+    #[test]
+    fn abort_restores_sync() {
+        let c = Arc::new(AbortController::new());
+        let fire = c.clone();
+        let (url, _) = counted(move |path, n| {
+            if n == 3 {
+                fire.abort();
+            }
+            scan_route(path)
+        });
+        let (mut w, online) = setup_at(&url);
+        let before = state(&w);
+        let res = block_on(w.with_abort(Some(c.signal()), async |w| {
+            w.sync(online.clone(), FULL_SCAN).await
+        }));
+        assert_eq!(res, Err(Error::Aborted));
+        assert_eq!(state(&w), before);
+        assert_eq!(block_on(w.sync(online, FULL_SCAN)), Ok(()));
+    }
+
+    #[test]
+    fn abort_restores_refresh_before_any_write() {
+        let c = Arc::new(AbortController::new());
+        let fire = c.clone();
+        let (url, _) = counted(move |path, n| {
+            if path.ends_with("/status") {
+                if n == 0 {
+                    fire.abort();
+                }
+                ("200 OK", br#"{"confirmed":true,"block_height":1}"#.to_vec())
+            } else if path == "/blocks/tip/height" {
+                ("200 OK", b"1".to_vec())
+            } else {
+                ("404 Not Found", vec![])
+            }
+        });
+        let (mut w, online) = setup_at(&url);
+        let txid = "11".repeat(32);
+        seed_vanilla(
+            &w,
+            &txid,
+            WalletTransactionType::SendBtc,
+            TransferStatus::WaitingConfirmations,
+            vec![],
+        );
+        let status = |w: &Wallet| w.database.iter_wallet_transactions().unwrap()[0].status;
+        let before = state(&w);
+        let res = block_on(w.with_abort(Some(c.signal()), async |w| {
+            w.refresh(online.clone(), None, vec![], true).await
+        }));
+        assert_eq!(res.err(), Some(Error::Aborted));
+        assert_eq!(status(&w), TransferStatus::WaitingConfirmations);
+        assert_eq!(state(&w), before);
+        block_on(w.refresh(online, None, vec![], true)).unwrap();
+        assert_eq!(status(&w), TransferStatus::Settled);
+    }
+
+    #[test]
+    fn abort_stops_begin_calls_in_their_sync() {
+        let current = Arc::new(std::sync::Mutex::new(Arc::new(AbortController::new())));
+        let fire = current.clone();
+        let (url, count) = counted(move |path, _| {
+            fire.lock().unwrap().abort();
+            scan_route(path)
+        });
+        let (mut w, online) = setup_at(&url);
+        let address = w.get_address().unwrap();
+        let before = state(&w);
+        let o = || online.clone();
+        macro_rules! aborted {
+            ($call:expr) => {
+                let c = Arc::new(AbortController::new());
+                *current.lock().unwrap() = c.clone();
+                let requests = count.load(SeqCst);
+                let res = block_on(w.with_abort(Some(c.signal()), $call));
+                assert_eq!(res.err(), Some(Error::Aborted));
+                assert!(count.load(SeqCst) > requests);
+                assert_eq!(state(&w), before);
+            };
+        }
+        aborted!(async |w| {
+            w.create_utxos_begin(o(), false, false, None, None, 1, false, false)
+                .await
+        });
+        aborted!(async |w| {
+            w.send_btc_begin(o(), address.clone(), 1000, 1, false, false)
+                .await
+        });
+        aborted!(async |w| w.drain_to_begin(o(), address.clone(), 1, false).await);
+    }
+
+    #[test]
+    fn abort_reaches_only_its_own_call() {
+        let c1 = Arc::new(AbortController::new());
+        let c2 = AbortController::new();
+        let fire = c1.clone();
+        let url1 = fake_esplora(move |_: &str| {
+            fire.abort();
+            std::thread::sleep(Duration::from_secs(2));
+            ("200 OK", GENESIS_HASH.to_vec())
+        });
+        let url2 = fake_esplora(|_: &str| {
+            std::thread::sleep(Duration::from_secs(1));
+            ("200 OK", GENESIS_HASH.to_vec())
+        });
+        let mut w1 = make_test_wallet(false);
+        let mut w2 = make_test_wallet(false);
+        let (r1, r2) = block_on(async {
+            let mut f1 = pin!(w1.with_abort(Some(c1.signal()), async |w| {
+                w.go_online(options(&url1, &[])).await
+            }));
+            let mut f2 = pin!(w2.with_abort(Some(c2.signal()), async |w| {
+                w.go_online(options(&url2, &[])).await
+            }));
+            let (mut r1, mut r2) = (None, None);
+            poll_fn(|cx| {
+                if r1.is_none()
+                    && let Poll::Ready(r) = f1.as_mut().poll(cx)
+                {
+                    r1 = Some(r);
+                }
+                if r2.is_none()
+                    && let Poll::Ready(r) = f2.as_mut().poll(cx)
+                {
+                    r2 = Some(r);
+                }
+                if r1.is_some() && r2.is_some() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            (r1.unwrap(), r2.unwrap())
+        });
+        assert_eq!(r1, Err(Error::Aborted));
+        assert!(r2.is_ok(), "{r2:?}");
+    }
+
+    #[test]
+    fn abort_cuts_a_write_in_flight() {
+        macro_rules! cut {
+            ($write:expr) => {
+                let c = Arc::new(AbortController::new());
+                let fire = c.clone();
+                let (url, count) = counted(move |_, _| {
+                    fire.abort();
+                    std::thread::sleep(Duration::from_secs(5));
+                    ("200 OK", vec![])
+                });
+                let client = ProxyClient::new(&url).unwrap();
+                let write = $write;
+                block_on(crate::abort::scope(Some(c.signal()), async {
+                    let start = Instant::now();
+                    assert_eq!(write(&client).await.err(), Some(Error::Aborted));
+                    assert!(start.elapsed() < Duration::from_secs(3));
+                    assert!(crate::abort::wrote());
+                    assert_eq!(count.load(SeqCst), 1);
+                    assert_eq!(write(&client).await.err(), Some(Error::Aborted));
+                    assert_eq!(count.load(SeqCst), 1);
+                }));
+            };
+        }
+        let ids = vec![s!("id")];
+        cut!(async |p: &ProxyClient| p.clean_ack(&ids, "sig").await.map(|_| ()));
+        let data = PostConsignmentData {
+            invoice_id: s!("invoice"),
+            transfer_id: s!("transfer"),
+            sender_transport_endpoint: s!("endpoint"),
+            sender_pk: s!("pk"),
+            consignment_hash: s!("hash"),
+            batch: false,
+            signature: s!("sig"),
+        };
+        cut!(async |p: &ProxyClient| {
+            p.post_consignment(&data, b"consignment", "0", "0")
+                .await
+                .map(|_| ())
+        });
+    }
+
+    #[test]
+    fn cut_broadcast_looks_up_the_tx() {
+        let tx = Psbt::from_str(&dummy_psbt().0).unwrap().unsigned_tx;
+        let broadcast = |confirmed: bool| {
+            let c = Arc::new(AbortController::new());
+            let fire = c.clone();
+            let (url, _) = counted(move |path, _| match path {
+                "/tx" => {
+                    fire.abort();
+                    ("200 OK", vec![])
+                }
+                p if p.ends_with("/status") && confirmed => {
+                    ("200 OK", br#"{"confirmed":true,"block_height":1}"#.to_vec())
+                }
+                p if p.ends_with("/status") => ("200 OK", br#"{"confirmed":false}"#.to_vec()),
+                "/blocks/tip/height" => ("200 OK", b"1".to_vec()),
+                _ => ("404 Not Found", vec![]),
+            });
+            let (w, _) = setup_at(&url);
+            block_on(crate::abort::scope(Some(c.signal()), async {
+                let res = w._broadcast_tx(tx.clone()).await;
+                (res, crate::abort::wrote())
+            }))
+        };
+        let (res, wrote) = broadcast(true);
+        assert!(res.is_ok());
+        assert!(wrote);
+        assert!(matches!(
+            broadcast(false).0,
+            Err(Error::FailedBroadcast { .. })
+        ));
+
+        let (url, count) = counted(|_, _| ("200 OK", vec![]));
+        let (w, _) = setup_at(&url);
+        let res = block_on(crate::abort::scope(
+            Some(fired_signal()),
+            w._broadcast_tx(tx.clone()),
+        ));
+        assert_eq!(res.err(), Some(Error::Aborted));
+        assert_eq!(count.load(SeqCst), 0);
     }
 }

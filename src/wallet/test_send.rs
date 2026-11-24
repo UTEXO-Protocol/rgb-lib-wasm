@@ -13,6 +13,7 @@ use crate::no_wallet::{
 };
 use crate::utils::{INDEXER_SYNCS, TRANSITION_BUILDERS_LOADED};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::online::assert_abort_restores;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
     AssetFilter, Balance, Online, Outpoint, ReceiveData, Recipient, RefreshFilter,
@@ -1693,10 +1694,11 @@ async fn send_and_refresh_are_atomic() {
         TransferStatus::WaitingConfirmations
     );
 
-    let unsigned = send_begin(&mut a, recipient(&witness, 100, Some(1000), PROXY_URL))
-        .await
-        .unwrap()
-        .psbt;
+    let unsigned = assert_abort_restores(&mut a, "send_begin", async |w| {
+        send_begin(w, recipient(&witness, 100, Some(1000), PROXY_URL)).await
+    })
+    .await
+    .psbt;
     let signed = a.sign_psbt(unsigned, None).unwrap();
     assert_no_partial_change(&mut a, "send_end", 0, async |w| {
         w.send_end(a_on.clone(), signed.clone()).await

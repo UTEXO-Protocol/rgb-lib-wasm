@@ -6,6 +6,7 @@ use super::test_burn::*;
 use crate::database::enums::RecipientTypeFull;
 use crate::wallet::offline::MOCK_IFA_LINK_RIGHT;
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::online::assert_abort_restores;
 use crate::wallet::{AssetFilter, Invoice, Online, Recipient, TransferScope, Wallet};
 use crate::{
     AssetSchema, Assignment, Error, FileContent, OS_LINK, RgbTransfer, TS_LINK, TransferKind,
@@ -776,8 +777,8 @@ async fn link_is_atomic() {
         .await
     })
     .await;
-    let begin = wallet
-        .link_begin(
+    let begin = assert_abort_restores(&mut wallet, "link_begin", async |w| {
+        w.link_begin(
             online.clone(),
             asset_id.clone(),
             replacement.clone(),
@@ -787,7 +788,8 @@ async fn link_is_atomic() {
             false,
         )
         .await
-        .unwrap();
+    })
+    .await;
     let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
     assert_no_partial_change(&mut wallet, "link_end", 1, async |w| {
         w.link_end(online.clone(), signed.clone()).await

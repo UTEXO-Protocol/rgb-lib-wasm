@@ -682,8 +682,20 @@ thread_local! {
     pub(crate) static FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The fault point that fires an abort controller next in this test thread.
+    pub(crate) static ABORT_AT: std::cell::RefCell<
+        Option<(&'static str, std::rc::Rc<crate::AbortController>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
 /// Fail when a test injects a fault at `point`.
 pub(crate) fn fault_point(point: &'static str) -> Result<(), Error> {
+    #[cfg(test)]
+    if let Some((_, controller)) = ABORT_AT.with_borrow_mut(|a| a.take_if(|(p, _)| *p == point)) {
+        controller.abort();
+    }
     #[cfg(test)]
     if FAULT.with(|f| f.get() == Some(point)) {
         FAULT.with(|f| f.set(None));
