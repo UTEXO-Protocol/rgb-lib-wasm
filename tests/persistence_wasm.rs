@@ -168,14 +168,8 @@ async fn test_stale_save_errors_and_keeps_snapshot() {
 #[wasm_bindgen_test]
 async fn test_second_loader_cannot_overwrite_winner() {
     let (wd, sk) = flushed_empty_wallet("flush-two-loaders").await;
-    // Without Web Locks two loaders open one wallet.
-    js_sys::eval(
-        "Object.defineProperty(navigator, 'locks', { value: undefined, configurable: true })",
-    )
-    .unwrap();
     let first = Wallet::restore(wd.clone(), sk.clone()).await.unwrap();
     let second = Wallet::restore(wd, sk).await.unwrap();
-    js_sys::eval("delete navigator.locks").unwrap();
     first.flush().await.unwrap();
     let won = load_snapshot(&first.idb_key()).await.unwrap().unwrap();
     let (ww, ws) = (won.writer, won.sequence);

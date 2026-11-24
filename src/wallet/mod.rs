@@ -25,7 +25,6 @@ mod test_send;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_vanilla;
 pub mod vss;
-pub(crate) mod web_lock;
 
 pub use crate::no_wallet::{
     Invoice, InvoiceData, Outpoint, RecipientInfo, RecipientType, TransportEndpoint,

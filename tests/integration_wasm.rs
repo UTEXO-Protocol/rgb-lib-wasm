@@ -950,7 +950,6 @@ async fn test_full_wallet_flow() {
         Error::WrongOperation { txid: txid.clone() },
     )
     .await;
-    drop(saved);
     wallet.backup("pw").unwrap();
     assert!(!wallet.backup_info().unwrap());
     wallet.flush().await.unwrap();

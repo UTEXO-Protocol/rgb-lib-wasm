@@ -889,10 +889,6 @@ pub enum Error {
         path: String,
     },
 
-    /// The wallet is open in another tab or wallet object
-    #[error("The wallet is open elsewhere")]
-    WalletInUse,
-
     /// A wallet setting fixed when the wallet was created has been given a different value
     #[error(
         "Wallet setting '{setting}' cannot be changed: the wallet was created with '{expected}', got '{provided}'"
