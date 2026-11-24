@@ -147,6 +147,17 @@ the error of the last failed save, until a save commits.
 Lightning-specific `consume_fascia` and `color_psbt_and_consume` operations
 await this durable commit before returning success.
 
+### One open wallet
+
+- `create()`/`load()` and Rust `restore()`/`load()` hold an exclusive Web Lock while the wallet is open.
+- A second `create()` or `load()` of the same wallet, in another tab or in the same page, fails with `The wallet is open elsewhere`.
+- `free()` (JS) or `drop` (Rust) releases the lock after the wallet's queued saves end. Page unload and discard also release it. Call `free()` when you close a wallet.
+- The lock name is a SHA-256 hash of the wallet directory and network.
+- `new` takes no lock and cannot save over a stored snapshot.
+- Without the Web Locks API the wallet opens with no lock.
+- After a panic the wallet cannot be freed and keeps its lock; reload the page.
+- The lock prevents mistakes and is not a security boundary. A script on the same origin can hold the lock and stop the wallet from opening, and it can already read and delete IndexedDB. What to do on this error is the app's choice.
+
 ### Going online
 
 ```javascript
@@ -405,9 +416,9 @@ To protect a wallet:
 
 | Method | Async | Description |
 |--------|-------|-------------|
-| `new(walletDataJson, keysJson)` | no | Create wallet (no IndexedDB restore) |
-| `create(walletDataJson, keysJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails |
-| `load(dataDir, network, masterFingerprint, mnemonic?)` | yes | Load a saved wallet with its saved settings; `mnemonic` null loads it watch-only |
+| `new(walletDataJson, keysJson)` | no | Create wallet (no IndexedDB restore); takes no lock |
+| `create(walletDataJson, keysJson)` | yes | Create wallet with IndexedDB restore; fails if restore fails; fails while the wallet is open elsewhere |
+| `load(dataDir, network, masterFingerprint, mnemonic?)` | yes | Load a saved wallet with its saved settings; `mnemonic` null loads it watch-only; fails while the wallet is open elsewhere |
 | `flush()` | yes | Durably commit current wallet state to IndexedDB |
 | `getWalletData()` | no | Return WalletData as JS object |
 | `getKeys()` | no | Return SinglesigKeys; `mnemonic` is null |

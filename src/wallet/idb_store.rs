@@ -171,6 +171,8 @@ pub(crate) struct SaveQueue {
     written: std::cell::Cell<u64>,
     /// Error of the last write, until a write commits.
     failed: std::cell::RefCell<Option<String>>,
+    /// Releases the wallet's Web Lock when the last save ends.
+    lock: std::cell::RefCell<Option<super::web_lock::LockRelease>>,
 }
 
 impl SaveQueue {
@@ -192,6 +194,11 @@ impl SaveQueue {
         }
         *self.failed.borrow_mut() = res.clone().err();
         res
+    }
+
+    /// Hold the Web Lock release until the queue drops.
+    pub(crate) fn hold(&self, release: super::web_lock::LockRelease) {
+        *self.lock.borrow_mut() = Some(release);
     }
 
     /// Error of a write that no later write has fixed.

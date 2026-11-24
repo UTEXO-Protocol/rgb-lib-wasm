@@ -1351,6 +1351,8 @@ pub struct Wallet {
     pub(crate) idb_writer: u64,
     /// Writer and sequence of the snapshot loaded from IndexedDB.
     pub(crate) idb_loaded: Option<(u64, u64)>,
+    /// Web Lock of the open wallet. None for new and without the Web Locks API.
+    pub(crate) _web_lock: Option<super::web_lock::WebLock>,
     /// Persistent in-memory RGB stock.
     pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<crate::utils::MemStock>>>,
     pub(crate) vss_client: Option<super::vss::VssBackupClient>,
@@ -1366,8 +1368,11 @@ impl Wallet {
     /// [`Error::WalletSettingMismatch`]. Other settings come from `wallet_data` and are saved
     /// with the next save.
     /// It asks the browser to keep the storage. A refusal does not fail the call.
+    /// It fails with [`Error::WalletInUse`] while the same wallet is open elsewhere.
     pub async fn restore(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
-        let wallet = Self::new(wallet_data, keys)?;
+        let mut wallet = Self::new(wallet_data, keys)?;
+        let lock = super::web_lock::acquire(&wallet.idb_key()).await?;
+        wallet.hold_lock(lock);
         let snapshot = super::idb_store::load_snapshot(&wallet.idb_key())
             .await
             .map_err(|details| Error::Persistence { details })?;
@@ -1378,6 +1383,7 @@ impl Wallet {
     ///
     /// The settings come from the last save. Pass the `mnemonic` to load a wallet able to sign,
     /// or `None` to load it watch-only. A wallet that was never saved cannot be loaded.
+    /// It fails with [`Error::WalletInUse`] while the same wallet is open elsewhere.
     pub async fn load(
         data_dir: &str,
         bitcoin_network: BitcoinNetwork,
@@ -1388,6 +1394,7 @@ impl Wallet {
             &PathBuf::from(data_dir).join(master_fingerprint),
             bitcoin_network,
         );
+        let lock = super::web_lock::acquire(&key).await?;
         let snapshot = super::idb_store::load_snapshot(&key)
             .await
             .map_err(|details| Error::Persistence { details })?
@@ -1399,7 +1406,19 @@ impl Wallet {
             .manifest
             .clone()
             .into_parts(data_dir.to_string(), mnemonic.map(Zeroizing::new));
-        Self::new(wallet_data, keys)?.apply_snapshot(Some(snapshot))
+        let mut wallet = Self::new(wallet_data, keys)?;
+        wallet.hold_lock(lock);
+        wallet.apply_snapshot(Some(snapshot))
+    }
+
+    fn hold_lock(
+        &mut self,
+        lock: Option<(super::web_lock::WebLock, super::web_lock::LockRelease)>,
+    ) {
+        if let Some((web_lock, release)) = lock {
+            self.idb_queue.hold(release);
+            self._web_lock = Some(web_lock);
+        }
     }
 
     fn apply_snapshot(
@@ -1419,7 +1438,7 @@ impl Wallet {
     /// Create a new RGB wallet based on the provided [`WalletData`] and [`SinglesigKeys`].
     ///
     /// It does not load IndexedDB. It cannot save over a stored snapshot; use [`Wallet::restore`]
-    /// or [`Wallet::load`] for that.
+    /// or [`Wallet::load`] for that. It takes no Web Lock.
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
     pub fn new(wallet_data: WalletData, keys: SinglesigKeys) -> Result<Self, Error> {
         let wdata = wallet_data.clone();
@@ -1534,6 +1553,7 @@ impl Wallet {
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer,
             idb_loaded: None,
+            _web_lock: None,
             rgb_stock: {
                 let stock = std::mem::take(&mut runtime.stock);
                 std::rc::Rc::new(std::cell::RefCell::new(Some(stock)))
@@ -4947,6 +4967,7 @@ pub(crate) mod address_reuse_tests {
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             idb_writer: 0,
             idb_loaded: None,
+            _web_lock: None,
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),

@@ -282,6 +282,8 @@ fn get_descriptors_match_rust() {
     assert_eq!(descriptors, rust.get_descriptors());
 }
 
+const IN_USE: &str = "The wallet is open elsewhere";
+
 #[wasm_bindgen_test]
 async fn load_restores_flushed_wallet() {
     let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
@@ -293,6 +295,23 @@ async fn load_restores_flushed_wallet() {
     let fingerprint = serde_json::from_str::<SinglesigKeys>(&keys)
         .unwrap()
         .master_fingerprint;
+    assert_eq!(
+        err(WasmWallet::create(&wd, &keys).await.err().unwrap()),
+        IN_USE
+    );
+    assert_eq!(
+        err(
+            WasmWallet::load(&data.data_dir, "regtest", &fingerprint, None)
+                .await
+                .err()
+                .unwrap()
+        ),
+        IN_USE
+    );
+    assert!(WasmWallet::new(&wd, &keys).is_ok());
+    let (other_wd, other_keys) = wallet_json(vec![AssetSchema::Nia]);
+    assert!(WasmWallet::create(&other_wd, &other_keys).await.is_ok());
+    drop(wallet);
 
     let loaded = WasmWallet::load(&data.data_dir, "regtest", &fingerprint, None)
         .await
@@ -301,6 +320,53 @@ async fn load_restores_flushed_wallet() {
         String::from(js_sys::JSON::stringify(&loaded.get_wallet_data().unwrap()).unwrap()),
         wd
     );
+    assert_eq!(
+        err(WasmWallet::create(&wd, &keys).await.err().unwrap()),
+        IN_USE
+    );
+    drop(loaded);
+    assert!(WasmWallet::create(&wd, &keys).await.is_ok());
+}
+
+async fn held_lock_names() -> Vec<String> {
+    let names: js_sys::Array =
+        await_js("navigator.locks.query().then(s => s.held.map(l => l.name))")
+            .await
+            .unchecked_into();
+    names.iter().map(|n| n.as_string().unwrap()).collect()
+}
+
+#[wasm_bindgen_test]
+async fn web_lock_reopen_keeps_queued_save() {
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let first = WasmWallet::create(&wd, &keys).await.unwrap();
+    let addr = first.get_address().unwrap();
+    drop(first);
+    let second = WasmWallet::create(&wd, &keys).await.unwrap();
+    assert_ne!(second.get_address().unwrap(), addr);
+    second.flush().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn web_lock_name_is_hash() {
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let parsed: SinglesigKeys = serde_json::from_str(&keys).unwrap();
+    let before = held_lock_names().await;
+    let _first = WasmWallet::create(&wd, &keys).await.unwrap();
+    let new: Vec<String> = held_lock_names()
+        .await
+        .into_iter()
+        .filter(|n| !before.contains(n))
+        .collect();
+    assert_eq!(new.len(), 1);
+    let name = &new[0];
+    let hash = name.strip_prefix("rgb-lib-wasm-wallet-").unwrap();
+    assert_eq!(hash.len(), 64);
+    assert!(
+        hash.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    );
+    assert!(!name.contains(&parsed.master_fingerprint));
 }
 
 #[wasm_bindgen_test]
