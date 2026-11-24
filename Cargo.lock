@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-lib-wasm"
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.5"
 dependencies = [
  "amplify",
  "base64 0.23.1",
@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "rgb-lib-wasm-bindings"
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.5"
 dependencies = [
  "hex",
  "instant",
