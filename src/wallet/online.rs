@@ -5192,38 +5192,107 @@ impl Wallet {
         invoice_id: &str,
         recipient_seed: &[u8],
     ) -> Result<Option<(String, GetConsignmentResponse)>, Error> {
+        let Some(listed) = self
+            .list_proxy_invoice_transfers(proxy_url, invoice_id, recipient_seed)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut failure = None;
+        for (tid, state) in listed {
+            if state != ProxyTransferState::Pending {
+                continue;
+            }
+            match self
+                .fetch_invoice_transfer(proxy_url, invoice_id, &tid)
+                .await
+            {
+                Ok(Some(r)) => return Ok(Some((tid, r))),
+                Ok(None) => continue,
+                Err(e) if proxy_lookup_failed(&e) => {
+                    failure.get_or_insert(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        failure.map_or(Ok(None), Err)
+    }
+
+    /// Transfers to an invoice on a proxy, with their state, sorted by ID.
+    /// Returns `None` if the proxy does not know the invoice. Ignores IDs that fail
+    /// [`is_transfer_id`].
+    async fn list_proxy_invoice_transfers(
+        &self,
+        proxy_url: &str,
+        invoice_id: &str,
+        recipient_seed: &[u8],
+    ) -> Result<Option<Vec<(String, ProxyTransferState)>>, Error> {
         let res = list_invoice_transfers(proxy_url, invoice_id, recipient_seed).await?;
         let Some(transfers) = lookup_answer(proxy_url, res, INVOICE_UNKNOWN_CODES)? else {
             return Ok(None);
         };
-        let mut pending: Vec<String> = transfers
+        let mut listed: Vec<(String, ProxyTransferState)> = transfers
             .into_iter()
-            .filter(|(_, state)| *state == ProxyTransferState::Pending)
-            .map(|(tid, _)| tid)
-            .collect();
-        pending.sort();
-        let mut failure = None;
-        for tid in pending {
-            let result = match self._get_consignment_async(proxy_url, &tid).await {
-                Ok(Some(r)) => r,
-                Ok(None) => continue,
-                Err(e) if proxy_lookup_failed(&e) => {
-                    failure.get_or_insert(e);
-                    continue;
+            .filter(|(transfer_id, _)| {
+                let valid = is_transfer_id(transfer_id);
+                if !valid {
+                    warn!(self.logger, "Ignoring invalid transfer ID {transfer_id:?}");
                 }
-                Err(e) => return Err(e),
-            };
-            // a transfer whose ID doesn't match the sender pubkey was not posted by its sender
-            if transfer_id(invoice_id, &result.sender_pk) != tid {
-                warn!(
-                    self.logger,
-                    "Ignoring transfer {tid}, which doesn't match its sender pubkey"
-                );
-                continue;
-            }
-            return Ok(Some((tid, result)));
+                valid
+            })
+            .collect();
+        listed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(Some(listed))
+    }
+
+    /// Download the consignment of a transfer.
+    /// Returns `None` if it is not available or the sender pubkey does not match the transfer ID.
+    async fn fetch_invoice_transfer(
+        &self,
+        proxy_url: &str,
+        invoice_id: &str,
+        transfer_id: &str,
+    ) -> Result<Option<GetConsignmentResponse>, Error> {
+        let Some(result) = self._get_consignment_async(proxy_url, transfer_id).await? else {
+            return Ok(None);
+        };
+        if !Self::posted_by_sender(invoice_id, transfer_id, &result) {
+            warn!(
+                self.logger,
+                "Ignoring transfer {transfer_id}, which doesn't match its sender pubkey"
+            );
+            return Ok(None);
         }
-        failure.map_or(Ok(None), Err)
+        Ok(Some(result))
+    }
+
+    /// Seal blinding of a proxy transfer, derived from the keys of both parties.
+    /// Returns `None` if the sender pubkey is invalid.
+    fn proxy_seal_blinding(
+        recipient_seed: &[u8],
+        sender_pubkey: &str,
+    ) -> Result<Option<u64>, Error> {
+        let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
+            details: s!("invalid recipient secret key"),
+        })?;
+        let Some(sender_vk) = hex::decode(sender_pubkey)
+            .ok()
+            .and_then(|pk| verifying_key_from_bytes(&pk).ok())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding,
+        ))
+    }
+
+    /// Whether the transfer ID matches the sender pubkey. If not, the sender did not post it.
+    fn posted_by_sender(
+        invoice_id: &str,
+        transfer_id: &str,
+        result: &GetConsignmentResponse,
+    ) -> bool {
+        self::transfer_id(invoice_id, &result.sender_pk) == transfer_id
     }
 
     /// Whether a blind receive still waiting for the counterparty may be failed, which releases its
@@ -5292,21 +5361,27 @@ impl Wallet {
         Ok(true)
     }
 
-    /// Let the recipient proxy delete the data of a transfer that has been handled. Failures are
-    /// only logged, as the proxy deletes the data anyway once the invoice expires.
-    async fn mark_transfer_retrieved(
+    /// Let the proxy delete the data of a handled transfer (`transfer.retrieved`).
+    /// With `delete`, also free its invoice quota slot (`transfer.delete`). Failures are only logged.
+    async fn release_transfer_data(
         &self,
         proxy_url: &str,
         transfer_id: &str,
         recipient_seed: &[u8],
+        delete: bool,
     ) {
         let Ok(seed) = <[u8; 32]>::try_from(recipient_seed) else {
             return;
         };
         let sk = ed25519_from_seed(&seed);
-        let digest = sha256_digest(transfer_retrieved_message(transfer_id).as_bytes());
-        let signature = hex::encode(sign_ed25519(&sk, &digest));
+        let message = if delete {
+            delete_transfer_message(transfer_id)
+        } else {
+            transfer_retrieved_message(transfer_id)
+        };
+        let signature = hex::encode(sign_ed25519(&sk, &sha256_digest(message.as_bytes())));
         let res = match ProxyClient::new(proxy_url) {
+            Ok(client) if delete => client.delete_transfer(transfer_id, &signature).await,
             Ok(client) => client.transfer_retrieved(transfer_id, &signature).await,
             Err(e) => Err(e),
         };
@@ -5314,9 +5389,9 @@ impl Wallet {
             Ok(r) if r.error.is_none() => {}
             Ok(r) => warn!(
                 self.logger,
-                "Failed to mark transfer as retrieved: {:?}", r.error
+                "Failed to release the transfer data: {:?}", r.error
             ),
-            Err(e) => warn!(self.logger, "Failed to mark transfer as retrieved: {e}"),
+            Err(e) => warn!(self.logger, "Failed to release the transfer data: {e}"),
         }
     }
 
@@ -5503,10 +5578,17 @@ impl Wallet {
         asset_schema: AssetSchema,
         data: &ProxyReceiveData,
         recipient_seed: &[u8],
-        seed: &[u8; 32],
-        sender_vk: &VerifyingKey,
     ) -> Result<bool, Error> {
         let attachments = self.extract_attachments(runtime, valid_contract, asset_schema)?;
+        let seed: &[u8; 32] = &recipient_seed.try_into().map_err(|_| Error::Internal {
+            details: s!("invalid recipient secret key"),
+        })?;
+        let sender_vk = &hex::decode(&data.sender_pubkey)
+            .ok()
+            .and_then(|pk| verifying_key_from_bytes(&pk).ok())
+            .ok_or_else(|| Error::Internal {
+                details: s!("invalid sender pubkey"),
+            })?;
         for attachment in attachments {
             let digest = hex::encode(attachment.digest);
             if self.media.contains_key(&digest) {
@@ -5911,7 +5993,7 @@ impl Wallet {
         // once the consignment has been handled (ACKed or refused), its data is saved locally and
         // the proxy can delete it, while the transfer keeps counting towards the invoice quota
         if res.is_some() {
-            self.mark_transfer_retrieved(&data.proxy_url, &data.transfer_id, &recipient_seed)
+            self.release_transfer_data(&data.proxy_url, &data.transfer_id, &recipient_seed, false)
                 .await;
         }
         Ok(res)
@@ -6002,14 +6084,7 @@ impl Wallet {
                 .await;
         }
 
-        // the seal blinding is derived from the keys of both parties
-        let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
-            details: s!("invalid recipient secret key"),
-        })?;
-        let sender_vk = hex::decode(&data.sender_pubkey)
-            .ok()
-            .and_then(|pk| verifying_key_from_bytes(&pk).ok());
-        let Some(sender_vk) = sender_vk else {
+        let Some(blinding) = Self::proxy_seal_blinding(recipient_seed, &data.sender_pubkey)? else {
             error!(self.logger, "Invalid sender pubkey");
             return self
                 ._refuse_consignment_async(
@@ -6021,7 +6096,6 @@ impl Wallet {
                 )
                 .await;
         };
-        let blinding = derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding;
         let matcher = transfer.receive_matcher(blinding)?;
 
         debug!(self.logger, "Validating consignment...");
@@ -6423,8 +6497,6 @@ impl Wallet {
                                     asset_schema,
                                     data,
                                     recipient_seed,
-                                    &seed,
-                                    &sender_vk,
                                 )
                                 .await?
                         {
@@ -6522,8 +6594,6 @@ impl Wallet {
                             asset_schema,
                             data,
                             recipient_seed,
-                            &seed,
-                            &sender_vk,
                         )
                         .await?
                 {
@@ -13890,19 +13960,39 @@ mod send_end_tests {
                 .to_bytes(),
         );
         let valid = transfer_id(&invoice, &sender_pk);
+        let retrieved = "0".repeat(64);
+        let failing = format!("{}1", "0".repeat(63));
+        let forging = format!("{}2", "0".repeat(63));
         let _list = rpc_mock(
             &mut server,
             "transfer.list",
             &format!(
-                r#"{{"jsonrpc":"2.0","id":null,"result":{{"0":"pending","00":"pending","{valid}":"pending"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":null,"result":{{"0":"pending","{retrieved}":"retrieved","{failing}":"pending","{forging}":"pending","{valid}":"pending"}}}}"#
             ),
         );
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":null,"result":{{"consignment":"","sender_transport_endpoint":"","sender_pk":"{sender_pk}","consignment_hash":"","batch":false}}}}"#
         );
-        // the lookup of transfer "0" fails and transfer "00" does not match its sender pubkey
-        let failed = rpc_mock(&mut server, r#""transfer_id":"0""#, INTERNAL_ERROR);
-        let forged = rpc_mock(&mut server, r#""transfer_id":"00""#, &body);
+        // "0" and the retrieved transfer are not fetched. The next lookup fails.
+        // The one after it does not match its sender pubkey.
+        let invalid = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!(r#""transfer_id":"0""#)))
+            .expect(0)
+            .create();
+        let skipped = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(format!(
+                r#""transfer_id":"{retrieved}""#
+            )))
+            .expect(0)
+            .create();
+        let failed = rpc_mock(
+            &mut server,
+            &format!(r#""transfer_id":"{failing}""#),
+            INTERNAL_ERROR,
+        );
+        let forged = rpc_mock(&mut server, &format!(r#""transfer_id":"{forging}""#), &body);
         let genuine = rpc_mock(&mut server, &format!(r#""transfer_id":"{valid}""#), &body);
         let (tid, res) =
             block_on(wallet.find_invoice_transfer(&server.url(), &invoice, &RECIPIENT_SEED))
@@ -13910,9 +14000,87 @@ mod send_end_tests {
                 .unwrap();
         assert_eq!(tid, valid);
         assert_eq!(res.sender_pk, sender_pk);
+        invalid.assert();
+        skipped.assert();
         failed.assert();
         forged.assert();
         genuine.assert();
+    }
+
+    #[test]
+    fn list_proxy_invoice_transfers_keeps_all_states_sorted() {
+        let (wallet, _) = setup();
+        let mut server = mockito::Server::new();
+        let a64 = "a".repeat(64);
+        let b64 = "b".repeat(64);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":null,"result":{{"{b64}":"retrieved","{a64}":"pending"}}}}"#
+        );
+        let _mock = rpc_mock(&mut server, "transfer.list", &body);
+        let url = server.url();
+        assert_eq!(
+            block_on(wallet.list_proxy_invoice_transfers(&url, "iid", &RECIPIENT_SEED)).unwrap(),
+            Some(vec![
+                (a64, ProxyTransferState::Pending),
+                (b64, ProxyTransferState::Retrieved)
+            ])
+        );
+    }
+
+    #[test]
+    fn proxy_seal_blinding_checks_the_keys() {
+        let expected = derive_shared(
+            &ed25519_from_seed(&RECIPIENT_SEED),
+            &ed25519_from_seed(&OPERATION_SEED).verifying_key(),
+        )
+        .unwrap()
+        .seal_blinding;
+        assert_eq!(
+            Wallet::proxy_seal_blinding(&RECIPIENT_SEED, &sender_pk()).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            Wallet::proxy_seal_blinding(&RECIPIENT_SEED, "zz").unwrap(),
+            None
+        );
+        assert_eq!(
+            Wallet::proxy_seal_blinding(&RECIPIENT_SEED, "00").unwrap(),
+            None
+        );
+        assert!(matches!(
+            Wallet::proxy_seal_blinding(&[8; 31], &sender_pk()),
+            Err(Error::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn release_transfer_data_picks_the_call() {
+        let (wallet, _) = setup();
+        let mut server = mockito::Server::new();
+        let tid = "0".repeat(64);
+        for (delete, method, message) in [
+            (true, "transfer.delete", delete_transfer_message(&tid)),
+            (
+                false,
+                "transfer.retrieved",
+                transfer_retrieved_message(&tid),
+            ),
+        ] {
+            let sig = hex::encode(sign_ed25519(
+                &ed25519_from_seed(&RECIPIENT_SEED),
+                &sha256_digest(message.as_bytes()),
+            ));
+            let mock = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJsonString(format!(
+                    r#"{{"method":"{method}","params":{{"transfer_id":"{tid}","signature":"{sig}"}}}}"#
+                )))
+                .with_header("content-type", "application/json")
+                .with_body(TRUE_BODY)
+                .create();
+            block_on(wallet.release_transfer_data(&server.url(), &tid, &RECIPIENT_SEED, delete));
+            mock.assert();
+        }
     }
 
     // A witness receive waiting for its consignment on the recipient proxies `endpoints`.
@@ -14072,7 +14240,7 @@ mod send_end_tests {
         check(String::new(), &[list], |e| {
             matches!(e, Error::ProxyInvalidResponse { .. })
         });
-        let list = ("transfer.list", list_body("0"));
+        let list = ("transfer.list", list_body(&"0".repeat(64)));
         let consignment = ("consignment.get", INTERNAL_ERROR.to_string());
         check(String::new(), &[list, consignment], |e| {
             matches!(e, Error::ProxyJsonRpcError { code: -32603, .. })
