@@ -393,8 +393,8 @@ const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
 // the filter is 'All', 'Terminals' or { Witness: txid }
 const inspection = inspectConsignment(consignmentBytes, 'Terminals');
 
-// Inspect the PSBT and fascia of a *Begin result without a wallet (entropy is optional)
-const fasciaInspection = inspectFascia(begin.psbt, new Uint8Array(begin.details.fascia), begin.details.entropy, 'Regtest');
+// Inspect the PSBT and fascia of a *Begin result without a wallet (entropy is optional; max fascia size in bytes and max bundle count)
+const fasciaInspection = inspectFascia(begin.psbt, new Uint8Array(begin.details.fascia), begin.details.entropy, 1048576n, 10, 'Regtest');
 
 // Fill in the SPV proofs a transfer consignment misses, from an esplora indexer
 // consignment is null when no proof was set
@@ -428,7 +428,7 @@ To protect a wallet:
 | `checkIndexerUrl(url, network)` | Validate an indexer URL for the network and return its protocol ('Esplora') |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
 | `inspectConsignment(bytes, bundleFilter)` | Inspect an RGB consignment without a wallet |
-| `inspectFascia(psbt, fascia, entropy?, network)` | Check that a PSBT commits to the fascia of its RGB operation and inspect the operation, without a wallet |
+| `inspectFascia(psbt, fascia, entropy?, maxFasciaSize, maxBundles, network)` | Check that a PSBT commits to the fascia of its RGB operation and inspect the operation, without a wallet. Refuses a fascia larger than `maxFasciaSize` bytes (BigInt) or with more than `maxBundles` bundles |
 | `fillSpvProofs(bytes, indexerUrl)` | Fill in the SPV proofs a transfer consignment misses, from an esplora indexer |
 
 ### `WasmInvoice`
@@ -504,7 +504,7 @@ To protect a wallet:
 | `signPsbt(psbt, signOptions?)` | no | Sign a PSBT. `signOptions` (`SignOptions`) takes `trustWitnessUtxo`, `assumeHeight`, `allowAllSighashes`, `tryFinalize`, `signWithTapInternalKey`, `allowGrinding`; an omitted field takes the BDK default |
 | `finalizePsbt(psbt)` | no | Finalize a signed PSBT |
 | `inspectPsbt(psbt)` | no | Inspect a PSBT: inputs, outputs, totals, fee, signature count and size, with the wallet's own ones marked. In JS, the amounts, totals, fee and size are BigInt |
-| `inspectFascia(psbt, fascia, entropy?)` | no | Check that a PSBT commits to the fascia this wallet built and inspect the operation, with spent allocations and the wallet's outputs. `entropy` is a BigInt |
+| `inspectFascia(psbt, fascia, entropy?, maxFasciaSize, maxBundles)` | no | Check that a PSBT commits to the fascia this wallet built and inspect the operation, with spent allocations and the wallet's outputs. `entropy` is a BigInt. Refuses a fascia larger than `maxFasciaSize` bytes (BigInt) or with more than `maxBundles` bundles |
 | `backup(password)` | no | Create encrypted backup (returns bytes) |
 | `restoreBackup(bytes, password)` | no | Restore from encrypted backup |
 | `backupInfo()` | no | Check if backup is needed |

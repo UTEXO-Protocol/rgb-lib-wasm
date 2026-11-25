@@ -278,6 +278,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
             begin.psbt.clone(),
             &begin.details.fascia,
             Some(begin.details.entropy),
+            u64::MAX,
+            u32::MAX,
         )
         .unwrap();
     let mut types: Vec<_> = inspection.operations[0]
@@ -326,6 +328,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
         begin.psbt.clone(),
         &conceal_split(&begin.details.fascia),
         Some(begin.details.entropy),
+        u64::MAX,
+        u32::MAX,
     );
     assert!(
         matches!(&result, Err(Error::RgbInspection { details }) if details.contains("isn't assigned by the bundle")),
@@ -357,6 +361,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
         begin.psbt.clone(),
         &without_split,
         Some(begin.details.entropy),
+        u64::MAX,
+        u32::MAX,
     );
     assert!(
         matches!(&result, Err(Error::RgbInspection { details }) if details.contains("not declared in bundle")),
@@ -691,6 +697,8 @@ async fn ifa_send_moves_inflation_rights() {
                 begin.psbt.clone(),
                 &begin.details.fascia,
                 Some(begin.details.entropy),
+                u64::MAX,
+                u32::MAX,
             )
             .unwrap();
         let signed = a.sign_psbt(begin.psbt, None).unwrap();
