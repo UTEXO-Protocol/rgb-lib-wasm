@@ -1609,15 +1609,16 @@ impl WasmWallet {
         to_js(&result)
     }
 
-    /// Return the checked mint received on a recipient ID as a ReceivedMint object, or null.
+    /// Return the checked mints received on a recipient ID as an array of ReceivedMint objects.
+    /// The array has one item per transfer and can be empty.
     #[wasm_bindgen(js_name = "getReceivedMint")]
     pub fn get_received_mint(&self, recipient_id: &str) -> Result<JsValue, JsValue> {
-        let received_mint = self
+        let received_mints = self
             .inner
             .borrow()
             .get_received_mint(recipient_id.to_string())
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        received_mint.map_or(Ok(JsValue::NULL), |m| to_js(&m))
+        to_js(&received_mints)
     }
 
     /// List vanilla (non-colored) unspent outputs. Returns a JS array of LocalOutput objects.

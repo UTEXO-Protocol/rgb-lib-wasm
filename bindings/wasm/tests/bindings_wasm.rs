@@ -220,8 +220,13 @@ async fn save_new_asset_reads_arguments() {
 }
 
 #[wasm_bindgen_test]
-fn get_received_mint_is_null_when_unknown() {
-    assert!(wallet().get_received_mint("unknown").unwrap().is_null());
+fn get_received_mint_is_empty_when_unknown() {
+    let mints: js_sys::Array = wallet()
+        .get_received_mint("unknown")
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    assert_eq!(mints.length(), 0);
 }
 
 #[wasm_bindgen_test]

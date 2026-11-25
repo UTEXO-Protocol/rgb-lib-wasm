@@ -495,7 +495,7 @@ To protect a wallet:
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
 | `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint, signal?)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
-| `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
+| `getReceivedMint(recipientId)` | no | Return what the lock of each checked mint received on a recipient ID has to match (`lockId`, `amount`, `beforeBlock`), one per transfer; an empty array if none |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `refresh(online, assetId?, filter, skipSync, signal?)` | yes | Refresh pending transfers and settle ended vanilla operations |
 | `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
