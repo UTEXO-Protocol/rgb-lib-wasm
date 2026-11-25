@@ -455,6 +455,7 @@ To protect a wallet:
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
 | `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
 | `listAssetMedia(assetId)` | no | List the media of an RGB asset |
+| `exportContract(assetId)` | no | Export the contract of an RGB asset (bytes, no bundles) with the bytes of its media |
 | `listAssets(schemas)` | no | List known RGB assets |
 | `listTransfers(assetFilter, scope)` | no | List RGB transfers by asset filter and scope |
 | `listUnspents(online?, settledOnly, skipSync)` | yes | List unspent outputs with RGB allocations, after a sync unless `skipSync` |

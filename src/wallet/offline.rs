@@ -204,6 +204,16 @@ impl Media {
     }
 }
 
+/// The contract of an RGB asset, with the media it references.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct ExportedContract {
+    /// The contract consignment, with no bundles
+    pub contract: Vec<u8>,
+    /// The bytes of each media the contract references
+    pub media: Vec<Vec<u8>>,
+}
+
 /// Metadata of an RGB asset.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
@@ -3283,6 +3293,53 @@ impl Wallet {
         })
     }
 
+    /// Return the contract (no bundles) of the RGB asset with the given ID, with the media it
+    /// references. It changes no wallet state.
+    pub fn export_contract(&self, asset_id: String) -> Result<ExportedContract, Error> {
+        info!(self.logger, "Exporting contract '{}'...", asset_id);
+        let asset = self.database.check_asset_exists(asset_id.clone())?;
+        let contract_id = ContractId::from_str(&asset_id).expect("asset ID in DB should be valid");
+        let runtime = self.rgb_runtime()?;
+        let contract = runtime.export_contract(contract_id)?;
+        let attachment = match asset.schema {
+            AssetSchema::Nia => {
+                runtime
+                    .contract_wrapper::<NonInflatableAsset>(contract_id)?
+                    .contract_terms()
+                    .media
+            }
+            AssetSchema::Ifa => {
+                runtime
+                    .contract_wrapper::<InflatableFungibleAsset>(contract_id)?
+                    .contract_terms()
+                    .media
+            }
+            AssetSchema::Bfa => {
+                runtime
+                    .contract_wrapper::<BridgedFungibleAsset>(contract_id)?
+                    .contract_terms()
+                    .media
+            }
+        };
+        drop(runtime);
+        let media = attachment
+            .into_iter()
+            .map(|a| {
+                let digest = hex::encode(a.digest);
+                self.media.get(&digest).cloned().ok_or(Error::IO {
+                    details: format!("media {digest} not found"),
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut bytes = vec![];
+        contract.save(&mut bytes)?;
+        info!(self.logger, "Export contract completed");
+        Ok(ExportedContract {
+            contract: bytes,
+            media,
+        })
+    }
+
     /// Return the [`Balance`] for the RGB asset with the given ID.
     pub fn get_asset_balance(&self, asset_id: String) -> Result<Balance, Error> {
         info!(self.logger, "Getting balance for asset '{}'...", asset_id);
@@ -5740,6 +5797,140 @@ mod inspect_psbt_tests {
         let res = w.inspect_psbt(psbt.to_string());
         assert!(
             matches!(&res, Err(Error::PsbtInspection { details }) if details == "cannot inspect non-segwit PSBT"),
+            "{res:?}"
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod export_contract_tests {
+    use super::address_reuse_tests::state;
+    use super::*;
+    use crate::keys::generate_keys;
+
+    fn exporting_wallet() -> Wallet {
+        let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+        let wd = WalletData {
+            data_dir: s!(":memory:"),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa, AssetSchema::Bfa],
+            reuse_addresses: false,
+            allow_reckless_schemas: false,
+        };
+        let wallet = Wallet::new(wd, SinglesigKeys::from_keys(&keys, None)).unwrap();
+        for vout in 0..3 {
+            wallet
+                .database
+                .set_txo(DbTxoActMod {
+                    txid: ActiveValue::Set("11".repeat(32)),
+                    vout: ActiveValue::Set(vout),
+                    btc_amount: ActiveValue::Set(s!("1000")),
+                    spent: ActiveValue::Set(false),
+                    exists: ActiveValue::Set(true),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        wallet
+    }
+
+    fn media_attachment(data: &[u8]) -> Attachment {
+        Attachment {
+            ty: MediaType::with("text/plain"),
+            digest: Bytes32::from_byte_array(sha256_digest(data)),
+        }
+    }
+
+    fn set_media(wallet: &mut Wallet, data: &[u8]) {
+        MOCK_ISSUE_MEDIA.set(Some(media_attachment(data)));
+        wallet
+            .media
+            .insert(hex::encode(sha256_digest(data)), data.to_vec());
+    }
+
+    fn assert_exported(wallet: &Wallet, asset_id: &str, schema: AssetSchema) -> ExportedContract {
+        let before = state(wallet);
+        let exported = wallet.export_contract(asset_id.to_string()).unwrap();
+        assert_eq!(state(wallet), before);
+        let contract = Contract::load(&exported.contract[..]).unwrap();
+        assert_eq!(contract.contract_id().to_string(), asset_id);
+        assert_eq!(contract.schema_id(), SchemaId::from(schema));
+        assert!(!contract.transfer);
+        assert!(contract.bundles.is_empty());
+        exported
+    }
+
+    #[test]
+    fn export_contract_success() {
+        let mut wallet = exporting_wallet();
+        set_media(&mut wallet, b"nia media");
+        let nia = wallet
+            .issue_asset_nia(s!("NIA"), s!("Nia"), 0, vec![100])
+            .unwrap();
+        set_media(&mut wallet, b"ifa media");
+        let ifa = wallet
+            .issue_asset_ifa(
+                s!("IFA"),
+                s!("Ifa"),
+                0,
+                vec![100],
+                vec![],
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        set_media(&mut wallet, b"bfa media");
+        let bfa = wallet
+            .issue_asset_bfa(
+                s!("BFA"),
+                s!("Bfa"),
+                0,
+                1,
+                31337,
+                s!("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let no_media = wallet
+            .issue_asset_nia(s!("NONE"), s!("None"), 0, vec![100])
+            .unwrap();
+
+        let exported = assert_exported(&wallet, &nia.asset_id, AssetSchema::Nia);
+        assert_eq!(exported.media, vec![b"nia media".to_vec()]);
+        let exported = assert_exported(&wallet, &ifa.asset_id, AssetSchema::Ifa);
+        assert_eq!(exported.media, vec![b"ifa media".to_vec()]);
+        let exported = assert_exported(&wallet, &bfa.asset_id, AssetSchema::Bfa);
+        assert_eq!(exported.media, vec![b"bfa media".to_vec()]);
+        let exported = assert_exported(&wallet, &no_media.asset_id, AssetSchema::Nia);
+        assert!(exported.media.is_empty());
+    }
+
+    #[test]
+    fn export_contract_fail() {
+        let wallet = exporting_wallet();
+        let res = wallet.export_contract(s!("rgb:unknown"));
+        assert!(
+            matches!(&res, Err(Error::AssetNotFound { asset_id }) if asset_id == "rgb:unknown"),
+            "{res:?}"
+        );
+
+        MOCK_ISSUE_MEDIA.set(Some(media_attachment(b"media")));
+        let nia = wallet
+            .issue_asset_nia(s!("NIA"), s!("Nia"), 0, vec![100])
+            .unwrap();
+        let res = wallet.export_contract(nia.asset_id);
+        let expected = format!("media {} not found", hex::encode(sha256_digest(b"media")));
+        assert!(
+            matches!(&res, Err(Error::IO { details }) if *details == expected),
             "{res:?}"
         );
     }

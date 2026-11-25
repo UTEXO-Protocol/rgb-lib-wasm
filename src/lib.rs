@@ -174,7 +174,9 @@ use rgbstd::{
     Allocation, Amount, Assign, Assignments, ExposedSeal, GlobalStateType, Identity,
     KnownTransition, Layer1, Operation, Opout as RgbOpout, OutputSeal, OwnedFraction, Precision,
     Schema, SecretSeal, Transition, TransitionBundle, TransitionType, TypedAssigns,
-    containers::{Consignment, UniversalFile, ValidConsignment, ValidContract, ValidTransfer},
+    containers::{
+        Consignment, Contract, UniversalFile, ValidConsignment, ValidContract, ValidTransfer,
+    },
     contract::{
         AllocatedState, ContractBuilder, ContractData, FilteredContractState, IssuerWrapper,
         TransitionBuilder,

@@ -20,6 +20,24 @@ fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Convert an exported contract to `{ contract: Uint8Array, media: Uint8Array[] }`.
+pub fn exported_contract_to_js(
+    exported: &rgb_lib_wasm::wallet::ExportedContract,
+) -> Result<JsValue, JsValue> {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &obj,
+        &"contract".into(),
+        &js_sys::Uint8Array::from(&exported.contract[..]),
+    )?;
+    let media = js_sys::Array::new();
+    for m in &exported.media {
+        media.push(&js_sys::Uint8Array::from(&m[..]));
+    }
+    js_sys::Reflect::set(&obj, &"media".into(), &media)?;
+    Ok(obj.into())
+}
+
 /// Parse an optional encryption preference: "Required", "Unsupported" or "Optional".
 fn parse_encryption(
     encryption: Option<String>,
@@ -521,6 +539,18 @@ impl WasmWallet {
             .list_asset_media(asset_id.to_string())
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&medias)
+    }
+
+    /// Export the contract of an RGB asset with its media.
+    /// Returns `{ contract: Uint8Array, media: Uint8Array[] }`.
+    #[wasm_bindgen(js_name = "exportContract")]
+    pub fn export_contract(&self, asset_id: &str) -> Result<JsValue, JsValue> {
+        let exported = self
+            .inner
+            .borrow()
+            .export_contract(asset_id.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        exported_contract_to_js(&exported)
     }
 
     /// Return the balance for a specific asset.

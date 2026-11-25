@@ -855,6 +855,10 @@ impl RgbRuntime {
             })
     }
 
+    pub(crate) fn export_contract(&self, contract_id: ContractId) -> Result<Contract, Error> {
+        self.stock.export_contract(contract_id).map_err(Error::from)
+    }
+
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]
     pub(crate) fn import_contract<R: ResolveWitness>(
         &mut self,
