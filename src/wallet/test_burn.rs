@@ -799,7 +799,12 @@ async fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
     rights
 }
 
-async fn inflate_and_settle(b: &mut Wallet, b_online: &Online, asset_id: &str, amount: u64) {
+pub(super) async fn inflate_and_settle(
+    b: &mut Wallet,
+    b_online: &Online,
+    asset_id: &str,
+    amount: u64,
+) {
     let ords = witness_ords(b);
     let unsigned = b
         .inflate_begin(

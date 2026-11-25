@@ -245,6 +245,14 @@ fn export_contract_fails_for_unknown_asset() {
 }
 
 #[wasm_bindgen_test]
+fn import_contract_fails_for_invalid_bytes() {
+    let e = err(wallet()
+        .import_contract(b"not a contract", vec![])
+        .unwrap_err());
+    assert_eq!(e, "Invalid contract");
+}
+
+#[wasm_bindgen_test]
 fn exported_contract_to_js_gives_uint8_arrays() {
     let v = exported_contract_to_js(&ExportedContract {
         contract: vec![1, 2],
