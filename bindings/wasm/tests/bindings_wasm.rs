@@ -10,13 +10,13 @@ use rgb_lib_wasm::wallet::backup_store::{
 };
 use rgb_lib_wasm::wallet::vss::{VssBackupConfig, VssStore};
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, ReceiveData, SinglesigKeys, TransferScope, WalletData,
-    WalletDescriptors,
+    AssetFilter, DatabaseType, ExportedContract, Online, ReceiveData, SinglesigKeys, TransferScope,
+    WalletData, WalletDescriptors,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{
-    JsAbortSignal, WasmInvoice, WasmWallet, check_indexer_url, fill_spv_proofs,
-    inspect_consignment, inspect_fascia, max_expiration_secs,
+    JsAbortSignal, WasmInvoice, WasmWallet, check_indexer_url, exported_contract_to_js,
+    fill_spv_proofs, inspect_consignment, inspect_fascia, max_expiration_secs,
 };
 
 fn wallet() -> WasmWallet {
@@ -236,6 +236,36 @@ fn get_burn_consignment_fails_for_unknown_asset() {
 fn list_asset_media_fails_for_unknown_asset() {
     let e = err(wallet().list_asset_media("rgb:unknown").unwrap_err());
     assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+}
+
+#[wasm_bindgen_test]
+fn export_contract_fails_for_unknown_asset() {
+    let e = err(wallet().export_contract("rgb:unknown").unwrap_err());
+    assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+}
+
+#[wasm_bindgen_test]
+fn exported_contract_to_js_gives_uint8_arrays() {
+    let v = exported_contract_to_js(&ExportedContract {
+        contract: vec![1, 2],
+        media: vec![vec![3], vec![4, 5]],
+    })
+    .unwrap();
+    let contract = prop(&v, "contract");
+    assert!(contract.is_instance_of::<js_sys::Uint8Array>());
+    assert_eq!(js_sys::Uint8Array::from(contract).to_vec(), vec![1, 2]);
+    let media: js_sys::Array = prop(&v, "media").dyn_into().unwrap();
+    assert_eq!(media.length(), 2);
+    assert!(
+        media
+            .iter()
+            .all(|m| m.is_instance_of::<js_sys::Uint8Array>())
+    );
+    let media: Vec<Vec<u8>> = media
+        .iter()
+        .map(|m| js_sys::Uint8Array::from(m).to_vec())
+        .collect();
+    assert_eq!(media, vec![vec![3], vec![4, 5]]);
 }
 
 #[wasm_bindgen_test]
@@ -653,6 +683,12 @@ async fn issue_bfa_reports_supply_and_locations() {
             .as_deref(),
         Some(bridge)
     );
+    let exported = wallet.export_contract(&asset_id).unwrap();
+    let contract = prop(&exported, "contract");
+    assert!(contract.is_instance_of::<js_sys::Uint8Array>());
+    assert!(js_sys::Uint8Array::from(contract).length() > 0);
+    let media: js_sys::Array = prop(&exported, "media").dyn_into().unwrap();
+    assert_eq!(media.length(), 0);
 }
 
 #[wasm_bindgen_test]
