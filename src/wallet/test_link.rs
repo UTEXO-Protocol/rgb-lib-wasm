@@ -369,6 +369,8 @@ async fn link_right_sent_beside_fungible() {
             begin.psbt.clone(),
             &begin.details.fascia,
             Some(begin.details.entropy),
+            u64::MAX,
+            u32::MAX,
         )
         .unwrap();
     let transitions = &inspection.operations[0].transitions;

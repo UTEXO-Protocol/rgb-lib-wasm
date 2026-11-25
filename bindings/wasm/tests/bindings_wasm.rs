@@ -511,7 +511,7 @@ fn inspect_fascia_js() {
     .unwrap();
     let get = |v: &JsValue, key: &str| js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap();
 
-    let inspection = inspect_fascia(psbt, fascia, None, "Regtest").unwrap();
+    let inspection = inspect_fascia(psbt, fascia, None, u64::MAX, u32::MAX, "Regtest").unwrap();
     assert_eq!(
         get(&inspection, "txid"),
         JsValue::from_str(expected["txid"].as_str().unwrap())
@@ -524,17 +524,48 @@ fn inspect_fascia_js() {
     assert_eq!(operations.length(), 1);
 
     let error = |result: Result<JsValue, JsValue>| result.unwrap_err().as_string().unwrap();
-    assert!(error(inspect_fascia(psbt, &[0], None, "Regtest")).contains("Invalid fascia"));
-    assert!(inspect_fascia(psbt, fascia, None, "Bogus").is_err());
-    let w = wallet();
     assert!(
-        error(w.inspect_fascia(psbt, fascia, None))
+        error(inspect_fascia(
+            psbt,
+            &[0],
+            None,
+            u64::MAX,
+            u32::MAX,
+            "Regtest"
+        ))
+        .contains("Invalid fascia")
+    );
+    assert!(inspect_fascia(psbt, fascia, None, u64::MAX, u32::MAX, "Bogus").is_err());
+    let w = wallet();
+    let size = fascia.len() as u64;
+    let too_large = format!("larger than the max allowed size of {} bytes", size - 1);
+    assert!(
+        error(inspect_fascia(
+            psbt,
+            fascia,
+            None,
+            size - 1,
+            u32::MAX,
+            "Regtest"
+        ))
+        .contains(&too_large)
+    );
+    inspect_fascia(psbt, fascia, None, size, u32::MAX, "Regtest").unwrap();
+    assert_eq!(
+        error(inspect_fascia(psbt, fascia, None, u64::MAX, 0, "Regtest")),
+        "Error during RGB inspection: fascia bundle count 1 exceeds the maximum of 0"
+    );
+    inspect_fascia(psbt, fascia, None, u64::MAX, 1, "Regtest").unwrap();
+    // the size check runs before the ownership check
+    assert!(error(w.inspect_fascia(psbt, fascia, None, size - 1, u32::MAX)).contains(&too_large));
+    assert!(
+        error(w.inspect_fascia(psbt, fascia, None, u64::MAX, u32::MAX))
             .contains("found a PSBT input that does not belong to this wallet")
     );
     let mut non_segwit = psbt.parse::<rgb_lib_wasm::bitcoin::Psbt>().unwrap();
     non_segwit.inputs[0].witness_utxo = None;
     assert!(
-        error(w.inspect_fascia(&non_segwit.to_string(), fascia, None))
+        error(w.inspect_fascia(&non_segwit.to_string(), fascia, None, u64::MAX, u32::MAX))
             .contains("RGB-related PSBTs require segwit")
     );
 }

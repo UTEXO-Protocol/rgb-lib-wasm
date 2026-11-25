@@ -476,6 +476,8 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
                 res.psbt.clone(),
                 &res.details.fascia,
                 Some(res.details.entropy),
+                u64::MAX,
+                u32::MAX,
             )
             .unwrap();
         let concealed: Vec<_> = inspection.operations[0].transitions[0]

@@ -1900,12 +1900,20 @@ async fn inspect_fascia_with_and_without_wallet() {
     let entropy = begin.details.entropy;
 
     let wallet_inspection = a
-        .inspect_fascia(begin.psbt.clone(), fascia, Some(entropy))
+        .inspect_fascia(
+            begin.psbt.clone(),
+            fascia,
+            Some(entropy),
+            u64::MAX,
+            u32::MAX,
+        )
         .unwrap();
     let inspection = inspect_fascia(
         begin.psbt.clone(),
         fascia,
         Some(entropy),
+        u64::MAX,
+        u32::MAX,
         BitcoinNetwork::Regtest,
     )
     .unwrap();
@@ -2012,10 +2020,49 @@ async fn inspect_fascia_with_and_without_wallet() {
         );
     };
 
+    // a fascia longer than the max size is refused
+    let size = fascia.len() as u64;
+    let result = a.inspect_fascia(
+        begin.psbt.clone(),
+        fascia,
+        Some(entropy),
+        size - 1,
+        u32::MAX,
+    );
+    assert!(
+        matches!(result, Err(Error::FileTooLarge { max_size }) if max_size == size - 1),
+        "{result:?}"
+    );
+    a.inspect_fascia(begin.psbt.clone(), fascia, Some(entropy), size, u32::MAX)
+        .unwrap();
+
+    // a fascia with more bundles than the max is refused
+    let bundles = wallet_inspection.operations.len() as u32;
+    let result = a.inspect_fascia(
+        begin.psbt.clone(),
+        fascia,
+        Some(entropy),
+        u64::MAX,
+        bundles - 1,
+    );
+    let text = format!(
+        "fascia bundle count {bundles} exceeds the maximum of {}",
+        bundles - 1
+    );
+    assert!(
+        matches!(&result, Err(Error::RgbInspection { details }) if *details == text),
+        "{result:?}"
+    );
+    a.inspect_fascia(begin.psbt.clone(), fascia, Some(entropy), u64::MAX, bundles)
+        .unwrap();
+
     // a given entropy must be the one the fascia carries
     let text = format!("built with entropy {entropy}, not the given");
     let wrong = Some(entropy.wrapping_add(1));
-    assert_error(a.inspect_fascia(begin.psbt.clone(), fascia, wrong), &text);
+    assert_error(
+        a.inspect_fascia(begin.psbt.clone(), fascia, wrong, u64::MAX, u32::MAX),
+        &text,
+    );
 
     // the PSBT must be the one of the fascia witness
     let mut other_psbt = psbt.clone();
@@ -2023,12 +2070,21 @@ async fn inspect_fascia_with_and_without_wallet() {
     other_psbt.unsigned_tx.lock_time = LockTime::from_consensus(lock_time.wrapping_add(1));
     let other_psbt = other_psbt.to_string();
     let text = "does not match PSBT TXID";
-    assert_error(a.inspect_fascia(other_psbt, fascia, Some(entropy)), text);
+    assert_error(
+        a.inspect_fascia(other_psbt, fascia, Some(entropy), u64::MAX, u32::MAX),
+        text,
+    );
 
     // a transition not committed by its bundle
     let tampered = fascia_with_bumped_nonce(fascia);
     assert_error(
-        a.inspect_fascia(begin.psbt.clone(), &tampered, Some(entropy)),
+        a.inspect_fascia(
+            begin.psbt.clone(),
+            &tampered,
+            Some(entropy),
+            u64::MAX,
+            u32::MAX,
+        ),
         "is not committed",
     );
 }

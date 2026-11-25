@@ -199,6 +199,8 @@ async fn bfa_mint_settles_and_is_spendable() {
             res.psbt.clone(),
             &res.details.fascia,
             Some(res.details.entropy),
+            u64::MAX,
+            u32::MAX,
         )
         .unwrap();
     assert_eq!(inspection.operations.len(), 1);
