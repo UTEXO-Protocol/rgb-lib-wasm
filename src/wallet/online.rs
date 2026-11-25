@@ -16346,6 +16346,36 @@ mod send_end_tests {
             ));
         }
         check_scopes_match_all(&wallet, &[any(), AssetFilter::None]);
+
+        // every consignment path has the RGB binary file extension
+        let issue = seed_batch(&wallet, "i", TransferStatus::Settled, true, None);
+        wallet
+            .database
+            .set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(seed_txo(&wallet, "i", 0)),
+                asset_transfer_idx: ActiveValue::Set(
+                    batch_transfer_row(&wallet, issue).asset_transfer_idx,
+                ),
+                r#type: ActiveValue::Set(ColoringType::Issue),
+                assignment: ActiveValue::Set(Assignment::Fungible(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        let transfers = wallet
+            .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+            .unwrap();
+        for (idx, kind, file) in [
+            (issue, TransferKind::Issuance, "asset.rgb"),
+            (send, TransferKind::Send, "consignment_out.rgb"),
+            (rcv_a, TransferKind::ReceiveWitness, "rcv_compose.rgb"),
+        ] {
+            let transfer = transfers
+                .iter()
+                .find(|t| t.batch_transfer_idx == idx && t.kind == kind)
+                .unwrap();
+            let path = transfer.consignment_path.as_deref().unwrap();
+            assert!(Path::new(path).ends_with(file), "{path}");
+        }
     }
 
     #[test]

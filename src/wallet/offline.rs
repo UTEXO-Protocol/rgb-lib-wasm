@@ -72,9 +72,12 @@ pub(crate) const NUM_KNOWN_SCHEMAS: usize = 3;
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
 pub(crate) const ASSET_ID_PREFIX: &str = "rgb:";
-pub(crate) const CONSIGNMENT_FILE: &str = "consignment_out";
+const RGB_BIN_EXTENSION: &str = "rgb";
+pub(crate) static CONSIGNMENT_FILE: LazyLock<String> =
+    LazyLock::new(|| format!("consignment_out.{RGB_BIN_EXTENSION}"));
 
-const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
+static CONSIGNMENT_RCV_FILE: LazyLock<String> =
+    LazyLock::new(|| format!("rcv_compose.{RGB_BIN_EXTENSION}"));
 
 pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
 pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
@@ -2039,7 +2042,9 @@ impl Wallet {
     }
 
     fn _get_issue_consignment_path(&self, asset_id: &str) -> PathBuf {
-        self.wallet_dir.join(ASSETS_DIR).join(asset_id)
+        self.wallet_dir
+            .join(ASSETS_DIR)
+            .join(format!("{asset_id}.{RGB_BIN_EXTENSION}"))
     }
 
     pub(crate) fn get_or_insert_media(&self, digest: String, mime: String) -> Result<i32, Error> {
@@ -3568,7 +3573,7 @@ impl Wallet {
     pub(crate) fn get_receive_consignment_path(&self, recipient_id: &str) -> PathBuf {
         self.get_transfers_dir()
             .join(self.normalize_recipient_id(recipient_id))
-            .join(CONSIGNMENT_RCV_FILE)
+            .join(CONSIGNMENT_RCV_FILE.as_str())
     }
 
     pub(crate) fn get_transfer_data(

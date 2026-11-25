@@ -460,7 +460,7 @@ impl Wallet {
     pub fn get_send_consignment_path(&self, asset_id: &str, transfer_id: &str) -> PathBuf {
         let transfer_dir = self.get_transfer_dir(transfer_id);
         let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
-        asset_transfer_dir.join(CONSIGNMENT_FILE)
+        asset_transfer_dir.join(CONSIGNMENT_FILE.as_str())
     }
 
     /// The consignment bytes of a pending send, for tests.
