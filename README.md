@@ -456,6 +456,7 @@ To protect a wallet:
 | `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
 | `listAssetMedia(assetId)` | no | List the media of an RGB asset |
 | `exportContract(assetId)` | no | Export the contract of an RGB asset (bytes, no bundles) with the bytes of its media |
+| `importContract(contract, media)` | no | Import the contract of an RGB asset (bytes, no bundles); its media comes from the wallet or from `media` (Uint8Array[]) |
 | `listAssets(schemas)` | no | List known RGB assets |
 | `listTransfers(assetFilter, scope)` | no | List RGB transfers by asset filter and scope |
 | `listUnspents(online?, settledOnly, skipSync)` | yes | List unspent outputs with RGB allocations, after a sync unless `skipSync` |

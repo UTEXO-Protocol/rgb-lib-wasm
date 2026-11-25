@@ -324,15 +324,17 @@ impl Wallet {
         })
     }
 
-    #[cfg(feature = "esplora")]
+    /// Import a new contract into the RGB stock, read its asset data and save the asset in the DB.
     pub(crate) fn save_new_asset_internal(
         &self,
-        runtime: &RgbRuntime,
-        contract_id: ContractId,
+        runtime: &mut RgbRuntime,
         asset_schema: AssetSchema,
         valid_contract: ValidContract,
-        valid_transfer: ValidTransfer,
+        valid_transfer: Option<ValidTransfer>,
     ) -> Result<(), Error> {
+        // a contract has no witnesses to resolve
+        runtime.import_contract(valid_contract.clone(), &DumbResolver)?;
+        let contract_id = valid_contract.contract_id();
         let timestamp = valid_contract.genesis.timestamp;
         let local_asset_data = match &asset_schema {
             AssetSchema::Nia => {
@@ -382,10 +384,14 @@ impl Wallet {
                 };
                 let initial_supply = contract.total_issued_supply().into();
                 let max_supply = contract.max_supply().into();
-                let known_circulating_supply =
-                    IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
-                        .total_issued_supply()
-                        .into();
+                let known_circulating_supply = match valid_transfer {
+                    Some(valid_transfer) => {
+                        IfaWrapper::with(runtime.consignment_data(&valid_transfer)?)
+                            .total_issued_supply()
+                            .into()
+                    }
+                    None => initial_supply,
+                };
                 let reject_list = contract
                     .reject_list_url()
                     .map(|u| RgbRejectListInfo::Url(u.to_string()));
