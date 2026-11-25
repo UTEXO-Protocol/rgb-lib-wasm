@@ -553,6 +553,20 @@ impl WasmWallet {
         exported_contract_to_js(&exported)
     }
 
+    /// Import the contract of an RGB asset (bytes, no bundles) with the bytes of the media it needs.
+    #[wasm_bindgen(js_name = "importContract")]
+    pub fn import_contract(
+        &self,
+        contract: &[u8],
+        media: Vec<js_sys::Uint8Array>,
+    ) -> Result<(), JsValue> {
+        let media = media.iter().map(|m| m.to_vec()).collect();
+        self.inner
+            .borrow_mut()
+            .import_contract(contract, media)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Return the balance for a specific asset.
     #[wasm_bindgen(js_name = "getAssetBalance")]
     pub fn get_asset_balance(&self, asset_id: &str) -> Result<JsValue, JsValue> {

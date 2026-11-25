@@ -5507,30 +5507,7 @@ impl Wallet {
         seed: &[u8; 32],
         sender_vk: &VerifyingKey,
     ) -> Result<bool, Error> {
-        let mut attachments = vec![];
-        match asset_schema {
-            AssetSchema::Nia => {
-                let contract_data = runtime.consignment_data(valid_contract)?;
-                let contract = NiaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-            AssetSchema::Ifa => {
-                let contract_data = runtime.consignment_data(valid_contract)?;
-                let contract = IfaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-            AssetSchema::Bfa => {
-                let contract_data = runtime.consignment_data(valid_contract)?;
-                let contract = BfaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-        };
+        let attachments = self.extract_attachments(runtime, valid_contract, asset_schema)?;
         for attachment in attachments {
             let digest = hex::encode(attachment.digest);
             if self.media.contains_key(&digest) {
@@ -5591,14 +5568,7 @@ impl Wallet {
         receiving: &HashMap<Opout, Assignment>,
         asset_schema: AssetSchema,
         check_reject_list: bool,
-    ) -> Result<
-        Option<(
-            ValidConsignment<true>,
-            HashMap<Opout, Assignment>,
-            PreFetchResolver,
-        )>,
-        Error,
-    > {
+    ) -> Result<Option<(ValidConsignment<true>, HashMap<Opout, Assignment>)>, Error> {
         let chain_resolver = self
             .prefetch_consignment_witnesses(consignment)
             .await
@@ -5658,7 +5628,7 @@ impl Wallet {
             }
         }
 
-        Ok(Some((valid_consignment, received, chain_resolver)))
+        Ok(Some((valid_consignment, received)))
     }
 
     /// Prepare the PSBT of an operation on one asset (an inflation, a burn or a mint).
@@ -6501,7 +6471,7 @@ impl Wallet {
                 bridge = Some((evm_client, address));
             }
         }
-        let Some((valid_consignment, received, chain_resolver)) = self
+        let Some((valid_consignment, received)) = self
             ._check_received_consignment(
                 pending,
                 &consignment,
@@ -6569,17 +6539,13 @@ impl Wallet {
                         .await;
                 }
 
-                runtime
-                    .import_contract(valid_contract.clone(), &chain_resolver)
-                    .expect("failure importing received contract");
-                debug!(self.logger, "Contract registered");
                 self.save_new_asset_internal(
-                    &runtime,
-                    contract_id,
+                    &mut runtime,
                     asset_schema,
                     valid_contract,
-                    valid_consignment.clone(),
+                    Some(valid_consignment.clone()),
                 )?;
+                debug!(self.logger, "Contract registered");
             }
 
             let mut updated_asset_transfer: DbAssetTransferActMod = asset_transfer.clone().into();
@@ -7751,13 +7717,11 @@ impl Wallet {
         }
 
         let valid_contract = valid_consignment.clone().into_valid_contract();
-        runtime.import_contract(valid_contract.clone(), &chain_resolver)?;
         self.save_new_asset_internal(
-            &runtime,
-            contract_id,
+            &mut runtime,
             asset_schema,
             valid_contract,
-            valid_consignment,
+            Some(valid_consignment),
         )?;
         drop(runtime);
         self.update_backup_info(false)?;

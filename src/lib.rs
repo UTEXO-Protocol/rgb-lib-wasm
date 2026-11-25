@@ -212,7 +212,6 @@ use rgbstd::{
     daggy::NodeIndex,
     validation::{OpsDag, Validity, Warning},
 };
-#[cfg(feature = "esplora")]
 use schemata::{BfaWrapper, IfaWrapper, NiaWrapper};
 use schemata::{
     BridgedFungibleAsset, GS_BRIDGE_LOCATION, GS_BURN_REASON, GS_BURNED_ASSET, GS_BURNED_INFLATION,

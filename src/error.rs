@@ -20,6 +20,13 @@ pub enum Error {
     #[error("Allocations already available")]
     AllocationsAlreadyAvailable,
 
+    /// The asset is already known to the wallet
+    #[error("Asset with id {asset_id} is already known")]
+    AssetAlreadyKnown {
+        /// Asset ID
+        asset_id: String,
+    },
+
     /// Requested asset was not found
     #[error("Asset with id {asset_id} not found")]
     AssetNotFound {
@@ -156,6 +163,13 @@ pub enum Error {
     FileAlreadyExists {
         /// The file path
         path: String,
+    },
+
+    /// The file is larger than the max size allowed
+    #[error("The file is larger than the max allowed size of {max_size} bytes")]
+    FileTooLarge {
+        /// The max size allowed, in bytes
+        max_size: u64,
     },
 
     /// A master fingerprint does not match the wallet's
@@ -343,6 +357,10 @@ pub enum Error {
         /// Error details
         details: String,
     },
+
+    /// The provided bytes are not a contract consignment
+    #[error("Invalid contract")]
+    InvalidContract,
 
     /// The provided contract ID is invalid
     #[error("Invalid contract ID: {contract_id}")]

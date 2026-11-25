@@ -71,6 +71,9 @@ pub(crate) const NUM_KNOWN_SCHEMAS: usize = 3;
 
 pub(crate) const MAX_TRANSPORT_ENDPOINTS: usize = 3;
 
+/// Max size, in bytes, of a contract that [`import_contract`](Wallet::import_contract) accepts.
+pub(crate) const MAX_CONTRACT_SIZE: u64 = 16 * 1024 * 1024;
+
 pub(crate) const ASSET_ID_PREFIX: &str = "rgb:";
 const RGB_BIN_EXTENSION: &str = "rgb";
 pub(crate) static CONSIGNMENT_FILE: LazyLock<String> =
@@ -2068,6 +2071,21 @@ impl Wallet {
         })
     }
 
+    pub(crate) fn extract_attachments(
+        &self,
+        runtime: &RgbRuntime,
+        valid_contract: &ValidContract,
+        asset_schema: AssetSchema,
+    ) -> Result<Vec<Attachment>, Error> {
+        let contract_data = runtime.consignment_data(valid_contract)?;
+        let media = match asset_schema {
+            AssetSchema::Nia => NiaWrapper::with(contract_data).contract_terms().media,
+            AssetSchema::Ifa => IfaWrapper::with(contract_data).contract_terms().media,
+            AssetSchema::Bfa => BfaWrapper::with(contract_data).contract_terms().media,
+        };
+        Ok(media.into_iter().collect())
+    }
+
     pub(crate) fn get_asset_medias(&self, media_idx: Option<i32>) -> Result<HashSet<Media>, Error> {
         let mut asset_medias = HashSet::new();
         if let Some(media_idx) = media_idx {
@@ -2254,7 +2272,7 @@ impl Wallet {
             asset_id.clone(),
             asset_schema,
             Some(created_at),
-            created_at,
+            validated_contract.genesis.timestamp,
             asset_data,
         )?;
         let batch_transfer = DbBatchTransferActMod {
@@ -2518,7 +2536,7 @@ impl Wallet {
             asset_id.clone(),
             asset_schema,
             Some(created_at),
-            created_at,
+            validated_contract.genesis.timestamp,
             asset_data,
         )?;
         let batch_transfer = DbBatchTransferActMod {
@@ -2780,7 +2798,7 @@ impl Wallet {
             asset_id.clone(),
             asset_schema,
             Some(created_at),
-            created_at,
+            validated_contract.genesis.timestamp,
             asset_data,
         )?;
         let batch_transfer = DbBatchTransferActMod {
@@ -3338,6 +3356,75 @@ impl Wallet {
             contract: bytes,
             media,
         })
+    }
+
+    /// Import the contract of an RGB asset (as `export_contract` gives it), with no allocations.
+    ///
+    /// Media come from the wallet, or else from `media`. A refused import changes nothing.
+    /// [`flush`](Wallet::flush) makes an import durable.
+    pub fn import_contract(&mut self, contract: &[u8], media: Vec<Vec<u8>>) -> Result<(), Error> {
+        let cp = self.checkpoint("import_contract");
+        let res = self._import_contract(contract, media);
+        self.commit_queued(cp, res)
+    }
+
+    fn _import_contract(&mut self, contract: &[u8], media: Vec<Vec<u8>>) -> Result<(), Error> {
+        info!(self.logger, "Importing contract...");
+        if contract.len() as u64 > MAX_CONTRACT_SIZE {
+            return Err(Error::FileTooLarge {
+                max_size: MAX_CONTRACT_SIZE,
+            });
+        }
+        let contract = Contract::load(contract).map_err(|_| Error::InvalidContract)?;
+        let asset_id = contract.contract_id().to_string();
+        let asset_schema: AssetSchema = contract.schema_id().try_into()?;
+        self.check_schema_support(&asset_schema)?;
+        if self.database.get_asset(asset_id.clone())?.is_some() {
+            return Err(Error::AssetAlreadyKnown { asset_id });
+        }
+
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            ..Default::default()
+        };
+        let valid_contract = contract
+            .validate(
+                &asset_schema.schema_rules(),
+                &DumbResolver,
+                &validation_config,
+            )
+            .map_err(|e| match e {
+                ValidationError::InvalidConsignment(e) => Error::ConsignmentValidationFailed {
+                    details: e.to_string(),
+                },
+                e => Error::Internal {
+                    details: format!("unexpected consignment validation error: {e}"),
+                },
+            })?;
+
+        let mut runtime = self.rgb_runtime()?;
+        let attachments = self.extract_attachments(&runtime, &valid_contract, asset_schema)?;
+        let mut provided: HashMap<String, Vec<u8>> = media
+            .into_iter()
+            .map(|m| (hex::encode(sha256_digest(&m)), m))
+            .collect();
+        for attachment in attachments {
+            let digest = hex::encode(attachment.digest);
+            if self.media.contains_key(&digest) {
+                continue;
+            }
+            let Some(bytes) = provided.remove(&digest) else {
+                return Err(Error::InvalidAttachments {
+                    details: s!("media defined by the contract was not provided"),
+                });
+            };
+            self.media.insert(digest, bytes);
+        }
+        self.save_new_asset_internal(&mut runtime, asset_schema, valid_contract, None)?;
+        drop(runtime);
+        self.update_backup_info(false)?;
+        info!(self.logger, "Import contract '{}' completed", asset_id);
+        Ok(())
     }
 
     /// Return the [`Balance`] for the RGB asset with the given ID.
@@ -5033,6 +5120,39 @@ pub(crate) mod address_reuse_tests {
         }
     }
 
+    /// Add three unspent TXOs, so that the wallet can issue with no indexer.
+    pub(crate) fn add_fake_txos(wallet: &Wallet) {
+        for vout in 0..3 {
+            wallet
+                .database
+                .set_txo(DbTxoActMod {
+                    txid: ActiveValue::Set("11".repeat(32)),
+                    vout: ActiveValue::Set(vout),
+                    btc_amount: ActiveValue::Set(s!("1000")),
+                    spent: ActiveValue::Set(false),
+                    exists: ActiveValue::Set(true),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    }
+
+    pub(crate) fn media_attachment(data: &[u8]) -> Attachment {
+        Attachment {
+            ty: MediaType::with("text/plain"),
+            digest: Bytes32::from_byte_array(sha256_digest(data)),
+        }
+    }
+
+    /// Set the media of the next asset issued. Return its digest.
+    pub(crate) fn set_media(wallet: &mut Wallet, data: &[u8]) -> String {
+        MOCK_ISSUE_MEDIA.set(Some(media_attachment(data)));
+        let digest = hex::encode(sha256_digest(data));
+        wallet.media.insert(digest.clone(), data.to_vec());
+        digest
+    }
+
     /// Return all the state an operation can change.
     pub(crate) fn state(wallet: &Wallet) -> serde_json::Value {
         serde_json::json!({
@@ -5804,7 +5924,7 @@ mod inspect_psbt_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod export_contract_tests {
-    use super::address_reuse_tests::state;
+    use super::address_reuse_tests::{add_fake_txos, media_attachment, set_media, state};
     use super::*;
     use crate::keys::generate_keys;
 
@@ -5820,35 +5940,8 @@ mod export_contract_tests {
             allow_reckless_schemas: false,
         };
         let wallet = Wallet::new(wd, SinglesigKeys::from_keys(&keys, None)).unwrap();
-        for vout in 0..3 {
-            wallet
-                .database
-                .set_txo(DbTxoActMod {
-                    txid: ActiveValue::Set("11".repeat(32)),
-                    vout: ActiveValue::Set(vout),
-                    btc_amount: ActiveValue::Set(s!("1000")),
-                    spent: ActiveValue::Set(false),
-                    exists: ActiveValue::Set(true),
-                    pending_witness: ActiveValue::Set(false),
-                    ..Default::default()
-                })
-                .unwrap();
-        }
+        add_fake_txos(&wallet);
         wallet
-    }
-
-    fn media_attachment(data: &[u8]) -> Attachment {
-        Attachment {
-            ty: MediaType::with("text/plain"),
-            digest: Bytes32::from_byte_array(sha256_digest(data)),
-        }
-    }
-
-    fn set_media(wallet: &mut Wallet, data: &[u8]) {
-        MOCK_ISSUE_MEDIA.set(Some(media_attachment(data)));
-        wallet
-            .media
-            .insert(hex::encode(sha256_digest(data)), data.to_vec());
     }
 
     fn assert_exported(wallet: &Wallet, asset_id: &str, schema: AssetSchema) -> ExportedContract {
@@ -5860,11 +5953,20 @@ mod export_contract_tests {
         assert_eq!(contract.schema_id(), SchemaId::from(schema));
         assert!(!contract.transfer);
         assert!(contract.bundles.is_empty());
+        assert_eq!(
+            wallet
+                .get_asset_metadata(asset_id.to_string())
+                .unwrap()
+                .timestamp,
+            contract.genesis.timestamp
+        );
         exported
     }
 
     #[test]
     fn export_contract_success() {
+        // the clock of the wallet differs from the genesis clock
+        crate::utils::CLOCK_OFFSET.with(|o| o.set(10));
         let mut wallet = exporting_wallet();
         set_media(&mut wallet, b"nia media");
         let nia = wallet
