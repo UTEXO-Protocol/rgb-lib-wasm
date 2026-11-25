@@ -2977,15 +2977,20 @@ impl Wallet {
     }
 
     /// Inspect a PSBT and fascia with wallet ownership and schema details.
+    ///
+    /// A fascia longer than `max_fascia_size` bytes gives [`Error::FileTooLarge`], and a fascia
+    /// with more than `max_bundles` bundles gives [`Error::RgbInspection`].
     pub fn inspect_fascia(
         &self,
         psbt: String,
         fascia: &[u8],
         entropy: Option<u64>,
+        max_fascia_size: u64,
+        max_bundles: u32,
     ) -> Result<RgbInspection, Error> {
         info!(self.logger, "Inspecting fascia...");
         let psbt = Psbt::from_str(&psbt)?;
-        let fascia = parse_fascia(fascia)?;
+        let fascia = parse_fascia(fascia, max_fascia_size)?;
 
         // verify all PSBT inputs belong to this wallet
         for psbt_input in psbt.inputs.iter() {
@@ -3030,6 +3035,7 @@ impl Wallet {
             &psbt,
             &fascia,
             entropy,
+            max_bundles,
             |contract_id, bundle, witness_tx| {
                 // collect the RGB inputs allocated in stock to the spent outputs
                 let mut stock_inputs = HashMap::new();
