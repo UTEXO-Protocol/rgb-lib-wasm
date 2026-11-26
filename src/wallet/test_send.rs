@@ -23,9 +23,9 @@ use crate::wallet::{
     WalletData,
 };
 use crate::{
-    AssetSchema, Assignment, Attachment, BitcoinNetwork, Bytes32, ConsignmentExt, Encryption,
-    Error, MediaType, RgbTransfer, SpvProof, TransferKind, TransferStatus, TypeOfTransition,
-    WitnessBundle, sha256_digest,
+    AssetSchema, Assignment, Attachment, BitcoinNetwork, Bytes32, Encryption, Error, MediaType,
+    RgbTransfer, SpvProof, TransferKind, TransferStatus, TypeOfTransition, WitnessBundle,
+    sha256_digest,
 };
 use amplify::ByteArray;
 use amplify::confinement::Confined;
@@ -373,12 +373,9 @@ async fn send_enters_the_stock_at_broadcast() {
     assert_eq!(witness_ords(&a), ords);
     assert!(a.send_consignment_bytes(&txid, &asset_id).is_none());
     end(&mut a, &a_on, signed).await;
-    let bytes = a.send_consignment_bytes(&txid, &asset_id).unwrap();
     assert_eq!(witness_ord(&a, &txid), None);
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert!(witness_ord(&a, &txid).is_some());
-    // a broadcast send keeps its consignment
-    assert_eq!(a.get_consignment(sent(&a, &txid).idx), Ok(Some(bytes)));
 
     // a donation enters the stock at its end
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(50), &[PROXY_URL]).await;
@@ -386,7 +383,6 @@ async fn send_enters_the_stock_at_broadcast() {
     assert_eq!(witness_ord(&a, &txid), None);
     end(&mut a, &a_on, signed).await;
     assert!(witness_ord(&a, &txid).is_some());
-    assert!(a.get_consignment(sent(&a, &txid).idx).unwrap().is_some());
 }
 
 #[wasm_bindgen_test]
@@ -491,7 +487,6 @@ async fn recipient_refuses_consignment_not_paying_it() {
     refresh(&mut r2, &r2_on).await;
 
     assert_eq!(transfer_of(&r2, &rid2).status, TransferStatus::Failed);
-    assert_eq!(r2.get_consignment(transfer_of(&r2, &rid2).idx), Ok(None));
     assert!(
         r2.list_unspents(None, false, true)
             .await
@@ -710,21 +705,6 @@ async fn receive_settles_after_reload() {
     let (mut a, a_on) = nia_wallet(5).await;
     let (mut r, r_on) = nia_wallet(1).await;
     let asset_id = issue(&a, vec![AMOUNT]);
-    // an issuance returns the contract
-    let issuance = a
-        .list_transfers(AssetFilter::Id(asset_id.clone()), TransferScope::All)
-        .unwrap()
-        .into_iter()
-        .find(|t| t.kind == TransferKind::Issuance)
-        .unwrap();
-    let contract = a.get_consignment(issuance.idx).unwrap().unwrap();
-    assert_eq!(
-        crate::Contract::load(&contract[..])
-            .unwrap()
-            .contract_id()
-            .to_string(),
-        asset_id
-    );
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
     let row = |w: &Wallet| {
         w.database
@@ -737,10 +717,7 @@ async fn receive_settles_after_reload() {
     let mut transfer: DbTransferActMod = row(&r).into();
     transfer.receive_dir = ActiveValue::Set(Some("custom_dir".to_string()));
     r.database.update_transfer(&mut transfer).unwrap();
-    let txid = send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
-    let bytes = a.get_consignment(sent(&a, &txid).idx).unwrap().unwrap();
-    // a receive has no consignment before it arrives
-    assert_eq!(r.get_consignment(transfer_of(&r, &rid).idx), Ok(None));
+    send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
     refresh(&mut r, &r_on).await;
     assert_eq!(
         transfer_of(&r, &rid).status,
@@ -758,8 +735,6 @@ async fn receive_settles_after_reload() {
         !r.received_consignments
             .contains_key(&r.normalize_recipient_id(&rid))
     );
-    let received = || Ok(Some(bytes.clone()));
-    assert_eq!(r.get_consignment(transfer_of(&r, &rid).idx), received());
     // A NIA consignment has no reject list, so no DAG is built.
     assert!(
         r.received_valid_consignments["custom_dir"]
@@ -772,14 +747,13 @@ async fn receive_settles_after_reload() {
         .await
         .unwrap();
     let r_on = r.go_online(go_online_options(false)).await.unwrap();
-    assert_eq!(r.get_consignment(transfer_of(&r, &rid).idx), received());
     let v = validations();
     settle_both(&mut a, &a_on, &mut r, &r_on).await;
     assert_eq!(transfer_of(&r, &rid).status, TransferStatus::Settled);
-    assert_eq!(r.get_consignment(transfer_of(&r, &rid).idx), received());
     assert_eq!(balance(&r, &asset_id).settled, 100);
     // with no copy in memory, settlement validates once
     assert_eq!(validations(), v + 1);
+    assert!(!r.received_consignments.contains_key("custom_dir"));
 }
 
 // extra allocations listed as spent by a transition the consignment does not carry are refused
