@@ -252,6 +252,7 @@ pub async fn witness_rcv_enc(
             endpoints,
             1,
             encryption,
+            None,
         )
         .await?;
     register_receive(&data, encryption.unwrap_or(Encryption::Required));
@@ -292,6 +293,7 @@ pub async fn blind_rcv_enc(
             endpoints,
             1,
             encryption,
+            None,
         )
         .await?;
     register_receive(&data, encryption.unwrap_or(Encryption::Required));

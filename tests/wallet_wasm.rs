@@ -170,6 +170,7 @@ async fn test_receive_and_transfers() {
             vec![transport_endpoint(PROXY_URL)],
             1,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -208,6 +209,7 @@ async fn test_receive_and_transfers() {
             vec![transport_endpoint(PROXY_URL)],
             1,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -237,6 +239,7 @@ async fn test_receive_and_transfers() {
             rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
             None,
         )
         .await
@@ -357,6 +360,7 @@ async fn test_errors_and_backup() {
             rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
             None,
         )
         .await
@@ -675,6 +679,7 @@ async fn witness_receive_on(wallet: &mut Wallet) -> String {
             rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
             None,
         )
         .await

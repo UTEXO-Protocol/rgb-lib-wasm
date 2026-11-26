@@ -157,6 +157,89 @@ async fn mint(
     )
 }
 
+/// Two mints to a reusable blind invoice with quota 2 both settle.
+#[wasm_bindgen_test]
+async fn bfa_mint_reused_invoice() {
+    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 5).await;
+    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let bridge = new_evm_address();
+    deploy_bridge(&bridge).await;
+    // a mint right per mint, plus the last one that cannot be spent
+    let asset_id = a
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            3,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap()
+        .asset_id;
+
+    let receive = b
+        .blind_receive(
+            Some(b_online.clone()),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+            None,
+            Some(2),
+        )
+        .await
+        .unwrap();
+    register_receive(&receive, Encryption::Required);
+    let res_1 = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    let res_2 = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    assert_ne!(res_1.details.opid, res_2.details.opid);
+
+    // the recipient checks each mint on its own
+    refresh(&mut b, &b_online).await;
+    let mut opids: Vec<String> = b
+        .get_received_mint(receive.recipient_id.clone())
+        .unwrap()
+        .into_iter()
+        .map(|m| m.opid)
+        .collect();
+    opids.sort();
+    let mut expected = vec![res_1.details.opid.clone(), res_2.details.opid.clone()];
+    expected.sort();
+    assert_eq!(opids, expected);
+
+    // both mints complete once their locks are final
+    lock_mint(&bridge, &res_1, MINT_AMOUNT).await;
+    lock_mint(&bridge, &res_2, MINT_AMOUNT).await;
+    refresh(&mut b, &b_online).await;
+    for res in [&res_1, &res_2] {
+        mint_end(&mut a, &a_online, res).await.unwrap();
+    }
+    settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(
+        b.get_asset_balance(asset_id).unwrap().settled,
+        MINT_AMOUNT * 2
+    );
+}
+
 #[wasm_bindgen_test]
 async fn bfa_mint_settles_and_is_spendable() {
     let (wd, keys) = wallet_data(vec![AssetSchema::Bfa]);
