@@ -261,11 +261,9 @@ fn get_received_mint_is_empty_when_unknown() {
 }
 
 #[wasm_bindgen_test]
-fn get_burn_consignment_fails_for_unknown_asset() {
-    let e = err(wallet()
-        .get_burn_consignment("rgb:unknown", &"00".repeat(32))
-        .unwrap_err());
-    assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+fn get_consignment_fails_for_unknown_transfer() {
+    let e = err(wallet().get_consignment(999).unwrap_err());
+    assert!(e.starts_with("Transfer with idx 999 not found"), "{e}");
 }
 
 #[wasm_bindgen_test]
@@ -847,6 +845,20 @@ async fn inflate_begin_returns_result_object() {
     let change_utxos: js_sys::Array = prop(&inflation, "changeUtxos").dyn_into().unwrap();
     assert_eq!(change_utxos.length(), 1);
     assert!(prop(&inflation, "changeUtxo").is_undefined());
+
+    // an issuance gives its contract and an inflation gives null
+    let issuance = transfers
+        .iter()
+        .find(|t| prop(t, "kind").as_string().as_deref() == Some("Issuance"))
+        .unwrap();
+    let idx = |t: &JsValue| prop(t, "idx").as_f64().unwrap() as i32;
+    let contract: js_sys::Uint8Array = wallet
+        .get_consignment(idx(&issuance))
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    assert!(contract.length() > 0);
+    assert!(wallet.get_consignment(idx(&inflation)).unwrap().is_null());
 }
 
 #[wasm_bindgen_test]
