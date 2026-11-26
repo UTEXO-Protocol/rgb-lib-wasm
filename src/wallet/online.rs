@@ -1942,16 +1942,6 @@ impl Wallet {
         size: u32,
         fee_rate: FeeRate,
     ) -> Result<Psbt, bdk_wallet::error::CreateTxError> {
-        let change_script = if self.wallet_data.reuse_addresses {
-            Some(
-                self._get_new_address(KeychainKind::Internal)
-                    .map_err(|_| bdk_wallet::error::CreateTxError::NoUtxosSelected)?
-                    .script_pubkey(),
-            )
-        } else {
-            None
-        };
-
         let mut tx_builder = self.bdk_wallet.build_tx();
         tx_builder
             .add_utxos(inputs)
@@ -1960,9 +1950,6 @@ impl Wallet {
             .fee_rate(fee_rate);
         for address in addresses {
             tx_builder.add_recipient(address.clone(), BdkAmount::from_sat(size as u64));
-        }
-        if let Some(change) = change_script {
-            tx_builder.drain_to(change);
         }
         let mut psbt = tx_builder.finish()?;
         self.add_non_witness_utxos(&mut psbt);
@@ -3790,7 +3777,7 @@ impl Wallet {
         let bdk_txid = psbt.unsigned_tx.compute_txid();
         let txid = bdk_txid.to_string();
         let row = self.database.get_wallet_transaction_by_txid(&txid)?;
-        // an end or a refresh removes the artifacts of an RGB operation and keeps its batch
+        // an end or a refresh keeps only the consignments of an RGB operation, and its batch
         if self.transfer_artifacts.contains_key(&txid)
             || self._get_outgoing_batch_transfer(&txid)?.is_some()
             || row.as_ref().is_some_and(|t| t.r#type != r#type)
@@ -5097,9 +5084,18 @@ impl Wallet {
         }
     }
 
-    /// Forget the data kept for a received consignment.
+    /// Keep only the consignments of the ended transfer with this TXID.
+    fn keep_only_consignments(&mut self, txid: &str) {
+        if let Some(artifacts) = self.transfer_artifacts.get_mut(txid) {
+            *artifacts = TransferArtifacts {
+                consignment_bytes: std::mem::take(&mut artifacts.consignment_bytes),
+                ..Default::default()
+            };
+        }
+    }
+
+    /// Forget the proxy data of a received consignment. The consignment stays.
     fn clear_received_data(&mut self, recipient_id: &str) {
-        self.received_consignments.remove(recipient_id);
         self.received_valid_consignments.remove(recipient_id);
         self.received_consignment_meta.remove(recipient_id);
         self.received_signed_txs.remove(recipient_id);
@@ -5148,6 +5144,7 @@ impl Wallet {
             .collect();
         self._unflag_pending_witness_txos(&HashSet::new(), &scripts)?;
         self.clear_received_data(recipient_id);
+        self.received_consignments.remove(recipient_id);
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         Ok(Some(
             self.database
@@ -7000,7 +6997,7 @@ impl Wallet {
         self._broadcast_signed_tx(signed_tx).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
-        self.transfer_artifacts.remove(txid);
+        self.keep_only_consignments(txid);
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
         Ok(self
@@ -7219,7 +7216,7 @@ impl Wallet {
             .database
             .update_batch_transfer(&mut updated_batch_transfer)?;
 
-        // Clean up: received data no longer needed after settle
+        // a settled receive does not need the proxy data
         if incoming {
             let batch_transfer_data =
                 batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
@@ -9245,7 +9242,7 @@ impl Wallet {
                 TransferStatus::WaitingConfirmations,
                 &consignment_hashes,
             )?;
-            self.transfer_artifacts.remove(&txid);
+            self.keep_only_consignments(&txid);
             idx
         } else {
             let idx = self._update_or_save_transfers(
@@ -9363,24 +9360,11 @@ impl Wallet {
         let mut unspendable = self._get_unspendable_bdk_outpoints()?;
         unspendable.extend(self.get_reserved_vanilla_outpoints()?);
 
-        let change_script = if self.wallet_data.reuse_addresses {
-            Some(
-                self._get_new_address(KeychainKind::Internal)?
-                    .script_pubkey(),
-            )
-        } else {
-            None
-        };
-
         let mut tx_builder = self.bdk_wallet.build_tx();
         tx_builder
             .unspendable(unspendable)
             .add_recipient(script_pubkey, BdkAmount::from_sat(amount))
             .fee_rate(fee_rate_checked);
-
-        if let Some(change) = change_script {
-            tx_builder.drain_to(change);
-        }
 
         let mut psbt = tx_builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
@@ -10072,7 +10056,7 @@ impl Wallet {
     /// have already been signed.
     ///
     /// The wallet keeps a consignment that proves the burn, with its full history.
-    /// [`get_burn_consignment`](Wallet::get_burn_consignment) returns it.
+    /// [`get_consignment`](Wallet::get_consignment) returns it.
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn burn_end(
@@ -11215,7 +11199,7 @@ pub(crate) fn fake_esplora(
 #[cfg(test)]
 mod go_online_tests {
     use super::*;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use crate::wallet::offline::test_wallet::make_test_wallet;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
     const PROXY_ENDPOINT: &str = "rpc://127.0.0.1:3000/json-rpc";
@@ -11266,7 +11250,7 @@ mod go_online_tests {
 
     #[test]
     fn go_online_replaces_proxy_auth_keys() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
         let online = Online {
             id: 1,
@@ -11313,7 +11297,7 @@ mod go_online_tests {
     fn go_online_checks_db_assets_in_stock() {
         use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet
             .database
             .set_asset(DbAssetActMod {
@@ -11345,7 +11329,7 @@ mod go_online_tests {
     fn go_online_detects_missing_media() {
         use crate::database::memory_db::{ActiveValue, DbMediaActMod};
 
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let digest = hex::encode(sha256_digest(b"media"));
         wallet
             .database
@@ -11381,7 +11365,7 @@ mod go_online_tests {
 
     #[test]
     fn abort_stops_the_genesis_request_in_flight() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let c = Arc::new(crate::AbortController::new());
         let fire = c.clone();
         let url = fake_esplora(move |_: &str| {
@@ -11403,10 +11387,10 @@ mod go_online_tests {
 
     #[test]
     fn abort_in_the_consistency_scan_restores_state() {
-        use crate::wallet::offline::address_reuse_tests::state;
+        use crate::wallet::offline::test_wallet::state;
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let c = Arc::new(crate::AbortController::new());
         let fire = c.clone();
         let scans = AtomicUsize::new(0);
@@ -11436,7 +11420,7 @@ mod go_online_tests {
 
     #[test]
     fn go_online_stores_proxy_auth_keys() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         // the regtest genesis hash, so the network check passes
         let block_hash = |_: &str| {
             (
@@ -11480,7 +11464,7 @@ mod go_online_tests {
 
     #[test]
     fn go_online_rejects_invalid_proxy_auth_keys() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let seed1 = "11".repeat(32);
 
         let res = go_online(
@@ -11563,12 +11547,12 @@ mod separate_signer_tests {
 
     use super::*;
     use crate::keys::generate_keys;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+    use crate::wallet::offline::test_wallet::make_test_wallet_with_keys;
 
     fn funded_wallet_and_signer() -> (Wallet, Wallet, OutPoint) {
         let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-        let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
-        let signer = make_test_wallet_with_keys(keys, false);
+        let mut wallet = make_test_wallet_with_keys(keys.clone());
+        let signer = make_test_wallet_with_keys(keys);
 
         let funding_tx = Transaction {
             version: Version::TWO,
@@ -11637,7 +11621,7 @@ mod separate_signer_tests {
 mod send_end_tests {
     use super::*;
     use crate::no_wallet::recipient_id_from_script_buf;
-    use crate::wallet::offline::address_reuse_tests::{
+    use crate::wallet::offline::test_wallet::{
         assert_no_partial_change, make_test_wallet, pending_mint_locks, state,
     };
     use strict_encoding::StrictDumb;
@@ -11650,7 +11634,7 @@ mod send_end_tests {
     }
 
     pub(super) fn setup_at(url: &str) -> (Wallet, Online) {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet.online_data = Some(OnlineData::for_test(url));
         let online = Online {
             id: 1,
@@ -15368,6 +15352,15 @@ mod send_end_tests {
             assert_eq!(res, Ok(true));
             assert_eq!(status(&wallet, idx), TransferStatus::Failed);
             assert_eq!(ttes_used(&wallet, idx), vec![false]);
+
+            // a failed receive does not expose the bytes it did not validate
+            let mut transfer: DbTransferActMod = batch_transfer_row(&wallet, idx).into();
+            transfer.recipient_type =
+                ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
+            wallet.database.update_transfer(&mut transfer).unwrap();
+            assert!(wallet.received_consignments.contains_key("recipient"));
+            let transfer_idx = batch_transfer_row(&wallet, idx).idx;
+            assert_eq!(wallet.get_consignment(transfer_idx), Ok(None));
         }
     }
 
@@ -16347,10 +16340,10 @@ mod send_end_tests {
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::idb_store::WalletSnapshot;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::offline::test_wallet::make_test_wallet_with_keys;
 
         let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
-        let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
+        let mut wallet = make_test_wallet_with_keys(keys.clone());
         wallet.online_data = Some(OnlineData::for_test(INDEXER_URL));
         *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
         let input_idx = seed_txo(&wallet, "i", 0);
@@ -16399,7 +16392,7 @@ mod send_end_tests {
 
         let json = serde_json::to_string(&wallet.snapshot().unwrap()).unwrap();
         let snapshot: WalletSnapshot = serde_json::from_str(&json).unwrap();
-        let mut restored = make_test_wallet_with_keys(keys, false);
+        let mut restored = make_test_wallet_with_keys(keys);
         restored.restore_from_snapshot(snapshot).unwrap();
         check(&restored);
     }
@@ -16632,7 +16625,7 @@ mod bfa_tests {
         use crate::database::memory_db::{ActiveValue, DbAssetActMod};
         use crate::no_wallet::{RgbBridgeLocationInfo, RgbEvmContractInfo};
 
-        let wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let wallet = crate::wallet::offline::test_wallet::make_test_wallet();
         let asset_id = ContractId::copy_from_slice([5; 32]).unwrap().to_string();
         wallet
             .database
@@ -16756,9 +16749,9 @@ mod bfa_tests {
 
     #[test]
     fn issue_with_invalid_linked_from_contract() {
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet.wallet_data.supported_schemas = AssetSchema::VALUES.to_vec();
         let invalid = Error::InvalidContractId {
             contract_id: s!("invalid"),
@@ -16861,7 +16854,7 @@ mod bfa_tests {
         use crate::api::evm::tests::block_on;
         use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 
-        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let mut wallet = crate::wallet::offline::test_wallet::make_test_wallet();
         wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Ifa];
         let url = "http://127.0.0.1:1";
         wallet.online_data = Some(OnlineData::for_test(url));
@@ -16983,9 +16976,9 @@ mod bfa_tests {
 
     #[test]
     fn issue_asset_bfa_takes_unicode_ticker() {
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Bfa];
         let issue = |ticker: String| {
             wallet.issue_asset_bfa(
@@ -17021,7 +17014,7 @@ mod bfa_tests {
     fn evm_reject_list_rejects_descendants_of_rejected_opout() {
         use crate::api::evm::tests::*;
         use crate::api::evm::{REJECT_LIST_ENTRIES_SELECTOR, REJECT_LIST_LENGTH_SELECTOR};
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
         // entry 1 rejects, entry 2 allows, both finalized
         let mut server = mockito::Server::new();
@@ -17050,7 +17043,7 @@ mod bfa_tests {
                 &encode_entries(&[(1, true), (2, false)]),
             ),
         ];
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let mut online_data = OnlineData::for_test(&server.url());
         online_data.evm_chains = HashMap::from([(
             31337,
@@ -17206,7 +17199,7 @@ mod bfa_tests {
     #[test]
     fn url_reject_list_parse() {
         use crate::api::evm::tests::{block_on, test_opout};
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
         // lines are trimmed, empty lines are skipped and invalid lines are ignored
         let mut server = mockito::Server::new();
@@ -17216,7 +17209,7 @@ mod bfa_tests {
             test_opout(2)
         );
         let _mock = server.mock("GET", "/").with_body(body).create();
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet.online_data = Some(OnlineData::for_test(&server.url()));
         let source = RejectListSource::Url(server.url());
         let (reject, allow) = block_on(wallet._get_reject_list_async(&source)).unwrap();
@@ -17253,7 +17246,7 @@ mod bfa_tests {
         use crate::api::evm::tests::block_on;
         use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 
-        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let mut wallet = crate::wallet::offline::test_wallet::make_test_wallet();
         wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Ifa];
         let url = "http://127.0.0.1:1";
         wallet.online_data = Some(OnlineData::for_test(url));
@@ -17320,7 +17313,7 @@ mod bfa_tests {
             ]
         }
 
-        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let mut wallet = crate::wallet::offline::test_wallet::make_test_wallet();
         wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Ifa];
         for (id, schema, supply) in [
             ("rgb:ifa", AssetSchema::Ifa, Some(s!("1000"))),
@@ -17336,7 +17329,7 @@ mod bfa_tests {
                 })
                 .unwrap();
         }
-        let addr = crate::wallet::offline::address_reuse_tests::make_test_wallet(false)
+        let addr = crate::wallet::offline::test_wallet::make_test_wallet()
             .get_address()
             .unwrap();
         let url = "http://127.0.0.1:1";
@@ -17407,7 +17400,7 @@ mod bfa_tests {
         use crate::api::evm::tests::block_on;
         use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 
-        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let mut wallet = crate::wallet::offline::test_wallet::make_test_wallet();
         wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Bfa];
         let url = "http://127.0.0.1:1";
         wallet.online_data = Some(OnlineData::for_test(url));
@@ -17489,7 +17482,7 @@ mod bfa_tests {
                 r#""error":{"code":-32000,"message":"missing trie node"}"#,
             ),
         ];
-        let mut wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let mut wallet = crate::wallet::offline::test_wallet::make_test_wallet();
         wallet.wallet_data.supported_schemas = vec![AssetSchema::Nia, AssetSchema::Bfa];
         let result = block_on(wallet.go_online(OnlineOptions {
             indexer_config: IndexerConfig::Esplora {
@@ -17520,7 +17513,7 @@ mod bfa_tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn check_burn_reason_wants_32_hex_bytes() {
-        let wallet = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let wallet = crate::wallet::offline::test_wallet::make_test_wallet();
         let reason = "ab".repeat(32);
         assert_eq!(
             wallet
@@ -17574,13 +17567,13 @@ mod bfa_tests {
 mod save_new_asset_tests {
     use super::*;
     use crate::block_on;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use crate::wallet::offline::test_wallet::make_test_wallet;
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn save_new_asset_refuses_bad_input() {
         let url = "http://127.0.0.1:1";
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let online = Online {
             id: 1,
             indexer_url: url.to_string(),
@@ -17611,7 +17604,7 @@ mod save_new_asset_tests {
 mod recipient_checks_tests {
     use super::*;
     use crate::no_wallet::recipient_id_from_script_buf;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use crate::wallet::offline::test_wallet::make_test_wallet;
 
     fn valid_recipient(wallet: &mut Wallet, endpoint: String, now_ts: i64) -> Recipient {
         let script = wallet
@@ -17653,7 +17646,7 @@ mod recipient_checks_tests {
     #[test]
     fn parse_recipient_bounds_invoice_expiration() {
         let now_ts = now().unix_timestamp();
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let mut r = valid_recipient(&mut wallet, s!("rpc://127.0.0.1:1/json-rpc"), now_ts);
 
         r.expiration_timestamp = Some((now_ts + i64::from(MAX_EXPIRATION_SECS)) as u64);
@@ -17668,7 +17661,7 @@ mod recipient_checks_tests {
     #[test]
     fn parse_recipient_checks_in_order() {
         let now_ts = now().unix_timestamp();
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let valid = valid_recipient(&mut wallet, s!("rpc://127.0.0.1:1/json-rpc"), now_ts);
         let too_many = vec![valid.transport_endpoints[0].clone(); MAX_TRANSPORT_ENDPOINTS + 1];
         let script = XChainNet::<Beneficiary>::from_str(&valid.recipient_id)
@@ -17715,7 +17708,7 @@ mod recipient_checks_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sync_options_tests {
     use super::*;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use crate::wallet::offline::test_wallet::make_test_wallet;
 
     // Make the wallet know an unconfirmed TX that spends `prev` and pays `spk`.
     fn pay(wallet: &mut Wallet, spk: ScriptBuf, prev: OutPoint) -> Txid {
@@ -17750,7 +17743,7 @@ mod sync_options_tests {
 
     #[test]
     fn fast_sync_vanilla_spks_takes_lookback_tail() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let _ = wallet
             .bdk_wallet
             .reveal_addresses_to(KeychainKind::Internal, 9)
@@ -17786,7 +17779,7 @@ mod sync_options_tests {
 
     #[test]
     fn include_spent_registers_spent_colored_outputs() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let _ = wallet
             .bdk_wallet
             .reveal_addresses_to(KeychainKind::External, 0)
@@ -17818,7 +17811,7 @@ pub(crate) async fn assert_aborted_restores<T>(
     point: &'static str,
     call: &impl AsyncFn(&mut Wallet) -> Result<T, Error>,
 ) {
-    let before = crate::wallet::offline::address_reuse_tests::state(wallet);
+    let before = crate::wallet::offline::test_wallet::state(wallet);
     let controller = std::rc::Rc::new(crate::AbortController::new());
     crate::utils::ABORT_AT.with_borrow_mut(|a| *a = Some((point, controller.clone())));
     let res = wallet
@@ -17826,10 +17819,7 @@ pub(crate) async fn assert_aborted_restores<T>(
         .await;
     crate::utils::ABORT_AT.with_borrow_mut(|a| *a = None);
     assert_eq!(res.err(), Some(Error::Aborted));
-    assert_eq!(
-        crate::wallet::offline::address_reuse_tests::state(wallet),
-        before
-    );
+    assert_eq!(crate::wallet::offline::test_wallet::state(wallet), before);
 }
 
 /// Abort `call` as [`assert_aborted_restores`] does, then run it again without a signal and
@@ -17850,7 +17840,7 @@ mod abort_tests {
     use super::send_end_tests::{dummy_psbt, seed_vanilla, setup_at};
     use super::*;
     use crate::AbortController;
-    use crate::wallet::offline::address_reuse_tests::{make_test_wallet, state};
+    use crate::wallet::offline::test_wallet::{make_test_wallet, state};
     use std::{
         future::poll_fn,
         pin::pin,
@@ -18006,8 +17996,8 @@ mod abort_tests {
             std::thread::sleep(Duration::from_secs(1));
             ("200 OK", GENESIS_HASH.to_vec())
         });
-        let mut w1 = make_test_wallet(false);
-        let mut w2 = make_test_wallet(false);
+        let mut w1 = make_test_wallet();
+        let mut w2 = make_test_wallet();
         let (r1, r2) = block_on(async {
             let mut f1 = pin!(w1.with_abort(Some(c1.signal()), async |w| {
                 w.go_online(options(&url1, &[])).await

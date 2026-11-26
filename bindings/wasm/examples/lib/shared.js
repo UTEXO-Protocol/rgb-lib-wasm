@@ -293,7 +293,6 @@ export function fillWalletData(network) {
     databaseType: 'Sqlite',
     maxAllocationsPerUtxo: 5,
     supportedSchemas: ['Nia', 'Ifa'],
-    reuseAddresses: false,
   };
   const el = document.getElementById('wallet-data');
   if (el) el.value = json(wd);

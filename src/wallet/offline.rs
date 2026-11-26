@@ -1069,10 +1069,6 @@ pub struct WalletData {
     /// List of schemas the wallet should support (when issuing, sending and receiving). Empty list
     /// means the wallet should support all the schemas rgb-lib supports.
     pub supported_schemas: Vec<AssetSchema>,
-    /// When `true`, address generation returns a pinned address instead of creating new ones.
-    /// Default: `false`
-    #[serde(default)]
-    pub reuse_addresses: bool,
     /// When `false`, a mainnet wallet that supports IFA or BFA fails with
     /// [`crate::Error::CannotUseSchemaOnMainnet`]. When `true`, it is created and a warning is logged.
     /// Default: `false`
@@ -1193,6 +1189,7 @@ pub(crate) struct WalletManifest {
     pub(crate) database_type: DatabaseType,
     pub(crate) max_allocations_per_utxo: u32,
     pub(crate) supported_schemas: Vec<AssetSchema>,
+    // Stored state keeps this field. The wallet does not read it.
     pub(crate) reuse_addresses: bool,
     pub(crate) allow_reckless_schemas: bool,
     pub(crate) account_xpub_vanilla: String,
@@ -1209,7 +1206,7 @@ impl WalletManifest {
             database_type: wallet_data.database_type.clone(),
             max_allocations_per_utxo: wallet_data.max_allocations_per_utxo,
             supported_schemas: wallet_data.supported_schemas.clone(),
-            reuse_addresses: wallet_data.reuse_addresses,
+            reuse_addresses: false,
             allow_reckless_schemas: wallet_data.allow_reckless_schemas,
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
@@ -1266,7 +1263,6 @@ impl WalletManifest {
                 database_type: self.database_type,
                 max_allocations_per_utxo: self.max_allocations_per_utxo,
                 supported_schemas: self.supported_schemas,
-                reuse_addresses: self.reuse_addresses,
                 allow_reckless_schemas: self.allow_reckless_schemas,
             },
             SinglesigKeys {
@@ -1331,8 +1327,6 @@ pub struct Wallet {
     /// Colored and vanilla signers. They are empty for a watch-only wallet.
     pub(crate) signers: [SignersContainer; 2],
     pub(crate) bdk_database: BdkPersister,
-    /// Pinned derivation index per keychain for address reuse.
-    pub(crate) reuse_address_index: HashMap<KeychainKind, u32>,
     #[cfg(feature = "esplora")]
     pub(crate) online_data: Option<OnlineData>,
     /// In-memory storage for transfer artifacts (replaces filesystem on wasm32).
@@ -1529,7 +1523,6 @@ impl Wallet {
             bdk_wallet,
             signers,
             bdk_database,
-            reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
             online_data: None,
             #[cfg(feature = "esplora")]
@@ -3257,27 +3250,67 @@ impl Wallet {
         Ok(self.received_mints.get(&recipient_id).cloned())
     }
 
-    /// Return the consignment of the burn of `asset_id` with TXID `txid`. It proves the burn with
-    /// the signed transaction and the full history. The wallet keeps it once the burn is ended.
+    /// Return the consignment of the transfer with this `idx` from
+    /// [`list_transfers`](Wallet::list_transfers). In JS it is `Uint8Array | null`.
     ///
-    /// Fails with [`Error::UnknownTransfer`] if the wallet has no ended burn of the asset with
-    /// that TXID.
-    pub fn get_burn_consignment(&self, asset_id: String, txid: String) -> Result<Vec<u8>, Error> {
-        info!(self.logger, "Getting burn consignment...");
-        let transfers = self.list_transfers(
-            AssetFilter::Id(asset_id.clone()),
-            TransferScope::Txid(txid.clone()),
-        )?;
-        if !transfers.iter().any(|t| t.kind == TransferKind::Burn) {
-            return Err(Error::UnknownTransfer { txid });
-        }
-        let bytes = self
-            .transfer_artifacts
-            .get(&txid)
-            .and_then(|a| a.consignment_bytes.get(&asset_id))
-            .cloned()
-            .ok_or(Error::UnknownTransfer { txid })?;
-        info!(self.logger, "Get burn consignment completed");
+    /// - A send, burn, link or mint gives the consignment the wallet sent.
+    /// - A blind or witness receive gives the consignment the wallet received and validated. It
+    ///   gives it while pending and after settlement, also for a mint that waits for its lock.
+    /// - A receive gives `None` before its consignment arrives and when it failed.
+    /// - An issuance gives the contract.
+    /// - An inflation gives `None`.
+    ///
+    /// Fails with [`Error::BatchTransferNotFound`] if no transfer has this idx.
+    pub fn get_consignment(&self, transfer_idx: i32) -> Result<Option<Vec<u8>>, Error> {
+        info!(self.logger, "Getting consignment...");
+        let db_data = self.database.get_db_data(false)?;
+        let transfer = db_data
+            .transfers
+            .iter()
+            .find(|t| t.idx == transfer_idx)
+            .ok_or(Error::BatchTransferNotFound { idx: transfer_idx })?;
+        let (asset_transfer, batch_transfer) =
+            transfer.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
+        let kind = self
+            .get_transfer_data(
+                transfer,
+                &asset_transfer,
+                &batch_transfer,
+                &db_data.txos,
+                &db_data.colorings,
+            )?
+            .kind;
+        let asset_id = asset_transfer.asset_id.unwrap_or_default();
+        let bytes = match kind {
+            TransferKind::Inflation => None,
+            TransferKind::Issuance => Some(self.export_contract(asset_id)?.contract),
+            TransferKind::Send | TransferKind::Burn | TransferKind::Link | TransferKind::Mint => {
+                batch_transfer
+                    .txid
+                    .and_then(|txid| self.transfer_artifacts.get(&txid))
+                    .and_then(|a| a.consignment_bytes.get(&asset_id))
+                    .cloned()
+            }
+            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => {
+                let recipient_id = transfer.recipient_id.as_deref().unwrap_or_default();
+                let bytes = self.received_consignments.get(recipient_id);
+                match batch_transfer.status {
+                    // a failed receive can keep bytes the wallet did not validate
+                    TransferStatus::Failed => None,
+                    // only a checked mint that waits for its lock has validated bytes
+                    TransferStatus::Initiated | TransferStatus::WaitingCounterparty => bytes
+                        .filter(|b| {
+                            self.received_mints.contains_key(recipient_id)
+                                && self.pending_mint_locks.get(recipient_id).is_some_and(|l| {
+                                    l.consignment_digest == hex::encode(sha256_digest(b))
+                                })
+                        })
+                        .cloned(),
+                    _ => bytes.cloned(),
+                }
+            }
+        };
+        info!(self.logger, "Get consignment completed");
         Ok(bytes)
     }
 
@@ -4558,18 +4591,6 @@ impl Wallet {
     }
 
     pub(crate) fn _get_new_address(&mut self, keychain: KeychainKind) -> Result<BdkAddress, Error> {
-        if self.wallet_data.reuse_addresses {
-            let index = self
-                .reuse_address_index
-                .get(&keychain)
-                .copied()
-                .unwrap_or(0);
-            // reveal_addresses_to ensures BDK's sync engine tracks this address
-            let _ = self.bdk_wallet.reveal_addresses_to(keychain, index);
-            self.bdk_wallet.persist(&mut self.bdk_database)?;
-            let address = self.bdk_wallet.peek_address(keychain, index).address;
-            return Ok(address);
-        }
         let address = self.bdk_wallet.reveal_next_address(keychain).address;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         Ok(address)
@@ -4589,40 +4610,9 @@ impl Wallet {
     fn _get_address(&mut self) -> Result<String, Error> {
         info!(self.logger, "Getting address...");
         let address = self._get_new_address(KeychainKind::Internal)?;
-
-        if !self.wallet_data.reuse_addresses {
-            self.update_backup_info(false)?;
-        }
+        self.update_backup_info(false)?;
 
         info!(self.logger, "Get address completed");
-        Ok(address.to_string())
-    }
-
-    /// Rotate the pinned address for the given keychain.
-    ///
-    /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
-    /// index so subsequent address generation returns a fresh address.
-    pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
-        let cp = self.checkpoint("rotate_address");
-        let res = self._rotate_address(keychain);
-        self.commit_queued(cp, res)
-    }
-
-    fn _rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
-        if !self.wallet_data.reuse_addresses {
-            return Err(Error::AddressReuseDisabled);
-        }
-        let index = self
-            .reuse_address_index
-            .get(&keychain)
-            .copied()
-            .unwrap_or(0);
-        let new_index = index + 1;
-        self.reuse_address_index.insert(keychain, new_index);
-        let _ = self.bdk_wallet.reveal_addresses_to(keychain, new_index);
-        self.bdk_wallet.persist(&mut self.bdk_database)?;
-        let address = self.bdk_wallet.peek_address(keychain, new_index).address;
-
         Ok(address.to_string())
     }
 }
@@ -4649,7 +4639,6 @@ pub(crate) struct Checkpoint {
     received_mints: HashMap<String, ReceivedMint>,
     media: HashMap<String, Vec<u8>>,
     pending_mint_locks: HashMap<String, PendingMintLocks>,
-    reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
 fn idb_key_for(wallet_dir: &Path, bitcoin_network: BitcoinNetwork) -> String {
@@ -4765,7 +4754,6 @@ impl Wallet {
             media: self.media.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
             rgb_store,
-            reuse_address_index: self.reuse_address_index.clone(),
             manifest: WalletManifest::new(&self.wallet_data, &self.keys),
             backup_versions: self.backup_versions.borrow().clone(),
         })
@@ -4822,9 +4810,6 @@ impl Wallet {
         self.received_mints = snapshot.received_mints;
         self.media = snapshot.media;
         self.pending_mint_locks = snapshot.pending_mint_locks;
-
-        // Restore address reuse pinned indices
-        self.reuse_address_index = snapshot.reuse_address_index;
 
         *self.rgb_stock.borrow_mut() = Some(stock);
         *self.backup_versions.borrow_mut() = snapshot.backup_versions;
@@ -4908,7 +4893,6 @@ impl Wallet {
             received_mints: self.received_mints.clone(),
             media: self.media.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
-            reuse_address_index: self.reuse_address_index.clone(),
         }
     }
 
@@ -4930,7 +4914,6 @@ impl Wallet {
         self.received_mints = cp.received_mints;
         self.media = cp.media;
         self.pending_mint_locks = cp.pending_mint_locks;
-        self.reuse_address_index = cp.reuse_address_index;
         #[cfg(feature = "esplora")]
         if !self.broadcast_txs.is_empty() {
             // a broadcast TX stays in BDK, as its change can pay an address revealed here
@@ -5010,7 +4993,7 @@ impl Wallet {
 }
 
 #[cfg(test)]
-pub(crate) mod address_reuse_tests {
+pub(crate) mod test_wallet {
     use super::*;
     use crate::keys::generate_keys;
 
@@ -5035,24 +5018,23 @@ pub(crate) mod address_reuse_tests {
     /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
-    pub(crate) fn make_test_wallet(reuse: bool) -> Wallet {
-        make_test_wallet_with_keys(
-            generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot),
-            reuse,
-        )
+    pub(crate) fn make_test_wallet() -> Wallet {
+        make_test_wallet_with_keys(generate_keys(
+            BitcoinNetwork::Regtest,
+            WitnessVersion::Taproot,
+        ))
     }
 
-    pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys, reuse: bool) -> Wallet {
-        make_test_wallet_with_singlesig_keys(SinglesigKeys::from_keys(&keys, None), reuse)
+    pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys) -> Wallet {
+        make_test_wallet_with_singlesig_keys(SinglesigKeys::from_keys(&keys, None))
     }
 
-    pub(crate) fn make_test_wallet_with_singlesig_keys(keys: SinglesigKeys, reuse: bool) -> Wallet {
-        make_test_wallet_on_network(keys, reuse, BitcoinNetwork::Regtest)
+    pub(crate) fn make_test_wallet_with_singlesig_keys(keys: SinglesigKeys) -> Wallet {
+        make_test_wallet_on_network(keys, BitcoinNetwork::Regtest)
     }
 
     pub(crate) fn make_test_wallet_on_network(
         keys: SinglesigKeys,
-        reuse: bool,
         bitcoin_network: BitcoinNetwork,
     ) -> Wallet {
         let bdk_network = BdkNetwork::from(bitcoin_network);
@@ -5079,7 +5061,6 @@ pub(crate) mod address_reuse_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia],
-            reuse_addresses: reuse,
             allow_reckless_schemas: false,
         };
 
@@ -5097,7 +5078,6 @@ pub(crate) mod address_reuse_tests {
             bdk_wallet,
             signers,
             bdk_database,
-            reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
             online_data: None,
             #[cfg(feature = "esplora")]
@@ -5176,7 +5156,6 @@ pub(crate) mod address_reuse_tests {
             "received_mints": wallet.received_mints,
             "media": wallet.media,
             "pending_mint_locks": wallet.pending_mint_locks,
-            "reuse_address_index": wallet.reuse_address_index,
         })
     }
 
@@ -5217,7 +5196,7 @@ pub(crate) mod address_reuse_tests {
 
     #[test]
     fn get_address_is_atomic() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         block_on(assert_no_partial_change(
             &mut wallet,
             "get_address",
@@ -5225,79 +5204,16 @@ pub(crate) mod address_reuse_tests {
             async |w| w.get_address(),
         ));
     }
-
-    #[test]
-    fn rotate_address_is_atomic() {
-        let mut wallet = make_test_wallet(true);
-        block_on(assert_no_partial_change(
-            &mut wallet,
-            "rotate_address",
-            0,
-            async |w| w.rotate_address(KeychainKind::Internal),
-        ));
-    }
-
-    #[test]
-    fn reuse_returns_same_address() {
-        let mut wallet = make_test_wallet(true);
-        let addr1 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        let addr2 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        assert_eq!(addr1, addr2, "reuse enabled: same address expected");
-    }
-
-    #[test]
-    fn no_reuse_returns_different_addresses() {
-        let mut wallet = make_test_wallet(false);
-        let addr1 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        let addr2 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        assert_ne!(addr1, addr2, "reuse disabled: different addresses expected");
-    }
-
-    #[test]
-    fn reuse_index_changes_address() {
-        let mut wallet = make_test_wallet(true);
-        let old_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
-
-        // Simulate what rotate_address does internally
-        wallet.reuse_address_index.insert(KeychainKind::Internal, 1);
-        let new_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
-
-        assert_ne!(
-            old_addr, new_addr,
-            "bumping index should change the pinned address"
-        );
-    }
-
-    #[test]
-    fn keychains_have_independent_indices() {
-        let mut wallet = make_test_wallet(true);
-        let internal = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        let external = wallet._get_new_address(KeychainKind::External).unwrap();
-        assert_ne!(
-            internal.to_string(),
-            external.to_string(),
-            "different keychains"
-        );
-
-        // Bump External index — should not affect Internal
-        wallet.reuse_address_index.insert(KeychainKind::External, 1);
-        let internal_after = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        assert_eq!(
-            internal.to_string(),
-            internal_after.to_string(),
-            "Internal unchanged after External index bump"
-        );
-    }
 }
 
 #[cfg(test)]
 mod debug_tests {
     use super::*;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use crate::wallet::offline::test_wallet::make_test_wallet;
 
     #[test]
     fn debug_hides_wallet_mnemonic() {
-        let keys = make_test_wallet(false).get_keys();
+        let keys = make_test_wallet().get_keys();
         let phrase = keys.mnemonic.clone().unwrap();
         assert!(!format!("{keys:?}").contains(phrase.as_str()));
     }
@@ -5321,7 +5237,6 @@ mod mainnet_schema_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
-            reuse_addresses: false,
             allow_reckless_schemas: reckless,
         };
         (wd, SinglesigKeys::from_keys(&keys, None))
@@ -5374,7 +5289,6 @@ mod keys_and_settings_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia],
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         }
     }
@@ -5596,7 +5510,6 @@ mod keys_and_settings_tests {
             data_dir: s!("other"),
             max_allocations_per_utxo: 1,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
-            reuse_addresses: true,
             allow_reckless_schemas: true,
             ..wallet_data()
         };
@@ -5611,13 +5524,13 @@ mod keys_and_settings_tests {
         let wd = WalletData {
             max_allocations_per_utxo: 1,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
-            reuse_addresses: true,
             allow_reckless_schemas: true,
             ..wallet_data()
         };
         let sk = SinglesigKeys::from_keys(&keys, Some(2));
         let json = serde_json::to_string(&WalletManifest::new(&wd, &sk)).unwrap();
         assert!(!json.contains(keys.mnemonic.as_str()));
+        assert!(json.contains("\"reuse_addresses\":false"));
 
         let manifest: WalletManifest = serde_json::from_str(&json).unwrap();
         let (got_wd, got_sk) = manifest.into_parts(s!("dir"), Some(keys.mnemonic.clone()));
@@ -5642,7 +5555,7 @@ mod keys_and_settings_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod receive_expiration_tests {
-    use super::address_reuse_tests::make_test_wallet;
+    use super::test_wallet::make_test_wallet;
     use super::*;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
@@ -5677,7 +5590,7 @@ mod receive_expiration_tests {
 
     #[test]
     fn receive_past_expiration_fails() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let online = online(&mut wallet);
         let result = crate::block_on(wallet.witness_receive(
             Some(online),
@@ -5695,7 +5608,7 @@ mod receive_expiration_tests {
 
     #[test]
     fn receive_needs_online() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let exp = now().unix_timestamp() as u64 + 100_000;
         for result in [
             crate::block_on(wallet.witness_receive(
@@ -5725,20 +5638,25 @@ mod receive_expiration_tests {
 
     #[test]
     fn receive_keeps_given_expiration_and_stores_v1_data() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let online = online(&mut wallet);
         let (server, _mocks) = proxy();
         let exp = now().unix_timestamp() + 100_000;
-        let data = crate::block_on(wallet.create_receive_data(
-            Some(online),
-            None,
-            Assignment::Any,
-            exp,
-            vec![format!("rpc://{}", server.host_with_port())],
-            RecipientType::Witness,
-            Some(Encryption::Optional),
-        ))
-        .unwrap();
+        let mut receive = || {
+            crate::block_on(wallet.create_receive_data(
+                Some(online.clone()),
+                None,
+                Assignment::Any,
+                exp,
+                vec![format!("rpc://{}", server.host_with_port())],
+                RecipientType::Witness,
+                Some(Encryption::Optional),
+            ))
+            .unwrap()
+        };
+        let data = receive();
+        // each witness receive has its own address
+        assert_ne!(receive().recipient_id, data.recipient_id);
         wallet.store_receive_transfer(&data, 1).unwrap();
         let public_key = hex::encode(&data.recipient_pubkey);
         let db_data = wallet.database.get_db_data(false).unwrap();
@@ -5772,7 +5690,7 @@ mod receive_expiration_tests {
 
 #[cfg(test)]
 mod available_allocations_tests {
-    use super::address_reuse_tests::make_test_wallet;
+    use super::test_wallet::make_test_wallet;
     use super::*;
 
     fn unspent(vout: u32, allocations: usize, pending_blinded: u32) -> LocalUnspent {
@@ -5802,7 +5720,7 @@ mod available_allocations_tests {
 
     #[test]
     fn available_allocations_capped_by_the_bundle_limit() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet.wallet_data.max_allocations_per_utxo = u32::MAX;
         let max = MAX_UTXO_ASSET_ALLOCATIONS;
         let mut unspents = vec![
@@ -5846,10 +5764,7 @@ mod inspect_psbt_tests {
     }
 
     fn wallet(keys: &str) -> Wallet {
-        address_reuse_tests::make_test_wallet_with_singlesig_keys(
-            serde_json::from_str(keys).unwrap(),
-            false,
-        )
+        test_wallet::make_test_wallet_with_singlesig_keys(serde_json::from_str(keys).unwrap())
     }
 
     fn matches_rgb_lib(w: &Wallet, psbt: &str, expected: &str) -> PsbtInspection {
@@ -5930,7 +5845,7 @@ mod inspect_psbt_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod export_contract_tests {
-    use super::address_reuse_tests::{add_fake_txos, media_attachment, set_media, state};
+    use super::test_wallet::{add_fake_txos, media_attachment, set_media, state};
     use super::*;
     use crate::keys::generate_keys;
 
@@ -5942,7 +5857,6 @@ mod export_contract_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa, AssetSchema::Bfa],
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         };
         let wallet = Wallet::new(wd, SinglesigKeys::from_keys(&keys, None)).unwrap();

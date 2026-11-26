@@ -705,9 +705,9 @@ mod tests {
 
     #[test]
     fn batch_transfer_sent_only_after_send_end() {
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
-        let wallet = make_test_wallet(false);
+        let wallet = make_test_wallet();
         let txid = "0000000000000000000000000000000000000000000000000000000000000001";
         // send_begin saves the send as Initiated
         let idx = wallet
@@ -735,9 +735,9 @@ mod tests {
     #[test]
     fn list_asset_media_lists_db_media() {
         use crate::database::memory_db::{ActiveValue, DbAssetActMod, DbMediaActMod};
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
-        let wallet = make_test_wallet(false);
+        let wallet = make_test_wallet();
         let asset_id = |b: u8| ContractId::copy_from_slice([b; 32]).unwrap().to_string();
         assert!(matches!(
             wallet.list_asset_media(asset_id(7)),

@@ -12,10 +12,6 @@ pub enum Error {
     #[error("Aborted")]
     Aborted,
 
-    /// Address rotation called when reuse_addresses is false
-    #[error("Address reuse is not enabled")]
-    AddressReuseDisabled,
-
     /// No need to create more allocations
     #[error("Allocations already available")]
     AllocationsAlreadyAvailable,
