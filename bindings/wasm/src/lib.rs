@@ -827,25 +827,6 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Rotate the pinned address for the given keychain.
-    /// keychain: 0 = External (colored), 1 = Internal (vanilla)
-    #[wasm_bindgen(js_name = "rotateAddress")]
-    pub fn rotate_address(&self, keychain: u32) -> Result<String, JsValue> {
-        let kc = match keychain {
-            0 => rgb_lib_wasm::bdk_wallet::KeychainKind::External,
-            1 => rgb_lib_wasm::bdk_wallet::KeychainKind::Internal,
-            _ => {
-                return Err(JsValue::from_str(
-                    "Invalid keychain: use 0 (External) or 1 (Internal)",
-                ));
-            }
-        };
-        self.inner
-            .borrow_mut()
-            .rotate_address(kc)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-
     /// Delete failed transfers. Returns true if any were deleted.
     #[wasm_bindgen(js_name = "deleteTransfers")]
     pub fn delete_transfers(
@@ -1461,13 +1442,15 @@ impl WasmWallet {
         to_js(&result)
     }
 
-    /// Return the consignment of an ended burn as a Uint8Array.
-    #[wasm_bindgen(js_name = "getBurnConsignment")]
-    pub fn get_burn_consignment(&self, asset_id: &str, txid: &str) -> Result<Vec<u8>, JsValue> {
-        self.inner
+    /// Return the consignment of a transfer: Uint8Array | null.
+    #[wasm_bindgen(js_name = "getConsignment")]
+    pub fn get_consignment(&self, transfer_idx: i32) -> Result<JsValue, JsValue> {
+        let bytes = self
+            .inner
             .borrow()
-            .get_burn_consignment(asset_id.to_string(), txid.to_string())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .get_consignment(transfer_idx)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(bytes.map_or(JsValue::NULL, |b| js_sys::Uint8Array::from(&b[..]).into()))
     }
 
     /// Link an IFA or BFA asset to another contract: begin, sign with the wallet keys and end.

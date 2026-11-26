@@ -12,7 +12,7 @@ use crate::no_wallet::{
     RgbTransitionInfo, SpvProofFill, WitnessWithoutProof, fill_spv_proofs, inspect_fascia,
 };
 use crate::utils::{INDEXER_SYNCS, TRANSITION_BUILDERS_LOADED};
-use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::offline::test_wallet::assert_no_partial_change;
 use crate::wallet::online::assert_abort_restores;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
 use crate::wallet::{
@@ -377,6 +377,7 @@ async fn send_enters_the_stock_at_broadcast() {
     assert_eq!(witness_ord(&a, &txid), None);
     end(&mut a, &a_on, signed).await;
     assert!(witness_ord(&a, &txid).is_some());
+    assert!(a.get_consignment(sent(&a, &txid).idx).unwrap().is_some());
 }
 
 #[wasm_bindgen_test]
@@ -701,11 +702,16 @@ async fn receive_settles_after_reload() {
     let asset_id = issue(&a, vec![AMOUNT]);
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
     send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
+    let consignment = |w: &Wallet| w.get_consignment(transfer_of(w, &rid).idx).unwrap();
+    // no consignment before it arrives
+    assert_eq!(consignment(&r), None);
     refresh(&mut r, &r_on).await;
     assert_eq!(
         transfer_of(&r, &rid).status,
         TransferStatus::WaitingConfirmations
     );
+    assert!(consignment(&r).is_some());
+    assert_eq!(consignment(&r), consignment(&a));
     // A NIA consignment has no reject list, so no DAG is built.
     assert!(
         r.received_valid_consignments[&rid]
@@ -724,6 +730,9 @@ async fn receive_settles_after_reload() {
     assert_eq!(balance(&r, &asset_id).settled, 100);
     // with no copy in memory, settlement validates once
     assert_eq!(validations(), v + 1);
+    // the sender and the recipient keep the consignment after settlement
+    assert!(consignment(&r).is_some());
+    assert_eq!(consignment(&r), consignment(&a));
 }
 
 // extra allocations listed as spent by a transition the consignment does not carry are refused

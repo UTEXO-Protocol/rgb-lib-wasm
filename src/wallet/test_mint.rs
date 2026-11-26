@@ -9,7 +9,7 @@ use crate::no_wallet::{
     TransitionMetadata, inspect_consignment,
 };
 use crate::wallet::offline::MOCK_ISSUE_MEDIA;
-use crate::wallet::offline::address_reuse_tests::{assert_no_partial_change, state};
+use crate::wallet::offline::test_wallet::{assert_no_partial_change, state};
 use crate::wallet::online::assert_aborted_restores;
 use crate::wallet::online::{
     MOCK_MINT_KEPT_AMOUNT, RECEIVED_CONSIGNMENT_VALIDATIONS, paying_mint_opid, unsupported_claims,
@@ -1901,10 +1901,19 @@ async fn bfa_mint_retry_looks_up_lock() {
     )
     .await
     .unwrap();
+    let sent = a
+        .get_consignment(transfer_of(&a, &rcv.recipient_id).idx)
+        .unwrap();
+    assert!(sent.is_some());
+    let received = |b: &Wallet| {
+        b.get_consignment(transfer_of(b, &rcv.recipient_id).idx)
+            .unwrap()
+    };
 
     // checking the mint validates its consignment and saves the locks it waits for
     let v0 = validations();
     refresh(&mut b, &b_online).await;
+    assert_eq!(received(&b), sent);
     assert!(
         b.get_received_mint(rcv.recipient_id.clone())
             .unwrap()
@@ -1931,6 +1940,8 @@ async fn bfa_mint_retry_looks_up_lock() {
         .get_mut(&rcv.recipient_id)
         .unwrap()
         .consignment_digest = "00".repeat(32);
+    // bytes the wallet did not check give no consignment
+    assert_eq!(received(&b), None);
     refresh(&mut b, &b_online).await;
     assert_eq!(validations(), v0 + 2);
     assert_eq!(

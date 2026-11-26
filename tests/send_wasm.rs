@@ -34,7 +34,6 @@ fn test_wallet_data(
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         },
         SinglesigKeys::from_keys(&keys, None),

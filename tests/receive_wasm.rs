@@ -26,7 +26,6 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         },
         SinglesigKeys::from_keys(&keys, None),
@@ -181,6 +180,11 @@ async fn witness_receive_locates_payment() {
         .iter()
         .map(|rid| transfer_of(&wallet_b, rid).batch_transfer_idx)
         .collect();
+    let consignment = |w: &Wallet| w.get_consignment(transfer_of(w, &rids[0]).idx).unwrap();
+    let sent = consignment(&wallet_a);
+    assert!(sent.is_some());
+    // no consignment before it arrives
+    assert_eq!(consignment(&wallet_b), None);
 
     // a failed lookup keeps each receive pending
     rpc_fail(PROXY_URL, "transfer.list");
@@ -214,6 +218,7 @@ async fn witness_receive_locates_payment() {
         assert_eq!(transfer.kind, TransferKind::ReceiveWitness);
         assert_eq!(transfer.txid, Some(txid.clone()));
     }
+    assert_eq!(consignment(&wallet_b), sent);
     // nothing was sent to the third invoice
     assert_eq!(
         transfer_of(&wallet_b, &rids[2]).status,
@@ -221,6 +226,7 @@ async fn witness_receive_locates_payment() {
     );
 
     settle(&mut wallet_b, &online_b, &rids[..2]).await;
+    assert_eq!(consignment(&wallet_b), sent);
     for (rid, amount) in rids.iter().zip([66, 34]) {
         let transfer = transfer_of(&wallet_b, rid);
         assert_eq!(transfer.status, TransferStatus::Settled);

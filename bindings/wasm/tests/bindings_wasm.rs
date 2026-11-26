@@ -36,7 +36,6 @@ fn wallet_json(supported_schemas: Vec<AssetSchema>) -> (String, String) {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 5,
         supported_schemas,
-        reuse_addresses: false,
         allow_reckless_schemas: false,
     };
     (
@@ -225,11 +224,12 @@ fn get_received_mint_is_null_when_unknown() {
 }
 
 #[wasm_bindgen_test]
-fn get_burn_consignment_fails_for_unknown_asset() {
-    let e = err(wallet()
-        .get_burn_consignment("rgb:unknown", &"00".repeat(32))
-        .unwrap_err());
-    assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+fn get_consignment_fails_for_unknown_transfer() {
+    let e = err(wallet().get_consignment(999).unwrap_err());
+    assert!(
+        e.starts_with("Batch transfer with idx 999 not found"),
+        "{e}"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -811,6 +811,24 @@ async fn inflate_begin_returns_result_object() {
     let change_utxos: js_sys::Array = prop(&inflation, "changeUtxos").dyn_into().unwrap();
     assert_eq!(change_utxos.length(), 1);
     assert!(prop(&inflation, "changeUtxo").is_undefined());
+
+    // an issuance gives the contract and an inflation gives null
+    let consignment = |t: &JsValue| {
+        wallet
+            .get_consignment(prop(t, "idx").as_f64().unwrap() as i32)
+            .unwrap()
+    };
+    let issuance = transfers
+        .iter()
+        .find(|t| prop(t, "kind").as_string().as_deref() == Some("Issuance"))
+        .unwrap();
+    let contract: js_sys::Uint8Array =
+        prop(&wallet.export_contract(&asset_id).unwrap(), "contract")
+            .dyn_into()
+            .unwrap();
+    let issued: js_sys::Uint8Array = consignment(&issuance).dyn_into().unwrap();
+    assert_eq!(issued.to_vec(), contract.to_vec());
+    assert!(consignment(&inflation).is_null());
 }
 
 #[wasm_bindgen_test]

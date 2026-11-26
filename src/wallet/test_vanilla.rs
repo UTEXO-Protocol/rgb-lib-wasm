@@ -4,7 +4,7 @@ use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, wallet_data};
 use crate::database::DbWalletTransaction;
 use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
-use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::offline::test_wallet::assert_no_partial_change;
 use crate::wallet::online::assert_abort_restores;
 use crate::wallet::vss::VssBackupConfig;
 use crate::wallet::{
