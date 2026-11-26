@@ -217,13 +217,15 @@ const txid = await wallet.sendBtcEnd(online, signed);
 
 ```javascript
 // Blind receive (UTXO-based)
-// The wallet reserves the invoice on its proxies, so it takes the Online object. The last argument
-// is the encryption preference ('Required' by default, 'Unsupported' or 'Optional').
-const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+// The wallet reserves the invoice on its proxies, so it takes the Online object.
+// The last two arguments are the encryption preference and the quota.
+// Encryption is 'Required' (default), 'Unsupported' or 'Optional'.
+// The quota is the number of transfers (default 1). Above 1, it needs transport endpoints.
+const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
 // blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey }
 
 // Witness receive (address-based)
-const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
 ```
 
 ### Parsing invoices
