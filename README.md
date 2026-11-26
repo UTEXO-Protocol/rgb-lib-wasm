@@ -491,7 +491,7 @@ To protect a wallet:
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun, signal?)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
-| `getBurnConsignment(assetId, txid)` | no | Return the consignment of an ended burn (bytes), which proves it with its history |
+| `getConsignment(transferIdx)` | no | Return the consignment of a transfer (bytes), the idx as `listTransfers` gives it: the sent consignment of a send, burn, link or mint; the contract of an issuance; the received and validated consignment of a blind or witness receive, while pending (a mint also while it waits for its lock) and after `Settled`; `null` for an inflation, before a receive's consignment arrives and for a receive that failed without a validated consignment. Fails for an unknown idx |
 | `link(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
 | `linkBegin(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks, dryRun, signal?)` | yes | Prepare link PSBT |
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
