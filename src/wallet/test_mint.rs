@@ -394,6 +394,7 @@ async fn bfa_mint_settles_and_is_spendable() {
             .unwrap()
             .is_empty()
     );
+    let b_idx = transfer_of(&b, &receive.recipient_id).idx;
     b.backup("pw").unwrap();
     assert!(!b.backup_info().unwrap());
     b.refresh(b_online.clone(), None, vec![], false)
@@ -403,6 +404,7 @@ async fn bfa_mint_settles_and_is_spendable() {
         .get_received_mint(receive.recipient_id.clone())
         .unwrap()
         .remove(0);
+    assert_eq!(b.get_consignment(b_idx), Ok(Some(bytes.clone())));
     // the check keeps the transfer waiting and marks a backup as required
     assert_eq!(
         transfer_status(&mut b, &receive.recipient_id),
@@ -540,6 +542,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     );
     assert_eq!(transfer.txid, Some(minted.txid));
     assert!(transfer.consignment_path.is_some());
+    assert_eq!(a.get_consignment(transfer.idx), Ok(Some(bytes.clone())));
     assert_eq!(mint_rights(&mut a, &asset_id).await, 2);
     let b_balance = b.get_asset_balance(asset_id.clone()).unwrap();
     assert_eq!(
@@ -597,9 +600,14 @@ async fn bfa_mint_settles_and_is_spendable() {
             .iter()
             .any(|o| o.script_pubkey == script && o.value.to_sat() == 1000)
     );
+    let w_bytes = a
+        .send_consignment_bytes(&psbt.unsigned_tx.compute_txid().to_string(), &asset_id)
+        .unwrap();
+    let w_idx = transfer_of(&b, &receive.recipient_id).idx;
     b.refresh(b_online.clone(), None, vec![], false)
         .await
         .unwrap();
+    assert_eq!(b.get_consignment(w_idx), Ok(Some(w_bytes.clone())));
     lock_mint(&bridge, &res, MINT_AMOUNT).await;
     mint_end(&mut a, &a_online, &res).await.unwrap();
     for _ in 0..3 {
@@ -640,6 +648,7 @@ async fn bfa_mint_settles_and_is_spendable() {
         .unwrap();
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
+    assert_eq!(b.get_consignment(w_idx), Ok(Some(w_bytes)));
     assert_eq!(
         b.get_asset_balance(asset_id).unwrap().settled,
         70 + MINT_AMOUNT
