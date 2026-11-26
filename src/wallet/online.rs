@@ -3863,7 +3863,7 @@ impl Wallet {
         let bdk_txid = psbt.unsigned_tx.compute_txid();
         let txid = bdk_txid.to_string();
         let row = self.database.get_wallet_transaction_by_txid(&txid)?;
-        // an end or a refresh removes the artifacts of an RGB operation and keeps its batch
+        // an RGB operation keeps its batch
         if self.transfer_artifacts.contains_key(&txid)
             || self._get_outgoing_batch_transfer(&txid)?.is_some()
             || row.as_ref().is_some_and(|t| t.r#type != r#type)
@@ -7655,6 +7655,16 @@ impl Wallet {
         })
     }
 
+    /// Drop the artifacts of a broadcast operation. Keep its consignments.
+    fn keep_consignments_only(&mut self, txid: &str) {
+        if let Some(a) = self.transfer_artifacts.get_mut(txid) {
+            *a = TransferArtifacts {
+                consignment_bytes: std::mem::take(&mut a.consignment_bytes),
+                ..Default::default()
+            };
+        }
+    }
+
     /// Broadcast the TX of an outgoing batch transfer (a no-op on the network if a recipient
     /// already did), update the RGB state and move the transfer to `WaitingConfirmations`.
     async fn broadcast_batch(
@@ -7682,7 +7692,7 @@ impl Wallet {
         self._broadcast_signed_tx(signed_tx).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
-        self.transfer_artifacts.remove(txid);
+        self.keep_consignments_only(txid);
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
         Ok(self
@@ -7900,12 +7910,17 @@ impl Wallet {
             .database
             .update_batch_transfer(&mut updated_batch_transfer)?;
 
-        // Clean up: received data no longer needed after settle
+        // Keep the consignment. Forget the other received data.
         if incoming {
             let batch_transfer_data =
                 batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
             if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data) {
+                let receive_dir = self.get_receive_dir(&transfer);
+                let consignment = self.received_consignments.remove(&receive_dir);
                 self.clear_received_data(&transfer);
+                if let Some(bytes) = consignment {
+                    self.received_consignments.insert(receive_dir, bytes);
+                }
             }
         }
 
@@ -9925,7 +9940,7 @@ impl Wallet {
                 TransferStatus::WaitingConfirmations,
                 &consignment_hashes,
             )?;
-            self.transfer_artifacts.remove(&txid);
+            self.keep_consignments_only(&txid);
             idx
         } else {
             let idx = self._update_or_save_transfers(
@@ -10752,7 +10767,7 @@ impl Wallet {
     /// have already been signed.
     ///
     /// The wallet keeps a consignment that proves the burn, with its full history.
-    /// [`get_burn_consignment`](Wallet::get_burn_consignment) returns it.
+    /// [`get_consignment`](Wallet::get_consignment) returns it.
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn burn_end(

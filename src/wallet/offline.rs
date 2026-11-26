@@ -3310,27 +3310,81 @@ impl Wallet {
         Ok(received_mints)
     }
 
-    /// Return the consignment of the burn of `asset_id` with TXID `txid`. It proves the burn with
-    /// the signed transaction and the full history. The wallet keeps it once the burn is ended.
+    /// Return the consignment of the transfer with idx `transfer_idx`:
+    /// - a send, burn, link or mint: the sent consignment;
+    /// - an issuance: the contract;
+    /// - a receive: the validated consignment, while pending and after settlement. A mint that
+    ///   waits for its lock also has it.
     ///
-    /// Fails with [`Error::UnknownTransfer`] if the wallet has no ended burn of the asset with
-    /// that TXID.
-    pub fn get_burn_consignment(&self, asset_id: String, txid: String) -> Result<Vec<u8>, Error> {
-        info!(self.logger, "Getting burn consignment...");
-        let transfers = self.list_transfers(
-            AssetFilter::Id(asset_id.clone()),
-            TransferScope::Txid(txid.clone()),
-        )?;
-        if !transfers.iter().any(|t| t.kind == TransferKind::Burn) {
-            return Err(Error::UnknownTransfer { txid });
+    /// Returns `None` for an inflation, before a receive's consignment arrives and for a receive
+    /// with no valid consignment.
+    ///
+    /// Fails with [`Error::TransferNotFound`] if the wallet has no transfer with that idx.
+    pub fn get_consignment(&self, transfer_idx: i32) -> Result<Option<Vec<u8>>, Error> {
+        info!(
+            self.logger,
+            "Getting consignment of transfer {transfer_idx}..."
+        );
+        let db_data = self.database.get_db_data(false)?;
+        let not_found = || Error::TransferNotFound { idx: transfer_idx };
+        let t = db_data
+            .transfers
+            .iter()
+            .find(|t| t.idx == transfer_idx)
+            .ok_or_else(not_found)?;
+        let (asset_transfer, batch_transfer) =
+            t.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
+        if !asset_transfer.user_driven {
+            return Err(not_found());
         }
-        let bytes = self
-            .transfer_artifacts
-            .get(&txid)
-            .and_then(|a| a.consignment_bytes.get(&asset_id))
-            .cloned()
-            .ok_or(Error::UnknownTransfer { txid })?;
-        info!(self.logger, "Get burn consignment completed");
+        let kind = self
+            .get_transfer_data(
+                t,
+                &asset_transfer,
+                &batch_transfer,
+                &db_data.txos,
+                &db_data.colorings,
+            )?
+            .kind;
+        let bytes = match kind {
+            TransferKind::Send | TransferKind::Burn | TransferKind::Link | TransferKind::Mint => {
+                let txid = batch_transfer.txid.as_ref();
+                let asset_id = asset_transfer.asset_id.as_ref();
+                txid.zip(asset_id).and_then(|(txid, id)| {
+                    self.transfer_artifacts
+                        .get(txid)?
+                        .consignment_bytes
+                        .get(id)
+                        .cloned()
+                })
+            }
+            TransferKind::Inflation => None,
+            TransferKind::Issuance => {
+                let asset_id = asset_transfer
+                    .asset_id
+                    .clone()
+                    .expect("issuance should have an asset ID");
+                Some(self.export_contract(asset_id)?.contract)
+            }
+            TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => {
+                let receive_dir = self.get_receive_dir(t);
+                self.received_consignments
+                    .get(&receive_dir)
+                    .and_then(|bytes| {
+                        let digest = hex::encode(sha256_digest(bytes));
+                        // a lock wait alone does not show that the checks ran
+                        let valid = batch_transfer.txid.is_some()
+                            || self.received_mints.contains_key(&receive_dir)
+                                && self
+                                    .pending_mint_locks
+                                    .get(&receive_dir)
+                                    .is_some_and(|l| l.consignment_digest == digest);
+                        (t.consignment_hash.as_deref() == Some(digest.as_str()) && valid)
+                            .then(|| bytes.clone())
+                    })
+            }
+        };
+        info!(self.logger, "Get consignment completed");
         Ok(bytes)
     }
 
