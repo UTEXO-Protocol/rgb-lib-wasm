@@ -10,13 +10,13 @@ use rgb_lib_wasm::wallet::backup_store::{
 };
 use rgb_lib_wasm::wallet::vss::{VssBackupConfig, VssStore};
 use rgb_lib_wasm::wallet::{
-    AssetFilter, DatabaseType, Online, ReceiveData, SinglesigKeys, TransferScope, WalletData,
-    WalletDescriptors,
+    AssetFilter, DatabaseType, ExportedContract, Online, ReceiveData, SinglesigKeys, TransferScope,
+    WalletData, WalletDescriptors,
 };
 use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, WitnessVersion, generate_keys};
 use rgb_lib_wasm_bindings::{
-    JsAbortSignal, WasmInvoice, WasmWallet, check_indexer_url, fill_spv_proofs,
-    inspect_consignment, inspect_fascia, max_expiration_secs,
+    JsAbortSignal, WasmInvoice, WasmWallet, check_indexer_url, exported_contract_to_js,
+    fill_spv_proofs, inspect_consignment, inspect_fascia, max_expiration_secs,
 };
 
 fn wallet() -> WasmWallet {
@@ -92,7 +92,7 @@ async fn witness_receive_takes_number_bigint_and_string() {
         JsValue::from_str(&exp.to_string()),
     ] {
         let data = wallet
-            .witness_receive(online.clone(), None, any(), v, endpoints(), 1, None)
+            .witness_receive(online.clone(), None, any(), v, endpoints(), 1, None, None)
             .await
             .unwrap();
         let data: ReceiveData = serde_wasm_bindgen::from_value(data).unwrap();
@@ -119,6 +119,7 @@ async fn receive_rejects_malformed_expiration() {
             endpoints(),
             1,
             None,
+            None,
         )
         .await
         .unwrap_err());
@@ -132,7 +133,7 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
     // the invoice is reserved on the proxy, so the wallet needs to be online
     for online in [JsValue::NULL, JsValue::UNDEFINED] {
         let e = err(wallet
-            .witness_receive(online, None, any(), exp.clone(), endpoints(), 1, None)
+            .witness_receive(online, None, any(), exp.clone(), endpoints(), 1, None, None)
             .await
             .unwrap_err());
         assert_eq!(e, "The Online object is needed to perform this operation");
@@ -147,10 +148,39 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
             endpoints(),
             1,
             Some("Sometimes".to_string()),
+            None,
         )
         .await
         .unwrap_err());
     assert_eq!(e, "Invalid encryption: Sometimes");
+    let e = err(wallet
+        .witness_receive(
+            online.clone(),
+            None,
+            any(),
+            exp.clone(),
+            endpoints(),
+            1,
+            None,
+            Some(0),
+        )
+        .await
+        .unwrap_err());
+    assert_eq!(e, "Invalid quota: must be at least 1");
+    let e = err(wallet
+        .blind_receive(
+            online.clone(),
+            None,
+            any(),
+            exp.clone(),
+            endpoints(),
+            1,
+            None,
+            Some(0),
+        )
+        .await
+        .unwrap_err());
+    assert_eq!(e, "Invalid quota: must be at least 1");
     for encryption in ["Required", "Unsupported", "Optional"] {
         wallet
             .witness_receive(
@@ -161,6 +191,7 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
                 endpoints(),
                 1,
                 Some(encryption.to_string()),
+                None,
             )
             .await
             .unwrap();
@@ -220,22 +251,63 @@ async fn save_new_asset_reads_arguments() {
 }
 
 #[wasm_bindgen_test]
-fn get_received_mint_is_null_when_unknown() {
-    assert!(wallet().get_received_mint("unknown").unwrap().is_null());
+fn get_received_mint_is_empty_when_unknown() {
+    let mints: js_sys::Array = wallet()
+        .get_received_mint("unknown")
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    assert_eq!(mints.length(), 0);
 }
 
 #[wasm_bindgen_test]
-fn get_burn_consignment_fails_for_unknown_asset() {
-    let e = err(wallet()
-        .get_burn_consignment("rgb:unknown", &"00".repeat(32))
-        .unwrap_err());
-    assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+fn get_consignment_fails_for_unknown_transfer() {
+    let e = err(wallet().get_consignment(999).unwrap_err());
+    assert!(e.starts_with("Transfer with idx 999 not found"), "{e}");
 }
 
 #[wasm_bindgen_test]
 fn list_asset_media_fails_for_unknown_asset() {
     let e = err(wallet().list_asset_media("rgb:unknown").unwrap_err());
     assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+}
+
+#[wasm_bindgen_test]
+fn export_contract_fails_for_unknown_asset() {
+    let e = err(wallet().export_contract("rgb:unknown").unwrap_err());
+    assert!(e.starts_with("Asset with id rgb:unknown not found"), "{e}");
+}
+
+#[wasm_bindgen_test]
+fn import_contract_fails_for_invalid_bytes() {
+    let e = err(wallet()
+        .import_contract(b"not a contract", vec![])
+        .unwrap_err());
+    assert_eq!(e, "Invalid contract");
+}
+
+#[wasm_bindgen_test]
+fn exported_contract_to_js_gives_uint8_arrays() {
+    let v = exported_contract_to_js(&ExportedContract {
+        contract: vec![1, 2],
+        media: vec![vec![3], vec![4, 5]],
+    })
+    .unwrap();
+    let contract = prop(&v, "contract");
+    assert!(contract.is_instance_of::<js_sys::Uint8Array>());
+    assert_eq!(js_sys::Uint8Array::from(contract).to_vec(), vec![1, 2]);
+    let media: js_sys::Array = prop(&v, "media").dyn_into().unwrap();
+    assert_eq!(media.length(), 2);
+    assert!(
+        media
+            .iter()
+            .all(|m| m.is_instance_of::<js_sys::Uint8Array>())
+    );
+    let media: Vec<Vec<u8>> = media
+        .iter()
+        .map(|m| js_sys::Uint8Array::from(m).to_vec())
+        .collect();
+    assert_eq!(media, vec![vec![3], vec![4, 5]]);
 }
 
 #[wasm_bindgen_test]
@@ -473,7 +545,7 @@ fn inspect_fascia_js() {
     .unwrap();
     let get = |v: &JsValue, key: &str| js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap();
 
-    let inspection = inspect_fascia(psbt, fascia, None, "Regtest").unwrap();
+    let inspection = inspect_fascia(psbt, fascia, None, u64::MAX, u32::MAX, "Regtest").unwrap();
     assert_eq!(
         get(&inspection, "txid"),
         JsValue::from_str(expected["txid"].as_str().unwrap())
@@ -486,17 +558,48 @@ fn inspect_fascia_js() {
     assert_eq!(operations.length(), 1);
 
     let error = |result: Result<JsValue, JsValue>| result.unwrap_err().as_string().unwrap();
-    assert!(error(inspect_fascia(psbt, &[0], None, "Regtest")).contains("Invalid fascia"));
-    assert!(inspect_fascia(psbt, fascia, None, "Bogus").is_err());
-    let w = wallet();
     assert!(
-        error(w.inspect_fascia(psbt, fascia, None))
+        error(inspect_fascia(
+            psbt,
+            &[0],
+            None,
+            u64::MAX,
+            u32::MAX,
+            "Regtest"
+        ))
+        .contains("Invalid fascia")
+    );
+    assert!(inspect_fascia(psbt, fascia, None, u64::MAX, u32::MAX, "Bogus").is_err());
+    let w = wallet();
+    let size = fascia.len() as u64;
+    let too_large = format!("larger than the max allowed size of {} bytes", size - 1);
+    assert!(
+        error(inspect_fascia(
+            psbt,
+            fascia,
+            None,
+            size - 1,
+            u32::MAX,
+            "Regtest"
+        ))
+        .contains(&too_large)
+    );
+    inspect_fascia(psbt, fascia, None, size, u32::MAX, "Regtest").unwrap();
+    assert_eq!(
+        error(inspect_fascia(psbt, fascia, None, u64::MAX, 0, "Regtest")),
+        "Error during RGB inspection: fascia bundle count 1 exceeds the maximum of 0"
+    );
+    inspect_fascia(psbt, fascia, None, u64::MAX, 1, "Regtest").unwrap();
+    // the size check runs before the ownership check
+    assert!(error(w.inspect_fascia(psbt, fascia, None, size - 1, u32::MAX)).contains(&too_large));
+    assert!(
+        error(w.inspect_fascia(psbt, fascia, None, u64::MAX, u32::MAX))
             .contains("found a PSBT input that does not belong to this wallet")
     );
     let mut non_segwit = psbt.parse::<rgb_lib_wasm::bitcoin::Psbt>().unwrap();
     non_segwit.inputs[0].witness_utxo = None;
     assert!(
-        error(w.inspect_fascia(&non_segwit.to_string(), fascia, None))
+        error(w.inspect_fascia(&non_segwit.to_string(), fascia, None, u64::MAX, u32::MAX))
             .contains("RGB-related PSBTs require segwit")
     );
 }
@@ -653,6 +756,12 @@ async fn issue_bfa_reports_supply_and_locations() {
             .as_deref(),
         Some(bridge)
     );
+    let exported = wallet.export_contract(&asset_id).unwrap();
+    let contract = prop(&exported, "contract");
+    assert!(contract.is_instance_of::<js_sys::Uint8Array>());
+    assert!(js_sys::Uint8Array::from(contract).length() > 0);
+    let media: js_sys::Array = prop(&exported, "media").dyn_into().unwrap();
+    assert_eq!(media.length(), 0);
 }
 
 #[wasm_bindgen_test]
@@ -736,6 +845,20 @@ async fn inflate_begin_returns_result_object() {
     let change_utxos: js_sys::Array = prop(&inflation, "changeUtxos").dyn_into().unwrap();
     assert_eq!(change_utxos.length(), 1);
     assert!(prop(&inflation, "changeUtxo").is_undefined());
+
+    // an issuance gives its contract and an inflation gives null
+    let issuance = transfers
+        .iter()
+        .find(|t| prop(t, "kind").as_string().as_deref() == Some("Issuance"))
+        .unwrap();
+    let idx = |t: &JsValue| prop(t, "idx").as_f64().unwrap() as i32;
+    let contract: js_sys::Uint8Array = wallet
+        .get_consignment(idx(&issuance))
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    assert!(contract.length() > 0);
+    assert!(wallet.get_consignment(idx(&inflation)).unwrap().is_null());
 }
 
 #[wasm_bindgen_test]
@@ -1118,6 +1241,7 @@ async fn refresh_reports_proxy_failures_to_js() {
                 (now_secs() + 100_000).into(),
                 eps,
                 1,
+                None,
                 None,
             )
             .await
@@ -1585,7 +1709,7 @@ async fn backup_store_backup_and_restore() {
     let online = online(&a).await;
     let exp = JsValue::from(now_secs() + 100_000);
     let receive = a
-        .witness_receive(online, None, any(), exp, endpoints(), 1, None)
+        .witness_receive(online, None, any(), exp, endpoints(), 1, None, None)
         .await
         .unwrap();
     let recipient_id: String = prop(&receive, "recipientId").as_string().unwrap();

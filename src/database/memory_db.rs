@@ -265,6 +265,22 @@ pub struct DbPendingWitnessScriptActMod {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbInvoice {
+    pub idx: i32,
+    pub quota: u32,
+    pub asset_id: Option<String>,
+    pub deadline: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DbInvoiceActMod {
+    pub idx: ActiveValue<i32>,
+    pub quota: ActiveValue<u32>,
+    pub asset_id: ActiveValue<Option<String>>,
+    pub deadline: ActiveValue<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbTransfer {
     pub idx: i32,
     pub asset_transfer_idx: i32,
@@ -281,6 +297,8 @@ pub struct DbTransfer {
     pub proxy_transfer_id: Option<String>,
     pub invoice_expiration: Option<i64>,
     pub burn_reason: Option<String>,
+    pub receive_dir: Option<String>,
+    pub invoice_idx: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -300,6 +318,8 @@ pub struct DbTransferActMod {
     pub proxy_transfer_id: ActiveValue<Option<String>>,
     pub invoice_expiration: ActiveValue<Option<i64>>,
     pub burn_reason: ActiveValue<Option<String>>,
+    pub receive_dir: ActiveValue<Option<String>>,
+    pub invoice_idx: ActiveValue<Option<i32>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,6 +532,8 @@ impl From<DbTransfer> for DbTransferActMod {
             proxy_transfer_id: ActiveValue::Unchanged(m.proxy_transfer_id),
             invoice_expiration: ActiveValue::Unchanged(m.invoice_expiration),
             burn_reason: ActiveValue::Unchanged(m.burn_reason),
+            receive_dir: ActiveValue::Unchanged(m.receive_dir),
+            invoice_idx: ActiveValue::Unchanged(m.invoice_idx),
         }
     }
 }
@@ -585,6 +607,8 @@ pub struct InMemoryDb {
     next_wallet_transaction_idx: RefCell<i32>,
     pending_witness_scripts: RefCell<Vec<DbPendingWitnessScript>>,
     next_pending_witness_script_idx: RefCell<i32>,
+    invoices: RefCell<Vec<DbInvoice>>,
+    next_invoice_idx: RefCell<i32>,
     backup_info: RefCell<Option<DbBackupInfo>>,
     next_backup_info_idx: RefCell<i32>,
 }
@@ -615,6 +639,8 @@ impl InMemoryDb {
             next_wallet_transaction_idx,
             pending_witness_scripts,
             next_pending_witness_script_idx,
+            invoices,
+            next_invoice_idx,
             backup_info,
             next_backup_info_idx,
         } = saved;
@@ -652,6 +678,8 @@ impl InMemoryDb {
             .replace(pending_witness_scripts.into_inner());
         self.next_pending_witness_script_idx
             .replace(next_pending_witness_script_idx.into_inner());
+        self.invoices.replace(invoices.into_inner());
+        self.next_invoice_idx.replace(next_invoice_idx.into_inner());
         self.backup_info.replace(backup_info.into_inner());
         self.next_backup_info_idx
             .replace(next_backup_info_idx.into_inner());
@@ -681,6 +709,8 @@ impl InMemoryDb {
             next_wallet_transaction_idx: RefCell::new(1),
             pending_witness_scripts: RefCell::new(Vec::new()),
             next_pending_witness_script_idx: RefCell::new(1),
+            invoices: RefCell::new(Vec::new()),
+            next_invoice_idx: RefCell::new(1),
             backup_info: RefCell::new(None),
             next_backup_info_idx: RefCell::new(1),
         }
@@ -791,17 +821,31 @@ impl InMemoryDb {
         Ok(idx)
     }
 
+    /// Watch a witness receive script. Do nothing if it is already watched.
     pub(crate) fn set_pending_witness_script(
         &self,
         p: DbPendingWitnessScriptActMod,
-    ) -> Result<i32, InternalError> {
+    ) -> Result<(), InternalError> {
+        let script = av(p.script);
+        let mut scripts = self.pending_witness_scripts.borrow_mut();
+        if scripts.iter().any(|s| s.script == script) {
+            return Ok(());
+        }
         let idx = *self.next_pending_witness_script_idx.borrow();
         *self.next_pending_witness_script_idx.borrow_mut() += 1;
-        let row = DbPendingWitnessScript {
+        scripts.push(DbPendingWitnessScript { idx, script });
+        Ok(())
+    }
+
+    pub(crate) fn set_invoice(&self, i: DbInvoiceActMod) -> Result<i32, InternalError> {
+        let idx = *self.next_invoice_idx.borrow();
+        *self.next_invoice_idx.borrow_mut() += 1;
+        self.invoices.borrow_mut().push(DbInvoice {
             idx,
-            script: av(p.script),
-        };
-        self.pending_witness_scripts.borrow_mut().push(row);
+            quota: av(i.quota),
+            asset_id: av(i.asset_id),
+            deadline: av(i.deadline),
+        });
         Ok(idx)
     }
 
@@ -839,6 +883,8 @@ impl InMemoryDb {
             proxy_transfer_id: av(t.proxy_transfer_id),
             invoice_expiration: av(t.invoice_expiration),
             burn_reason: av(t.burn_reason),
+            receive_dir: av(t.receive_dir),
+            invoice_idx: av(t.invoice_idx),
         };
         self.transfers.borrow_mut().push(row);
         Ok(idx)
@@ -968,6 +1014,12 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &t.burn_reason {
             row.burn_reason = v.clone();
+        }
+        if let ActiveValue::Set(v) = &t.receive_dir {
+            row.receive_dir = v.clone();
+        }
+        if let ActiveValue::Set(v) = t.invoice_idx {
+            row.invoice_idx = v;
         }
         Ok(row.clone())
     }
@@ -1405,6 +1457,33 @@ impl InMemoryDb {
         Ok(self.transfers.borrow().clone())
     }
 
+    pub(crate) fn iter_invoices(&self) -> Result<Vec<DbInvoice>, InternalError> {
+        Ok(self.invoices.borrow().clone())
+    }
+
+    /// The transfers to a reusable invoice.
+    pub(crate) fn get_invoice_transfers(
+        &self,
+        invoice_idx: i32,
+    ) -> Result<Vec<DbTransfer>, InternalError> {
+        Ok(self
+            .transfers
+            .borrow()
+            .iter()
+            .filter(|t| t.invoice_idx == Some(invoice_idx))
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn get_transfer(&self, idx: i32) -> Result<Option<DbTransfer>, InternalError> {
+        Ok(self
+            .transfers
+            .borrow()
+            .iter()
+            .find(|t| t.idx == idx)
+            .cloned())
+    }
+
     pub(crate) fn iter_txos(&self) -> Result<Vec<DbTxo>, InternalError> {
         Ok(self.txos.borrow().clone())
     }
@@ -1733,13 +1812,40 @@ impl InMemoryDb {
         let colorings = colorings.unwrap_or_else(|| self.iter_colorings().unwrap_or_default());
         let transfers = transfers.unwrap_or_else(|| self.iter_transfers().unwrap_or_default());
 
-        let pending_blinded_utxos =
+        let mut pending_blinded_utxos =
             unpaid_invoices(&transfers, &asset_transfers, &batch_transfers, &colorings)
                 .into_iter()
                 .fold(HashMap::new(), |mut acc, (_, utxo)| {
                     *acc.entry(utxo).or_insert(0) += 1;
                     acc
                 });
+        // A live blind invoice can still receive transfers on its UTXO.
+        // Keep the UTXO, with room for those transfers.
+        let now = now().unix_timestamp();
+        for invoice in self.iter_invoices()?.iter().filter(|i| i.live(now)) {
+            let Some(Some(RecipientTypeFull::Blind { unblinded_utxo })) = transfers
+                .iter()
+                .find(|t| t.invoice_idx == Some(invoice.idx))
+                .map(|t| &t.recipient_type)
+            else {
+                continue;
+            };
+            let mut received = 0;
+            for t in transfers
+                .iter()
+                .filter(|t| t.invoice_idx == Some(invoice.idx))
+            {
+                if !t
+                    .related_transfers(&asset_transfers, &batch_transfers)?
+                    .1
+                    .failed()
+                {
+                    received += 1;
+                }
+            }
+            *pending_blinded_utxos.entry(unblinded_utxo).or_insert(0) +=
+                invoice.quota.saturating_sub(received);
+        }
 
         utxos
             .iter()
@@ -1762,6 +1868,42 @@ impl InMemoryDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoice_table_round_trip() {
+        let db = InMemoryDb::new();
+        let invoice = |deadline| DbInvoiceActMod {
+            quota: ActiveValue::Set(2),
+            deadline: ActiveValue::Set(deadline),
+            ..Default::default()
+        };
+        assert_eq!(db.set_invoice(invoice(10)).unwrap(), 1);
+        assert_eq!(db.set_invoice(invoice(20)).unwrap(), 2);
+        let first = db.iter_invoices().unwrap()[0].clone();
+        assert!(first.live(9));
+        assert!(!first.live(10));
+        let idx = db
+            .set_transfer(DbTransferActMod {
+                invoice_idx: ActiveValue::Set(Some(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        db.set_transfer(DbTransferActMod::default()).unwrap();
+        let linked = db.get_invoice_transfers(1).unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(db.get_transfer(idx).unwrap(), Some(linked[0].clone()));
+        assert_eq!(db.get_transfer(999).unwrap(), None);
+
+        let saved: InMemoryDb = serde_json::from_str(&serde_json::to_string(&db).unwrap()).unwrap();
+        let restored = InMemoryDb::new();
+        restored.restore(saved);
+        assert_eq!(
+            restored.iter_invoices().unwrap(),
+            db.iter_invoices().unwrap()
+        );
+        assert_eq!(restored.get_invoice_transfers(1).unwrap(), linked);
+        assert_eq!(restored.set_invoice(invoice(30)).unwrap(), 3);
+    }
 
     fn make_db() -> InMemoryDb {
         InMemoryDb::new()
@@ -2469,16 +2611,14 @@ mod tests {
     #[test]
     fn test_pending_witness_script_set_del_iter() {
         let db = make_db();
-        db.set_pending_witness_script(DbPendingWitnessScriptActMod {
-            script: ActiveValue::Set("script_a".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        db.set_pending_witness_script(DbPendingWitnessScriptActMod {
-            script: ActiveValue::Set("script_b".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
+        // A watched script is not added again.
+        for script in ["script_a", "script_b", "script_a"] {
+            db.set_pending_witness_script(DbPendingWitnessScriptActMod {
+                script: ActiveValue::Set(script.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
 
         assert_eq!(db.iter_pending_witness_scripts().unwrap().len(), 2);
 
@@ -2969,6 +3109,59 @@ mod tests {
             .get_rgb_allocations(vec![txo], None, None, None, None)
             .unwrap();
         assert_eq!(unspents[0].pending_blinded, 1);
+    }
+
+    #[test]
+    fn live_blind_invoice_reserves_slots() {
+        let db = make_db();
+        db.set_txo(make_txo_mod("tx1", 0, "1000")).unwrap();
+        let txo = db.iter_txos().unwrap()[0].clone();
+        let bt = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::WaitingCounterparty))
+            .unwrap();
+        let at = db
+            .set_asset_transfer(make_asset_transfer_mod(bt, None))
+            .unwrap();
+        let transfer_idx = db
+            .set_transfer(DbTransferActMod {
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Blind {
+                    unblinded_utxo: txo.outpoint(),
+                })),
+                ..make_transfer_mod(at, true)
+            })
+            .unwrap();
+        let pending_blinded = || {
+            db.get_rgb_allocations(vec![txo.clone()], None, None, None, None)
+                .unwrap()[0]
+                .pending_blinded
+        };
+        assert_eq!(pending_blinded(), 1);
+        let link = |deadline| {
+            let invoice_idx = db
+                .set_invoice(DbInvoiceActMod {
+                    quota: ActiveValue::Set(3),
+                    deadline: ActiveValue::Set(deadline),
+                    ..Default::default()
+                })
+                .unwrap();
+            db.update_transfer(&mut DbTransferActMod {
+                idx: ActiveValue::Set(transfer_idx),
+                invoice_idx: ActiveValue::Set(Some(invoice_idx)),
+                ..Default::default()
+            })
+            .unwrap();
+        };
+        link(now().unix_timestamp() + 100);
+        assert_eq!(pending_blinded(), 3);
+        db.update_batch_transfer(&mut DbBatchTransferActMod {
+            idx: ActiveValue::Set(bt),
+            status: ActiveValue::Set(TransferStatus::Failed),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(pending_blinded(), 3);
+        link(now().unix_timestamp() - 1);
+        assert_eq!(pending_blinded(), 0);
     }
 
     #[test]

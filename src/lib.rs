@@ -174,7 +174,9 @@ use rgbstd::{
     Allocation, Amount, Assign, Assignments, ExposedSeal, GlobalStateType, Identity,
     KnownTransition, Layer1, Operation, Opout as RgbOpout, OutputSeal, OwnedFraction, Precision,
     Schema, SecretSeal, Transition, TransitionBundle, TransitionType, TypedAssigns,
-    containers::{Consignment, UniversalFile, ValidConsignment, ValidContract, ValidTransfer},
+    containers::{
+        Consignment, Contract, UniversalFile, ValidConsignment, ValidContract, ValidTransfer,
+    },
     contract::{
         AllocatedState, ContractBuilder, ContractData, FilteredContractState, IssuerWrapper,
         TransitionBuilder,
@@ -210,7 +212,6 @@ use rgbstd::{
     daggy::NodeIndex,
     validation::{OpsDag, Validity, Warning},
 };
-#[cfg(feature = "esplora")]
 use schemata::{BfaWrapper, IfaWrapper, NiaWrapper};
 use schemata::{
     BridgedFungibleAsset, GS_BRIDGE_LOCATION, GS_BURN_REASON, GS_BURNED_ASSET, GS_BURNED_INFLATION,
@@ -238,9 +239,9 @@ use zeroize::Zeroizing;
 use crate::database::{
     DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
     DbBackupInfoActMod, DbBatchTransfer, DbBatchTransferActMod, DbColoring, DbColoringActMod,
-    DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbTransfer, DbTransferActMod,
-    DbTransferTransportEndpoint, DbTransferTransportEndpointActMod, DbTransportEndpoint,
-    DbTransportEndpointActMod, DbTxo,
+    DbInvoice, DbInvoiceActMod, DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbTransfer,
+    DbTransferActMod, DbTransferTransportEndpoint, DbTransferTransportEndpointActMod,
+    DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
 };
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
@@ -262,8 +263,8 @@ use crate::{
             AckTransferData, CONSIGNMENT_GONE_CODES, GetAckResponse, GetConsignmentResponse,
             INVOICE_UNKNOWN_CODES, InvoiceStatus, JsonRpcError, JsonRpcResponse, PostAckResponse,
             PostConsignmentData, ProxyClient, ProxyTransferState, ServerInfoResponse,
-            get_ack_message, list_transfers_message, lookup_answer, map_proxy_error,
-            post_consignment_message, post_media_message, pow_difficulty_required,
+            delete_transfer_message, get_ack_message, list_transfers_message, lookup_answer,
+            map_proxy_error, post_consignment_message, post_media_message, pow_difficulty_required,
             prepare_ack_auth_message, prepare_invoice_auth_message, transfer_retrieved_message,
         },
         reject_list::RejectListClient,
@@ -271,8 +272,8 @@ use crate::{
     database::{DbData, LocalRecipient, LocalRecipientData, LocalWitnessData},
     encryption::{
         decode_hash_hex, decrypt_blob, derive_shared, ed25519_from_seed, encrypt_blob, invoice_id,
-        sha256_digest, sign_ed25519, solve_pow as solve_pow_nonce, transfer_id, verify_ed25519,
-        verifying_key_from_bytes,
+        is_transfer_id, sha256_digest, sign_ed25519, solve_pow as solve_pow_nonce, transfer_id,
+        verify_ed25519, verifying_key_from_bytes,
     },
     error::IndexerError,
     utils::{INDEXER_STOP_GAP, proxy_max_media},

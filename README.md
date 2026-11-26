@@ -217,13 +217,15 @@ const txid = await wallet.sendBtcEnd(online, signed);
 
 ```javascript
 // Blind receive (UTXO-based)
-// The wallet reserves the invoice on its proxies, so it takes the Online object. The last argument
-// is the encryption preference ('Required' by default, 'Unsupported' or 'Optional').
-const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+// The wallet reserves the invoice on its proxies, so it takes the Online object.
+// The last two arguments are the encryption preference and the quota.
+// Encryption is 'Required' (default), 'Unsupported' or 'Optional'.
+// The quota is the number of transfers (default 1). Above 1, it needs transport endpoints.
+const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
 // blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey }
 
 // Witness receive (address-based)
-const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
 ```
 
 ### Parsing invoices
@@ -393,8 +395,8 @@ const result = validateConsignmentOffchain(consignmentBytes, txid, 'Regtest');
 // the filter is 'All', 'Terminals' or { Witness: txid }
 const inspection = inspectConsignment(consignmentBytes, 'Terminals');
 
-// Inspect the PSBT and fascia of a *Begin result without a wallet (entropy is optional)
-const fasciaInspection = inspectFascia(begin.psbt, new Uint8Array(begin.details.fascia), begin.details.entropy, 'Regtest');
+// Inspect the PSBT and fascia of a *Begin result without a wallet (entropy is optional; max fascia size in bytes and max bundle count)
+const fasciaInspection = inspectFascia(begin.psbt, new Uint8Array(begin.details.fascia), begin.details.entropy, 1048576n, 10, 'Regtest');
 
 // Fill in the SPV proofs a transfer consignment misses, from an esplora indexer
 // consignment is null when no proof was set
@@ -428,7 +430,7 @@ To protect a wallet:
 | `checkIndexerUrl(url, network)` | Validate an indexer URL for the network and return its protocol ('Esplora') |
 | `validateConsignmentOffchain(bytes, txid, network)` | Validate an RGB consignment using bundled witness data |
 | `inspectConsignment(bytes, bundleFilter)` | Inspect an RGB consignment without a wallet |
-| `inspectFascia(psbt, fascia, entropy?, network)` | Check that a PSBT commits to the fascia of its RGB operation and inspect the operation, without a wallet |
+| `inspectFascia(psbt, fascia, entropy?, maxFasciaSize, maxBundles, network)` | Check that a PSBT commits to the fascia of its RGB operation and inspect the operation, without a wallet. Refuses a fascia larger than `maxFasciaSize` bytes (BigInt) or with more than `maxBundles` bundles |
 | `fillSpvProofs(bytes, indexerUrl)` | Fill in the SPV proofs a transfer consignment misses, from an esplora indexer |
 
 ### `WasmInvoice`
@@ -455,6 +457,8 @@ To protect a wallet:
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
 | `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
 | `listAssetMedia(assetId)` | no | List the media of an RGB asset |
+| `exportContract(assetId)` | no | Export the contract of an RGB asset (bytes, no bundles) with the bytes of its media |
+| `importContract(contract, media)` | no | Import the contract of an RGB asset (bytes, no bundles); its media comes from the wallet or from `media` (Uint8Array[]) |
 | `listAssets(schemas)` | no | List known RGB assets |
 | `listTransfers(assetFilter, scope)` | no | List RGB transfers by asset filter and scope |
 | `listUnspents(online?, settledOnly, skipSync)` | yes | List unspent outputs with RGB allocations, after a sync unless `skipSync` |
@@ -487,13 +491,13 @@ To protect a wallet:
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun, signal?)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
-| `getBurnConsignment(assetId, txid)` | no | Return the consignment of an ended burn (bytes), which proves it with its history |
+| `getConsignment(transferIdx)` | no | Return the consignment of a transfer (bytes), the idx as `listTransfers` gives it: the sent consignment of a send, burn, link or mint; the contract of an issuance; the received and validated consignment of a blind or witness receive, while pending (a mint also while it waits for its lock) and after `Settled`; `null` for an inflation, before a receive's consignment arrives and for a receive that failed without a validated consignment. Fails for an unknown idx |
 | `link(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
 | `linkBegin(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks, dryRun, signal?)` | yes | Prepare link PSBT |
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
 | `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint, signal?)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
-| `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
+| `getReceivedMint(recipientId)` | no | Return what the lock of each checked mint received on a recipient ID has to match (`lockId`, `amount`, `beforeBlock`), one per transfer; an empty array if none |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `refresh(online, assetId?, filter, skipSync, signal?)` | yes | Refresh pending transfers and settle ended vanilla operations |
 | `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
@@ -502,7 +506,7 @@ To protect a wallet:
 | `signPsbt(psbt, signOptions?)` | no | Sign a PSBT. `signOptions` (`SignOptions`) takes `trustWitnessUtxo`, `assumeHeight`, `allowAllSighashes`, `tryFinalize`, `signWithTapInternalKey`, `allowGrinding`; an omitted field takes the BDK default |
 | `finalizePsbt(psbt)` | no | Finalize a signed PSBT |
 | `inspectPsbt(psbt)` | no | Inspect a PSBT: inputs, outputs, totals, fee, signature count and size, with the wallet's own ones marked. In JS, the amounts, totals, fee and size are BigInt |
-| `inspectFascia(psbt, fascia, entropy?)` | no | Check that a PSBT commits to the fascia this wallet built and inspect the operation, with spent allocations and the wallet's outputs. `entropy` is a BigInt |
+| `inspectFascia(psbt, fascia, entropy?, maxFasciaSize, maxBundles)` | no | Check that a PSBT commits to the fascia this wallet built and inspect the operation, with spent allocations and the wallet's outputs. `entropy` is a BigInt. Refuses a fascia larger than `maxFasciaSize` bytes (BigInt) or with more than `maxBundles` bundles |
 | `backup(password)` | no | Create encrypted backup (returns bytes) |
 | `restoreBackup(bytes, password)` | no | Restore from encrypted backup |
 | `backupInfo()` | no | Check if backup is needed |

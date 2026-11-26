@@ -190,7 +190,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
 
     // the kept consignment proves the burn with the signed transaction
     let bytes = wallet
-        .get_burn_consignment(asset_id.clone(), res.txid.clone())
+        .get_consignment(transfer(&wallet, &asset_id, res.batch_transfer_idx).idx)
+        .unwrap()
         .unwrap();
     assert!(
         validate_consignment_offchain(&bytes, &res.txid, BitcoinNetwork::Regtest)
@@ -244,10 +245,9 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(begin.details.burn_reason, None);
     let psbt = Psbt::from_str(&begin.psbt).unwrap();
     // a begun burn has no consignment yet
-    let begun = psbt.unsigned_tx.compute_txid().to_string();
     assert_eq!(
-        wallet.get_burn_consignment(asset_id.clone(), begun.clone()),
-        Err(Error::UnknownTransfer { txid: begun })
+        wallet.get_consignment(transfer(&wallet, &asset_id, idx).idx),
+        Ok(None)
     );
     // a burn has no recipient and no output other than the OP_RETURN and the BTC change
     let artifacts = &wallet.transfer_artifacts[&psbt.unsigned_tx.compute_txid().to_string()];
@@ -278,6 +278,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
             begin.psbt.clone(),
             &begin.details.fascia,
             Some(begin.details.entropy),
+            u64::MAX,
+            u32::MAX,
         )
         .unwrap();
     let mut types: Vec<_> = inspection.operations[0]
@@ -326,6 +328,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
         begin.psbt.clone(),
         &conceal_split(&begin.details.fascia),
         Some(begin.details.entropy),
+        u64::MAX,
+        u32::MAX,
     );
     assert!(
         matches!(&result, Err(Error::RgbInspection { details }) if details.contains("isn't assigned by the bundle")),
@@ -357,6 +361,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
         begin.psbt.clone(),
         &without_split,
         Some(begin.details.entropy),
+        u64::MAX,
+        u32::MAX,
     );
     assert!(
         matches!(&result, Err(Error::RgbInspection { details }) if details.contains("not declared in bundle")),
@@ -368,7 +374,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(ended.entropy, begin.details.entropy);
     // the second burn spends the change of the mined first burn and carries its proof
     let consignment = wallet
-        .get_burn_consignment(asset_id.clone(), ended.txid.clone())
+        .get_consignment(transfer(&wallet, &asset_id, ended.batch_transfer_idx).idx)
+        .unwrap()
         .unwrap();
     assert!(proven(&RgbTransfer::load(&consignment[..]).unwrap())[&res.txid]);
     mine_and_refresh(&mut wallet, &online).await;
@@ -393,9 +400,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(balance(&restored, &asset_id), (150, 150, 150));
     for w in [&wallet, &restored] {
         assert_eq!(
-            w.get_burn_consignment(asset_id.clone(), res.txid.clone())
-                .unwrap(),
-            bytes
+            w.get_consignment(transfer(w, &asset_id, res.batch_transfer_idx).idx),
+            Ok(Some(bytes.clone()))
         );
     }
 }
@@ -691,6 +697,8 @@ async fn ifa_send_moves_inflation_rights() {
                 begin.psbt.clone(),
                 &begin.details.fascia,
                 Some(begin.details.entropy),
+                u64::MAX,
+                u32::MAX,
             )
             .unwrap();
         let signed = a.sign_psbt(begin.psbt, None).unwrap();
@@ -799,7 +807,12 @@ async fn inflation_rights(wallet: &mut Wallet, asset_id: &str) -> Vec<u64> {
     rights
 }
 
-async fn inflate_and_settle(b: &mut Wallet, b_online: &Online, asset_id: &str, amount: u64) {
+pub(super) async fn inflate_and_settle(
+    b: &mut Wallet,
+    b_online: &Online,
+    asset_id: &str,
+    amount: u64,
+) {
     let ords = witness_ords(b);
     let unsigned = b
         .inflate_begin(

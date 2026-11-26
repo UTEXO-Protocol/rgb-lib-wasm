@@ -486,19 +486,24 @@ fn consignment_inspection<const TRANSFER: bool>(
 /// Inspect a PSBT and the fascia of its RGB operation, given as bytes, without a wallet.
 ///
 /// The entropy defaults to the one the fascia carries. This does not validate the operations.
+/// A fascia longer than `max_fascia_size` bytes gives [`Error::FileTooLarge`], and a fascia with
+/// more than `max_bundles` bundles gives [`Error::RgbInspection`].
 pub fn inspect_fascia(
     psbt: String,
     fascia: &[u8],
     entropy: Option<u64>,
+    max_fascia_size: u64,
+    max_bundles: u32,
     bitcoin_network: BitcoinNetwork,
 ) -> Result<RgbInspection, Error> {
     let psbt = Psbt::from_str(&psbt)?;
-    let fascia = parse_fascia(fascia)?;
+    let fascia = parse_fascia(fascia, max_fascia_size)?;
 
     fascia_inspection(
         &psbt,
         &fascia,
         entropy,
+        max_bundles,
         |contract_id, bundle, witness_tx| {
             bundle_info(
                 contract_id,
@@ -516,7 +521,12 @@ pub fn inspect_fascia(
 }
 
 /// Read a strict encoded fascia.
-pub(crate) fn parse_fascia(fascia: &[u8]) -> Result<Fascia, Error> {
+pub(crate) fn parse_fascia(fascia: &[u8], max_fascia_size: u64) -> Result<Fascia, Error> {
+    if fascia.len() as u64 > max_fascia_size {
+        return Err(Error::FileTooLarge {
+            max_size: max_fascia_size,
+        });
+    }
     let bytes = Confined::try_from(fascia.to_vec()).map_err(|_| Error::InvalidFascia)?;
     Fascia::from_strict_serialized::<FILE_MAX_LEN>(bytes).map_err(|_| Error::InvalidFascia)
 }
@@ -527,6 +537,7 @@ pub(crate) fn fascia_inspection(
     psbt: &Psbt,
     fascia: &Fascia,
     entropy: Option<u64>,
+    max_bundles: u32,
     mut bundle_operation: impl FnMut(
         ContractId,
         &TransitionBundle,
@@ -540,6 +551,16 @@ pub(crate) fn fascia_inspection(
         return Err(Error::RgbInspection {
             details: format!(
                 "fascia witness ID {fascia_witness_id} does not match PSBT TXID {witness_id}"
+            ),
+        });
+    }
+
+    // refuse too many bundles before the bundle loop and the MPC rebuild
+    let bundle_count = fascia.bundles().len();
+    if bundle_count > max_bundles as usize {
+        return Err(Error::RgbInspection {
+            details: format!(
+                "fascia bundle count {bundle_count} exceeds the maximum of {max_bundles}"
             ),
         });
     }
@@ -1145,7 +1166,7 @@ pub(crate) mod tests {
     }
 
     fn entropy(fascia: &[u8]) -> u64 {
-        parse_fascia(fascia)
+        parse_fascia(fascia, u64::MAX)
             .unwrap()
             .seal_witness()
             .mpc_merkle_block
@@ -1159,8 +1180,18 @@ pub(crate) mod tests {
         entropy: Option<u64>,
         network: BitcoinNetwork,
     ) -> serde_json::Value {
-        serde_json::to_value(inspect_fascia(psbt.to_string(), fascia, entropy, network).unwrap())
-            .unwrap()
+        serde_json::to_value(
+            inspect_fascia(
+                psbt.to_string(),
+                fascia,
+                entropy,
+                u64::MAX,
+                u32::MAX,
+                network,
+            )
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     /// Edit the JSON of a fascia and encode it again.
@@ -1168,7 +1199,7 @@ pub(crate) mod tests {
         fascia: &[u8],
         edit: impl FnOnce(&mut serde_json::Value),
     ) -> Vec<u8> {
-        let mut json = serde_json::to_value(parse_fascia(fascia).unwrap()).unwrap();
+        let mut json = serde_json::to_value(parse_fascia(fascia, u64::MAX).unwrap()).unwrap();
         edit(&mut json);
         serde_json::from_value::<Fascia>(json)
             .unwrap()
@@ -1196,7 +1227,7 @@ pub(crate) mod tests {
     /// Conceal the seals of the transition that another transition of the same bundle spends.
     /// The bundle ID does not change.
     pub(crate) fn conceal_split(fascia: &[u8]) -> Vec<u8> {
-        let parsed = parse_fascia(fascia).unwrap();
+        let parsed = parse_fascia(fascia, u64::MAX).unwrap();
         let bundle = parsed.bundles().values().next().unwrap();
         let spent_opids: Vec<OpId> = bundle
             .known_transitions
@@ -1406,7 +1437,14 @@ pub(crate) mod tests {
         let psbt = psbt(fixture!("fascia_send.psbt"));
         let fascia = fixture!("fascia_send.fascia");
         let inspect = |psbt: &str, fascia: &[u8]| {
-            inspect_fascia(psbt.to_string(), fascia, None, BitcoinNetwork::Regtest)
+            inspect_fascia(
+                psbt.to_string(),
+                fascia,
+                None,
+                u64::MAX,
+                u32::MAX,
+                BitcoinNetwork::Regtest,
+            )
         };
 
         let result = inspect("not a PSBT", fascia);
@@ -1421,6 +1459,48 @@ pub(crate) mod tests {
             let result = inspect(&psbt, bytes);
             assert!(matches!(result, Err(Error::InvalidFascia)), "{result:?}");
         }
+
+        // a fascia longer than the max size is refused
+        let size = fascia.len() as u64;
+        let limited = |max_fascia_size: u64, max_bundles: u32| {
+            inspect_fascia(
+                psbt.clone(),
+                fascia,
+                None,
+                max_fascia_size,
+                max_bundles,
+                BitcoinNetwork::Regtest,
+            )
+        };
+        let result = limited(size - 1, u32::MAX);
+        assert!(
+            matches!(result, Err(Error::FileTooLarge { max_size }) if max_size == size - 1),
+            "{result:?}"
+        );
+        limited(size, u32::MAX).unwrap();
+
+        // the size check runs before the decode
+        let result = inspect_fascia(
+            psbt.clone(),
+            b"not a fascia",
+            None,
+            0,
+            u32::MAX,
+            BitcoinNetwork::Regtest,
+        );
+        assert!(
+            matches!(result, Err(Error::FileTooLarge { max_size: 0 })),
+            "{result:?}"
+        );
+
+        // a fascia with more bundles than the max is refused
+        let result = limited(u64::MAX, 0);
+        assert!(
+            matches!(&result, Err(Error::RgbInspection { details })
+                if details == "fascia bundle count 1 exceeds the maximum of 0"),
+            "{result:?}"
+        );
+        limited(u64::MAX, 1).unwrap();
     }
 
     #[test]
@@ -1431,7 +1511,14 @@ pub(crate) mod tests {
         let fascia = fixture!("fascia_send.fascia");
         let e = entropy(fascia);
         let inspect = |fascia: &[u8], entropy: Option<u64>| {
-            inspect_fascia(psbt.clone(), fascia, entropy, BitcoinNetwork::Regtest)
+            inspect_fascia(
+                psbt.clone(),
+                fascia,
+                entropy,
+                u64::MAX,
+                u32::MAX,
+                BitcoinNetwork::Regtest,
+            )
         };
 
         // an entropy that is not the one the fascia carries
@@ -1501,15 +1588,33 @@ pub(crate) mod tests {
             other_psbt.to_string(),
             fascia,
             Some(e),
+            u64::MAX,
+            0,
             BitcoinNetwork::Regtest,
         );
         assert_inspection_error(result, "does not match PSBT TXID");
+
+        // the bundle count check runs before the bundle inspection
+        let result = fascia_inspection(
+            &Psbt::from_str(&psbt).unwrap(),
+            &parse_fascia(fascia, u64::MAX).unwrap(),
+            Some(e),
+            0,
+            |_, _, _| panic!("bundle inspected"),
+        );
+        assert!(
+            matches!(&result, Err(Error::RgbInspection { details })
+                if details == "fascia bundle count 1 exceeds the maximum of 0"),
+            "{result:?}"
+        );
 
         // an input that spends a concealed seal of the bundle
         let result = inspect_fascia(
             burn_psbt,
             &conceal_split(burn),
             Some(entropy(burn)),
+            u64::MAX,
+            u32::MAX,
             BitcoinNetwork::Regtest,
         );
         assert_inspection_error(result, "isn't assigned by the bundle");

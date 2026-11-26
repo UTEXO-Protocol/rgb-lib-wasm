@@ -20,6 +20,13 @@ pub enum Error {
     #[error("Allocations already available")]
     AllocationsAlreadyAvailable,
 
+    /// The asset is already known to the wallet
+    #[error("Asset with id {asset_id} is already known")]
+    AssetAlreadyKnown {
+        /// Asset ID
+        asset_id: String,
+    },
+
     /// Requested asset was not found
     #[error("Asset with id {asset_id} not found")]
     AssetNotFound {
@@ -156,6 +163,13 @@ pub enum Error {
     FileAlreadyExists {
         /// The file path
         path: String,
+    },
+
+    /// The file is larger than the max size allowed
+    #[error("The file is larger than the max allowed size of {max_size} bytes")]
+    FileTooLarge {
+        /// The max size allowed, in bytes
+        max_size: u64,
     },
 
     /// A master fingerprint does not match the wallet's
@@ -344,6 +358,10 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided bytes are not a contract consignment
+    #[error("Invalid contract")]
+    InvalidContract,
+
     /// The provided contract ID is invalid
     #[error("Invalid contract ID: {contract_id}")]
     InvalidContractId {
@@ -491,6 +509,13 @@ pub enum Error {
     /// The provided pubkey is invalid
     #[error("Invalid pubkey: {details}")]
     InvalidPubkey {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided invoice quota is invalid
+    #[error("Invalid quota: {details}")]
+    InvalidQuota {
         /// Error details
         details: String,
     },
@@ -791,6 +816,13 @@ pub enum Error {
     /// The transfer ID is already in use by a different operation on the sender proxy
     #[error("Transfer ID in use")]
     TransferIDInUse,
+
+    /// The requested transfer was not found
+    #[error("Transfer with idx {idx} not found")]
+    TransferNotFound {
+        /// Transfer idx
+        idx: i32,
+    },
 
     /// The contract that is linked from or to is not known to the wallet
     #[error("Contract {contract_id} is not known to the wallet")]

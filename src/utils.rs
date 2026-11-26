@@ -526,6 +526,10 @@ pub(crate) fn calculate_descriptor_from_xpub(
 /// grant none.
 #[cfg(feature = "esplora")]
 pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
+    #[cfg(test)]
+    if let Some(grace) = MOCK_RETENTION_GRACE.with(std::cell::Cell::get) {
+        return grace;
+    }
     info.retention_grace_secs
         .as_ref()
         .and_then(|grace| grace.parse::<u32>().ok())
@@ -711,6 +715,12 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    /// Retention grace that replaces the one a proxy advertises, if set.
+    pub(crate) static MOCK_RETENTION_GRACE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// The fault point that fails next in this test thread.
     pub(crate) static FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
@@ -853,6 +863,10 @@ impl RgbRuntime {
             .ok_or_else(|| Error::Internal {
                 details: format!("genesis {contract_id} not found"),
             })
+    }
+
+    pub(crate) fn export_contract(&self, contract_id: ContractId) -> Result<Contract, Error> {
+        self.stock.export_contract(contract_id).map_err(Error::from)
     }
 
     #[cfg_attr(not(feature = "esplora"), allow(dead_code))]

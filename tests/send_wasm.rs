@@ -476,6 +476,8 @@ async fn send_to_oneself_crash_impl(dry_run: bool) {
                 res.psbt.clone(),
                 &res.details.fascia,
                 Some(res.details.entropy),
+                u64::MAX,
+                u32::MAX,
             )
             .unwrap();
         let concealed: Vec<_> = inspection.operations[0].transitions[0]
@@ -1314,6 +1316,7 @@ async fn proxy_auth() {
             vec![endpoint.clone()],
             1,
             None,
+            None,
         )
         .await;
     assert!(res.is_err());
@@ -1332,6 +1335,7 @@ async fn proxy_auth() {
             vec![endpoint.clone()],
             1,
             None,
+            None,
         )
         .await;
     assert!(matches!(res, Err(Error::InvalidProxyAuthSignature)));
@@ -1349,6 +1353,7 @@ async fn proxy_auth() {
             default_rcv_expiration(),
             vec![endpoint.clone()],
             1,
+            None,
             None,
         )
         .await

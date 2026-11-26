@@ -41,6 +41,21 @@ thread_local! {
     // test mock: keep a processed receive in WaitingCounterparty with no ACK
     pub(crate) static MOCK_ACK_PENDING: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
+    // test mock: number of failed consignment downloads of discovered transfers
+    pub(crate) static MOCK_GET_CONSIGNMENT_FAILURES: std::cell::RefCell<u32> =
+        const { std::cell::RefCell::new(0) };
+    // test mock: number of failed transfer deletions
+    pub(crate) static MOCK_TRANSFER_DELETE_FAILURES: std::cell::RefCell<u32> =
+        const { std::cell::RefCell::new(0) };
+}
+
+#[cfg(test)]
+fn mock_fail(counter: &'static std::thread::LocalKey<std::cell::RefCell<u32>>) -> bool {
+    counter.with_borrow_mut(|n| {
+        let fail = *n > 0;
+        *n = n.saturating_sub(1);
+        fail
+    })
 }
 
 // test mock: move part of the recipient amount to `num` extra assignments of `amount` to the
@@ -1085,6 +1100,23 @@ pub(crate) struct ProxyReceiveData {
     pub(crate) batch: bool,
 }
 
+/// A watched witness receive script.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WatchedWitnessScript {
+    /// whether a receive that it pays is pending
+    pub(crate) pending: bool,
+    /// whether more than one transfer can pay it (reusable invoice)
+    pub(crate) shared: bool,
+}
+
+/// What saving a consignment downloaded from a recipient proxy led to.
+pub(crate) enum SavedConsignment {
+    /// saved, ready to process
+    Saved(ProxyReceiveData),
+    /// refused, with the updated batch transfer
+    Refused(Option<DbBatchTransfer>),
+}
+
 /// The assignments of a type an operation moves with a transition of the type's default type,
 /// beside its main transition (see [`add_or_side_output`]).
 #[derive(Default)]
@@ -2064,7 +2096,10 @@ impl Wallet {
                     vout,
                 });
             }
-            if let Some(recipient_id) = transfer.recipient_id
+            // Pending witness reconciliation handles a shared script.
+            // Its other TXOs can belong to pending transfers.
+            if transfer.invoice_idx.is_none()
+                && let Some(recipient_id) = transfer.recipient_id
                 && let Some(script) = script_buf_from_recipient_id(recipient_id)?
             {
                 scripts.insert(script);
@@ -2076,8 +2111,8 @@ impl Wallet {
     /// Drop the pending witness state of the witness receives that are not pending anymore and
     /// return the scripts still watched.
     ///
-    /// Returns the kept scripts, each mapped to whether its receive is pending.
-    fn _reconcile_pending_witness(&self) -> Result<HashMap<String, bool>, Error> {
+    /// Returns the kept scripts. Each tells if its receive is pending and if it is shared.
+    fn _reconcile_pending_witness(&self) -> Result<HashMap<String, WatchedWitnessScript>, Error> {
         let pending_witness_scripts = self.database.iter_pending_witness_scripts()?;
         let pending_witness_txos = self.database.iter_pending_witness_txos()?;
         if pending_witness_scripts.is_empty() && pending_witness_txos.is_empty() {
@@ -2085,7 +2120,8 @@ impl Wallet {
         }
 
         // keep the receives that are pending or failed within the grace time
-        let failed_since = now().unix_timestamp()
+        let now = now().unix_timestamp();
+        let failed_since = now
             - i64::from(
                 self.online_data
                     .as_ref()
@@ -2093,7 +2129,36 @@ impl Wallet {
                     .failed_witness_receive_grace_secs,
             );
         let db_data = self.database.get_db_data(false)?;
-        let mut receives: HashMap<String, bool> = HashMap::new();
+        // A reusable invoice script is pending if any of its transfers is pending.
+        let mut receives: HashMap<String, WatchedWitnessScript> = HashMap::new();
+        // The script of a live reusable invoice is always pending.
+        // A later transfer can pay it before its consignment is accepted.
+        for invoice in self
+            .database
+            .iter_invoices()?
+            .into_iter()
+            .filter(|i| i.live(now))
+        {
+            let Some(recipient_id) = self
+                .database
+                .get_invoice_transfers(invoice.idx)?
+                .into_iter()
+                .filter(|t| matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. })))
+                .find_map(|t| t.recipient_id)
+            else {
+                continue;
+            };
+            let Some(script) = script_buf_from_recipient_id(recipient_id)? else {
+                continue;
+            };
+            receives.insert(
+                script.to_hex_string(),
+                WatchedWitnessScript {
+                    pending: true,
+                    shared: true,
+                },
+            );
+        }
         let mut pending_asset_transfers = HashSet::new();
         for batch_transfer in &db_data.batch_transfers {
             let pending = batch_transfer.status.pending();
@@ -2120,7 +2185,9 @@ impl Wallet {
                 if let Some(recipient_id) = transfer.recipient_id
                     && let Some(script) = script_buf_from_recipient_id(recipient_id)?
                 {
-                    *receives.entry(script.to_hex_string()).or_insert(false) |= pending;
+                    let entry = receives.entry(script.to_hex_string()).or_default();
+                    entry.pending |= pending;
+                    entry.shared |= transfer.invoice_idx.is_some();
                     if pending {
                         pending_asset_transfers.insert(transfer.asset_transfer_idx);
                     }
@@ -2149,7 +2216,9 @@ impl Wallet {
                     .tx_graph()
                     .get_txout(txo.outpoint().into())
                     .is_some_and(|txout| {
-                        receives.get(&txout.script_pubkey.to_hex_string()) == Some(&true)
+                        receives
+                            .get(&txout.script_pubkey.to_hex_string())
+                            .is_some_and(|r| r.pending)
                     })
             };
             if has_pending_coloring || pays_pending_script() {
@@ -3554,10 +3623,12 @@ impl Wallet {
         Ok(())
     }
 
+    /// A new TXO that pays one of `pending_witness_scripts` is flagged only if the receive is pending.
+    /// The paid script is then dropped. A shared script stays and flags every new TXO.
     fn update_db_colored_txos_from_bdk(
         &self,
         include_spent: bool,
-        pending_witness_scripts: &HashMap<String, bool>,
+        pending_witness_scripts: &HashMap<String, WatchedWitnessScript>,
     ) -> Result<(), Error> {
         let db_txos = self.database.iter_txos()?;
 
@@ -3584,9 +3655,11 @@ impl Wallet {
         for new_utxo in new_utxos.iter().cloned() {
             let mut new_db_utxo: DbTxoActMod = new_utxo.clone().into();
             let script = new_utxo.txout.script_pubkey.to_hex_string();
-            if let Some(receive_pending) = pending_witness_scripts.get(&script) {
-                new_db_utxo.pending_witness = ActiveValue::Set(*receive_pending);
-                self.database.del_pending_witness_script(script)?;
+            if let Some(pws) = pending_witness_scripts.get(&script) {
+                new_db_utxo.pending_witness = ActiveValue::Set(pws.pending);
+                if !pws.shared {
+                    self.database.del_pending_witness_script(script)?;
+                }
             }
             self.database.set_txo(new_db_utxo.clone())?;
         }
@@ -3790,7 +3863,7 @@ impl Wallet {
         let bdk_txid = psbt.unsigned_tx.compute_txid();
         let txid = bdk_txid.to_string();
         let row = self.database.get_wallet_transaction_by_txid(&txid)?;
-        // an end or a refresh removes the artifacts of an RGB operation and keeps its batch
+        // an RGB operation keeps its batch
         if self.transfer_artifacts.contains_key(&txid)
             || self._get_outgoing_batch_transfer(&txid)?.is_some()
             || row.as_ref().is_some_and(|t| t.r#type != r#type)
@@ -4846,10 +4919,10 @@ impl Wallet {
     /// consignment.
     async fn _waiting_for_mint_locks(
         &self,
-        recipient_id: &str,
+        transfer: &DbTransfer,
         consignment_bytes: &[u8],
     ) -> Result<bool, Error> {
-        let Some(entry) = self.pending_mint_locks.get(recipient_id) else {
+        let Some(entry) = self.pending_mint_locks.get(&self.get_receive_dir(transfer)) else {
             return Ok(false);
         };
         if hex::encode(sha256_digest(consignment_bytes)) != entry.consignment_digest {
@@ -5051,7 +5124,7 @@ impl Wallet {
     /// broadcast deadline and broadcast it.
     async fn broadcast_received_tx(
         &mut self,
-        recipient_id: &str,
+        transfer: &DbTransfer,
         signed_tx_b64: &str,
         signed_tx_hash: &str,
         sender_pubkey_hex: &str,
@@ -5069,15 +5142,18 @@ impl Wallet {
                 details: e.to_string(),
             })?;
         self.received_signed_txs
-            .insert(recipient_id.to_string(), tx_bytes);
+            .insert(self.get_receive_dir(transfer), tx_bytes);
         self._broadcast_tx(tx).await?;
         Ok(())
     }
 
     /// Broadcast again the signed TX released to a recipient, if saved, e.g. after it was evicted
     /// from the mempool. Failures are only logged, as the TX may e.g. have been replaced.
-    async fn rebroadcast_received_tx(&self, recipient_id: &str) {
-        let Some(tx_bytes) = self.received_signed_txs.get(recipient_id) else {
+    async fn rebroadcast_received_tx(&self, transfer: &DbTransfer) {
+        let Some(tx_bytes) = self
+            .received_signed_txs
+            .get(&self.get_receive_dir(transfer))
+        else {
             return;
         };
         let tx: BdkTransaction = match bdk_wallet::bitcoin::consensus::encode::deserialize(tx_bytes)
@@ -5098,22 +5174,31 @@ impl Wallet {
     }
 
     /// Forget the data kept for a received consignment.
-    fn clear_received_data(&mut self, recipient_id: &str) {
-        self.received_consignments.remove(recipient_id);
-        self.received_valid_consignments.remove(recipient_id);
-        self.received_consignment_meta.remove(recipient_id);
-        self.received_signed_txs.remove(recipient_id);
-        self.pending_mint_locks.remove(recipient_id);
+    fn clear_received_data(&mut self, transfer: &DbTransfer) {
+        self.remove_receive_dir(&self.get_receive_dir(transfer));
+    }
+
+    /// Forget the data kept under a receive dir.
+    fn remove_receive_dir(&mut self, receive_dir: &str) {
+        self.received_consignments.remove(receive_dir);
+        self.received_valid_consignments.remove(receive_dir);
+        self.received_consignment_meta.remove(receive_dir);
+        self.received_signed_txs.remove(receive_dir);
+        self.pending_mint_locks.remove(receive_dir);
     }
 
     async fn _refuse_consignment_async(
         &mut self,
         data: &ProxyReceiveData,
-        recipient_id: &str,
+        transfer: &DbTransfer,
         recipient_seed: &[u8],
         updated_batch_transfer: &mut DbBatchTransferActMod,
         mint: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        let recipient_id = transfer
+            .recipient_id
+            .as_deref()
+            .expect("transfer should have a recipient ID");
         debug!(
             self.logger,
             "Refusing invalid consignment for {recipient_id}"
@@ -5142,12 +5227,15 @@ impl Wallet {
                 }
             };
         }
-        // a sync may have flagged a TXO paying the script of the refused receive
-        let scripts = script_buf_from_recipient_id(recipient_id.to_string())?
-            .into_iter()
-            .collect();
-        self._unflag_pending_witness_txos(&HashSet::new(), &scripts)?;
-        self.clear_received_data(recipient_id);
+        // A sync can flag a TXO that pays the script of the refused receive.
+        // Pending witness reconciliation handles a shared script.
+        if transfer.invoice_idx.is_none() {
+            let scripts = script_buf_from_recipient_id(recipient_id.to_string())?
+                .into_iter()
+                .collect();
+            self._unflag_pending_witness_txos(&HashSet::new(), &scripts)?;
+        }
+        self.clear_received_data(transfer);
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
         Ok(Some(
             self.database
@@ -5184,38 +5272,107 @@ impl Wallet {
         invoice_id: &str,
         recipient_seed: &[u8],
     ) -> Result<Option<(String, GetConsignmentResponse)>, Error> {
+        let Some(listed) = self
+            .list_proxy_invoice_transfers(proxy_url, invoice_id, recipient_seed)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut failure = None;
+        for (tid, state) in listed {
+            if state != ProxyTransferState::Pending {
+                continue;
+            }
+            match self
+                .fetch_invoice_transfer(proxy_url, invoice_id, &tid)
+                .await
+            {
+                Ok(Some(r)) => return Ok(Some((tid, r))),
+                Ok(None) => continue,
+                Err(e) if proxy_lookup_failed(&e) => {
+                    failure.get_or_insert(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        failure.map_or(Ok(None), Err)
+    }
+
+    /// Transfers to an invoice on a proxy, with their state, sorted by ID.
+    /// Returns `None` if the proxy does not know the invoice. Ignores IDs that fail
+    /// [`is_transfer_id`].
+    async fn list_proxy_invoice_transfers(
+        &self,
+        proxy_url: &str,
+        invoice_id: &str,
+        recipient_seed: &[u8],
+    ) -> Result<Option<Vec<(String, ProxyTransferState)>>, Error> {
         let res = list_invoice_transfers(proxy_url, invoice_id, recipient_seed).await?;
         let Some(transfers) = lookup_answer(proxy_url, res, INVOICE_UNKNOWN_CODES)? else {
             return Ok(None);
         };
-        let mut pending: Vec<String> = transfers
+        let mut listed: Vec<(String, ProxyTransferState)> = transfers
             .into_iter()
-            .filter(|(_, state)| *state == ProxyTransferState::Pending)
-            .map(|(tid, _)| tid)
-            .collect();
-        pending.sort();
-        let mut failure = None;
-        for tid in pending {
-            let result = match self._get_consignment_async(proxy_url, &tid).await {
-                Ok(Some(r)) => r,
-                Ok(None) => continue,
-                Err(e) if proxy_lookup_failed(&e) => {
-                    failure.get_or_insert(e);
-                    continue;
+            .filter(|(transfer_id, _)| {
+                let valid = is_transfer_id(transfer_id);
+                if !valid {
+                    warn!(self.logger, "Ignoring invalid transfer ID {transfer_id:?}");
                 }
-                Err(e) => return Err(e),
-            };
-            // a transfer whose ID doesn't match the sender pubkey was not posted by its sender
-            if transfer_id(invoice_id, &result.sender_pk) != tid {
-                warn!(
-                    self.logger,
-                    "Ignoring transfer {tid}, which doesn't match its sender pubkey"
-                );
-                continue;
-            }
-            return Ok(Some((tid, result)));
+                valid
+            })
+            .collect();
+        listed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(Some(listed))
+    }
+
+    /// Download the consignment of a transfer.
+    /// Returns `None` if it is not available or the sender pubkey does not match the transfer ID.
+    async fn fetch_invoice_transfer(
+        &self,
+        proxy_url: &str,
+        invoice_id: &str,
+        transfer_id: &str,
+    ) -> Result<Option<GetConsignmentResponse>, Error> {
+        let Some(result) = self._get_consignment_async(proxy_url, transfer_id).await? else {
+            return Ok(None);
+        };
+        if !Self::posted_by_sender(invoice_id, transfer_id, &result) {
+            warn!(
+                self.logger,
+                "Ignoring transfer {transfer_id}, which does not match its sender pubkey"
+            );
+            return Ok(None);
         }
-        failure.map_or(Ok(None), Err)
+        Ok(Some(result))
+    }
+
+    /// Seal blinding of a proxy transfer, derived from the keys of both parties.
+    /// Returns `None` if the sender pubkey is invalid.
+    fn proxy_seal_blinding(
+        recipient_seed: &[u8],
+        sender_pubkey: &str,
+    ) -> Result<Option<u64>, Error> {
+        let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
+            details: s!("invalid recipient secret key"),
+        })?;
+        let Some(sender_vk) = hex::decode(sender_pubkey)
+            .ok()
+            .and_then(|pk| verifying_key_from_bytes(&pk).ok())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding,
+        ))
+    }
+
+    /// Whether the transfer ID matches the sender pubkey. If not, the sender did not post it.
+    fn posted_by_sender(
+        invoice_id: &str,
+        transfer_id: &str,
+        result: &GetConsignmentResponse,
+    ) -> bool {
+        self::transfer_id(invoice_id, &result.sender_pk) == transfer_id
     }
 
     /// Whether a blind receive still waiting for the counterparty may be failed, which releases its
@@ -5284,21 +5441,32 @@ impl Wallet {
         Ok(true)
     }
 
-    /// Let the recipient proxy delete the data of a transfer that has been handled. Failures are
-    /// only logged, as the proxy deletes the data anyway once the invoice expires.
-    async fn mark_transfer_retrieved(
+    /// Let the proxy delete the data of a handled transfer (`transfer.retrieved`).
+    /// With `delete`, also free its invoice quota slot (`transfer.delete`). Failures are only logged.
+    async fn release_transfer_data(
         &self,
         proxy_url: &str,
         transfer_id: &str,
         recipient_seed: &[u8],
+        delete: bool,
     ) {
         let Ok(seed) = <[u8; 32]>::try_from(recipient_seed) else {
             return;
         };
+        #[cfg(test)]
+        if delete && mock_fail(&MOCK_TRANSFER_DELETE_FAILURES) {
+            warn!(self.logger, "Failed to release the transfer data: mocked");
+            return;
+        }
         let sk = ed25519_from_seed(&seed);
-        let digest = sha256_digest(transfer_retrieved_message(transfer_id).as_bytes());
-        let signature = hex::encode(sign_ed25519(&sk, &digest));
+        let message = if delete {
+            delete_transfer_message(transfer_id)
+        } else {
+            transfer_retrieved_message(transfer_id)
+        };
+        let signature = hex::encode(sign_ed25519(&sk, &sha256_digest(message.as_bytes())));
         let res = match ProxyClient::new(proxy_url) {
+            Ok(client) if delete => client.delete_transfer(transfer_id, &signature).await,
             Ok(client) => client.transfer_retrieved(transfer_id, &signature).await,
             Err(e) => Err(e),
         };
@@ -5306,9 +5474,9 @@ impl Wallet {
             Ok(r) if r.error.is_none() => {}
             Ok(r) => warn!(
                 self.logger,
-                "Failed to mark transfer as retrieved: {:?}", r.error
+                "Failed to release the transfer data: {:?}", r.error
             ),
-            Err(e) => warn!(self.logger, "Failed to mark transfer as retrieved: {e}"),
+            Err(e) => warn!(self.logger, "Failed to release the transfer data: {e}"),
         }
     }
 
@@ -5325,11 +5493,6 @@ impl Wallet {
         donation_tx: Option<BdkTransaction>,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger, "ACKing consignment...");
-
-        let recipient_id = transfer
-            .recipient_id
-            .clone()
-            .expect("transfer should have a recipient ID");
 
         // record our own ACK on the transfer
         let mut updated_transfer: DbTransferActMod = transfer.clone().into();
@@ -5388,7 +5551,7 @@ impl Wallet {
             (Some(signed_tx), Some(signed_tx_hash), Some(sender_pubkey)) => {
                 // the TX has been released: decrypt and broadcast it
                 self.broadcast_received_tx(
-                    &recipient_id,
+                    transfer,
                     &signed_tx,
                     &signed_tx_hash,
                     &sender_pubkey,
@@ -5465,14 +5628,10 @@ impl Wallet {
                     self.logger,
                     "Sender proxy retention grace ({grace}s) is below the acceptable minimum"
                 );
-                let recipient_id = transfer
-                    .recipient_id
-                    .clone()
-                    .expect("transfer should have a recipient ID");
                 return self
                     ._refuse_consignment_async(
                         data,
-                        &recipient_id,
+                        transfer,
                         recipient_seed,
                         updated_batch_transfer,
                         false,
@@ -5504,33 +5663,17 @@ impl Wallet {
         asset_schema: AssetSchema,
         data: &ProxyReceiveData,
         recipient_seed: &[u8],
-        seed: &[u8; 32],
-        sender_vk: &VerifyingKey,
     ) -> Result<bool, Error> {
-        let mut attachments = vec![];
-        match asset_schema {
-            AssetSchema::Nia => {
-                let contract_data = runtime.consignment_data(valid_contract)?;
-                let contract = NiaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-            AssetSchema::Ifa => {
-                let contract_data = runtime.consignment_data(valid_contract)?;
-                let contract = IfaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-            AssetSchema::Bfa => {
-                let contract_data = runtime.consignment_data(valid_contract)?;
-                let contract = BfaWrapper::with(contract_data);
-                if let Some(attachment) = contract.contract_terms().media {
-                    attachments.push(attachment)
-                }
-            }
-        };
+        let attachments = self.extract_attachments(runtime, valid_contract, asset_schema)?;
+        let seed: &[u8; 32] = &recipient_seed.try_into().map_err(|_| Error::Internal {
+            details: s!("invalid recipient secret key"),
+        })?;
+        let sender_vk = &hex::decode(&data.sender_pubkey)
+            .ok()
+            .and_then(|pk| verifying_key_from_bytes(&pk).ok())
+            .ok_or_else(|| Error::Internal {
+                details: s!("invalid sender pubkey"),
+            })?;
         for attachment in attachments {
             let digest = hex::encode(attachment.digest);
             if self.media.contains_key(&digest) {
@@ -5591,14 +5734,7 @@ impl Wallet {
         receiving: &HashMap<Opout, Assignment>,
         asset_schema: AssetSchema,
         check_reject_list: bool,
-    ) -> Result<
-        Option<(
-            ValidConsignment<true>,
-            HashMap<Opout, Assignment>,
-            PreFetchResolver,
-        )>,
-        Error,
-    > {
+    ) -> Result<Option<(ValidConsignment<true>, HashMap<Opout, Assignment>)>, Error> {
         let chain_resolver = self
             .prefetch_consignment_witnesses(consignment)
             .await
@@ -5658,7 +5794,7 @@ impl Wallet {
             }
         }
 
-        Ok(Some((valid_consignment, received, chain_resolver)))
+        Ok(Some((valid_consignment, received)))
     }
 
     /// Prepare the PSBT of an operation on one asset (an inflation, a burn or a mint).
@@ -5743,6 +5879,7 @@ impl Wallet {
             .clone()
             .expect("transfer should have a recipient ID");
         debug!(self.logger, "Recipient ID: {recipient_id}");
+        let receive_dir = self.get_receive_dir(&transfer);
 
         let tte_data = self
             .database
@@ -5762,8 +5899,8 @@ impl Wallet {
         // if the consignment was downloaded in a previous attempt that failed for a transient
         // reason, reuse it instead of hitting the proxy again
         let cached = match (
-            self.received_consignments.contains_key(&recipient_id),
-            self.received_consignment_meta.get(&recipient_id),
+            self.received_consignments.contains_key(&receive_dir),
+            self.received_consignment_meta.get(&receive_dir),
         ) {
             (true, Some(meta)) => meta.transfer_id.clone().and_then(|cached_transfer_id| {
                 tte_data
@@ -5824,20 +5961,37 @@ impl Wallet {
                 },
             )?);
             let invoice_id = invoice_id(&recipient_id, &recipient_pk);
+            // discover_invoice_transfers finds reusable transfers and sets their transfer ID.
+            if transfer.invoice_idx.is_some() && transfer.proxy_transfer_id.is_none() {
+                return Ok(None);
+            }
             let mut proxy_res = None;
             let mut lookup_failure = None;
             for (transfer_transport_endpoint, transport_endpoint) in tte_data {
                 if transfer_transport_endpoint.kind != TransportEndpointKind::RecipientProxy {
                     continue;
                 }
-                let found = match self
-                    .find_invoice_transfer(
-                        &transport_endpoint.endpoint,
-                        &invoice_id,
-                        &recipient_seed,
-                    )
-                    .await
-                {
+                let lookup = match &transfer.proxy_transfer_id {
+                    // Download a discovered transfer from the endpoint where it was found.
+                    Some(transfer_id) if transfer_transport_endpoint.used => self
+                        .fetch_invoice_transfer(
+                            &transport_endpoint.endpoint,
+                            &invoice_id,
+                            transfer_id,
+                        )
+                        .await
+                        .map(|res| res.map(|r| (transfer_id.clone(), r))),
+                    Some(_) => Ok(None),
+                    None => {
+                        self.find_invoice_transfer(
+                            &transport_endpoint.endpoint,
+                            &invoice_id,
+                            &recipient_seed,
+                        )
+                        .await
+                    }
+                };
+                let found = match lookup {
                     Ok(Some(found)) => found,
                     Ok(None) => {
                         info!(
@@ -5865,67 +6019,19 @@ impl Wallet {
             let Some((proxy_url, (transfer_id, result))) = proxy_res else {
                 return lookup_failure.map_or(Ok(None), Err);
             };
-            // the sender endpoint arrives in RgbTransport (rpc://) format; convert to an HTTP URL
-            let sender_proxy =
-                self.convert_transport_endpoint_url(&result.sender_transport_endpoint)?;
-            let data = ProxyReceiveData {
-                proxy_url,
-                transfer_id,
-                sender_proxy,
-                sender_pubkey: result.sender_pk.clone(),
-                consignment_hash: result.consignment_hash.clone(),
-                recipient_encryption: transfer.recipient_encryption,
-                batch: result.batch,
-            };
-
-            // decode and (if needed) decrypt the consignment; a malformed payload is refused like
-            // one that fails decryption or verification
-            match Self::decrypt_payload_with_shared_key(
-                &result.consignment,
-                data.recipient_encryption,
-                &recipient_seed,
-                &data.sender_pubkey,
-                &data.consignment_hash,
-            ) {
-                Ok(bytes) => {
-                    self.received_consignments
-                        .insert(recipient_id.clone(), bytes);
-                }
-                Err(_) => {
-                    error!(self.logger, "Failed to decrypt/verify consignment");
-                    return self
-                        ._refuse_consignment_async(
-                            &data,
-                            &recipient_id,
-                            &recipient_seed,
-                            &mut updated_batch_transfer,
-                            false,
-                        )
-                        .await;
-                }
+            match self
+                .save_received_consignment(
+                    batch_transfer,
+                    &transfer,
+                    proxy_url,
+                    transfer_id,
+                    &result,
+                )
+                .await?
+            {
+                SavedConsignment::Saved(data) => data,
+                SavedConsignment::Refused(res) => return Ok(res),
             }
-            self.received_consignment_meta.insert(
-                recipient_id.clone(),
-                ReceivedConsignmentMeta {
-                    proxy_url: Some(data.proxy_url.clone()),
-                    transfer_id: Some(data.transfer_id.clone()),
-                    sender_transport_endpoint: data.sender_proxy.clone(),
-                    sender_pubkey: data.sender_pubkey.clone(),
-                    consignment_hash: data.consignment_hash.clone(),
-                    batch: data.batch,
-                    unsafe_txids: BTreeSet::new(),
-                },
-            );
-
-            // persist the transfer ID, the consignment hash and the sender proxy endpoint (for the
-            // ACK)
-            let mut ut: DbTransferActMod = transfer.clone().into();
-            ut.consignment_hash = ActiveValue::Set(Some(data.consignment_hash.clone()));
-            ut.proxy_transfer_id = ActiveValue::Set(Some(data.transfer_id.clone()));
-            self.database.update_transfer(&mut ut)?;
-            self.save_sender_transport_endpoint(transfer.idx, &data.sender_proxy)?;
-
-            data
         };
 
         let res = self
@@ -5933,19 +6039,559 @@ impl Wallet {
                 batch_transfer,
                 &asset_transfer,
                 &transfer,
-                recipient_id,
                 &data,
                 &recipient_seed,
                 &mut updated_batch_transfer,
             )
             .await?;
-        // once the consignment has been handled (ACKed or refused), its data is saved locally and
-        // the proxy can delete it, while the transfer keeps counting towards the invoice quota
-        if res.is_some() {
-            self.mark_transfer_retrieved(&data.proxy_url, &data.transfer_id, &recipient_seed)
-                .await;
-        }
+        self.release_handled_transfer(
+            &transfer,
+            &data.proxy_url,
+            &data.transfer_id,
+            &recipient_seed,
+            res.as_ref(),
+        )
+        .await;
         Ok(res)
+    }
+
+    /// The data of a transfer downloaded from a recipient proxy for `transfer`.
+    fn proxy_receive_data(
+        &self,
+        transfer: &DbTransfer,
+        proxy_url: String,
+        transfer_id: String,
+        result: &GetConsignmentResponse,
+    ) -> Result<ProxyReceiveData, Error> {
+        Ok(ProxyReceiveData {
+            proxy_url,
+            transfer_id,
+            // Convert the RgbTransport (rpc://) sender endpoint to an HTTP URL.
+            sender_proxy: self.convert_transport_endpoint_url(&result.sender_transport_endpoint)?,
+            sender_pubkey: result.sender_pk.clone(),
+            consignment_hash: result.consignment_hash.clone(),
+            recipient_encryption: transfer.recipient_encryption,
+            batch: result.batch,
+        })
+    }
+
+    /// Decrypt the consignment if needed and keep it under `receive_dir`.
+    /// Returns false on failure. A malformed payload is a failure.
+    fn decrypt_received_consignment(
+        &mut self,
+        consignment: &str,
+        data: &ProxyReceiveData,
+        recipient_seed: &[u8],
+        receive_dir: &str,
+    ) -> bool {
+        match Self::decrypt_payload_with_shared_key(
+            consignment,
+            data.recipient_encryption,
+            recipient_seed,
+            &data.sender_pubkey,
+            &data.consignment_hash,
+        ) {
+            Ok(bytes) => {
+                self.received_consignments
+                    .insert(receive_dir.to_string(), bytes);
+                true
+            }
+            Err(_) => {
+                error!(self.logger, "Failed to decrypt/verify consignment");
+                false
+            }
+        }
+    }
+
+    /// Save the consignment metadata, so processing does not download it again.
+    /// Also save the transfer ID, the consignment hash and the sender endpoint (for the ACK).
+    fn record_received_consignment(
+        &mut self,
+        transfer: &DbTransfer,
+        data: &ProxyReceiveData,
+    ) -> Result<(), Error> {
+        self.received_consignment_meta.insert(
+            self.get_receive_dir(transfer),
+            ReceivedConsignmentMeta {
+                proxy_url: Some(data.proxy_url.clone()),
+                transfer_id: Some(data.transfer_id.clone()),
+                sender_transport_endpoint: data.sender_proxy.clone(),
+                sender_pubkey: data.sender_pubkey.clone(),
+                consignment_hash: data.consignment_hash.clone(),
+                batch: data.batch,
+                unsafe_txids: BTreeSet::new(),
+            },
+        );
+        let mut ut: DbTransferActMod = transfer.clone().into();
+        ut.consignment_hash = ActiveValue::Set(Some(data.consignment_hash.clone()));
+        ut.proxy_transfer_id = ActiveValue::Set(Some(data.transfer_id.clone()));
+        self.database.update_transfer(&mut ut)?;
+        self.save_sender_transport_endpoint(transfer.idx, &data.sender_proxy)?;
+        Ok(())
+    }
+
+    /// Decrypt and record a downloaded consignment, see [`Self::record_received_consignment`].
+    /// Refuse a consignment that cannot be decrypted or verified.
+    async fn save_received_consignment(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        transfer: &DbTransfer,
+        proxy_url: String,
+        transfer_id: String,
+        result: &GetConsignmentResponse,
+    ) -> Result<SavedConsignment, Error> {
+        let recipient_seed = batch_transfer
+            .operation_secret_key
+            .clone()
+            .unwrap_or_default();
+        let data = self.proxy_receive_data(transfer, proxy_url, transfer_id, result)?;
+        let receive_dir = self.get_receive_dir(transfer);
+        if !self.decrypt_received_consignment(
+            &result.consignment,
+            &data,
+            &recipient_seed,
+            &receive_dir,
+        ) {
+            let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
+            // An unreadable consignment is not a known mint, so it gets a NACK.
+            let res = self
+                ._refuse_consignment_async(
+                    &data,
+                    transfer,
+                    &recipient_seed,
+                    &mut updated_batch_transfer,
+                    false,
+                )
+                .await?;
+            self.release_handled_transfer(
+                transfer,
+                &data.proxy_url,
+                &data.transfer_id,
+                &recipient_seed,
+                res.as_ref(),
+            )
+            .await;
+            return Ok(SavedConsignment::Refused(res));
+        }
+        self.record_received_consignment(transfer, &data)?;
+        Ok(SavedConsignment::Saved(data))
+    }
+
+    /// After the ACK or refusal (`handled`), let the proxy delete the transfer data.
+    /// The transfer still counts in the invoice quota.
+    /// A refused reusable transfer is deleted instead, which frees its quota slot.
+    async fn release_handled_transfer(
+        &self,
+        transfer: &DbTransfer,
+        proxy_url: &str,
+        transfer_id: &str,
+        recipient_seed: &[u8],
+        handled: Option<&DbBatchTransfer>,
+    ) {
+        let Some(updated) = handled else {
+            return;
+        };
+        let delete = transfer.invoice_idx.is_some() && updated.status == TransferStatus::Failed;
+        self.release_transfer_data(proxy_url, transfer_id, recipient_seed, delete)
+            .await;
+    }
+
+    /// Find new transfers of live reusable invoices (of `asset_id`, if given) on their proxies.
+    /// A transfer is stored only after its consignment is downloaded, checked and saved.
+    /// Delete rejected and failed transfers from the proxy. A later call retries a failed deletion.
+    async fn discover_invoice_transfers(&mut self, asset_id: Option<&str>) -> Result<(), Error> {
+        let now = now().unix_timestamp();
+        let invoices: Vec<DbInvoice> = self
+            .database
+            .iter_invoices()?
+            .into_iter()
+            .filter(|i| i.live(now))
+            .filter(|i| asset_id.is_none() || i.asset_id.as_deref() == asset_id)
+            .collect();
+        if invoices.is_empty() {
+            return Ok(());
+        }
+        let db_data = self.database.get_db_data(false)?;
+        for invoice in invoices {
+            let mut invoice_transfers: Vec<(DbTransfer, DbBatchTransfer)> = vec![];
+            for t in db_data
+                .transfers
+                .iter()
+                .filter(|t| t.invoice_idx == Some(invoice.idx))
+            {
+                let (_, bt) =
+                    t.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
+                invoice_transfers.push((t.clone(), bt));
+            }
+            invoice_transfers.sort_by_key(|(t, _)| t.idx);
+            // The invoice creates the first transfer, which holds its data.
+            let Some((first, first_batch)) = invoice_transfers.first().cloned() else {
+                continue;
+            };
+            let mut known: HashSet<String> = invoice_transfers
+                .iter()
+                .filter_map(|(t, _)| t.proxy_transfer_id.clone())
+                .collect();
+            let failed: HashSet<String> = invoice_transfers
+                .iter()
+                .filter(|(_, bt)| bt.failed())
+                .filter_map(|(t, _)| t.proxy_transfer_id.clone())
+                .collect();
+            let mut active = invoice_transfers
+                .iter()
+                .filter(|(t, bt)| t.proxy_transfer_id.is_some() && !bt.failed())
+                .count() as u32;
+            let mut first_free = first.proxy_transfer_id.is_none()
+                && first_batch.status == TransferStatus::WaitingCounterparty;
+            if active >= invoice.quota && failed.is_empty() {
+                continue;
+            }
+            let recipient_id = first
+                .recipient_id
+                .clone()
+                .expect("transfer should have a recipient ID");
+            let recipient_pk = hex::encode(first.recipient_pubkey.clone().unwrap_or_default());
+            let invoice_id = invoice_id(&recipient_id, &recipient_pk);
+            let recipient_seed = first_batch.operation_secret_key.clone().unwrap_or_default();
+            let tte_data: Vec<_> = self
+                .database
+                .get_transfer_transport_endpoints_data(first.idx)?
+                .into_iter()
+                .filter(|(tte, _)| tte.kind == TransportEndpointKind::RecipientProxy)
+                .collect();
+            for (tte, te) in &tte_data {
+                let Ok(Some(listed)) = self
+                    .list_proxy_invoice_transfers(&te.endpoint, &invoice_id, &recipient_seed)
+                    .await
+                else {
+                    continue;
+                };
+                for (transfer_id, state) in listed {
+                    if failed.contains(&transfer_id) {
+                        self.release_transfer_data(
+                            &te.endpoint,
+                            &transfer_id,
+                            &recipient_seed,
+                            true,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if state != ProxyTransferState::Pending
+                        || active >= invoice.quota
+                        || known.contains(&transfer_id)
+                    {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    if mock_fail(&MOCK_GET_CONSIGNMENT_FAILURES) {
+                        continue;
+                    }
+                    let Ok(Some(result)) = self
+                        ._get_consignment_async(&te.endpoint, &transfer_id)
+                        .await
+                    else {
+                        continue;
+                    };
+                    if !Self::posted_by_sender(&invoice_id, &transfer_id, &result) {
+                        warn!(
+                            self.logger,
+                            "Deleting transfer {transfer_id}, which does not match its sender pubkey"
+                        );
+                        self.release_transfer_data(
+                            &te.endpoint,
+                            &transfer_id,
+                            &recipient_seed,
+                            true,
+                        )
+                        .await;
+                        continue;
+                    }
+                    debug!(
+                        self.logger,
+                        "Discovered transfer {transfer_id} to invoice {}", invoice.idx
+                    );
+                    let assign_first = first_free;
+                    // the receive dir of the new transfer (see add_invoice_transfer)
+                    let receive_dir = if assign_first {
+                        self.get_receive_dir(&first)
+                    } else {
+                        self.invoice_transfer_receive_dir(&recipient_id, &transfer_id)
+                    };
+                    let savepoint = self._transfer_savepoint();
+                    // A later refresh discovers a transfer that cannot be saved.
+                    let saved = match self.check_discovered_transfer(
+                        &first,
+                        &invoice,
+                        &te.endpoint,
+                        &transfer_id,
+                        &result,
+                        &recipient_seed,
+                        &receive_dir,
+                    ) {
+                        Ok(Some(data)) => {
+                            let transfer = if assign_first {
+                                let mut updated_tte: DbTransferTransportEndpointActMod =
+                                    tte.clone().into();
+                                updated_tte.used = ActiveValue::Set(true);
+                                self.database
+                                    .update_transfer_transport_endpoint(&mut updated_tte)
+                                    .map_err(Error::from)
+                                    .map(|_| first.clone())
+                            } else {
+                                self.add_invoice_transfer(
+                                    &first,
+                                    &first_batch,
+                                    &invoice,
+                                    &tte_data,
+                                    &te.endpoint,
+                                    &transfer_id,
+                                )
+                            };
+                            transfer
+                                .and_then(|t| self.record_received_consignment(&t, &data))
+                                .map(|_| true)
+                        }
+                        Ok(None) => Ok(false),
+                        Err(e) => Err(e),
+                    };
+                    match saved {
+                        Ok(true) => {
+                            first_free &= !assign_first;
+                            known.insert(transfer_id);
+                            active += 1;
+                        }
+                        // Send a best-effort NACK and delete it from the proxy to free its quota slot.
+                        // It has no local transfer, so a new discovery retries a failed deletion.
+                        Ok(false) => {
+                            warn!(
+                                self.logger,
+                                "Refusing transfer {transfer_id}, which cannot pay invoice {}",
+                                invoice.idx
+                            );
+                            self.remove_receive_dir(&receive_dir);
+                            if let Ok(sender_proxy) = self
+                                .convert_transport_endpoint_url(&result.sender_transport_endpoint)
+                                && let Err(e) = self
+                                    .sign_and_post_ack(
+                                        &sender_proxy,
+                                        &transfer_id,
+                                        false,
+                                        &result.consignment_hash,
+                                        &recipient_seed,
+                                    )
+                                    .await
+                            {
+                                warn!(self.logger, "Failed to post NACK: {e}");
+                            }
+                            self.release_transfer_data(
+                                &te.endpoint,
+                                &transfer_id,
+                                &recipient_seed,
+                                true,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                self.logger,
+                                "Failed to save discovered transfer {transfer_id}: {e}"
+                            );
+                            self._rollback_transfer(savepoint);
+                            self.remove_receive_dir(&receive_dir);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Add an incoming transfer to a reusable invoice with the data of the `first` transfer.
+    /// Returns the new transfer.
+    fn add_invoice_transfer(
+        &self,
+        first: &DbTransfer,
+        first_batch: &DbBatchTransfer,
+        invoice: &DbInvoice,
+        tte_data: &[(DbTransferTransportEndpoint, DbTransportEndpoint)],
+        proxy_url: &str,
+        transfer_id: &str,
+    ) -> Result<DbTransfer, Error> {
+        let batch_transfer_idx = self.database.set_batch_transfer(DbBatchTransferActMod {
+            status: ActiveValue::Set(TransferStatus::WaitingCounterparty),
+            expiration: ActiveValue::Set(first_batch.expiration),
+            created_at: ActiveValue::Set(now().unix_timestamp()),
+            min_confirmations: ActiveValue::Set(first_batch.min_confirmations),
+            operation_secret_key: ActiveValue::Set(first_batch.operation_secret_key.clone()),
+            retention_deadline: ActiveValue::Set(first_batch.retention_deadline),
+            ..Default::default()
+        })?;
+        // Use the invoice asset: an any-asset first transfer takes the asset it receives.
+        let asset_transfer_idx = self.database.set_asset_transfer(DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(true),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            asset_id: ActiveValue::Set(invoice.asset_id.clone()),
+            ..Default::default()
+        })?;
+        let recipient_id = first
+            .recipient_id
+            .clone()
+            .expect("transfer should have a recipient ID");
+        // A witness recipient type gets its vout when the consignment is accepted.
+        let recipient_type = match &first.recipient_type {
+            Some(RecipientTypeFull::Witness { .. }) => RecipientTypeFull::Witness { vout: None },
+            other => other
+                .clone()
+                .expect("transfer should have a recipient type"),
+        };
+        let transfer_idx = self.database.set_transfer(DbTransferActMod {
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            requested_assignment: ActiveValue::Set(first.requested_assignment.clone()),
+            incoming: ActiveValue::Set(true),
+            recipient_id: ActiveValue::Set(Some(recipient_id.clone())),
+            recipient_type: ActiveValue::Set(Some(recipient_type)),
+            invoice_string: ActiveValue::Set(first.invoice_string.clone()),
+            recipient_pubkey: ActiveValue::Set(first.recipient_pubkey.clone()),
+            recipient_encryption: ActiveValue::Set(first.recipient_encryption),
+            invoice_idx: ActiveValue::Set(first.invoice_idx),
+            proxy_transfer_id: ActiveValue::Set(Some(transfer_id.to_string())),
+            receive_dir: ActiveValue::Set(Some(
+                self.invoice_transfer_receive_dir(&recipient_id, transfer_id),
+            )),
+            ..Default::default()
+        })?;
+        for (_, te) in tte_data {
+            self.save_transfer_transport_endpoint(
+                transfer_idx,
+                &LocalTransportEndpoint {
+                    endpoint: te.endpoint.clone(),
+                    transport_type: te.transport_type,
+                    used: te.endpoint == proxy_url,
+                    usable: true,
+                },
+            )?;
+        }
+        Ok(self
+            .database
+            .get_transfer(transfer_idx)?
+            .expect("transfer should exist"))
+    }
+
+    /// The receive dir of a transfer to a reusable invoice other than the first one.
+    fn invoice_transfer_receive_dir(&self, recipient_id: &str, transfer_id: &str) -> String {
+        // list_proxy_invoice_transfers checks that the transfer ID is a hex digest.
+        format!(
+            "{}_{}",
+            self.normalize_recipient_id(recipient_id),
+            &transfer_id[..16]
+        )
+    }
+
+    /// Decrypt a discovered consignment. Return its data if it can pay `first`: one destination,
+    /// the expected seal blinding, a supported schema and the invoice asset.
+    /// This rejects spam. Processing validates the consignment later.
+    #[allow(clippy::too_many_arguments)]
+    fn check_discovered_transfer(
+        &mut self,
+        first: &DbTransfer,
+        invoice: &DbInvoice,
+        proxy_url: &str,
+        transfer_id: &str,
+        result: &GetConsignmentResponse,
+        recipient_seed: &[u8],
+        receive_dir: &str,
+    ) -> Result<Option<ProxyReceiveData>, Error> {
+        let Ok(data) = self.proxy_receive_data(
+            first,
+            proxy_url.to_string(),
+            transfer_id.to_string(),
+            result,
+        ) else {
+            error!(self.logger, "Invalid sender transport endpoint");
+            return Ok(None);
+        };
+        if !self.decrypt_received_consignment(
+            &result.consignment,
+            &data,
+            recipient_seed,
+            receive_dir,
+        ) {
+            return Ok(None);
+        }
+        let consignment = match RgbTransfer::load(&self.received_consignments[receive_dir][..]) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(self.logger, "Failed to load consignment: {e}");
+                return Ok(None);
+            }
+        };
+        let Ok(asset_schema) = AssetSchema::try_from(consignment.schema_id()) else {
+            error!(self.logger, "Consignment has an unknown schema");
+            return Ok(None);
+        };
+        if !self.supports_schema(&asset_schema) {
+            error!(
+                self.logger,
+                "The wallet doesn't support the provided schema: {}", asset_schema
+            );
+            return Ok(None);
+        }
+        if invoice
+            .asset_id
+            .as_ref()
+            .is_some_and(|a| *a != consignment.contract_id().to_string())
+        {
+            error!(
+                self.logger,
+                "Received a different asset than the expected one"
+            );
+            return Ok(None);
+        }
+        let Some(blinding) = Self::proxy_seal_blinding(recipient_seed, &data.sender_pubkey)? else {
+            error!(self.logger, "Invalid sender pubkey");
+            return Ok(None);
+        };
+        let matcher = first.receive_matcher(blinding)?;
+        let spent = Self::known_spent_opouts(&consignment);
+        if self.find_payments(&consignment, &matcher, &spent).count() != 1 {
+            error!(
+                self.logger,
+                "Consignment does not pay the invoice at a single destination"
+            );
+            return Ok(None);
+        }
+        Ok(Some(data))
+    }
+
+    /// Whether another incoming transfer, not failed, already has the payment of `txid`.
+    /// A witness receive also matches `vout`.
+    fn payment_already_received(
+        &self,
+        transfer: &DbTransfer,
+        txid: &str,
+        vout: Option<u32>,
+    ) -> Result<bool, Error> {
+        let asset_transfers = self.database.iter_asset_transfers()?;
+        let batch_transfers = self.database.iter_batch_transfers()?;
+        for other in self.database.iter_transfers()? {
+            if other.idx == transfer.idx || other.recipient_id != transfer.recipient_id {
+                continue;
+            }
+            let (_, other_batch) = other.related_transfers(&asset_transfers, &batch_transfers)?;
+            if !other.incoming || other_batch.failed() || other_batch.txid.as_deref() != Some(txid)
+            {
+                continue;
+            }
+            let same_output = match other.recipient_type {
+                Some(RecipientTypeFull::Witness { vout: other_vout }) => other_vout == vout,
+                _ => true,
+            };
+            if same_output {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5954,14 +6600,14 @@ impl Wallet {
         batch_transfer: &DbBatchTransfer,
         asset_transfer: &DbAssetTransfer,
         transfer: &DbTransfer,
-        recipient_id: String,
         data: &ProxyReceiveData,
         recipient_seed: &[u8],
         updated_batch_transfer: &mut DbBatchTransferActMod,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        let receive_dir = self.get_receive_dir(transfer);
         let consignment_bytes = self
             .received_consignments
-            .get(&recipient_id)
+            .get(&receive_dir)
             .ok_or_else(|| Error::Internal {
                 details: s!("consignment not found in memory"),
             })?
@@ -5969,14 +6615,14 @@ impl Wallet {
 
         // a consignment waiting for mint locks is validated as far as it can be without them
         if self
-            ._waiting_for_mint_locks(&recipient_id, &consignment_bytes)
+            ._waiting_for_mint_locks(transfer, &consignment_bytes)
             .await?
         {
             return Ok(None);
         }
 
         // a mint already checked, or found below, gets no NACK when refused
-        let checked_mint = self.received_mints.contains_key(&recipient_id);
+        let checked_mint = self.received_mints.contains_key(&receive_dir);
         let mut mint_known = checked_mint;
         let mut runtime = self.rgb_runtime()?;
         let consignment = match RgbTransfer::load(&consignment_bytes[..]) {
@@ -5986,7 +6632,7 @@ impl Wallet {
                 return self
                     ._refuse_consignment_async(
                         data,
-                        &recipient_id,
+                        transfer,
                         recipient_seed,
                         updated_batch_transfer,
                         mint_known,
@@ -6006,7 +6652,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6025,7 +6671,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6033,26 +6679,18 @@ impl Wallet {
                 .await;
         }
 
-        // the seal blinding is derived from the keys of both parties
-        let seed: [u8; 32] = recipient_seed.try_into().map_err(|_| Error::Internal {
-            details: s!("invalid recipient secret key"),
-        })?;
-        let sender_vk = hex::decode(&data.sender_pubkey)
-            .ok()
-            .and_then(|pk| verifying_key_from_bytes(&pk).ok());
-        let Some(sender_vk) = sender_vk else {
+        let Some(blinding) = Self::proxy_seal_blinding(recipient_seed, &data.sender_pubkey)? else {
             error!(self.logger, "Invalid sender pubkey");
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
                 )
                 .await;
         };
-        let blinding = derive_shared(&ed25519_from_seed(&seed), &sender_vk)?.seal_blinding;
         let matcher = transfer.receive_matcher(blinding)?;
 
         debug!(self.logger, "Validating consignment...");
@@ -6077,7 +6715,7 @@ impl Wallet {
                 return self
                     ._refuse_consignment_async(
                         data,
-                        &recipient_id,
+                        transfer,
                         recipient_seed,
                         updated_batch_transfer,
                         mint_known,
@@ -6091,7 +6729,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6116,7 +6754,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6131,6 +6769,24 @@ impl Wallet {
         let witness_id = paying_bundle.witness_id();
         let txid = witness_id.to_string();
 
+        // Credit an output to one transfer only, for reusable invoices and shared addresses.
+        // A sender can post a copy of a transfer with a different key.
+        if self.payment_already_received(transfer, &txid, vout)? {
+            error!(
+                self.logger,
+                "The payment has already been received by another transfer"
+            );
+            return self
+                ._refuse_consignment_async(
+                    data,
+                    transfer,
+                    recipient_seed,
+                    updated_batch_transfer,
+                    mint_known,
+                )
+                .await;
+        }
+
         let single_allocation = receiving.len() == 1;
         #[cfg(test)]
         let single_allocation =
@@ -6144,7 +6800,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6180,7 +6836,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6201,7 +6857,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6223,7 +6879,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6239,7 +6895,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6273,7 +6929,7 @@ impl Wallet {
                 return self
                     ._refuse_consignment_async(
                         data,
-                        &recipient_id,
+                        transfer,
                         recipient_seed,
                         updated_batch_transfer,
                         mint_known,
@@ -6288,7 +6944,7 @@ impl Wallet {
                 return self
                     ._refuse_consignment_async(
                         data,
-                        &recipient_id,
+                        transfer,
                         recipient_seed,
                         updated_batch_transfer,
                         mint_known,
@@ -6332,7 +6988,7 @@ impl Wallet {
                 return self
                     ._refuse_consignment_async(
                         data,
-                        &recipient_id,
+                        transfer,
                         recipient_seed,
                         updated_batch_transfer,
                         mint_known,
@@ -6405,7 +7061,7 @@ impl Wallet {
                                 return self
                                     ._refuse_consignment_async(
                                         data,
-                                        &recipient_id,
+                                        transfer,
                                         recipient_seed,
                                         updated_batch_transfer,
                                         mint_known,
@@ -6437,7 +7093,7 @@ impl Wallet {
                             return self
                                 ._refuse_consignment_async(
                                     data,
-                                    &recipient_id,
+                                    transfer,
                                     recipient_seed,
                                     updated_batch_transfer,
                                     mint_known,
@@ -6454,15 +7110,13 @@ impl Wallet {
                                     asset_schema,
                                     data,
                                     recipient_seed,
-                                    &seed,
-                                    &sender_vk,
                                 )
                                 .await?
                         {
                             return self
                                 ._refuse_consignment_async(
                                     data,
-                                    &recipient_id,
+                                    transfer,
                                     recipient_seed,
                                     updated_batch_transfer,
                                     mint_known,
@@ -6470,7 +7124,7 @@ impl Wallet {
                                 .await;
                         }
                         self.received_mints
-                            .insert(recipient_id.clone(), mint.clone());
+                            .insert(receive_dir.clone(), mint.clone());
                         // a backup made before the check does not have it: mark one as required
                         self.update_backup_info(false)?;
                     }
@@ -6481,7 +7135,7 @@ impl Wallet {
                         .cloned()
                         .collect();
                     self.pending_mint_locks.insert(
-                        recipient_id.clone(),
+                        receive_dir.clone(),
                         PendingMintLocks {
                             consignment_digest: hex::encode(sha256_digest(&consignment_bytes)),
                             evm_chain_id: chain_id,
@@ -6501,7 +7155,7 @@ impl Wallet {
                 bridge = Some((evm_client, address));
             }
         }
-        let Some((valid_consignment, received, chain_resolver)) = self
+        let Some((valid_consignment, received)) = self
             ._check_received_consignment(
                 pending,
                 &consignment,
@@ -6515,7 +7169,7 @@ impl Wallet {
             return self
                 ._refuse_consignment_async(
                     data,
-                    &recipient_id,
+                    transfer,
                     recipient_seed,
                     updated_batch_transfer,
                     mint_known,
@@ -6553,15 +7207,13 @@ impl Wallet {
                             asset_schema,
                             data,
                             recipient_seed,
-                            &seed,
-                            &sender_vk,
                         )
                         .await?
                 {
                     return self
                         ._refuse_consignment_async(
                             data,
-                            &recipient_id,
+                            transfer,
                             recipient_seed,
                             updated_batch_transfer,
                             mint_known,
@@ -6569,17 +7221,13 @@ impl Wallet {
                         .await;
                 }
 
-                runtime
-                    .import_contract(valid_contract.clone(), &chain_resolver)
-                    .expect("failure importing received contract");
-                debug!(self.logger, "Contract registered");
                 self.save_new_asset_internal(
-                    &runtime,
-                    contract_id,
+                    &mut runtime,
                     asset_schema,
                     valid_contract,
-                    valid_consignment.clone(),
+                    Some(valid_consignment.clone()),
                 )?;
+                debug!(self.logger, "Contract registered");
             }
 
             let mut updated_asset_transfer: DbAssetTransferActMod = asset_transfer.clone().into();
@@ -6592,11 +7240,11 @@ impl Wallet {
                 .await?;
         }
         if let Some(mint) = received_mint {
-            self.received_mints.insert(recipient_id.clone(), mint);
+            self.received_mints.insert(receive_dir.clone(), mint);
         }
         // keep the validated consignment for settlement
         self.received_valid_consignments
-            .insert(recipient_id.clone(), valid_consignment);
+            .insert(receive_dir.clone(), valid_consignment);
 
         debug!(
             self.logger,
@@ -6661,7 +7309,7 @@ impl Wallet {
                 "Unsafe history detected in consignment: {unsafe_txids:?}"
             );
             self.received_consignment_meta
-                .get_mut(&recipient_id)
+                .get_mut(&receive_dir)
                 .ok_or_else(|| Error::Internal {
                     details: s!("consignment meta not found in memory"),
                 })?
@@ -7007,6 +7655,16 @@ impl Wallet {
         })
     }
 
+    /// Drop the artifacts of a broadcast operation. Keep its consignments.
+    fn keep_consignments_only(&mut self, txid: &str) {
+        if let Some(a) = self.transfer_artifacts.get_mut(txid) {
+            *a = TransferArtifacts {
+                consignment_bytes: std::mem::take(&mut a.consignment_bytes),
+                ..Default::default()
+            };
+        }
+    }
+
     /// Broadcast the TX of an outgoing batch transfer (a no-op on the network if a recipient
     /// already did), update the RGB state and move the transfer to `WaitingConfirmations`.
     async fn broadcast_batch(
@@ -7034,7 +7692,7 @@ impl Wallet {
         self._broadcast_signed_tx(signed_tx).await?;
         Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
         drop(runtime);
-        self.transfer_artifacts.remove(txid);
+        self.keep_consignments_only(txid);
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
         Ok(self
@@ -7130,9 +7788,7 @@ impl Wallet {
                 let batch_transfer_data =
                     batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
                 let (_, transfer) = self.database.get_incoming_transfer(&batch_transfer_data)?;
-                if let Some(recipient_id) = &transfer.recipient_id {
-                    self.rebroadcast_received_tx(recipient_id).await;
-                }
+                self.rebroadcast_received_tx(&transfer).await;
             }
         }
 
@@ -7164,6 +7820,7 @@ impl Wallet {
                 .recipient_id
                 .expect("transfer should have a recipient ID");
             debug!(self.logger, "Recipient ID: {recipient_id}");
+            let receive_dir = self.get_receive_dir(&transfer);
 
             if let Some(RecipientTypeFull::Witness { vout }) = transfer.recipient_type {
                 if !skip_sync {
@@ -7179,13 +7836,13 @@ impl Wallet {
                 self.database.update_txo(txo)?;
             }
 
-            let valid_consignment = match self.received_valid_consignments.get(&recipient_id) {
+            let valid_consignment = match self.received_valid_consignments.get(&receive_dir) {
                 Some(v) => v.clone(),
                 None => {
                     // the validated copy is gone (e.g. after a reload): validate again
                     let consignment_bytes = self
                         .received_consignments
-                        .get(&recipient_id)
+                        .get(&receive_dir)
                         .ok_or_else(|| Error::Internal {
                             details: s!("consignment not found in memory"),
                         })?;
@@ -7253,14 +7910,17 @@ impl Wallet {
             .database
             .update_batch_transfer(&mut updated_batch_transfer)?;
 
-        // Clean up: received data no longer needed after settle
+        // Keep the consignment. Forget the other received data.
         if incoming {
             let batch_transfer_data =
                 batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
-            if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data)
-                && let Some(recipient_id) = &transfer.recipient_id
-            {
-                self.clear_received_data(recipient_id);
+            if let Ok((_, transfer)) = self.database.get_incoming_transfer(&batch_transfer_data) {
+                let receive_dir = self.get_receive_dir(&transfer);
+                let consignment = self.received_consignments.remove(&receive_dir);
+                self.clear_received_data(&transfer);
+                if let Some(bytes) = consignment {
+                    self.received_consignments.insert(receive_dir, bytes);
+                }
             }
         }
 
@@ -7290,17 +7950,14 @@ impl Wallet {
         let (_, transfer) = self.database.get_incoming_transfer(
             &batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?,
         )?;
-        let recipient_id = transfer
-            .recipient_id
-            .clone()
-            .expect("transfer should have a recipient ID");
+        let receive_dir = self.get_receive_dir(&transfer);
         let txid = batch_transfer
             .txid
             .clone()
             .expect("batch_transfer in WaitingSafeHeight must have a txid");
         let meta = self
             .received_consignment_meta
-            .get(&recipient_id)
+            .get(&receive_dir)
             .cloned()
             .ok_or_else(|| Error::Internal {
                 details: s!("consignment meta not found in memory"),
@@ -7318,7 +7975,7 @@ impl Wallet {
 
         let consignment_bytes = self
             .received_consignments
-            .get(&recipient_id)
+            .get(&receive_dir)
             .ok_or_else(|| Error::Internal {
                 details: s!("consignment not found in memory"),
             })?;
@@ -7328,7 +7985,7 @@ impl Wallet {
             .iter()
             .find(|b| b.witness_id().to_string() == txid)
             .and_then(|b| Self::donation_signed_tx(&b.tx));
-        let mint = self.received_mints.contains_key(&recipient_id);
+        let mint = self.received_mints.contains_key(&receive_dir);
         let recipient_seed =
             batch_transfer
                 .operation_secret_key
@@ -7371,13 +8028,16 @@ impl Wallet {
     async fn _received_mint_tx_inputs_spent_elsewhere(
         &self,
         batch_transfer: &DbBatchTransfer,
-        recipient_id: &str,
+        transfer: &DbTransfer,
     ) -> Result<bool, Error> {
         let txid = batch_transfer
             .txid
             .as_deref()
             .expect("an accepted receive has a TXID");
-        let Some(bytes) = self.received_consignments.get(recipient_id) else {
+        let Some(bytes) = self
+            .received_consignments
+            .get(&self.get_receive_dir(transfer))
+        else {
             return Ok(false);
         };
         let consignment = RgbTransfer::load(&bytes[..]).map_err(InternalError::from)?;
@@ -7419,12 +8079,8 @@ impl Wallet {
         let (_, transfer) = self.database.get_incoming_transfer(&batch_transfer_data)?;
 
         if self._is_mint(batch_transfer, db_data)? {
-            let recipient_id = transfer
-                .recipient_id
-                .as_deref()
-                .expect("transfer should have a recipient ID");
             if self
-                ._received_mint_tx_inputs_spent_elsewhere(batch_transfer, recipient_id)
+                ._received_mint_tx_inputs_spent_elsewhere(batch_transfer, &transfer)
                 .await?
             {
                 info!(
@@ -7520,12 +8176,8 @@ impl Wallet {
 
         match (res.signed_tx, res.signed_tx_hash, res.sender_pk) {
             (Some(signed_tx), Some(signed_tx_hash), Some(sender_pubkey)) => {
-                let recipient_id = transfer
-                    .recipient_id
-                    .clone()
-                    .expect("transfer should have a recipient ID");
                 self.broadcast_received_tx(
-                    &recipient_id,
+                    &transfer,
                     &signed_tx,
                     &signed_tx_hash,
                     &sender_pubkey,
@@ -7751,13 +8403,11 @@ impl Wallet {
         }
 
         let valid_contract = valid_consignment.clone().into_valid_contract();
-        runtime.import_contract(valid_contract.clone(), &chain_resolver)?;
         self.save_new_asset_internal(
-            &runtime,
-            contract_id,
+            &mut runtime,
             asset_schema,
             valid_contract,
-            valid_consignment,
+            Some(valid_consignment),
         )?;
         drop(runtime);
         self.update_backup_info(false)?;
@@ -7799,6 +8449,15 @@ impl Wallet {
         filter: Vec<RefreshFilter>,
         skip_sync: bool,
     ) -> Result<RefreshResult, Error> {
+        // Discovery finds reusable transfers as new incoming WaitingCounterparty transfers.
+        if filter.is_empty()
+            || filter.contains(&RefreshFilter {
+                status: RefreshTransferStatus::WaitingCounterparty,
+                incoming: true,
+            })
+        {
+            self.discover_invoice_transfers(asset_id.as_deref()).await?;
+        }
         let mut db_data = self.database.get_db_data(false)?;
 
         if asset_id.is_some() {
@@ -9281,7 +9940,7 @@ impl Wallet {
                 TransferStatus::WaitingConfirmations,
                 &consignment_hashes,
             )?;
-            self.transfer_artifacts.remove(&txid);
+            self.keep_consignments_only(&txid);
             idx
         } else {
             let idx = self._update_or_save_transfers(
@@ -10108,7 +10767,7 @@ impl Wallet {
     /// have already been signed.
     ///
     /// The wallet keeps a consignment that proves the burn, with its full history.
-    /// [`get_burn_consignment`](Wallet::get_burn_consignment) returns it.
+    /// [`get_consignment`](Wallet::get_consignment) returns it.
     ///
     /// This doesn't require the wallet to have private keys.
     pub async fn burn_end(
@@ -10709,10 +11368,10 @@ impl Wallet {
         let (_, transfer) = self.database.get_incoming_transfer(
             &batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?,
         )?;
-        Ok(transfer
-            .recipient_id
-            .as_ref()
-            .is_some_and(|r| self.received_mints.contains_key(r)))
+        Ok(transfer.recipient_id.is_some()
+            && self
+                .received_mints
+                .contains_key(&self.get_receive_dir(&transfer)))
     }
 
     /// Begin a BFA mint: spend one mint right to mint `recipient`'s amount, backed by a lock of
@@ -13938,19 +14597,39 @@ mod send_end_tests {
                 .to_bytes(),
         );
         let valid = transfer_id(&invoice, &sender_pk);
+        let retrieved = "0".repeat(64);
+        let failing = format!("{}1", "0".repeat(63));
+        let forging = format!("{}2", "0".repeat(63));
         let _list = rpc_mock(
             &mut server,
             "transfer.list",
             &format!(
-                r#"{{"jsonrpc":"2.0","id":null,"result":{{"0":"pending","00":"pending","{valid}":"pending"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":null,"result":{{"0":"pending","{retrieved}":"retrieved","{failing}":"pending","{forging}":"pending","{valid}":"pending"}}}}"#
             ),
         );
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":null,"result":{{"consignment":"","sender_transport_endpoint":"","sender_pk":"{sender_pk}","consignment_hash":"","batch":false}}}}"#
         );
-        // the lookup of transfer "0" fails and transfer "00" does not match its sender pubkey
-        let failed = rpc_mock(&mut server, r#""transfer_id":"0""#, INTERNAL_ERROR);
-        let forged = rpc_mock(&mut server, r#""transfer_id":"00""#, &body);
+        // "0" and the retrieved transfer are not fetched. The next lookup fails.
+        // The one after it does not match its sender pubkey.
+        let invalid = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(s!(r#""transfer_id":"0""#)))
+            .expect(0)
+            .create();
+        let skipped = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(format!(
+                r#""transfer_id":"{retrieved}""#
+            )))
+            .expect(0)
+            .create();
+        let failed = rpc_mock(
+            &mut server,
+            &format!(r#""transfer_id":"{failing}""#),
+            INTERNAL_ERROR,
+        );
+        let forged = rpc_mock(&mut server, &format!(r#""transfer_id":"{forging}""#), &body);
         let genuine = rpc_mock(&mut server, &format!(r#""transfer_id":"{valid}""#), &body);
         let (tid, res) =
             block_on(wallet.find_invoice_transfer(&server.url(), &invoice, &RECIPIENT_SEED))
@@ -13958,9 +14637,87 @@ mod send_end_tests {
                 .unwrap();
         assert_eq!(tid, valid);
         assert_eq!(res.sender_pk, sender_pk);
+        invalid.assert();
+        skipped.assert();
         failed.assert();
         forged.assert();
         genuine.assert();
+    }
+
+    #[test]
+    fn list_proxy_invoice_transfers_keeps_all_states_sorted() {
+        let (wallet, _) = setup();
+        let mut server = mockito::Server::new();
+        let a64 = "a".repeat(64);
+        let b64 = "b".repeat(64);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":null,"result":{{"{b64}":"retrieved","{a64}":"pending"}}}}"#
+        );
+        let _mock = rpc_mock(&mut server, "transfer.list", &body);
+        let url = server.url();
+        assert_eq!(
+            block_on(wallet.list_proxy_invoice_transfers(&url, "iid", &RECIPIENT_SEED)).unwrap(),
+            Some(vec![
+                (a64, ProxyTransferState::Pending),
+                (b64, ProxyTransferState::Retrieved)
+            ])
+        );
+    }
+
+    #[test]
+    fn proxy_seal_blinding_checks_the_keys() {
+        let expected = derive_shared(
+            &ed25519_from_seed(&RECIPIENT_SEED),
+            &ed25519_from_seed(&OPERATION_SEED).verifying_key(),
+        )
+        .unwrap()
+        .seal_blinding;
+        assert_eq!(
+            Wallet::proxy_seal_blinding(&RECIPIENT_SEED, &sender_pk()).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            Wallet::proxy_seal_blinding(&RECIPIENT_SEED, "zz").unwrap(),
+            None
+        );
+        assert_eq!(
+            Wallet::proxy_seal_blinding(&RECIPIENT_SEED, "00").unwrap(),
+            None
+        );
+        assert!(matches!(
+            Wallet::proxy_seal_blinding(&[8; 31], &sender_pk()),
+            Err(Error::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn release_transfer_data_picks_the_call() {
+        let (wallet, _) = setup();
+        let mut server = mockito::Server::new();
+        let tid = "0".repeat(64);
+        for (delete, method, message) in [
+            (true, "transfer.delete", delete_transfer_message(&tid)),
+            (
+                false,
+                "transfer.retrieved",
+                transfer_retrieved_message(&tid),
+            ),
+        ] {
+            let sig = hex::encode(sign_ed25519(
+                &ed25519_from_seed(&RECIPIENT_SEED),
+                &sha256_digest(message.as_bytes()),
+            ));
+            let mock = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJsonString(format!(
+                    r#"{{"method":"{method}","params":{{"transfer_id":"{tid}","signature":"{sig}"}}}}"#
+                )))
+                .with_header("content-type", "application/json")
+                .with_body(TRUE_BODY)
+                .create();
+            block_on(wallet.release_transfer_data(&server.url(), &tid, &RECIPIENT_SEED, delete));
+            mock.assert();
+        }
     }
 
     // A witness receive waiting for its consignment on the recipient proxies `endpoints`.
@@ -14120,7 +14877,7 @@ mod send_end_tests {
         check(String::new(), &[list], |e| {
             matches!(e, Error::ProxyInvalidResponse { .. })
         });
-        let list = ("transfer.list", list_body("0"));
+        let list = ("transfer.list", list_body(&"0".repeat(64)));
         let consignment = ("consignment.get", INTERNAL_ERROR.to_string());
         check(String::new(), &[list, consignment], |e| {
             matches!(e, Error::ProxyJsonRpcError { code: -32603, .. })
@@ -14156,6 +14913,182 @@ mod send_end_tests {
         assert_eq!(ttes_used(&wallet, idx), vec![false, true]);
         consignment.assert();
         nack.assert();
+
+        // A known transfer ID is fetched only from its used proxy, with no listing.
+        let (mut wallet, online) = setup();
+        let mut unused = mockito::Server::new();
+        let mut server = mockito::Server::new();
+        let (idx, rid) = seed_proxy_receive(&mut wallet, &[unused.url(), server.url()]);
+        let transfer = batch_transfer_row(&wallet, idx);
+        let mut updated: DbTransferActMod = transfer.clone().into();
+        updated.proxy_transfer_id = ActiveValue::Set(Some(valid_tid(&rid)));
+        wallet.database.update_transfer(&mut updated).unwrap();
+        let ttes = wallet
+            .database
+            .get_transfer_transport_endpoints_data(transfer.idx);
+        let mut tte: DbTransferTransportEndpointActMod = ttes.unwrap().pop().unwrap().0.into();
+        tte.used = ActiveValue::Set(true);
+        wallet
+            .database
+            .update_transfer_transport_endpoint(&mut tte)
+            .unwrap();
+        let untouched = unused.mock("POST", "/").expect(0).create();
+        let list = rpc_mock(&mut server, "transfer.list", EMPTY_LIST).expect(0);
+        let body = consignment_body(&server);
+        let consignment = rpc_mock(&mut server, "consignment.get", &body);
+        let nack = nack_mock(&mut server);
+        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+        assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+        untouched.assert();
+        list.assert();
+        consignment.assert();
+        nack.assert();
+    }
+
+    // Link the receive of a batch to a new reusable invoice.
+    fn link_invoice(wallet: &Wallet, batch_idx: i32, quota: u32, deadline: i64) -> i32 {
+        let invoice_idx = wallet
+            .database
+            .set_invoice(DbInvoiceActMod {
+                quota: ActiveValue::Set(quota),
+                deadline: ActiveValue::Set(deadline),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut transfer: DbTransferActMod = batch_transfer_row(wallet, batch_idx).into();
+        transfer.invoice_idx = ActiveValue::Set(Some(invoice_idx));
+        wallet.database.update_transfer(&mut transfer).unwrap();
+        invoice_idx
+    }
+
+    #[test]
+    fn reusable_receive_refuses_spam_and_retries_delete() {
+        let (mut wallet, online) = setup();
+        let mut server = mockito::Server::new();
+        let (idx, rid) = seed_proxy_receive(&mut wallet, &[server.url()]);
+        link_invoice(&wallet, idx, 2, now().unix_timestamp() + 7200);
+        let receive_dir = wallet.get_receive_dir(&batch_transfer_row(&wallet, idx));
+        let mock = |server: &mut mockito::ServerGuard, method: &str, body: &str, hits: usize| {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(method.to_string()))
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .expect(hits)
+                .create()
+        };
+        let list = mock(
+            &mut server,
+            "transfer.list",
+            &list_body(&valid_tid(&rid)),
+            2,
+        );
+        let body = consignment_body(&server);
+        // Only discovery downloads a reusable transfer with no ID.
+        let consignment = mock(&mut server, "consignment.get", &body, 2);
+        let delete = mock(&mut server, "transfer.delete", TRUE_BODY, 1);
+        let nack = nack_mock(&mut server).expect(2);
+        MOCK_TRANSFER_DELETE_FAILURES.set(1);
+        for _ in 0..2 {
+            let res = block_on(wallet.refresh(online.clone(), None, vec![], true)).unwrap();
+            assert_eq!(wallet.database.iter_transfers().unwrap().len(), 1);
+            assert_pending(&wallet, idx, &res);
+            assert_eq!(batch_transfer_row(&wallet, idx).proxy_transfer_id, None);
+            assert!(!wallet.received_consignments.contains_key(&receive_dir));
+        }
+        MOCK_TRANSFER_DELETE_FAILURES.set(0);
+        // A filter without incoming WaitingCounterparty skips discovery.
+        let filter = vec![RefreshFilter {
+            status: RefreshTransferStatus::WaitingConfirmations,
+            incoming: true,
+        }];
+        block_on(wallet.refresh(online, None, filter, true)).unwrap();
+        list.assert();
+        consignment.assert();
+        delete.assert();
+        nack.assert();
+    }
+
+    #[test]
+    fn reconcile_keeps_live_invoice_script() {
+        let (mut wallet, _) = setup();
+        let script = new_script(&mut wallet);
+        let idx = seed_witness_receive(&wallet, "", TransferStatus::Settled, Some(1), &script);
+        link_invoice(&wallet, idx, 2, now().unix_timestamp() + 100);
+        set_pending_witness_scripts(&wallet, &[&script]);
+
+        let kept = wallet._reconcile_pending_witness().unwrap();
+        let shared = WatchedWitnessScript {
+            pending: true,
+            shared: true,
+        };
+        assert_eq!(kept, HashMap::from([(script.to_hex_string(), shared)]));
+        assert_eq!(
+            db_pending_witness_scripts(&wallet),
+            HashSet::from([script.to_hex_string()])
+        );
+
+        crate::utils::CLOCK_OFFSET.with(|o| o.set(200));
+        let kept = wallet._reconcile_pending_witness().unwrap();
+        crate::utils::CLOCK_OFFSET.with(|o| o.set(0));
+        assert!(kept.is_empty());
+        assert!(db_pending_witness_scripts(&wallet).is_empty());
+    }
+
+    #[test]
+    fn payment_already_received_checks_other_transfers() {
+        let (mut wallet, _) = setup();
+        let script = new_script(&mut wallet);
+        let (txid, other_txid) = ("33".repeat(32), "44".repeat(32));
+        let status = TransferStatus::WaitingConfirmations;
+        let other = seed_witness_receive(&wallet, &txid, status, Some(1), &script);
+        let status = TransferStatus::WaitingCounterparty;
+        let idx = seed_witness_receive(&wallet, "", status, None, &script);
+        let transfer = batch_transfer_row(&wallet, idx);
+        let received = |txid: &str, vout: u32| {
+            wallet
+                .payment_already_received(&transfer, txid, Some(vout))
+                .unwrap()
+        };
+        assert!(received(&txid, 1));
+        assert!(!received(&txid, 2));
+        assert!(!received(&other_txid, 1));
+
+        let mut batch = DbBatchTransferActMod {
+            idx: ActiveValue::Set(other),
+            status: ActiveValue::Set(TransferStatus::Failed),
+            ..Default::default()
+        };
+        wallet.database.update_batch_transfer(&mut batch).unwrap();
+        assert!(!received(&txid, 1));
+    }
+
+    #[test]
+    fn delete_transfers_keeps_live_invoice_transfers() {
+        let (wallet, _) = setup();
+        let failed = TransferStatus::Failed;
+        let idx = seed_batch(&wallet, &"33".repeat(32), failed, true, None);
+        let other = seed_batch(&wallet, &"44".repeat(32), failed, true, None);
+        link_invoice(&wallet, idx, 2, now().unix_timestamp() + 100);
+        let batch_idxs = |wallet: &Wallet| -> Vec<i32> {
+            let batches = wallet.database.iter_batch_transfers().unwrap();
+            batches.iter().map(|bt| bt.idx).collect()
+        };
+
+        assert!(matches!(
+            wallet.delete_transfers(Some(idx), false),
+            Err(Error::CannotDeleteBatchTransfer)
+        ));
+        assert!(wallet.delete_transfers(None, false).unwrap());
+        assert_eq!(batch_idxs(&wallet), vec![idx]);
+        assert!(!wallet.delete_transfers(None, false).unwrap());
+        assert_ne!(idx, other);
+
+        crate::utils::CLOCK_OFFSET.with(|o| o.set(200));
+        let res = wallet.delete_transfers(Some(idx), false);
+        crate::utils::CLOCK_OFFSET.with(|o| o.set(0));
+        assert!(res.unwrap());
+        assert!(batch_idxs(&wallet).is_empty());
     }
 
     #[test]
@@ -14902,12 +15835,13 @@ mod send_end_tests {
         let now = now().unix_timestamp();
         wallet
             .received_signed_txs
-            .insert(s!("recipient"), raw_tx(&dummy_psbt().0));
+            .insert(s!("dir"), raw_tx(&dummy_psbt().0));
         for expected in [
             TransferStatus::WaitingBroadcast,
             TransferStatus::WaitingConfirmations,
         ] {
             let idx = seed_batch(&wallet, &txid, expected, true, Some(now + 5000));
+            set_receive_dir(&wallet, idx, "dir");
             let mut updated: DbBatchTransferActMod = wallet
                 .database
                 .iter_batch_transfers()
@@ -15334,6 +16268,135 @@ mod send_end_tests {
         assert_receive_rolled_back(&wallet, idx);
     }
 
+    fn set_receive_dir(wallet: &Wallet, batch_idx: i32, dir: &str) {
+        let mut transfer: DbTransferActMod = batch_transfer_row(wallet, batch_idx).into();
+        transfer.receive_dir = ActiveValue::Set(Some(dir.to_string()));
+        wallet.database.update_transfer(&mut transfer).unwrap();
+    }
+
+    fn received_mint(n: u64) -> ReceivedMint {
+        ReceivedMint {
+            opid: format!("opid{n}"),
+            lock_id: s!("lock"),
+            amount: n,
+            before_block: 1,
+            evm_chain_id: 1,
+            bridge_contract: s!("bridge"),
+        }
+    }
+
+    #[test]
+    fn get_received_mint_lists_each_transfer() {
+        let (mut wallet, _) = setup();
+        let rcv_status = TransferStatus::WaitingCounterparty;
+        let i1 = seed_batch(&wallet, &"11".repeat(32), rcv_status, true, None);
+        let i2 = seed_batch(&wallet, &"22".repeat(32), rcv_status, true, None);
+        seed_batch(&wallet, &"44".repeat(32), rcv_status, false, None);
+        set_receive_dir(&wallet, i1, "dir_1");
+        set_receive_dir(&wallet, i2, "dir_2");
+        let (m1, m2) = (received_mint(1), received_mint(2));
+        wallet.received_mints.insert(s!("dir_1"), m1.clone());
+        wallet.received_mints.insert(s!("dir_2"), m2.clone());
+        // the key of the outgoing transfer
+        wallet
+            .received_mints
+            .insert(s!("recipient"), received_mint(3));
+        let mints = |w: &Wallet, rid: &str| w.get_received_mint(rid.to_string()).unwrap();
+
+        assert_eq!(mints(&wallet, "recipient"), vec![m1, m2]);
+        assert!(mints(&wallet, "unknown").is_empty());
+        assert!(mints(&wallet, "dir_1").is_empty());
+    }
+
+    #[test]
+    fn received_data_kept_per_transfer() {
+        let (mut wallet, _) = setup();
+        let server = mockito::Server::new();
+        let expiration = now().unix_timestamp() + 3600;
+        let script = new_script(&mut wallet);
+        let rid = recipient_id_from_script_buf(script, BitcoinNetwork::Regtest);
+        let mut seed = |dir: &str, transfer_id: &str| {
+            let idx = seed_receive_with_consignment(&mut wallet, &server.url(), expiration);
+            let mut transfer: DbTransferActMod = batch_transfer_row(&wallet, idx).into();
+            transfer.recipient_id = ActiveValue::Set(Some(rid.clone()));
+            transfer.receive_dir = ActiveValue::Set(Some(dir.to_string()));
+            wallet.database.update_transfer(&mut transfer).unwrap();
+            let consignment = wallet.received_consignments.remove("recipient").unwrap();
+            wallet
+                .received_consignments
+                .insert(dir.to_string(), consignment);
+            let mut meta = wallet
+                .received_consignment_meta
+                .remove("recipient")
+                .unwrap();
+            meta.transfer_id = Some(transfer_id.to_string());
+            wallet
+                .received_consignment_meta
+                .insert(dir.to_string(), meta);
+            idx
+        };
+        let i1 = seed("dir_1", "transfer_1");
+        let i2 = seed("dir_2", "transfer_2");
+        wallet
+            .received_consignments
+            .insert(s!("dir_2"), b"other".to_vec());
+        wallet.received_signed_txs.insert(s!("dir_2"), vec![2]);
+        // the digest does not match, so the locks are ignored
+        wallet
+            .pending_mint_locks
+            .insert(s!("dir_2"), pending_mint_locks());
+        // a known mint gets no NACK
+        let (m1, m2) = (received_mint(1), received_mint(2));
+        wallet.received_mints.insert(s!("dir_1"), m1.clone());
+        wallet.received_mints.insert(s!("dir_2"), m2.clone());
+        assert_eq!(
+            wallet.get_received_mint(rid.clone()).unwrap(),
+            vec![m1, m2.clone()]
+        );
+        let wait = |wallet: &mut Wallet, idx: i32| {
+            let db_data = wallet.database.get_db_data(false).unwrap();
+            let bt = db_data
+                .batch_transfers
+                .iter()
+                .find(|bt| bt.idx == idx)
+                .unwrap()
+                .clone();
+            block_on(wallet._wait_consignment_async(&bt, &db_data)).unwrap();
+        };
+
+        // the refusal of one transfer keeps the data of the other
+        wait(&mut wallet, i1);
+        assert_eq!(status(&wallet, i1), TransferStatus::Failed);
+        assert_eq!(
+            batch_transfer_row(&wallet, i1).proxy_transfer_id,
+            Some(s!("transfer_1"))
+        );
+        assert!(!wallet.received_consignments.contains_key("dir_1"));
+        assert!(!wallet.received_consignment_meta.contains_key("dir_1"));
+        assert_eq!(wallet.received_consignments["dir_2"], b"other");
+        assert_eq!(
+            wallet.received_consignment_meta["dir_2"].transfer_id,
+            Some(s!("transfer_2"))
+        );
+        assert!(wallet.received_signed_txs.contains_key("dir_2"));
+        assert!(wallet.pending_mint_locks.contains_key("dir_2"));
+        assert_eq!(status(&wallet, i2), TransferStatus::WaitingCounterparty);
+        assert_eq!(batch_transfer_row(&wallet, i2).proxy_transfer_id, None);
+        assert_eq!(wallet.get_received_mint(rid.clone()).unwrap(), vec![m2]);
+
+        wait(&mut wallet, i2);
+        assert_eq!(status(&wallet, i2), TransferStatus::Failed);
+        assert_eq!(
+            batch_transfer_row(&wallet, i2).proxy_transfer_id,
+            Some(s!("transfer_2"))
+        );
+        assert!(!wallet.received_consignments.contains_key("dir_2"));
+        assert!(!wallet.received_consignment_meta.contains_key("dir_2"));
+        assert!(!wallet.received_signed_txs.contains_key("dir_2"));
+        assert!(!wallet.pending_mint_locks.contains_key("dir_2"));
+        assert!(wallet.get_received_mint(rid.clone()).unwrap().is_empty());
+    }
+
     #[test]
     fn fail_transfers_expired_send_with_failing_ack() {
         let (mut wallet, online) = setup_at(&fake_esplora(esplora_route(None)));
@@ -15494,68 +16557,76 @@ mod send_end_tests {
         assert_eq!(status(&wallet, idx), TransferStatus::Failed);
     }
 
-    // a witness receive whose consignment is refused releases the TXO that paid it
+    // A refused witness consignment releases the TXO that paid it.
+    // A script shared by a reusable invoice is not released.
     #[test]
     fn refusing_a_consignment_clears_pending_witness_txo() {
-        let (mut wallet, online) = setup();
-        let mut server = mockito::Server::new();
-        let _ack = rpc_mock(
-            &mut server,
-            "ack.post",
-            r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#,
-        );
-        let idx = seed_receive_with_consignment(
-            &mut wallet,
-            &server.url(),
-            now().unix_timestamp() + 3600,
-        );
-        let script = new_script(&mut wallet);
-        let rid = recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest);
-        let mut transfer: DbTransferActMod = batch_transfer_row(&wallet, idx).into();
-        transfer.recipient_type = ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
-        transfer.recipient_id = ActiveValue::Set(Some(rid.clone()));
-        wallet.database.update_transfer(&mut transfer).unwrap();
-        let consignment = wallet.received_consignments.remove("recipient").unwrap();
-        wallet
-            .received_consignments
-            .insert(rid.clone(), consignment);
-        let meta = wallet
-            .received_consignment_meta
-            .remove("recipient")
-            .unwrap();
-        wallet.received_consignment_meta.insert(rid.clone(), meta);
-        wallet
-            .received_signed_txs
-            .insert(rid.clone(), raw_tx(&dummy_psbt().0));
-        wallet
-            .pending_mint_locks
-            .insert(rid.clone(), pending_mint_locks());
-        let txid = apply_tx_paying(&mut wallet, &[script]);
-        let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
-        let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
-        let kept = |w: &Wallet| {
-            [
-                w.received_consignments.contains_key(&rid),
-                w.received_consignment_meta.contains_key(&rid),
-                w.received_signed_txs.contains_key(&rid),
-                w.pending_mint_locks.contains_key(&rid),
-            ]
-        };
+        for reusable in [false, true] {
+            let (mut wallet, online) = setup();
+            let mut server = mockito::Server::new();
+            let _ack = rpc_mock(
+                &mut server,
+                "ack.post",
+                r#"{"jsonrpc":"2.0","id":null,"result":{"result":true}}"#,
+            );
+            let idx = seed_receive_with_consignment(
+                &mut wallet,
+                &server.url(),
+                now().unix_timestamp() + 3600,
+            );
+            let script = new_script(&mut wallet);
+            let rid = recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest);
+            let mut transfer: DbTransferActMod = batch_transfer_row(&wallet, idx).into();
+            transfer.recipient_type =
+                ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
+            transfer.recipient_id = ActiveValue::Set(Some(rid.clone()));
+            wallet.database.update_transfer(&mut transfer).unwrap();
+            if reusable {
+                link_invoice(&wallet, idx, 2, now().unix_timestamp() + 3600);
+            }
+            let key = wallet.normalize_recipient_id(&rid);
+            let consignment = wallet.received_consignments.remove("recipient").unwrap();
+            wallet
+                .received_consignments
+                .insert(key.clone(), consignment);
+            let meta = wallet
+                .received_consignment_meta
+                .remove("recipient")
+                .unwrap();
+            wallet.received_consignment_meta.insert(key.clone(), meta);
+            wallet
+                .received_signed_txs
+                .insert(key.clone(), raw_tx(&dummy_psbt().0));
+            wallet
+                .pending_mint_locks
+                .insert(key.clone(), pending_mint_locks());
+            let txid = apply_tx_paying(&mut wallet, &[script]);
+            let paid_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+            let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
+            let kept = |w: &Wallet| {
+                [
+                    w.received_consignments.contains_key(&key),
+                    w.received_consignment_meta.contains_key(&key),
+                    w.received_signed_txs.contains_key(&key),
+                    w.pending_mint_locks.contains_key(&key),
+                ]
+            };
 
-        // a failed refresh restores the data it cleared
-        block_on(assert_no_partial_change(
-            &mut wallet,
-            "refresh",
-            0,
-            async |w| w.refresh(online.clone(), None, vec![], true).await,
-        ));
-        assert_eq!(kept(&wallet), [true; 4]);
-        let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
+            // A failed refresh restores the data it cleared.
+            block_on(assert_no_partial_change(
+                &mut wallet,
+                "refresh",
+                0,
+                async |w| w.refresh(online.clone(), None, vec![], true).await,
+            ));
+            assert_eq!(kept(&wallet), [true; 4]);
+            let res = block_on(wallet.refresh(online, None, vec![], true)).unwrap();
 
-        assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
-        assert_eq!(kept(&wallet), [false; 4]);
-        assert!(!pending_witness(&wallet, paid_txo));
-        assert!(pending_witness(&wallet, unrelated_txo));
+            assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
+            assert_eq!(kept(&wallet), [false; 4]);
+            assert_eq!(pending_witness(&wallet, paid_txo), reusable);
+            assert!(pending_witness(&wallet, unrelated_txo));
+        }
     }
 
     #[test]
@@ -15575,9 +16646,16 @@ mod send_end_tests {
         let txid = apply_tx_paying(&mut wallet, &[script]);
         let script_txo = seed_pending_witness_txo(&wallet, &txid, 0);
 
+        // A shared script stays flagged.
+        let script = new_script(&mut wallet);
+        let reusable = seed_witness_receive(&wallet, "", status_before, None, &script);
+        link_invoice(&wallet, reusable, 2, now().unix_timestamp() + 3600);
+        let txid = apply_tx_paying(&mut wallet, &[script]);
+        let shared_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+
         let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
 
-        for idx in [by_outpoint, by_script] {
+        for idx in [by_outpoint, by_script, reusable] {
             let batch_transfer = wallet
                 .database
                 .iter_batch_transfers()
@@ -15590,7 +16668,15 @@ mod send_end_tests {
 
         assert!(!pending_witness(&wallet, outpoint_txo));
         assert!(!pending_witness(&wallet, script_txo));
+        assert!(pending_witness(&wallet, shared_txo));
         assert!(pending_witness(&wallet, unrelated_txo));
+    }
+
+    fn watched(pending: bool) -> WatchedWitnessScript {
+        WatchedWitnessScript {
+            pending,
+            shared: false,
+        }
     }
 
     fn set_pending_witness_scripts(wallet: &Wallet, scripts: &[&ScriptBuf]) {
@@ -15803,8 +16889,8 @@ mod send_end_tests {
         assert_eq!(
             kept,
             HashMap::from([
-                (recent.to_hex_string(), false),
-                (pending.to_hex_string(), true),
+                (recent.to_hex_string(), watched(false)),
+                (pending.to_hex_string(), watched(true)),
             ])
         );
         assert_eq!(
@@ -15819,7 +16905,10 @@ mod send_end_tests {
             .failed_witness_receive_grace_secs = 0;
         let kept = wallet._reconcile_pending_witness().unwrap();
 
-        assert_eq!(kept, HashMap::from([(pending.to_hex_string(), true)]));
+        assert_eq!(
+            kept,
+            HashMap::from([(pending.to_hex_string(), watched(true))])
+        );
         assert_eq!(
             db_pending_witness_scripts(&wallet),
             HashSet::from([pending.to_hex_string()])
@@ -15942,9 +17031,9 @@ mod send_end_tests {
         assert_eq!(
             kept,
             HashMap::from([
-                (scripts[0].clone(), true),
-                (scripts[3].clone(), false),
-                (scripts[4].clone(), false),
+                (scripts[0].clone(), watched(true)),
+                (scripts[3].clone(), watched(false)),
+                (scripts[4].clone(), watched(false)),
             ])
         );
         assert_eq!(
@@ -16346,6 +17435,36 @@ mod send_end_tests {
             ));
         }
         check_scopes_match_all(&wallet, &[any(), AssetFilter::None]);
+
+        // every consignment path has the RGB binary file extension
+        let issue = seed_batch(&wallet, "i", TransferStatus::Settled, true, None);
+        wallet
+            .database
+            .set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(seed_txo(&wallet, "i", 0)),
+                asset_transfer_idx: ActiveValue::Set(
+                    batch_transfer_row(&wallet, issue).asset_transfer_idx,
+                ),
+                r#type: ActiveValue::Set(ColoringType::Issue),
+                assignment: ActiveValue::Set(Assignment::Fungible(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        let transfers = wallet
+            .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+            .unwrap();
+        for (idx, kind, file) in [
+            (issue, TransferKind::Issuance, "asset.rgb"),
+            (send, TransferKind::Send, "consignment_out.rgb"),
+            (rcv_a, TransferKind::ReceiveWitness, "rcv_compose.rgb"),
+        ] {
+            let transfer = transfers
+                .iter()
+                .find(|t| t.batch_transfer_idx == idx && t.kind == kind)
+                .unwrap();
+            let path = transfer.consignment_path.as_deref().unwrap();
+            assert!(Path::new(path).ends_with(file), "{path}");
+        }
     }
 
     #[test]
@@ -16550,15 +17669,16 @@ mod send_end_tests {
         transfer.recipient_type = ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
         transfer.recipient_id = ActiveValue::Set(Some(rid.clone()));
         wallet.database.update_transfer(&mut transfer).unwrap();
+        let key = wallet.normalize_recipient_id(&rid);
         let consignment = wallet.received_consignments.remove("recipient").unwrap();
         wallet
             .received_consignments
-            .insert(rid.clone(), consignment);
+            .insert(key.clone(), consignment);
         let meta = wallet
             .received_consignment_meta
             .remove("recipient")
             .unwrap();
-        wallet.received_consignment_meta.insert(rid, meta);
+        wallet.received_consignment_meta.insert(key, meta);
         let mut get = mockito::Server::new();
         let fire = c.clone();
         let _get = get

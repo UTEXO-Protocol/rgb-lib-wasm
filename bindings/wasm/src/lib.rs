@@ -20,6 +20,24 @@ fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Convert an exported contract to `{ contract: Uint8Array, media: Uint8Array[] }`.
+pub fn exported_contract_to_js(
+    exported: &rgb_lib_wasm::wallet::ExportedContract,
+) -> Result<JsValue, JsValue> {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &obj,
+        &"contract".into(),
+        &js_sys::Uint8Array::from(&exported.contract[..]),
+    )?;
+    let media = js_sys::Array::new();
+    for m in &exported.media {
+        media.push(&js_sys::Uint8Array::from(&m[..]));
+    }
+    js_sys::Reflect::set(&obj, &"media".into(), &media)?;
+    Ok(obj.into())
+}
+
 /// Parse an optional encryption preference: "Required", "Unsupported" or "Optional".
 fn parse_encryption(
     encryption: Option<String>,
@@ -523,6 +541,32 @@ impl WasmWallet {
         to_js(&medias)
     }
 
+    /// Export the contract of an RGB asset with its media.
+    /// Returns `{ contract: Uint8Array, media: Uint8Array[] }`.
+    #[wasm_bindgen(js_name = "exportContract")]
+    pub fn export_contract(&self, asset_id: &str) -> Result<JsValue, JsValue> {
+        let exported = self
+            .inner
+            .borrow()
+            .export_contract(asset_id.to_string())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        exported_contract_to_js(&exported)
+    }
+
+    /// Import the contract of an RGB asset (bytes, no bundles) with the bytes of the media it needs.
+    #[wasm_bindgen(js_name = "importContract")]
+    pub fn import_contract(
+        &self,
+        contract: &[u8],
+        media: Vec<js_sys::Uint8Array>,
+    ) -> Result<(), JsValue> {
+        let media = media.iter().map(|m| m.to_vec()).collect();
+        self.inner
+            .borrow_mut()
+            .import_contract(contract, media)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Return the balance for a specific asset.
     #[wasm_bindgen(js_name = "getAssetBalance")]
     pub fn get_asset_balance(&self, asset_id: &str) -> Result<JsValue, JsValue> {
@@ -661,18 +705,28 @@ impl WasmWallet {
     }
 
     /// Inspect a PSBT and the fascia (`details.fascia` of a `*Begin` result) this wallet built. Returns an RgbInspection object.
+    ///
+    /// `maxFasciaSize` (BigInt) limits the fascia size in bytes and `maxBundles` (number) limits the bundle count.
     #[wasm_bindgen(js_name = "inspectFascia")]
     pub fn inspect_fascia(
         &self,
         psbt: &str,
         fascia: &[u8],
         entropy: Option<u64>,
+        max_fascia_size: u64,
+        max_bundles: u32,
     ) -> Result<JsValue, JsValue> {
         to_js(
             &self
                 .inner
                 .borrow()
-                .inspect_fascia(psbt.to_string(), fascia, entropy)
+                .inspect_fascia(
+                    psbt.to_string(),
+                    fascia,
+                    entropy,
+                    max_fascia_size,
+                    max_bundles,
+                )
                 .map_err(|e| JsValue::from_str(&e.to_string()))?,
         )
     }
@@ -686,6 +740,7 @@ impl WasmWallet {
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `transport_endpoints_js` is a JS array of endpoint strings.
     /// `encryption` is "Required" (default), "Unsupported" or "Optional".
+    /// `quota` is the number of transfers the invoice can receive (default 1).
     #[wasm_bindgen(js_name = "blindReceive")]
     #[allow(clippy::too_many_arguments)]
     pub async fn blind_receive(
@@ -697,6 +752,7 @@ impl WasmWallet {
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
         encryption: Option<String>,
+        quota: Option<u32>,
     ) -> Result<JsValue, JsValue> {
         let online = js_to_online_opt(online_js)?;
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
@@ -716,6 +772,7 @@ impl WasmWallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
+                quota,
             )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -728,6 +785,7 @@ impl WasmWallet {
     /// `assignment_js` is a JS object like `{ "Fungible": 100 }`, `"MintRight"` or `"Any"`.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `encryption` is "Required" (default), "Unsupported" or "Optional".
+    /// `quota` is the number of transfers the invoice can receive (default 1).
     #[wasm_bindgen(js_name = "witnessReceive")]
     #[allow(clippy::too_many_arguments)]
     pub async fn witness_receive(
@@ -739,6 +797,7 @@ impl WasmWallet {
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
         encryption: Option<String>,
+        quota: Option<u32>,
     ) -> Result<JsValue, JsValue> {
         let online = js_to_online_opt(online_js)?;
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
@@ -758,6 +817,7 @@ impl WasmWallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
+                quota,
             )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -1407,13 +1467,18 @@ impl WasmWallet {
         to_js(&result)
     }
 
-    /// Return the consignment of an ended burn as a Uint8Array.
-    #[wasm_bindgen(js_name = "getBurnConsignment")]
-    pub fn get_burn_consignment(&self, asset_id: &str, txid: &str) -> Result<Vec<u8>, JsValue> {
-        self.inner
+    /// Return the consignment of the transfer with this idx, or null.
+    #[wasm_bindgen(
+        js_name = "getConsignment",
+        unchecked_return_type = "Uint8Array | null"
+    )]
+    pub fn get_consignment(&self, transfer_idx: i32) -> Result<JsValue, JsValue> {
+        let bytes = self
+            .inner
             .borrow()
-            .get_burn_consignment(asset_id.to_string(), txid.to_string())
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+            .get_consignment(transfer_idx)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(bytes.map_or(JsValue::NULL, |b| js_sys::Uint8Array::from(&b[..]).into()))
     }
 
     /// Link an IFA or BFA asset to another contract: begin, sign with the wallet keys and end.
@@ -1555,15 +1620,16 @@ impl WasmWallet {
         to_js(&result)
     }
 
-    /// Return the checked mint received on a recipient ID as a ReceivedMint object, or null.
+    /// Return the checked mints received on a recipient ID as an array of ReceivedMint objects.
+    /// The array has one item per transfer and can be empty.
     #[wasm_bindgen(js_name = "getReceivedMint")]
     pub fn get_received_mint(&self, recipient_id: &str) -> Result<JsValue, JsValue> {
-        let received_mint = self
+        let received_mints = self
             .inner
             .borrow()
             .get_received_mint(recipient_id.to_string())
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        received_mint.map_or(Ok(JsValue::NULL), |m| to_js(&m))
+        to_js(&received_mints)
     }
 
     /// List vanilla (non-colored) unspent outputs. Returns a JS array of LocalOutput objects.
@@ -1826,19 +1892,29 @@ pub fn inspect_consignment(
 }
 
 /// Inspect a PSBT and the fascia of its RGB operation without a wallet.
+///
+/// `maxFasciaSize` (BigInt) limits the fascia size in bytes and `maxBundles` (number) limits the bundle count.
 #[wasm_bindgen(js_name = "inspectFascia")]
 pub fn inspect_fascia(
     psbt: &str,
     fascia: &[u8],
     entropy: Option<u64>,
+    max_fascia_size: u64,
+    max_bundles: u32,
     network: &str,
 ) -> Result<JsValue, JsValue> {
     let bitcoin_network = network
         .parse::<rgb_lib_wasm::BitcoinNetwork>()
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let inspection =
-        rgb_lib_wasm::no_wallet::inspect_fascia(psbt.to_string(), fascia, entropy, bitcoin_network)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let inspection = rgb_lib_wasm::no_wallet::inspect_fascia(
+        psbt.to_string(),
+        fascia,
+        entropy,
+        max_fascia_size,
+        max_bundles,
+        bitcoin_network,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
     to_js(&inspection)
 }
 

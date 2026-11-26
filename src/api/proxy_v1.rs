@@ -22,9 +22,6 @@ pub(crate) const INVOICE_UNKNOWN_CODES: &[i64] = &[-101];
 // the transfer is deleted or its consignment is not available
 pub(crate) const CONSIGNMENT_GONE_CODES: &[i64] = &[-113, -400, -402, -403];
 
-/// Number of transfers an invoice is reserved for: invoices are single-use.
-pub(crate) const INVOICE_QUOTA: u32 = 1;
-
 pub struct ProxyClient {
     client: RestClient,
     base_url: String,
@@ -217,8 +214,9 @@ pub(crate) fn prepare_invoice_auth_message(
     invoice_id: &str,
     expires_at: &str,
     recipient_pk: &str,
+    quota: u32,
 ) -> String {
-    format!("{invoice_id}{expires_at}{recipient_pk}{INVOICE_QUOTA}")
+    format!("{invoice_id}{expires_at}{recipient_pk}{quota}")
 }
 
 /// Message authenticating an `ack.prepare` call on a proxy with proxy-level authentication
@@ -276,11 +274,17 @@ pub(crate) fn transfer_retrieved_message(transfer_id: &str) -> String {
     format!("{transfer_id}retrieved")
 }
 
+/// Message the recipient signs to delete a transfer: `transfer_id ‖ "delete"`.
+pub(crate) fn delete_transfer_message(transfer_id: &str) -> String {
+    format!("{transfer_id}delete")
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct PrepareInvoiceParams {
     invoice_id: String,
     expires_at: String,
     recipient_pk: String,
+    quota: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
 }
@@ -310,7 +314,7 @@ struct ListTransfersParams {
 }
 
 #[derive(Debug, Serialize)]
-struct TransferRetrievedParams {
+struct TransferIDSignatureParams {
     transfer_id: String,
     signature: String,
 }
@@ -583,6 +587,7 @@ impl ProxyClient {
         invoice_id: &str,
         expiration: &str,
         recipient_pk: &str,
+        quota: u32,
         signature: Option<String>,
     ) -> Result<JsonRpcResponse<bool>, Error> {
         self.write_call(
@@ -591,6 +596,7 @@ impl ProxyClient {
                 invoice_id: invoice_id.to_string(),
                 expires_at: expiration.to_string(),
                 recipient_pk: recipient_pk.to_string(),
+                quota: quota.to_string(),
                 signature,
             }),
         )
@@ -695,7 +701,22 @@ impl ProxyClient {
     ) -> Result<JsonRpcResponse<bool>, Error> {
         self.write_call(
             "transfer.retrieved",
-            Some(TransferRetrievedParams {
+            Some(TransferIDSignatureParams {
+                transfer_id: transfer_id.to_string(),
+                signature: signature.to_string(),
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_transfer(
+        &self,
+        transfer_id: &str,
+        signature: &str,
+    ) -> Result<JsonRpcResponse<bool>, Error> {
+        self.write_call(
+            "transfer.delete",
+            Some(TransferIDSignatureParams {
                 transfer_id: transfer_id.to_string(),
                 signature: signature.to_string(),
             }),
@@ -1032,7 +1053,9 @@ mod tests {
 
     #[test]
     fn prepare_invoice_error() {
-        assert_proxy_errors(|c| async move { c.prepare_invoice("123", "999", "pk", None).await });
+        assert_proxy_errors(
+            |c| async move { c.prepare_invoice("123", "999", "pk", 1, None).await },
+        );
     }
 
     #[test]
@@ -1043,6 +1066,28 @@ mod tests {
     #[test]
     fn transfer_retrieved_error() {
         assert_proxy_errors(|c| async move { c.transfer_retrieved("123", "00").await });
+    }
+
+    #[test]
+    fn delete_transfer_error() {
+        assert_proxy_errors(|c| async move { c.delete_transfer("123", "00").await });
+    }
+
+    #[test]
+    fn prepare_invoice_sends_quota() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJsonString(s!(
+                r#"{"method":"invoice.prepare","params":{"invoice_id":"iid","expires_at":"999","recipient_pk":"rpk","quota":"3"}}"#
+            )))
+            .with_header("content-type", JSON)
+            .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
+            .create();
+        let client = ProxyClient::new(&server.url()).unwrap();
+        let res = block_on(client.prepare_invoice("iid", "999", "rpk", 3, None)).unwrap();
+        assert_eq!(res.result, Some(true));
+        mock.assert();
     }
 
     #[test]
@@ -1135,9 +1180,14 @@ mod tests {
     #[test]
     fn signed_messages() {
         assert_eq!(
-            prepare_invoice_auth_message("iid", "999", "rpk"),
+            prepare_invoice_auth_message("iid", "999", "rpk", 1),
             "iid999rpk1"
         );
+        assert_eq!(
+            prepare_invoice_auth_message("iid", "999", "rpk", 3),
+            "iid999rpk3"
+        );
+        assert_eq!(delete_transfer_message("tid"), "tiddelete");
         let transfer = |pk: &str, hash: &str| AckTransferData {
             recipient_pk: pk.to_string(),
             consignment_hash: hash.to_string(),
