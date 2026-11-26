@@ -30,16 +30,16 @@ pub struct WalletSnapshot {
     pub bdk_changeset: Option<ChangeSet>,
     /// Complete pending transfer state keyed by txid.
     pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
-    /// Received consignment bytes keyed by receive dir of the transfer.
+    /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
-    /// Proxy data of each received consignment keyed by receive dir of the transfer.
+    /// Proxy data of each received consignment keyed by recipient_id.
     pub(crate) received_consignment_meta: HashMap<String, super::ReceivedConsignmentMeta>,
-    /// Signed TXs released by the sender proxy keyed by receive dir of the transfer.
+    /// Signed TXs released by the sender proxy keyed by recipient_id.
     pub received_signed_txs: HashMap<String, Vec<u8>>,
-    /// Received mints keyed by receive dir of the transfer.
+    /// Received mints keyed by recipient_id.
     pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
-    /// Mint locks a received consignment waits for, keyed by receive dir of the transfer.
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
     pub(crate) pending_mint_locks: HashMap<String, super::PendingMintLocks>,
     /// Media bytes keyed by hex digest.
     pub(crate) media: HashMap<String, Vec<u8>>,

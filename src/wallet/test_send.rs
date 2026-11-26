@@ -7,7 +7,6 @@ use super::online::{
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
-use crate::database::memory_db::{ActiveValue, DbTransferActMod};
 use crate::no_wallet::inspection::tests::fascia_with_bumped_nonce;
 use crate::no_wallet::{
     RgbTransitionInfo, SpvProofFill, WitnessWithoutProof, fill_spv_proofs, inspect_fascia,
@@ -694,45 +693,22 @@ async fn receive_media_mismatch_retried() {
     );
 }
 
-// with no validated copy in memory, settlement validates the stored consignment again
+// with no validated copy in memory, settlement validates the consignment again
 #[wasm_bindgen_test]
 async fn receive_settles_after_reload() {
     let (mut a, a_on) = nia_wallet(5).await;
     let (mut r, r_on) = nia_wallet(1).await;
     let asset_id = issue(&a, vec![AMOUNT]);
     let rid = invoice(&mut r, &r_on, Assignment::Fungible(100), &[PROXY_URL]).await;
-    let row = |w: &Wallet| {
-        w.database
-            .iter_transfers()
-            .unwrap()
-            .into_iter()
-            .find(|t| t.incoming && t.recipient_id.as_deref() == Some(&rid))
-            .unwrap()
-    };
-    let mut transfer: DbTransferActMod = row(&r).into();
-    transfer.receive_dir = ActiveValue::Set(Some("custom_dir".to_string()));
-    r.database.update_transfer(&mut transfer).unwrap();
     send_to(&mut a, &a_on, &asset_id, &rid, 100, PROXY_URL, false).await;
     refresh(&mut r, &r_on).await;
     assert_eq!(
         transfer_of(&r, &rid).status,
         TransferStatus::WaitingConfirmations
     );
-    let path = transfer_of(&r, &rid).consignment_path.unwrap();
-    assert!(
-        std::path::Path::new(&path)
-            .parent()
-            .unwrap()
-            .ends_with("custom_dir")
-    );
-    assert!(r.received_consignments.contains_key("custom_dir"));
-    assert!(
-        !r.received_consignments
-            .contains_key(&r.normalize_recipient_id(&rid))
-    );
     // A NIA consignment has no reject list, so no DAG is built.
     assert!(
-        r.received_valid_consignments["custom_dir"]
+        r.received_valid_consignments[&rid]
             .validation_status()
             .ops_dag
             .is_none()
@@ -748,7 +724,6 @@ async fn receive_settles_after_reload() {
     assert_eq!(balance(&r, &asset_id).settled, 100);
     // with no copy in memory, settlement validates once
     assert_eq!(validations(), v + 1);
-    assert!(!r.received_consignments.contains_key("custom_dir"));
 }
 
 // extra allocations listed as spent by a transition the consignment does not carry are refused

@@ -1340,23 +1340,23 @@ pub struct Wallet {
     #[cfg(feature = "esplora")]
     pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
     /// In-memory storage for received consignment bytes (replaces filesystem on wasm32).
-    /// Key: receive dir of the transfer
+    /// Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
-    /// Validated copy of each received consignment, kept for settlement. Key: receive dir of the transfer
+    /// Validated copy of each received consignment, kept for settlement. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_valid_consignments: HashMap<String, ValidTransfer>,
-    /// Proxy data of each received consignment. Key: receive dir of the transfer
+    /// Proxy data of each received consignment. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
-    /// Signed TX released by the sender proxy. Key: receive dir of the transfer
+    /// Signed TX released by the sender proxy. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
-    /// Received mints, as checked. Key: receive dir of the transfer
+    /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
     /// Media bytes keyed by hex digest (replaces the media directory on wasm32).
     pub(crate) media: HashMap<String, Vec<u8>>,
-    /// Mint locks a received consignment waits for. Key: receive dir of the transfer
+    /// Mint locks a received consignment waits for, keyed by recipient_id
     pub(crate) pending_mint_locks: HashMap<String, PendingMintLocks>,
     /// TXs this wallet broadcast in the running operation. A failed operation keeps them in BDK.
     #[cfg(feature = "esplora")]
@@ -3225,39 +3225,36 @@ impl Wallet {
         Ok(transfers_changed)
     }
 
-    /// Get the checked mints received on `recipient_id`, one per transfer. A failed transfer has none.
-    /// Make each lock for [`ReceivedMint::lock_id`] and [`ReceivedMint::amount`], and include it
-    /// before [`ReceivedMint::before_block`]. The reject list does not refuse a checked mint later.
-    pub fn get_received_mint(&self, recipient_id: String) -> Result<Vec<ReceivedMint>, Error> {
+    /// Get the details of the mint received on the provided `recipient_id`, once the wallet has
+    /// checked it: what the lock on the external chain has to match for the mint to complete. The
+    /// lock has to be made for [`ReceivedMint::lock_id`], of [`ReceivedMint::amount`], and be
+    /// included before [`ReceivedMint::before_block`]. A checked mint is not refused later by the
+    /// reject list.
+    ///
+    /// Returns `None` if no mint checked by the wallet pays `recipient_id`, or if it failed.
+    pub fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, Error> {
         info!(self.logger, "Getting received mint...");
         // a failed receive has nothing left to lock for
         let db_data = self.database.get_db_data(false)?;
-        let mut received_mints = vec![];
-        for transfer in db_data
-            .transfers
-            .iter()
-            .filter(|t| t.incoming && t.recipient_id.as_deref() == Some(&recipient_id))
-        {
-            let failed = db_data
-                .asset_transfers
-                .iter()
-                .find(|at| at.idx == transfer.asset_transfer_idx)
-                .and_then(|at| {
-                    db_data
-                        .batch_transfers
-                        .iter()
-                        .find(|bt| bt.idx == at.batch_transfer_idx)
-                })
-                .is_some_and(|bt| bt.status == TransferStatus::Failed);
-            if failed {
-                continue;
-            }
-            if let Some(mint) = self.received_mints.get(&self.get_receive_dir(transfer)) {
-                received_mints.push(mint.clone());
-            }
-        }
+        let failed = db_data.transfers.iter().any(|t| {
+            t.recipient_id.as_deref() == Some(&recipient_id)
+                && db_data
+                    .asset_transfers
+                    .iter()
+                    .find(|at| at.idx == t.asset_transfer_idx)
+                    .and_then(|at| {
+                        db_data
+                            .batch_transfers
+                            .iter()
+                            .find(|bt| bt.idx == at.batch_transfer_idx)
+                    })
+                    .is_some_and(|bt| t.incoming && bt.status == TransferStatus::Failed)
+        });
         info!(self.logger, "Get received mint completed");
-        Ok(received_mints)
+        if failed {
+            return Ok(None);
+        }
+        Ok(self.received_mints.get(&recipient_id).cloned())
     }
 
     /// Return the consignment of the burn of `asset_id` with TXID `txid`. It proves the burn with
@@ -3723,21 +3720,9 @@ impl Wallet {
         recipient_id.replace(":", "_")
     }
 
-    /// Key of the data of an incoming transfer: its receive dir, else its normalized recipient ID.
-    pub(crate) fn get_receive_dir(&self, transfer: &DbTransfer) -> String {
-        transfer.receive_dir.clone().unwrap_or_else(|| {
-            self.normalize_recipient_id(
-                transfer
-                    .recipient_id
-                    .as_ref()
-                    .expect("transfer should have a recipient ID"),
-            )
-        })
-    }
-
-    pub(crate) fn get_receive_consignment_path(&self, transfer: &DbTransfer) -> PathBuf {
+    pub(crate) fn get_receive_consignment_path(&self, recipient_id: &str) -> PathBuf {
         self.get_transfers_dir()
-            .join(self.get_receive_dir(transfer))
+            .join(self.normalize_recipient_id(recipient_id))
             .join(CONSIGNMENT_RCV_FILE.as_str())
     }
 
@@ -3855,7 +3840,7 @@ impl Wallet {
                 TransferStatus::WaitingCounterparty,
             ) => None,
             (TransferKind::ReceiveBlind | TransferKind::ReceiveWitness, _) => {
-                Some(self.get_receive_consignment_path(transfer))
+                Some(self.get_receive_consignment_path(&transfer.recipient_id.clone().unwrap()))
             }
             (TransferKind::Issuance, _) => {
                 Some(self._get_issue_consignment_path(&asset_transfer.asset_id.clone().unwrap()))
@@ -4334,17 +4319,8 @@ impl Wallet {
             ..Default::default()
         };
         let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
-        // witness receives on a reused address share the recipient ID
-        let receive_dir =
-            (self.wallet_data.reuse_addresses && data.script_pubkey.is_some()).then(|| {
-                format!(
-                    "{}_{batch_transfer_idx}",
-                    self.normalize_recipient_id(&data.recipient_id)
-                )
-            });
         let transfer = DbTransferActMod {
             asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-            receive_dir: ActiveValue::Set(receive_dir),
             requested_assignment: ActiveValue::Set(Some(data.detected_assignment.clone())),
             incoming: ActiveValue::Set(true),
             recipient_id: ActiveValue::Set(Some(data.recipient_id.clone())),
@@ -5790,32 +5766,6 @@ mod receive_expiration_tests {
                 ("foo".to_string(), "bar".to_string()),
                 ("baz".to_string(), "qux".to_string()),
             ])
-        );
-    }
-
-    #[test]
-    fn witness_receives_on_reused_address_keep_own_data() {
-        let mut wallet = make_test_wallet(true);
-        let online = online(&mut wallet);
-        let (server, _mocks) = proxy();
-        for _ in 0..2 {
-            let data = crate::block_on(wallet.create_receive_data(
-                Some(online.clone()),
-                None,
-                Assignment::Any,
-                now().unix_timestamp() + 100_000,
-                vec![format!("rpc://{}", server.host_with_port())],
-                RecipientType::Witness,
-                None,
-            ))
-            .unwrap();
-            wallet.store_receive_transfer(&data, 1).unwrap();
-        }
-        let transfers = wallet.database.get_db_data(false).unwrap().transfers;
-        assert_eq!(transfers[0].recipient_id, transfers[1].recipient_id);
-        assert_ne!(
-            wallet.get_receive_dir(&transfers[0]),
-            wallet.get_receive_dir(&transfers[1])
         );
     }
 }

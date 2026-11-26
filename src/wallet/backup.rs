@@ -43,9 +43,9 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_consignment_meta:
         std::collections::HashMap<String, super::ReceivedConsignmentMeta>,
     pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
-    /// Received mints, keyed by receive dir of the transfer.
+    /// Received mints, keyed by recipient_id.
     pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
-    /// Mint locks a received consignment waits for, keyed by receive dir of the transfer.
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
     pub(crate) pending_mint_locks: std::collections::HashMap<String, super::PendingMintLocks>,
     /// Media bytes keyed by hex digest.
     pub(crate) media: std::collections::HashMap<String, Vec<u8>>,

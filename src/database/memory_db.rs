@@ -281,7 +281,6 @@ pub struct DbTransfer {
     pub proxy_transfer_id: Option<String>,
     pub invoice_expiration: Option<i64>,
     pub burn_reason: Option<String>,
-    pub receive_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -301,7 +300,6 @@ pub struct DbTransferActMod {
     pub proxy_transfer_id: ActiveValue<Option<String>>,
     pub invoice_expiration: ActiveValue<Option<i64>>,
     pub burn_reason: ActiveValue<Option<String>>,
-    pub receive_dir: ActiveValue<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,7 +512,6 @@ impl From<DbTransfer> for DbTransferActMod {
             proxy_transfer_id: ActiveValue::Unchanged(m.proxy_transfer_id),
             invoice_expiration: ActiveValue::Unchanged(m.invoice_expiration),
             burn_reason: ActiveValue::Unchanged(m.burn_reason),
-            receive_dir: ActiveValue::Unchanged(m.receive_dir),
         }
     }
 }
@@ -842,7 +839,6 @@ impl InMemoryDb {
             proxy_transfer_id: av(t.proxy_transfer_id),
             invoice_expiration: av(t.invoice_expiration),
             burn_reason: av(t.burn_reason),
-            receive_dir: av(t.receive_dir),
         };
         self.transfers.borrow_mut().push(row);
         Ok(idx)
@@ -972,9 +968,6 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &t.burn_reason {
             row.burn_reason = v.clone();
-        }
-        if let ActiveValue::Set(v) = &t.receive_dir {
-            row.receive_dir = v.clone();
         }
         Ok(row.clone())
     }
