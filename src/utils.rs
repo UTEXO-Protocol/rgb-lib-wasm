@@ -526,6 +526,10 @@ pub(crate) fn calculate_descriptor_from_xpub(
 /// grant none.
 #[cfg(feature = "esplora")]
 pub(crate) fn proxy_retention_grace(info: &ServerInfoResponse) -> u32 {
+    #[cfg(test)]
+    if let Some(grace) = MOCK_RETENTION_GRACE.with(std::cell::Cell::get) {
+        return grace;
+    }
     info.retention_grace_secs
         .as_ref()
         .and_then(|grace| grace.parse::<u32>().ok())
@@ -707,6 +711,12 @@ pub(crate) fn now() -> OffsetDateTime {
 thread_local! {
     /// Seconds a native test adds to the clock of its thread.
     pub(crate) static CLOCK_OFFSET: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Retention grace that replaces the one a proxy advertises, if set.
+    pub(crate) static MOCK_RETENTION_GRACE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]

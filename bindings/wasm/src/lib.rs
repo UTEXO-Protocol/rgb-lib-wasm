@@ -740,6 +740,7 @@ impl WasmWallet {
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `transport_endpoints_js` is a JS array of endpoint strings.
     /// `encryption` is "Required" (default), "Unsupported" or "Optional".
+    /// `quota` is the number of transfers the invoice can receive (default 1).
     #[wasm_bindgen(js_name = "blindReceive")]
     #[allow(clippy::too_many_arguments)]
     pub async fn blind_receive(
@@ -751,6 +752,7 @@ impl WasmWallet {
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
         encryption: Option<String>,
+        quota: Option<u32>,
     ) -> Result<JsValue, JsValue> {
         let online = js_to_online_opt(online_js)?;
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
@@ -770,6 +772,7 @@ impl WasmWallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
+                quota,
             )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -782,6 +785,7 @@ impl WasmWallet {
     /// `assignment_js` is a JS object like `{ "Fungible": 100 }`, `"MintRight"` or `"Any"`.
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `encryption` is "Required" (default), "Unsupported" or "Optional".
+    /// `quota` is the number of transfers the invoice can receive (default 1).
     #[wasm_bindgen(js_name = "witnessReceive")]
     #[allow(clippy::too_many_arguments)]
     pub async fn witness_receive(
@@ -793,6 +797,7 @@ impl WasmWallet {
         transport_endpoints_js: JsValue,
         min_confirmations: u8,
         encryption: Option<String>,
+        quota: Option<u32>,
     ) -> Result<JsValue, JsValue> {
         let online = js_to_online_opt(online_js)?;
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
@@ -812,6 +817,7 @@ impl WasmWallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
+                quota,
             )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;

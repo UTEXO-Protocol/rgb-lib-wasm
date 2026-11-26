@@ -1316,6 +1316,7 @@ async fn proxy_auth() {
             vec![endpoint.clone()],
             1,
             None,
+            None,
         )
         .await;
     assert!(res.is_err());
@@ -1334,6 +1335,7 @@ async fn proxy_auth() {
             vec![endpoint.clone()],
             1,
             None,
+            None,
         )
         .await;
     assert!(matches!(res, Err(Error::InvalidProxyAuthSignature)));
@@ -1351,6 +1353,7 @@ async fn proxy_auth() {
             default_rcv_expiration(),
             vec![endpoint.clone()],
             1,
+            None,
             None,
         )
         .await
