@@ -17,8 +17,6 @@ mod test_burn;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_import;
 #[cfg(all(test, target_arch = "wasm32"))]
-mod test_invoice_reuse;
-#[cfg(all(test, target_arch = "wasm32"))]
 mod test_link;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_mint;

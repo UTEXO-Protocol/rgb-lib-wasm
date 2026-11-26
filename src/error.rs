@@ -513,13 +513,6 @@ pub enum Error {
         details: String,
     },
 
-    /// The provided invoice quota is invalid
-    #[error("Invalid quota: {details}")]
-    InvalidQuota {
-        /// Error details
-        details: String,
-    },
-
     /// The provided recipient data is invalid
     #[error("The provided recipient data is invalid: {details}")]
     InvalidRecipientData {
@@ -816,13 +809,6 @@ pub enum Error {
     /// The transfer ID is already in use by a different operation on the sender proxy
     #[error("Transfer ID in use")]
     TransferIDInUse,
-
-    /// The requested transfer was not found
-    #[error("Transfer with idx {idx} not found")]
-    TransferNotFound {
-        /// Transfer idx
-        idx: i32,
-    },
 
     /// The contract that is linked from or to is not known to the wallet
     #[error("Contract {contract_id} is not known to the wallet")]

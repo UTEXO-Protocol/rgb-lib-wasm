@@ -217,15 +217,13 @@ const txid = await wallet.sendBtcEnd(online, signed);
 
 ```javascript
 // Blind receive (UTXO-based)
-// The wallet reserves the invoice on its proxies, so it takes the Online object.
-// The last two arguments are the encryption preference and the quota.
-// Encryption is 'Required' (default), 'Unsupported' or 'Optional'.
-// The quota is the number of transfers (default 1). Above 1, it needs transport endpoints.
-const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
+// The wallet reserves the invoice on its proxies, so it takes the Online object. The last argument
+// is the encryption preference ('Required' by default, 'Unsupported' or 'Optional').
+const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
 // blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey }
 
 // Witness receive (address-based)
-const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
+const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
 ```
 
 ### Parsing invoices
@@ -491,13 +489,13 @@ To protect a wallet:
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun, signal?)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
-| `getConsignment(transferIdx)` | no | Return the consignment of a transfer (bytes), the idx as `listTransfers` gives it: the sent consignment of a send, burn, link or mint; the contract of an issuance; the received and validated consignment of a blind or witness receive, while pending (a mint also while it waits for its lock) and after `Settled`; `null` for an inflation, before a receive's consignment arrives and for a receive that failed without a validated consignment. Fails for an unknown idx |
+| `getBurnConsignment(assetId, txid)` | no | Return the consignment of an ended burn (bytes), which proves it with its history |
 | `link(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
 | `linkBegin(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks, dryRun, signal?)` | yes | Prepare link PSBT |
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
 | `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint, signal?)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
-| `getReceivedMint(recipientId)` | no | Return what the lock of each checked mint received on a recipient ID has to match (`lockId`, `amount`, `beforeBlock`), one per transfer; an empty array if none |
+| `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `refresh(online, assetId?, filter, skipSync, signal?)` | yes | Refresh pending transfers and settle ended vanilla operations |
 | `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
