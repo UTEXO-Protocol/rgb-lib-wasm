@@ -239,9 +239,9 @@ use zeroize::Zeroizing;
 use crate::database::{
     DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
     DbBackupInfoActMod, DbBatchTransfer, DbBatchTransferActMod, DbColoring, DbColoringActMod,
-    DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbTransfer, DbTransferActMod,
-    DbTransferTransportEndpoint, DbTransferTransportEndpointActMod, DbTransportEndpoint,
-    DbTransportEndpointActMod, DbTxo,
+    DbInvoice, DbInvoiceActMod, DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbTransfer,
+    DbTransferActMod, DbTransferTransportEndpoint, DbTransferTransportEndpointActMod,
+    DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
 };
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
