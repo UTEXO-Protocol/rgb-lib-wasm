@@ -138,7 +138,7 @@ none is dropped. An async call returns after its save commits, and returns a
 persistence error if the save fails. `sync`, the listing calls that sync, `refresh`,
 `fail_transfers` and the begins that sync first also save when they keep a
 change and then fail. `backup` and `vss_backup` save the backup time. A sync call
-(`issue_asset_*`, `get_address`, `rotate_address`, `delete_transfers`,
+(`issue_asset_*`, `get_address`, `delete_transfers`,
 `abort_pending_vanilla_tx`, `restore_backup`) queues its save
 and returns before the write. It returns a persistence error when an earlier save
 failed and no save since has committed. Its change stays in memory and its save
@@ -362,6 +362,14 @@ const deleted = wallet.deleteTransfers(null, false);
 
 `refresh` returns a `Map` from batch transfer index to `{ updatedStatus, failure }`. A pending receive whose proxies answered with no transfer has no `failure`. When a proxy lookup fails and no other proxy has the transfer, `failure` names the kind: `ProxyUnreachable`, `ProxyTimeout`, `ProxyHttpError` (with a number `status`), `ProxyJsonRpcError` (with a number `code`) or `ProxyInvalidResponse`. Each kind has the proxy `endpoint`, and all except `ProxyHttpError` have `details`. For example: `{ ProxyTimeout: { endpoint, details } }`. The receive stays pending with its keys, and the next `refresh` tries again. A consignment that is not valid is refused, and its transfer becomes `Failed`.
 
+`getConsignment(transferIdx)` takes the `idx` of a transfer from `listTransfers` and returns its consignment:
+
+- A send, burn, link or mint gives the consignment the wallet sent.
+- A blind or witness receive gives the consignment the wallet received and validated. It gives it while the receive is pending, also for a mint that waits for its lock, and after `Settled`.
+- An issuance gives the contract.
+- It gives `null` for an inflation, for a receive before its consignment arrives, and for a failed receive.
+- An unknown `idx` fails.
+
 ### Stopping a call
 
 ```javascript
@@ -489,7 +497,6 @@ To protect a wallet:
 | `burn(online, assetId, amount, burnReason?, feeRate, minConf)` | yes | Burn IFA or BFA units, signing with the wallet keys |
 | `burnBegin(online, assetId, amount, burnReason?, feeRate, minConf, dryRun, signal?)` | yes | Prepare burn PSBT. `burnReason` is an optional hex-encoded 32-byte value |
 | `burnEnd(online, psbt)` | yes | Broadcast burn PSBT |
-| `getBurnConsignment(assetId, txid)` | no | Return the consignment of an ended burn (bytes), which proves it with its history |
 | `link(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks)` | yes | Link an IFA or BFA asset to another contract, spending its link right, signing with the wallet keys |
 | `linkBegin(online, assetId, linkedToContract, feeRate, minConf, skipContractChecks, dryRun, signal?)` | yes | Prepare link PSBT |
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
@@ -497,6 +504,7 @@ To protect a wallet:
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
 | `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
+| `getConsignment(transferIdx)` | no | Return the consignment of a transfer (`Uint8Array`) or `null` |
 | `refresh(online, assetId?, filter, skipSync, signal?)` | yes | Refresh pending transfers and settle ended vanilla operations |
 | `saveNewAsset(online, consignmentBytes, txid)` | yes | Import the asset of a transfer consignment with zero balance, so the wallet can make invoices for it |
 | `failTransfers(online, batchIdx?, noAssetOnly, skipSync)` | yes | Fail pending transfers |
