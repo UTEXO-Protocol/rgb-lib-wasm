@@ -10,7 +10,7 @@ use super::test_burn::inflate_and_settle;
 use crate::encryption::sha256_digest;
 use crate::no_wallet::RgbRejectListInfo;
 use crate::wallet::idb_store::{load_snapshot, save_snapshot};
-use crate::wallet::offline::address_reuse_tests::{
+use crate::wallet::offline::test_wallet::{
     add_fake_txos, assert_no_partial_change, set_media, state,
 };
 use crate::wallet::{

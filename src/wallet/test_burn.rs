@@ -9,7 +9,7 @@ use super::test_send::{
 use crate::database::memory_db::{ActiveValue, DbAssetActMod};
 use crate::no_wallet::inspection::tests::{conceal_split, tampered_fascia};
 use crate::utils::INDEXER_SYNCS;
-use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::offline::test_wallet::assert_no_partial_change;
 use crate::wallet::online::assert_abort_restores;
 use crate::wallet::{
     AssetFilter, Online, Outpoint, Recipient, SinglesigKeys, Transfer, TransferScope, Wallet,
@@ -189,9 +189,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
     serve_reject_list(&url, "");
 
     // the kept consignment proves the burn with the signed transaction
-    let bytes = wallet
-        .get_burn_consignment(asset_id.clone(), res.txid.clone())
-        .unwrap();
+    let first_burn = burned.idx;
+    let bytes = wallet.get_consignment(first_burn).unwrap().unwrap();
     assert!(
         validate_consignment_offchain(&bytes, &res.txid, BitcoinNetwork::Regtest)
             .unwrap()
@@ -244,10 +243,9 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(begin.details.burn_reason, None);
     let psbt = Psbt::from_str(&begin.psbt).unwrap();
     // a begun burn has no consignment yet
-    let begun = psbt.unsigned_tx.compute_txid().to_string();
     assert_eq!(
-        wallet.get_burn_consignment(asset_id.clone(), begun.clone()),
-        Err(Error::UnknownTransfer { txid: begun })
+        wallet.get_consignment(transfer(&wallet, &asset_id, idx).idx),
+        Ok(None)
     );
     // a burn has no recipient and no output other than the OP_RETURN and the BTC change
     let artifacts = &wallet.transfer_artifacts[&psbt.unsigned_tx.compute_txid().to_string()];
@@ -374,7 +372,8 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(ended.entropy, begin.details.entropy);
     // the second burn spends the change of the mined first burn and carries its proof
     let consignment = wallet
-        .get_burn_consignment(asset_id.clone(), ended.txid.clone())
+        .get_consignment(transfer(&wallet, &asset_id, idx).idx)
+        .unwrap()
         .unwrap();
     assert!(proven(&RgbTransfer::load(&consignment[..]).unwrap())[&res.txid]);
     mine_and_refresh(&mut wallet, &online).await;
@@ -398,11 +397,7 @@ async fn ifa_burn_with_and_without_reason_settles() {
     assert_eq!(burns(&restored, &asset_id), expected);
     assert_eq!(balance(&restored, &asset_id), (150, 150, 150));
     for w in [&wallet, &restored] {
-        assert_eq!(
-            w.get_burn_consignment(asset_id.clone(), res.txid.clone())
-                .unwrap(),
-            bytes
-        );
+        assert_eq!(w.get_consignment(first_burn).unwrap(), Some(bytes.clone()));
     }
 }
 

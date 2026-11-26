@@ -5,7 +5,7 @@ use super::test_bfa::*;
 use super::test_burn::*;
 use crate::database::enums::RecipientTypeFull;
 use crate::wallet::offline::MOCK_IFA_LINK_RIGHT;
-use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
+use crate::wallet::offline::test_wallet::assert_no_partial_change;
 use crate::wallet::online::assert_abort_restores;
 use crate::wallet::{AssetFilter, Invoice, Online, Recipient, TransferScope, Wallet};
 use crate::{
