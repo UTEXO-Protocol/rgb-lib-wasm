@@ -1,10 +1,9 @@
 use wasm_bindgen_test::*;
 
-use super::offline::{MOCK_CLOCK_SKEW_MARGIN, MOCK_ISSUE_MEDIA, MOCK_MAX_UTXO_ASSET_ALLOCATIONS};
+use super::offline::{MOCK_ISSUE_MEDIA, MOCK_MAX_UTXO_ASSET_ALLOCATIONS};
 use super::online::{
-    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS, MOCK_ACK_PENDING, MOCK_GET_CONSIGNMENT_FAILURES,
-    MOCK_SPAM_HIDDEN_SPENDS, MOCK_SPAM_RECIPIENT_ASSIGNMENTS, MOCK_TRANSFER_DELETE_FAILURES,
-    RECEIVED_CONSIGNMENT_VALIDATIONS,
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS, MOCK_ACK_PENDING, MOCK_SPAM_HIDDEN_SPENDS,
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS, RECEIVED_CONSIGNMENT_VALIDATIONS,
 };
 use super::test_bfa::utils::*;
 use super::test_bfa::{funded_wallet, s, send, send_and_settle, settle_both, wallet_data};
@@ -13,7 +12,7 @@ use crate::no_wallet::inspection::tests::fascia_with_bumped_nonce;
 use crate::no_wallet::{
     RgbTransitionInfo, SpvProofFill, WitnessWithoutProof, fill_spv_proofs, inspect_fascia,
 };
-use crate::utils::{INDEXER_SYNCS, MOCK_RETENTION_GRACE, TRANSITION_BUILDERS_LOADED};
+use crate::utils::{INDEXER_SYNCS, TRANSITION_BUILDERS_LOADED};
 use crate::wallet::offline::address_reuse_tests::assert_no_partial_change;
 use crate::wallet::online::assert_abort_restores;
 use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
@@ -59,10 +58,6 @@ impl Drop for ResetMocks {
         MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.set(false);
         MOCK_ACK_PENDING.set(false);
         MOCK_ISSUE_MEDIA.set(None);
-        MOCK_GET_CONSIGNMENT_FAILURES.replace(0);
-        MOCK_TRANSFER_DELETE_FAILURES.replace(0);
-        MOCK_CLOCK_SKEW_MARGIN.replace(None);
-        MOCK_RETENTION_GRACE.set(None);
     }
 }
 
@@ -88,11 +83,11 @@ pub(super) fn serve_media(content: &str) {
     );
 }
 
-pub(super) async fn nia_wallet(utxos: u8) -> (Wallet, Online) {
+async fn nia_wallet(utxos: u8) -> (Wallet, Online) {
     funded_wallet(wallet_data(vec![AssetSchema::Nia]), utxos).await
 }
 
-pub(super) fn issue(wallet: &Wallet, amounts: Vec<u64>) -> String {
+fn issue(wallet: &Wallet, amounts: Vec<u64>) -> String {
     wallet
         .issue_asset_nia(s("TST"), s("Test"), 0, amounts)
         .unwrap()
@@ -1768,7 +1763,6 @@ async fn park_on_safe_height(
             default_rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             2,
-            None,
             None,
         )
         .await

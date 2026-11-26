@@ -269,11 +269,6 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
-      - name: Run invoice reuse tests
-        if: matrix.group == 'receive-check'
-        env:
-          WASM_BINDGEN_TEST_TIMEOUT: 1800
-        run: 'wasm-pack test --headless --firefox --release --lib -- test_invoice_reuse::'
       - name: Run import tests
         if: matrix.group == 'lib'
         env:
