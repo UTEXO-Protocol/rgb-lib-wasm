@@ -4253,7 +4253,6 @@ impl Wallet {
                             &invoice_id,
                             &reservation_expiration,
                             &recipient_pk,
-                            1,
                         ),
                     )
                 });
@@ -4262,7 +4261,6 @@ impl Wallet {
                         &invoice_id,
                         &reservation_expiration,
                         &recipient_pk,
-                        1,
                         signature,
                     )
                     .await
@@ -5694,10 +5692,7 @@ mod receive_expiration_tests {
             .create();
         let prepare = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::Regex(s!("invoice.prepare")),
-                mockito::Matcher::Regex(s!(r#""quota":"1""#)),
-            ]))
+            .match_body(mockito::Matcher::Regex(s!("invoice.prepare")))
             .with_header("content-type", "application/json")
             .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
             .create();
