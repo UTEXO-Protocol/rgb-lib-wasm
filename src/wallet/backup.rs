@@ -40,9 +40,9 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_consignment_meta:
         std::collections::HashMap<String, super::ReceivedConsignmentMeta>,
     pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
-    /// Received mints, keyed by recipient_id.
+    /// Received mints, keyed by receive dir of the transfer.
     pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
-    /// Mint locks a received consignment waits for, keyed by recipient_id.
+    /// Mint locks a received consignment waits for, keyed by receive dir of the transfer.
     pub(crate) pending_mint_locks: std::collections::HashMap<String, super::PendingMintLocks>,
     /// Media bytes keyed by hex digest.
     pub(crate) media: std::collections::HashMap<String, Vec<u8>>,
@@ -419,6 +419,70 @@ impl super::Wallet {
     }
 }
 
+/// The state written by a release tag, with a blind and a witness receive still pending.
+#[cfg(test)]
+pub(crate) struct ReleasedFixture {
+    pub(crate) tag: &'static str,
+    pub(crate) keys: &'static str,
+    pub(crate) keys_backup: &'static str,
+    pub(crate) snapshot: &'static str,
+    pub(crate) backup: &'static [u8],
+    pub(crate) meta: &'static str,
+}
+
+/// Keys made again from the mnemonic of a released keys file, with or without `camel_case`.
+#[cfg(test)]
+pub(crate) fn released_keys(json: &str) -> super::SinglesigKeys {
+    let keys: serde_json::Value = serde_json::from_str(json).unwrap();
+    let keys = crate::keys::restore_keys(
+        crate::BitcoinNetwork::Regtest,
+        keys["mnemonic"].as_str().unwrap().to_string(),
+        keys["witness_version"].as_str().unwrap().parse().unwrap(),
+    )
+    .unwrap();
+    super::SinglesigKeys::from_keys(&keys, None)
+}
+
+#[cfg(test)]
+impl ReleasedFixture {
+    /// The keys of the `snapshot` or `backup` wallet.
+    pub(crate) fn singlesig_keys(&self, name: &str) -> super::SinglesigKeys {
+        released_keys(if name == "snapshot" {
+            self.keys
+        } else {
+            self.keys_backup
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) const RELEASED_FIXTURES: [ReleasedFixture; 3] = [
+    ReleasedFixture {
+        tag: "beta5",
+        keys: include_str!("../../tests/fixtures/pending/beta5/keys.json"),
+        keys_backup: include_str!("../../tests/fixtures/pending/beta5/keys_backup.json"),
+        snapshot: include_str!("../../tests/fixtures/pending/beta5/snapshot.json"),
+        backup: include_bytes!("../../tests/fixtures/pending/beta5/backup.bin"),
+        meta: include_str!("../../tests/fixtures/pending/beta5/meta.json"),
+    },
+    ReleasedFixture {
+        tag: "beta6",
+        keys: include_str!("../../tests/fixtures/pending/beta6/keys.json"),
+        keys_backup: include_str!("../../tests/fixtures/pending/beta6/keys_backup.json"),
+        snapshot: include_str!("../../tests/fixtures/pending/beta6/snapshot.json"),
+        backup: include_bytes!("../../tests/fixtures/pending/beta6/backup.bin"),
+        meta: include_str!("../../tests/fixtures/pending/beta6/meta.json"),
+    },
+    ReleasedFixture {
+        tag: "beta7",
+        keys: include_str!("../../tests/fixtures/pending/beta7/keys.json"),
+        keys_backup: include_str!("../../tests/fixtures/pending/beta7/keys_backup.json"),
+        snapshot: include_str!("../../tests/fixtures/pending/beta7/snapshot.json"),
+        backup: include_bytes!("../../tests/fixtures/pending/beta7/backup.bin"),
+        meta: include_str!("../../tests/fixtures/pending/beta7/meta.json"),
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,16 +797,16 @@ mod tests {
         );
     }
 
-    // A snapshot and a backup of a 1.0.0-beta.5 wallet with reused addresses load and work.
+    // Snapshots and backups of released wallets load and work. The `beta5` one reuses addresses.
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn beta5_snapshot_and_backup_load() {
+    fn released_snapshots_and_backups_load() {
         use crate::database::enums::TransferStatus;
+        use crate::database::memory_db::{ActiveValue, DbInvoiceActMod};
         use crate::wallet::offline::test_wallet::make_test_wallet_with_singlesig_keys;
         use crate::wallet::{AssetFilter, TransferScope};
 
-        let keys: crate::wallet::SinglesigKeys =
-            serde_json::from_str(include_str!("../../tests/fixtures/beta5/keys.json")).unwrap();
+        let keys = released_keys(include_str!("../../tests/fixtures/beta5/keys.json"));
         let meta: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/beta5/meta.json")).unwrap();
         let m = |k: &str| meta[k].as_str().unwrap().to_string();
@@ -804,6 +868,104 @@ mod tests {
                 wallet.get_new_address().unwrap().to_string(),
                 m("colored_address")
             );
+        }
+
+        for fixture in RELEASED_FIXTURES {
+            let meta: serde_json::Value = serde_json::from_str(fixture.meta).unwrap();
+            for name in ["snapshot", "backup"] {
+                let mut wallet = make_test_wallet_with_singlesig_keys(fixture.singlesig_keys(name));
+                if name == "snapshot" {
+                    let snapshot = serde_json::from_str(fixture.snapshot).unwrap();
+                    wallet.restore_from_snapshot(snapshot).unwrap();
+                } else {
+                    wallet.restore_backup(fixture.backup, "password").unwrap();
+                }
+                let m = |k: &str| meta[name][k].as_str().map(str::to_string);
+                let transfers = wallet
+                    .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+                    .unwrap();
+                let of = |k: &str| transfers.iter().find(|t| t.recipient_id == m(k)).unwrap();
+
+                let settled = of("settled_rid");
+                assert_eq!(settled.status, TransferStatus::Settled);
+                let consignment = wallet.get_consignment(settled.idx).unwrap();
+                assert_eq!(
+                    consignment.map(|c| hex::encode(crate::sha256_digest(&c))),
+                    m("settled_consignment_sha256")
+                );
+                // the data stays under the key its release wrote
+                let rid = m("settled_rid").unwrap();
+                let data_key = match fixture.tag {
+                    "beta5" => None,
+                    "beta6" => Some(rid.replace(':', "_")),
+                    _ => Some(rid),
+                };
+                assert_eq!(m("settled_data_key"), data_key);
+                if let Some(key) = data_key {
+                    assert!(wallet.received_consignments.contains_key(&key));
+                }
+
+                let db_data = wallet.database.get_db_data(false).unwrap();
+                for k in ["blind_rid", "witness_rid"] {
+                    let pending = of(k);
+                    assert_eq!(pending.status, TransferStatus::WaitingCounterparty);
+                    assert_eq!(wallet.get_consignment(pending.idx), Ok(None));
+                    let batch = db_data
+                        .batch_transfers
+                        .iter()
+                        .find(|b| b.idx == pending.batch_transfer_idx)
+                        .unwrap();
+                    assert!(batch.operation_secret_key.is_some());
+                }
+                let script =
+                    crate::no_wallet::script_buf_from_recipient_id(m("witness_rid").unwrap())
+                        .unwrap()
+                        .unwrap();
+                assert!(wallet.bdk_wallet.is_mine(script));
+                // beta6 keeps a reusable blind and witness invoice, in this order
+                let invoices = wallet.database.iter_invoices().unwrap();
+                let reusable = [("reusable_blind_rid", 1), ("reusable_witness_rid", 2)];
+                // beta6 wrote the expiration plus the proxy retention grace (1 day) and the clock
+                // skew margin (300 s)
+                let deadline = meta["expiration"].as_i64().unwrap() + 86_400 + 300;
+                let expected_invoices = if fixture.tag == "beta6" { 2 } else { 0 };
+                for (k, invoice_idx) in reusable {
+                    assert_eq!(m(k).is_some(), fixture.tag == "beta6");
+                    if m(k).is_none() {
+                        continue;
+                    }
+                    let t = db_data
+                        .transfers
+                        .iter()
+                        .find(|t| t.recipient_id == m(k))
+                        .unwrap();
+                    assert_eq!(t.invoice_idx, Some(invoice_idx));
+                    assert!(t.receive_dir.is_some());
+                    let invoice = invoices.iter().find(|i| i.idx == invoice_idx).unwrap();
+                    assert_eq!(invoice.quota, 2);
+                    assert_eq!(invoice.asset_id, None);
+                    assert_eq!(invoice.deadline, deadline);
+                    assert_eq!(of(k).status, TransferStatus::WaitingCounterparty);
+                }
+                // no other transfer links to an invoice
+                let linked = db_data.transfers.iter().filter(|t| t.invoice_idx.is_some());
+                assert_eq!(linked.count(), expected_invoices);
+                let with_dir = db_data.transfers.iter().filter(|t| t.receive_dir.is_some());
+                assert_eq!(with_dir.count(), expected_invoices);
+                assert_eq!(invoices.len(), expected_invoices);
+                let asset_id = meta["asset_id"].as_str().unwrap().to_string();
+                assert_eq!(wallet.get_asset_balance(asset_id).unwrap().settled, 100);
+                let invoice = DbInvoiceActMod {
+                    quota: ActiveValue::Set(2),
+                    asset_id: ActiveValue::Set(None),
+                    deadline: ActiveValue::Set(1),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    wallet.database.set_invoice(invoice).unwrap(),
+                    expected_invoices as i32 + 1
+                );
+            }
         }
     }
 
