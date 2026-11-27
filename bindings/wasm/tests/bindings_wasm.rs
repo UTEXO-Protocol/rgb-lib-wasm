@@ -36,7 +36,6 @@ fn wallet_json(supported_schemas: Vec<AssetSchema>) -> (String, String) {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 5,
         supported_schemas,
-        reuse_addresses: false,
         allow_reckless_schemas: false,
     };
     (
@@ -92,7 +91,7 @@ async fn witness_receive_takes_number_bigint_and_string() {
         JsValue::from_str(&exp.to_string()),
     ] {
         let data = wallet
-            .witness_receive(online.clone(), None, any(), v, endpoints(), 1, None, None)
+            .witness_receive(online.clone(), None, any(), v, endpoints(), 1, None)
             .await
             .unwrap();
         let data: ReceiveData = serde_wasm_bindgen::from_value(data).unwrap();
@@ -119,7 +118,6 @@ async fn receive_rejects_malformed_expiration() {
             endpoints(),
             1,
             None,
-            None,
         )
         .await
         .unwrap_err());
@@ -133,7 +131,7 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
     // the invoice is reserved on the proxy, so the wallet needs to be online
     for online in [JsValue::NULL, JsValue::UNDEFINED] {
         let e = err(wallet
-            .witness_receive(online, None, any(), exp.clone(), endpoints(), 1, None, None)
+            .witness_receive(online, None, any(), exp.clone(), endpoints(), 1, None)
             .await
             .unwrap_err());
         assert_eq!(e, "The Online object is needed to perform this operation");
@@ -148,39 +146,10 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
             endpoints(),
             1,
             Some("Sometimes".to_string()),
-            None,
         )
         .await
         .unwrap_err());
     assert_eq!(e, "Invalid encryption: Sometimes");
-    let e = err(wallet
-        .witness_receive(
-            online.clone(),
-            None,
-            any(),
-            exp.clone(),
-            endpoints(),
-            1,
-            None,
-            Some(0),
-        )
-        .await
-        .unwrap_err());
-    assert_eq!(e, "Invalid quota: must be at least 1");
-    let e = err(wallet
-        .blind_receive(
-            online.clone(),
-            None,
-            any(),
-            exp.clone(),
-            endpoints(),
-            1,
-            None,
-            Some(0),
-        )
-        .await
-        .unwrap_err());
-    assert_eq!(e, "Invalid quota: must be at least 1");
     for encryption in ["Required", "Unsupported", "Optional"] {
         wallet
             .witness_receive(
@@ -191,7 +160,6 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
                 endpoints(),
                 1,
                 Some(encryption.to_string()),
-                None,
             )
             .await
             .unwrap();
@@ -251,19 +219,17 @@ async fn save_new_asset_reads_arguments() {
 }
 
 #[wasm_bindgen_test]
-fn get_received_mint_is_empty_when_unknown() {
-    let mints: js_sys::Array = wallet()
-        .get_received_mint("unknown")
-        .unwrap()
-        .dyn_into()
-        .unwrap();
-    assert_eq!(mints.length(), 0);
+fn get_received_mint_is_null_when_unknown() {
+    assert!(wallet().get_received_mint("unknown").unwrap().is_null());
 }
 
 #[wasm_bindgen_test]
 fn get_consignment_fails_for_unknown_transfer() {
     let e = err(wallet().get_consignment(999).unwrap_err());
-    assert!(e.starts_with("Transfer with idx 999 not found"), "{e}");
+    assert!(
+        e.starts_with("Batch transfer with idx 999 not found"),
+        "{e}"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -846,19 +812,23 @@ async fn inflate_begin_returns_result_object() {
     assert_eq!(change_utxos.length(), 1);
     assert!(prop(&inflation, "changeUtxo").is_undefined());
 
-    // an issuance gives its contract and an inflation gives null
+    // an issuance gives the contract and an inflation gives null
+    let consignment = |t: &JsValue| {
+        wallet
+            .get_consignment(prop(t, "idx").as_f64().unwrap() as i32)
+            .unwrap()
+    };
     let issuance = transfers
         .iter()
         .find(|t| prop(t, "kind").as_string().as_deref() == Some("Issuance"))
         .unwrap();
-    let idx = |t: &JsValue| prop(t, "idx").as_f64().unwrap() as i32;
-    let contract: js_sys::Uint8Array = wallet
-        .get_consignment(idx(&issuance))
-        .unwrap()
-        .dyn_into()
-        .unwrap();
-    assert!(contract.length() > 0);
-    assert!(wallet.get_consignment(idx(&inflation)).unwrap().is_null());
+    let contract: js_sys::Uint8Array =
+        prop(&wallet.export_contract(&asset_id).unwrap(), "contract")
+            .dyn_into()
+            .unwrap();
+    let issued: js_sys::Uint8Array = consignment(&issuance).dyn_into().unwrap();
+    assert_eq!(issued.to_vec(), contract.to_vec());
+    assert!(consignment(&inflation).is_null());
 }
 
 #[wasm_bindgen_test]
@@ -1241,7 +1211,6 @@ async fn refresh_reports_proxy_failures_to_js() {
                 (now_secs() + 100_000).into(),
                 eps,
                 1,
-                None,
                 None,
             )
             .await
@@ -1709,7 +1678,7 @@ async fn backup_store_backup_and_restore() {
     let online = online(&a).await;
     let exp = JsValue::from(now_secs() + 100_000);
     let receive = a
-        .witness_receive(online, None, any(), exp, endpoints(), 1, None, None)
+        .witness_receive(online, None, any(), exp, endpoints(), 1, None)
         .await
         .unwrap();
     let recipient_id: String = prop(&receive, "recipientId").as_string().unwrap();

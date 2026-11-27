@@ -12,8 +12,8 @@ use crate::wallet::{
     WalletData,
 };
 use crate::{
-    AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferStatus, WitnessVersion,
-    generate_keys,
+    AssetSchema, Assignment, BitcoinNetwork, Error, OS_ASSET, TransferKind, TransferStatus,
+    WitnessVersion, generate_keys,
 };
 use amplify::{ByteArray, Wrapper};
 use bdk_wallet::bitcoin::OutPoint;
@@ -36,7 +36,6 @@ pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKe
             database_type: crate::wallet::DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         },
         SinglesigKeys::from_keys(&keys, None),
@@ -684,6 +683,18 @@ async fn bfa_send_receive_waits_for_mint_lock() {
     .await;
     let statuses = settle_both(&mut a, &a_online, &mut b, &b_online).await;
     assert!(statuses.is_empty(), "{statuses:?}");
+    // a receive that waits on the lock of a mint it did not check gives no consignment
+    let t = b
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.kind == TransferKind::ReceiveBlind)
+        .unwrap();
+    let rid = t.recipient_id.unwrap();
+    assert!(b.received_consignments.contains_key(&rid));
+    assert!(b.pending_mint_locks.contains_key(&rid));
+    assert!(!b.received_mints.contains_key(&rid));
+    assert_eq!(b.get_consignment(t.idx), Ok(None));
     assert!(b.list_assets(vec![]).unwrap().bfa.unwrap().is_empty());
 
     // a lock of another amount, then one not finalized, do not back the mint

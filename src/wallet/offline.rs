@@ -126,18 +126,6 @@ thread_local! {
     /// Media of the next asset issued, if set.
     pub(crate) static MOCK_ISSUE_MEDIA: std::cell::RefCell<Option<Attachment>> =
         const { std::cell::RefCell::new(None) };
-    /// Clock skew margin of the invoice deadline, if set.
-    pub(crate) static MOCK_CLOCK_SKEW_MARGIN: std::cell::RefCell<Option<u32>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Margin for proxy clock skew, added to the deadline of a reusable invoice.
-pub(crate) fn clock_skew_margin() -> u32 {
-    #[cfg(test)]
-    if let Some(margin) = MOCK_CLOCK_SKEW_MARGIN.with(|m| *m.borrow()) {
-        return margin;
-    }
-    PROXY_CLOCK_SKEW_MARGIN_SECS
 }
 
 /// The ID of the contract a contract `link` (e.g. [`LinkableSchemaWrapper::link_from`]) points
@@ -571,9 +559,6 @@ pub(crate) struct ReceiveDataInternal {
     recipient_pubkey: Vec<u8>,
     encryption: Encryption,
     retention_deadline: Option<i64>,
-    quota: u32,
-    invoice_deadline: Option<i64>,
-    receive_dir: Option<String>,
 }
 
 /// Supported database types.
@@ -1084,10 +1069,6 @@ pub struct WalletData {
     /// List of schemas the wallet should support (when issuing, sending and receiving). Empty list
     /// means the wallet should support all the schemas rgb-lib supports.
     pub supported_schemas: Vec<AssetSchema>,
-    /// When `true`, address generation returns a pinned address instead of creating new ones.
-    /// Default: `false`
-    #[serde(default)]
-    pub reuse_addresses: bool,
     /// When `false`, a mainnet wallet that supports IFA or BFA fails with
     /// [`crate::Error::CannotUseSchemaOnMainnet`]. When `true`, it is created and a warning is logged.
     /// Default: `false`
@@ -1208,6 +1189,7 @@ pub(crate) struct WalletManifest {
     pub(crate) database_type: DatabaseType,
     pub(crate) max_allocations_per_utxo: u32,
     pub(crate) supported_schemas: Vec<AssetSchema>,
+    // Stored state keeps this field. The wallet does not read it.
     pub(crate) reuse_addresses: bool,
     pub(crate) allow_reckless_schemas: bool,
     pub(crate) account_xpub_vanilla: String,
@@ -1224,7 +1206,7 @@ impl WalletManifest {
             database_type: wallet_data.database_type.clone(),
             max_allocations_per_utxo: wallet_data.max_allocations_per_utxo,
             supported_schemas: wallet_data.supported_schemas.clone(),
-            reuse_addresses: wallet_data.reuse_addresses,
+            reuse_addresses: false,
             allow_reckless_schemas: wallet_data.allow_reckless_schemas,
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
@@ -1281,7 +1263,6 @@ impl WalletManifest {
                 database_type: self.database_type,
                 max_allocations_per_utxo: self.max_allocations_per_utxo,
                 supported_schemas: self.supported_schemas,
-                reuse_addresses: self.reuse_addresses,
                 allow_reckless_schemas: self.allow_reckless_schemas,
             },
             SinglesigKeys {
@@ -1346,8 +1327,6 @@ pub struct Wallet {
     /// Colored and vanilla signers. They are empty for a watch-only wallet.
     pub(crate) signers: [SignersContainer; 2],
     pub(crate) bdk_database: BdkPersister,
-    /// Pinned derivation index per keychain for address reuse.
-    pub(crate) reuse_address_index: HashMap<KeychainKind, u32>,
     #[cfg(feature = "esplora")]
     pub(crate) online_data: Option<OnlineData>,
     /// In-memory storage for transfer artifacts (replaces filesystem on wasm32).
@@ -1355,23 +1334,23 @@ pub struct Wallet {
     #[cfg(feature = "esplora")]
     pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
     /// In-memory storage for received consignment bytes (replaces filesystem on wasm32).
-    /// Key: receive dir of the transfer
+    /// Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
-    /// Validated copy of each received consignment, kept for settlement. Key: receive dir of the transfer
+    /// Validated copy of each received consignment, kept for settlement. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_valid_consignments: HashMap<String, ValidTransfer>,
-    /// Proxy data of each received consignment. Key: receive dir of the transfer
+    /// Proxy data of each received consignment. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
-    /// Signed TX released by the sender proxy. Key: receive dir of the transfer
+    /// Signed TX released by the sender proxy. Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
-    /// Received mints, as checked. Key: receive dir of the transfer
+    /// Received mints, as checked, keyed by recipient_id
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
     /// Media bytes keyed by hex digest (replaces the media directory on wasm32).
     pub(crate) media: HashMap<String, Vec<u8>>,
-    /// Mint locks a received consignment waits for. Key: receive dir of the transfer
+    /// Mint locks a received consignment waits for, keyed by recipient_id
     pub(crate) pending_mint_locks: HashMap<String, PendingMintLocks>,
     /// TXs this wallet broadcast in the running operation. A failed operation keeps them in BDK.
     #[cfg(feature = "esplora")]
@@ -1544,7 +1523,6 @@ impl Wallet {
             bdk_wallet,
             signers,
             bdk_database,
-            reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
             online_data: None,
             #[cfg(feature = "esplora")]
@@ -1731,15 +1709,6 @@ impl Wallet {
             .sum())
     }
 
-    /// The maximum number of allocations a UTXO can hold and still be spent.
-    /// It counts all assets, so it is an upper bound for each asset.
-    pub(crate) fn max_utxo_allocations(&self) -> u32 {
-        Ord::min(
-            self.max_allocations_per_utxo(),
-            u32::try_from(max_utxo_asset_allocations()).unwrap_or(u32::MAX),
-        )
-    }
-
     pub(crate) fn get_available_allocations<T>(
         &self,
         unspents: T,
@@ -1754,7 +1723,12 @@ impl Wallet {
             .iter_mut()
             .for_each(|u| u.rgb_allocations.retain(|a| !a.status.failed()));
         let max_allocs = max_allocations.unwrap_or_else(|| {
-            self.max_utxo_allocations()
+            // a UTXO cannot get more allocations than it can hold and still be spent
+            let max_per_utxo = Ord::min(
+                self.max_allocations_per_utxo(),
+                u32::try_from(max_utxo_asset_allocations()).unwrap_or(u32::MAX),
+            );
+            max_per_utxo
                 .checked_sub(1)
                 .expect("max allocations per UTXO must be greater than 0")
         });
@@ -3157,9 +3131,7 @@ impl Wallet {
     /// If no `batch_transfer_idx` is provided, all failed transfers will be deleted, and if
     /// `no_asset_only` is true transfers with an associated asset ID will be skipped.
     ///
-    /// Eligible transfers are in status [`TransferStatus::Failed`]. Transfers of a live reusable
-    /// invoice are not eligible, because the invoice needs them to receive more transfers.
-    /// Delete-all skips them. A `batch_transfer_idx` of one returns an error.
+    /// Eligible transfers are the ones in status [`TransferStatus::Failed`].
     pub fn delete_transfers(
         &self,
         batch_transfer_idx: Option<i32>,
@@ -3186,28 +3158,6 @@ impl Wallet {
         let db_data = self.database.get_db_data(false)?;
         let mut transfers_changed = false;
 
-        // A live reusable invoice reaches its proxies and its UTXO or script through its transfers.
-        // Refresh also deletes its failed transfers from the proxies. Keep them while it is live.
-        let now = now().unix_timestamp();
-        let live_invoices: HashSet<i32> = self
-            .database
-            .iter_invoices()?
-            .into_iter()
-            .filter(|i| i.live(now))
-            .map(|i| i.idx)
-            .collect();
-        let live_invoice_asset_transfers: HashSet<i32> = db_data
-            .transfers
-            .iter()
-            .filter(|t| t.invoice_idx.is_some_and(|i| live_invoices.contains(&i)))
-            .map(|t| t.asset_transfer_idx)
-            .collect();
-        let of_live_invoice = |asset_transfers: &[DbAssetTransfer]| {
-            asset_transfers
-                .iter()
-                .any(|at| live_invoice_asset_transfers.contains(&at.idx))
-        };
-
         if let Some(batch_transfer_idx) = batch_transfer_idx {
             let batch_transfer = &self
                 .database
@@ -3218,10 +3168,6 @@ impl Wallet {
             }
 
             let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
-
-            if of_live_invoice(&asset_transfers) {
-                return Err(Error::CannotDeleteBatchTransfer);
-            }
 
             if no_asset_only {
                 let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
@@ -3248,9 +3194,6 @@ impl Wallet {
             for batch_transfer in batch_transfers.iter_mut() {
                 let asset_transfers =
                     batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
-                if of_live_invoice(&asset_transfers) {
-                    continue;
-                }
                 if no_asset_only {
                     let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
                     if connected_assets {
@@ -3275,113 +3218,96 @@ impl Wallet {
         Ok(transfers_changed)
     }
 
-    /// Get the checked mints received on `recipient_id`, one per transfer. A failed transfer has none.
-    /// Make each lock for [`ReceivedMint::lock_id`] and [`ReceivedMint::amount`], and include it
-    /// before [`ReceivedMint::before_block`]. The reject list does not refuse a checked mint later.
-    pub fn get_received_mint(&self, recipient_id: String) -> Result<Vec<ReceivedMint>, Error> {
+    /// Get the details of the mint received on the provided `recipient_id`, once the wallet has
+    /// checked it: what the lock on the external chain has to match for the mint to complete. The
+    /// lock has to be made for [`ReceivedMint::lock_id`], of [`ReceivedMint::amount`], and be
+    /// included before [`ReceivedMint::before_block`]. A checked mint is not refused later by the
+    /// reject list.
+    ///
+    /// Returns `None` if no mint checked by the wallet pays `recipient_id`, or if it failed.
+    pub fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, Error> {
         info!(self.logger, "Getting received mint...");
         // a failed receive has nothing left to lock for
         let db_data = self.database.get_db_data(false)?;
-        let mut received_mints = vec![];
-        for transfer in db_data
-            .transfers
-            .iter()
-            .filter(|t| t.incoming && t.recipient_id.as_deref() == Some(&recipient_id))
-        {
-            let failed = db_data
-                .asset_transfers
-                .iter()
-                .find(|at| at.idx == transfer.asset_transfer_idx)
-                .and_then(|at| {
-                    db_data
-                        .batch_transfers
-                        .iter()
-                        .find(|bt| bt.idx == at.batch_transfer_idx)
-                })
-                .is_some_and(|bt| bt.status == TransferStatus::Failed);
-            if failed {
-                continue;
-            }
-            if let Some(mint) = self.received_mints.get(&self.get_receive_dir(transfer)) {
-                received_mints.push(mint.clone());
-            }
-        }
+        let failed = db_data.transfers.iter().any(|t| {
+            t.recipient_id.as_deref() == Some(&recipient_id)
+                && db_data
+                    .asset_transfers
+                    .iter()
+                    .find(|at| at.idx == t.asset_transfer_idx)
+                    .and_then(|at| {
+                        db_data
+                            .batch_transfers
+                            .iter()
+                            .find(|bt| bt.idx == at.batch_transfer_idx)
+                    })
+                    .is_some_and(|bt| t.incoming && bt.status == TransferStatus::Failed)
+        });
         info!(self.logger, "Get received mint completed");
-        Ok(received_mints)
+        if failed {
+            return Ok(None);
+        }
+        Ok(self.received_mints.get(&recipient_id).cloned())
     }
 
-    /// Return the consignment of the transfer with idx `transfer_idx`:
-    /// - a send, burn, link or mint: the sent consignment;
-    /// - an issuance: the contract;
-    /// - a receive: the validated consignment, while pending and after settlement. A mint that
-    ///   waits for its lock also has it.
+    /// Return the consignment of the transfer with this `idx` from
+    /// [`list_transfers`](Wallet::list_transfers). In JS it is `Uint8Array | null`.
     ///
-    /// Returns `None` for an inflation, before a receive's consignment arrives and for a receive
-    /// with no valid consignment.
+    /// - A send, burn, link or mint gives the consignment the wallet sent.
+    /// - A blind or witness receive gives the consignment the wallet received and validated. It
+    ///   gives it while pending and after settlement, also for a mint that waits for its lock.
+    /// - A receive gives `None` before its consignment arrives and when it failed.
+    /// - An issuance gives the contract.
+    /// - An inflation gives `None`.
     ///
-    /// Fails with [`Error::TransferNotFound`] if the wallet has no transfer with that idx.
+    /// Fails with [`Error::BatchTransferNotFound`] if no transfer has this idx.
     pub fn get_consignment(&self, transfer_idx: i32) -> Result<Option<Vec<u8>>, Error> {
-        info!(
-            self.logger,
-            "Getting consignment of transfer {transfer_idx}..."
-        );
+        info!(self.logger, "Getting consignment...");
         let db_data = self.database.get_db_data(false)?;
-        let not_found = || Error::TransferNotFound { idx: transfer_idx };
-        let t = db_data
+        let transfer = db_data
             .transfers
             .iter()
             .find(|t| t.idx == transfer_idx)
-            .ok_or_else(not_found)?;
+            .ok_or(Error::BatchTransferNotFound { idx: transfer_idx })?;
         let (asset_transfer, batch_transfer) =
-            t.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
-        if !asset_transfer.user_driven {
-            return Err(not_found());
-        }
+            transfer.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
         let kind = self
             .get_transfer_data(
-                t,
+                transfer,
                 &asset_transfer,
                 &batch_transfer,
                 &db_data.txos,
                 &db_data.colorings,
             )?
             .kind;
+        let asset_id = asset_transfer.asset_id.unwrap_or_default();
         let bytes = match kind {
-            TransferKind::Send | TransferKind::Burn | TransferKind::Link | TransferKind::Mint => {
-                let txid = batch_transfer.txid.as_ref();
-                let asset_id = asset_transfer.asset_id.as_ref();
-                txid.zip(asset_id).and_then(|(txid, id)| {
-                    self.transfer_artifacts
-                        .get(txid)?
-                        .consignment_bytes
-                        .get(id)
-                        .cloned()
-                })
-            }
             TransferKind::Inflation => None,
-            TransferKind::Issuance => {
-                let asset_id = asset_transfer
-                    .asset_id
-                    .clone()
-                    .expect("issuance should have an asset ID");
-                Some(self.export_contract(asset_id)?.contract)
+            TransferKind::Issuance => Some(self.export_contract(asset_id)?.contract),
+            TransferKind::Send | TransferKind::Burn | TransferKind::Link | TransferKind::Mint => {
+                batch_transfer
+                    .txid
+                    .and_then(|txid| self.transfer_artifacts.get(&txid))
+                    .and_then(|a| a.consignment_bytes.get(&asset_id))
+                    .cloned()
             }
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => {
-                let receive_dir = self.get_receive_dir(t);
-                self.received_consignments
-                    .get(&receive_dir)
-                    .and_then(|bytes| {
-                        let digest = hex::encode(sha256_digest(bytes));
-                        // a lock wait alone does not show that the checks ran
-                        let valid = batch_transfer.txid.is_some()
-                            || self.received_mints.contains_key(&receive_dir)
-                                && self
-                                    .pending_mint_locks
-                                    .get(&receive_dir)
-                                    .is_some_and(|l| l.consignment_digest == digest);
-                        (t.consignment_hash.as_deref() == Some(digest.as_str()) && valid)
-                            .then(|| bytes.clone())
-                    })
+                let recipient_id = transfer.recipient_id.as_deref().unwrap_or_default();
+                let bytes = self.received_consignments.get(recipient_id);
+                match batch_transfer.status {
+                    // a failed receive can keep bytes the wallet did not validate
+                    TransferStatus::Failed => None,
+                    // only a checked mint that waits for its lock has validated bytes
+                    TransferStatus::Initiated | TransferStatus::WaitingCounterparty => bytes
+                        .filter(|b| {
+                            self.received_mints.contains_key(recipient_id)
+                                && self.pending_mint_locks.get(recipient_id).is_some_and(|l| {
+                                    l.consignment_digest == hex::encode(sha256_digest(b))
+                                })
+                        })
+                        .cloned(),
+                    _ => bytes.cloned(),
+                }
             }
         };
         info!(self.logger, "Get consignment completed");
@@ -3827,21 +3753,9 @@ impl Wallet {
         recipient_id.replace(":", "_")
     }
 
-    /// Key of the data of an incoming transfer: its receive dir, else its normalized recipient ID.
-    pub(crate) fn get_receive_dir(&self, transfer: &DbTransfer) -> String {
-        transfer.receive_dir.clone().unwrap_or_else(|| {
-            self.normalize_recipient_id(
-                transfer
-                    .recipient_id
-                    .as_ref()
-                    .expect("transfer should have a recipient ID"),
-            )
-        })
-    }
-
-    pub(crate) fn get_receive_consignment_path(&self, transfer: &DbTransfer) -> PathBuf {
+    pub(crate) fn get_receive_consignment_path(&self, recipient_id: &str) -> PathBuf {
         self.get_transfers_dir()
-            .join(self.get_receive_dir(transfer))
+            .join(self.normalize_recipient_id(recipient_id))
             .join(CONSIGNMENT_RCV_FILE.as_str())
     }
 
@@ -3959,7 +3873,7 @@ impl Wallet {
                 TransferStatus::WaitingCounterparty,
             ) => None,
             (TransferKind::ReceiveBlind | TransferKind::ReceiveWitness, _) => {
-                Some(self.get_receive_consignment_path(transfer))
+                Some(self.get_receive_consignment_path(&transfer.recipient_id.clone().unwrap()))
             }
             (TransferKind::Issuance, _) => {
                 Some(self._get_issue_consignment_path(&asset_transfer.asset_id.clone().unwrap()))
@@ -4175,31 +4089,8 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         recipient_type: RecipientType,
         encryption: Option<Encryption>,
-        quota: u32,
     ) -> Result<ReceiveDataInternal, Error> {
         let encryption = encryption.unwrap_or(Encryption::Required);
-
-        // A reusable invoice needs proxies to keep its transfers apart.
-        // The seal blinding from both parties' keys identifies the outputs of each transfer.
-        if quota == 0 {
-            return Err(Error::InvalidQuota {
-                details: s!("must be at least 1"),
-            });
-        }
-        if transport_endpoints.is_empty() && quota > 1 {
-            return Err(Error::InvalidQuota {
-                details: s!("a reusable invoice requires transport endpoints"),
-            });
-        }
-        // The blinded UTXO needs one allocation for each transfer.
-        if recipient_type == RecipientType::Blind && quota > self.max_utxo_allocations() {
-            return Err(Error::InvalidQuota {
-                details: format!(
-                    "a blind invoice can receive at most {} transfers",
-                    self.max_utxo_allocations()
-                ),
-            });
-        }
 
         #[cfg(not(feature = "esplora"))]
         {
@@ -4240,9 +4131,7 @@ impl Wallet {
                                 })
                         });
                     }
-                    // The blinded UTXO needs one allocation for each transfer.
-                    let max_allocations = self.max_utxo_allocations() - quota;
-                    let utxo = self.get_utxo(&[], Some(&unspents), true, Some(max_allocations))?;
+                    let utxo = self.get_utxo(&[], Some(&unspents), true, None)?;
                     let unblinded_utxo = utxo.outpoint();
                     debug!(
                         self.logger,
@@ -4360,8 +4249,6 @@ impl Wallet {
             // for a blind receive, the invoice expiration plus the longest retention grace among
             // the proxies, until which a transfer to the invoice can still be downloaded
             let mut retention_deadline: Option<i64> = None;
-            // Expiration plus the longest retention grace of the invoice proxies, for all recipient types.
-            let mut proxies_retention_deadline: Option<i64> = None;
 
             // reserve the invoice on the proxies
             let recipient_pk = hex::encode(recipient_vk.to_bytes());
@@ -4384,7 +4271,6 @@ impl Wallet {
                             &invoice_id,
                             &reservation_expiration,
                             &recipient_pk,
-                            quota,
                         ),
                     )
                 });
@@ -4393,19 +4279,20 @@ impl Wallet {
                         &invoice_id,
                         &reservation_expiration,
                         &recipient_pk,
-                        quota,
                         signature,
                     )
                     .await
                 {
                     Ok(res) if res.error.is_none() => {
                         reserved = true;
-                        let deadline = expiration_timestamp
-                            .saturating_add(i64::from(crate::utils::proxy_retention_grace(&info)));
-                        proxies_retention_deadline = Some(std::cmp::max(
-                            proxies_retention_deadline.unwrap_or(deadline),
-                            deadline,
-                        ));
+                        if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
+                            let deadline = expiration_timestamp
+                                + i64::from(crate::utils::proxy_retention_grace(&info));
+                            retention_deadline = Some(std::cmp::max(
+                                retention_deadline.unwrap_or(deadline),
+                                deadline,
+                            ));
+                        }
                     }
                     Ok(res) => match map_proxy_error(res.error.unwrap()) {
                         // a draining proxy, the invoice can be reserved on the other ones
@@ -4423,23 +4310,6 @@ impl Wallet {
                     Error::NoValidTransportEndpoint
                 });
             }
-            if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
-                retention_deadline = proxies_retention_deadline;
-            }
-            // The retention deadline must also pass on the proxy clocks.
-            let invoice_deadline = proxies_retention_deadline
-                .filter(|_| quota > 1)
-                .map(|d| d.saturating_add(i64::from(clock_skew_margin())));
-
-            // Transfers of a reusable invoice share the recipient ID.
-            // The unique invoice key gives each receive its own dir.
-            let receive_dir = (quota > 1).then(|| {
-                format!(
-                    "{}_{}",
-                    self.normalize_recipient_id(&recipient_id),
-                    hex::encode(&recipient_vk.to_bytes()[..8])
-                )
-            });
 
             Ok(ReceiveDataInternal {
                 asset_id,
@@ -4456,9 +4326,6 @@ impl Wallet {
                 recipient_pubkey: recipient_vk.to_bytes().to_vec(),
                 encryption,
                 retention_deadline,
-                quota,
-                invoice_deadline,
-                receive_dir,
             })
         }
     }
@@ -4485,31 +4352,8 @@ impl Wallet {
             ..Default::default()
         };
         let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
-        // A reusable invoice receives more transfers after the first one, until it expires.
-        let invoice_idx = data
-            .invoice_deadline
-            .map(|deadline| {
-                self.database.set_invoice(DbInvoiceActMod {
-                    quota: ActiveValue::Set(data.quota),
-                    asset_id: ActiveValue::Set(data.asset_id.clone()),
-                    deadline: ActiveValue::Set(deadline),
-                    ..Default::default()
-                })
-            })
-            .transpose()?;
-        // witness receives on a reused address share the recipient ID
-        let receive_dir = data.receive_dir.clone().or_else(|| {
-            (self.wallet_data.reuse_addresses && data.script_pubkey.is_some()).then(|| {
-                format!(
-                    "{}_{batch_transfer_idx}",
-                    self.normalize_recipient_id(&data.recipient_id)
-                )
-            })
-        });
         let transfer = DbTransferActMod {
-            invoice_idx: ActiveValue::Set(invoice_idx),
             asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-            receive_dir: ActiveValue::Set(receive_dir),
             requested_assignment: ActiveValue::Set(Some(data.detected_assignment.clone())),
             incoming: ActiveValue::Set(true),
             recipient_id: ActiveValue::Set(Some(data.recipient_id.clone())),
@@ -4581,11 +4425,6 @@ impl Wallet {
     ///
     /// The `encryption` preference is embedded in the invoice and is [`Encryption::Required`] when
     /// not specified.
-    ///
-    /// An optional `quota` (default 1) sets the number of transfers the invoice can receive. A quota
-    /// above 1 requires transport endpoints. Refresh creates a transfer for each one after the first.
-    /// The blinded UTXO keeps free slots and cannot be spent until the invoice expiration plus the
-    /// longest retention grace of its proxies.
     #[allow(clippy::too_many_arguments)]
     pub async fn blind_receive(
         &mut self,
@@ -4596,7 +4435,6 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
-        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         let cp = self.checkpoint("blind_receive");
         let res = self
@@ -4608,7 +4446,6 @@ impl Wallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
-                quota,
             )
             .await;
         self.commit(cp, res, |_| false).await
@@ -4624,7 +4461,6 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
-        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
@@ -4642,7 +4478,6 @@ impl Wallet {
                 transport_endpoints,
                 RecipientType::Blind,
                 encryption,
-                quota.unwrap_or(1),
             )
             .await?;
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
@@ -4686,11 +4521,6 @@ impl Wallet {
     ///
     /// The `encryption` preference is embedded in the invoice and is [`Encryption::Required`] when
     /// not specified.
-    ///
-    /// An optional `quota` (default 1) sets the number of transfers the invoice can receive. A quota
-    /// above 1 requires transport endpoints. Refresh creates a transfer for each one after the first.
-    /// Each transfer uses its own seal blinding, derived from the keys of both parties. It identifies
-    /// the paying output. That output cannot be spent until its transfer is accepted.
     #[allow(clippy::too_many_arguments)]
     pub async fn witness_receive(
         &mut self,
@@ -4701,7 +4531,6 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
-        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         let cp = self.checkpoint("witness_receive");
         let res = self
@@ -4713,7 +4542,6 @@ impl Wallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
-                quota,
             )
             .await;
         self.commit(cp, res, |_| false).await
@@ -4729,7 +4557,6 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
-        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
@@ -4747,7 +4574,6 @@ impl Wallet {
                 transport_endpoints,
                 RecipientType::Witness,
                 encryption,
-                quota.unwrap_or(1),
             )
             .await?;
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
@@ -4765,18 +4591,6 @@ impl Wallet {
     }
 
     pub(crate) fn _get_new_address(&mut self, keychain: KeychainKind) -> Result<BdkAddress, Error> {
-        if self.wallet_data.reuse_addresses {
-            let index = self
-                .reuse_address_index
-                .get(&keychain)
-                .copied()
-                .unwrap_or(0);
-            // reveal_addresses_to ensures BDK's sync engine tracks this address
-            let _ = self.bdk_wallet.reveal_addresses_to(keychain, index);
-            self.bdk_wallet.persist(&mut self.bdk_database)?;
-            let address = self.bdk_wallet.peek_address(keychain, index).address;
-            return Ok(address);
-        }
         let address = self.bdk_wallet.reveal_next_address(keychain).address;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         Ok(address)
@@ -4796,40 +4610,9 @@ impl Wallet {
     fn _get_address(&mut self) -> Result<String, Error> {
         info!(self.logger, "Getting address...");
         let address = self._get_new_address(KeychainKind::Internal)?;
-
-        if !self.wallet_data.reuse_addresses {
-            self.update_backup_info(false)?;
-        }
+        self.update_backup_info(false)?;
 
         info!(self.logger, "Get address completed");
-        Ok(address.to_string())
-    }
-
-    /// Rotate the pinned address for the given keychain.
-    ///
-    /// Only meaningful when `reuse_addresses` is `true`. Increments the pinned derivation
-    /// index so subsequent address generation returns a fresh address.
-    pub fn rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
-        let cp = self.checkpoint("rotate_address");
-        let res = self._rotate_address(keychain);
-        self.commit_queued(cp, res)
-    }
-
-    fn _rotate_address(&mut self, keychain: KeychainKind) -> Result<String, Error> {
-        if !self.wallet_data.reuse_addresses {
-            return Err(Error::AddressReuseDisabled);
-        }
-        let index = self
-            .reuse_address_index
-            .get(&keychain)
-            .copied()
-            .unwrap_or(0);
-        let new_index = index + 1;
-        self.reuse_address_index.insert(keychain, new_index);
-        let _ = self.bdk_wallet.reveal_addresses_to(keychain, new_index);
-        self.bdk_wallet.persist(&mut self.bdk_database)?;
-        let address = self.bdk_wallet.peek_address(keychain, new_index).address;
-
         Ok(address.to_string())
     }
 }
@@ -4856,7 +4639,6 @@ pub(crate) struct Checkpoint {
     received_mints: HashMap<String, ReceivedMint>,
     media: HashMap<String, Vec<u8>>,
     pending_mint_locks: HashMap<String, PendingMintLocks>,
-    reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
 fn idb_key_for(wallet_dir: &Path, bitcoin_network: BitcoinNetwork) -> String {
@@ -4972,7 +4754,6 @@ impl Wallet {
             media: self.media.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
             rgb_store,
-            reuse_address_index: self.reuse_address_index.clone(),
             manifest: WalletManifest::new(&self.wallet_data, &self.keys),
             backup_versions: self.backup_versions.borrow().clone(),
         })
@@ -5029,9 +4810,6 @@ impl Wallet {
         self.received_mints = snapshot.received_mints;
         self.media = snapshot.media;
         self.pending_mint_locks = snapshot.pending_mint_locks;
-
-        // Restore address reuse pinned indices
-        self.reuse_address_index = snapshot.reuse_address_index;
 
         *self.rgb_stock.borrow_mut() = Some(stock);
         *self.backup_versions.borrow_mut() = snapshot.backup_versions;
@@ -5115,7 +4893,6 @@ impl Wallet {
             received_mints: self.received_mints.clone(),
             media: self.media.clone(),
             pending_mint_locks: self.pending_mint_locks.clone(),
-            reuse_address_index: self.reuse_address_index.clone(),
         }
     }
 
@@ -5137,7 +4914,6 @@ impl Wallet {
         self.received_mints = cp.received_mints;
         self.media = cp.media;
         self.pending_mint_locks = cp.pending_mint_locks;
-        self.reuse_address_index = cp.reuse_address_index;
         #[cfg(feature = "esplora")]
         if !self.broadcast_txs.is_empty() {
             // a broadcast TX stays in BDK, as its change can pay an address revealed here
@@ -5217,7 +4993,7 @@ impl Wallet {
 }
 
 #[cfg(test)]
-pub(crate) mod address_reuse_tests {
+pub(crate) mod test_wallet {
     use super::*;
     use crate::keys::generate_keys;
 
@@ -5242,24 +5018,23 @@ pub(crate) mod address_reuse_tests {
     /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
-    pub(crate) fn make_test_wallet(reuse: bool) -> Wallet {
-        make_test_wallet_with_keys(
-            generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot),
-            reuse,
-        )
+    pub(crate) fn make_test_wallet() -> Wallet {
+        make_test_wallet_with_keys(generate_keys(
+            BitcoinNetwork::Regtest,
+            WitnessVersion::Taproot,
+        ))
     }
 
-    pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys, reuse: bool) -> Wallet {
-        make_test_wallet_with_singlesig_keys(SinglesigKeys::from_keys(&keys, None), reuse)
+    pub(crate) fn make_test_wallet_with_keys(keys: crate::keys::Keys) -> Wallet {
+        make_test_wallet_with_singlesig_keys(SinglesigKeys::from_keys(&keys, None))
     }
 
-    pub(crate) fn make_test_wallet_with_singlesig_keys(keys: SinglesigKeys, reuse: bool) -> Wallet {
-        make_test_wallet_on_network(keys, reuse, BitcoinNetwork::Regtest)
+    pub(crate) fn make_test_wallet_with_singlesig_keys(keys: SinglesigKeys) -> Wallet {
+        make_test_wallet_on_network(keys, BitcoinNetwork::Regtest)
     }
 
     pub(crate) fn make_test_wallet_on_network(
         keys: SinglesigKeys,
-        reuse: bool,
         bitcoin_network: BitcoinNetwork,
     ) -> Wallet {
         let bdk_network = BdkNetwork::from(bitcoin_network);
@@ -5286,7 +5061,6 @@ pub(crate) mod address_reuse_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia],
-            reuse_addresses: reuse,
             allow_reckless_schemas: false,
         };
 
@@ -5304,7 +5078,6 @@ pub(crate) mod address_reuse_tests {
             bdk_wallet,
             signers,
             bdk_database,
-            reuse_address_index: HashMap::new(),
             #[cfg(feature = "esplora")]
             online_data: None,
             #[cfg(feature = "esplora")]
@@ -5383,7 +5156,6 @@ pub(crate) mod address_reuse_tests {
             "received_mints": wallet.received_mints,
             "media": wallet.media,
             "pending_mint_locks": wallet.pending_mint_locks,
-            "reuse_address_index": wallet.reuse_address_index,
         })
     }
 
@@ -5424,7 +5196,7 @@ pub(crate) mod address_reuse_tests {
 
     #[test]
     fn get_address_is_atomic() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         block_on(assert_no_partial_change(
             &mut wallet,
             "get_address",
@@ -5432,79 +5204,16 @@ pub(crate) mod address_reuse_tests {
             async |w| w.get_address(),
         ));
     }
-
-    #[test]
-    fn rotate_address_is_atomic() {
-        let mut wallet = make_test_wallet(true);
-        block_on(assert_no_partial_change(
-            &mut wallet,
-            "rotate_address",
-            0,
-            async |w| w.rotate_address(KeychainKind::Internal),
-        ));
-    }
-
-    #[test]
-    fn reuse_returns_same_address() {
-        let mut wallet = make_test_wallet(true);
-        let addr1 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        let addr2 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        assert_eq!(addr1, addr2, "reuse enabled: same address expected");
-    }
-
-    #[test]
-    fn no_reuse_returns_different_addresses() {
-        let mut wallet = make_test_wallet(false);
-        let addr1 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        let addr2 = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        assert_ne!(addr1, addr2, "reuse disabled: different addresses expected");
-    }
-
-    #[test]
-    fn reuse_index_changes_address() {
-        let mut wallet = make_test_wallet(true);
-        let old_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
-
-        // Simulate what rotate_address does internally
-        wallet.reuse_address_index.insert(KeychainKind::Internal, 1);
-        let new_addr = wallet._get_new_address(KeychainKind::Internal).unwrap();
-
-        assert_ne!(
-            old_addr, new_addr,
-            "bumping index should change the pinned address"
-        );
-    }
-
-    #[test]
-    fn keychains_have_independent_indices() {
-        let mut wallet = make_test_wallet(true);
-        let internal = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        let external = wallet._get_new_address(KeychainKind::External).unwrap();
-        assert_ne!(
-            internal.to_string(),
-            external.to_string(),
-            "different keychains"
-        );
-
-        // Bump External index — should not affect Internal
-        wallet.reuse_address_index.insert(KeychainKind::External, 1);
-        let internal_after = wallet._get_new_address(KeychainKind::Internal).unwrap();
-        assert_eq!(
-            internal.to_string(),
-            internal_after.to_string(),
-            "Internal unchanged after External index bump"
-        );
-    }
 }
 
 #[cfg(test)]
 mod debug_tests {
     use super::*;
-    use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+    use crate::wallet::offline::test_wallet::make_test_wallet;
 
     #[test]
     fn debug_hides_wallet_mnemonic() {
-        let keys = make_test_wallet(false).get_keys();
+        let keys = make_test_wallet().get_keys();
         let phrase = keys.mnemonic.clone().unwrap();
         assert!(!format!("{keys:?}").contains(phrase.as_str()));
     }
@@ -5528,7 +5237,6 @@ mod mainnet_schema_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
-            reuse_addresses: false,
             allow_reckless_schemas: reckless,
         };
         (wd, SinglesigKeys::from_keys(&keys, None))
@@ -5581,7 +5289,6 @@ mod keys_and_settings_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia],
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         }
     }
@@ -5803,7 +5510,6 @@ mod keys_and_settings_tests {
             data_dir: s!("other"),
             max_allocations_per_utxo: 1,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
-            reuse_addresses: true,
             allow_reckless_schemas: true,
             ..wallet_data()
         };
@@ -5818,13 +5524,13 @@ mod keys_and_settings_tests {
         let wd = WalletData {
             max_allocations_per_utxo: 1,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
-            reuse_addresses: true,
             allow_reckless_schemas: true,
             ..wallet_data()
         };
         let sk = SinglesigKeys::from_keys(&keys, Some(2));
         let json = serde_json::to_string(&WalletManifest::new(&wd, &sk)).unwrap();
         assert!(!json.contains(keys.mnemonic.as_str()));
+        assert!(json.contains("\"reuse_addresses\":false"));
 
         let manifest: WalletManifest = serde_json::from_str(&json).unwrap();
         let (got_wd, got_sk) = manifest.into_parts(s!("dir"), Some(keys.mnemonic.clone()));
@@ -5849,7 +5555,7 @@ mod keys_and_settings_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod receive_expiration_tests {
-    use super::address_reuse_tests::{add_fake_txos, make_test_wallet};
+    use super::test_wallet::make_test_wallet;
     use super::*;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
@@ -5862,23 +5568,20 @@ mod receive_expiration_tests {
         }
     }
 
-    // A proxy that answers `server.info` with `grace` and `invoice.prepare` for `quota`.
-    fn proxy_with_quota(quota: u32, grace: u32) -> (mockito::ServerGuard, Vec<mockito::Mock>) {
+    // A proxy answering `server.info` and `invoice.prepare`.
+    fn proxy() -> (mockito::ServerGuard, Vec<mockito::Mock>) {
         let mut server = mockito::Server::new();
         let info = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(s!("server.info")))
             .with_header("content-type", "application/json")
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","id":null,"result":{{"protocol_version":"1.0","version":"0.4.0","uptime":1,"retention_grace_secs":"{grace}"}}}}"#
-            ))
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"0.4.0","uptime":1,"retention_grace_secs":"100"}}"#,
+            )
             .create();
         let prepare = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::Regex(s!("invoice.prepare")),
-                mockito::Matcher::Regex(format!(r#""quota":"{quota}""#)),
-            ]))
+            .match_body(mockito::Matcher::Regex(s!("invoice.prepare")))
             .with_header("content-type", "application/json")
             .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
             .create();
@@ -5887,7 +5590,7 @@ mod receive_expiration_tests {
 
     #[test]
     fn receive_past_expiration_fails() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let online = online(&mut wallet);
         let result = crate::block_on(wallet.witness_receive(
             Some(online),
@@ -5897,7 +5600,6 @@ mod receive_expiration_tests {
             vec![s!("rpc://127.0.0.1")],
             1,
             None,
-            None,
         ));
         assert!(matches!(result, Err(Error::InvalidExpiration)));
         let db_data = wallet.database.get_db_data(false).unwrap();
@@ -5906,7 +5608,7 @@ mod receive_expiration_tests {
 
     #[test]
     fn receive_needs_online() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let exp = now().unix_timestamp() as u64 + 100_000;
         for result in [
             crate::block_on(wallet.witness_receive(
@@ -5917,7 +5619,6 @@ mod receive_expiration_tests {
                 vec![s!("rpc://127.0.0.1")],
                 1,
                 None,
-                None,
             )),
             crate::block_on(wallet.blind_receive(
                 None,
@@ -5926,7 +5627,6 @@ mod receive_expiration_tests {
                 exp,
                 vec![s!("rpc://127.0.0.1")],
                 1,
-                None,
                 None,
             )),
         ] {
@@ -5938,21 +5638,25 @@ mod receive_expiration_tests {
 
     #[test]
     fn receive_keeps_given_expiration_and_stores_v1_data() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let online = online(&mut wallet);
-        let (server, _mocks) = proxy_with_quota(1, 100);
+        let (server, _mocks) = proxy();
         let exp = now().unix_timestamp() + 100_000;
-        let data = crate::block_on(wallet.create_receive_data(
-            Some(online),
-            None,
-            Assignment::Any,
-            exp,
-            vec![format!("rpc://{}", server.host_with_port())],
-            RecipientType::Witness,
-            Some(Encryption::Optional),
-            1,
-        ))
-        .unwrap();
+        let mut receive = || {
+            crate::block_on(wallet.create_receive_data(
+                Some(online.clone()),
+                None,
+                Assignment::Any,
+                exp,
+                vec![format!("rpc://{}", server.host_with_port())],
+                RecipientType::Witness,
+                Some(Encryption::Optional),
+            ))
+            .unwrap()
+        };
+        let data = receive();
+        // each witness receive has its own address
+        assert_ne!(receive().recipient_id, data.recipient_id);
         wallet.store_receive_transfer(&data, 1).unwrap();
         let public_key = hex::encode(&data.recipient_pubkey);
         let db_data = wallet.database.get_db_data(false).unwrap();
@@ -5963,9 +5667,6 @@ mod receive_expiration_tests {
         // the retention deadline is only for a blind receive
         assert_eq!(batch.retention_deadline, None);
         let transfer = &db_data.transfers[0];
-        assert_eq!(transfer.invoice_idx, None);
-        assert_eq!(transfer.receive_dir, None);
-        assert!(wallet.database.iter_invoices().unwrap().is_empty());
         assert_eq!(
             hex::encode(transfer.recipient_pubkey.as_ref().unwrap()),
             public_key
@@ -5985,176 +5686,11 @@ mod receive_expiration_tests {
             ])
         );
     }
-
-    #[test]
-    fn reuse_fail() {
-        let mut wallet = make_test_wallet(false);
-        let online = online(&mut wallet);
-        let exp = now().unix_timestamp() as u64 + 100_000;
-        let endpoints = vec![s!("rpc://127.0.0.1")];
-        let max = wallet.max_utxo_allocations();
-        let receive = |wallet: &mut Wallet, witness: bool, endpoints: Vec<String>, quota| {
-            let online = Some(online.clone());
-            let res = crate::block_on(async {
-                if witness {
-                    let rcv = wallet.witness_receive(
-                        online,
-                        None,
-                        Assignment::Any,
-                        exp,
-                        endpoints,
-                        1,
-                        None,
-                        quota,
-                    );
-                    rcv.await
-                } else {
-                    let rcv = wallet.blind_receive(
-                        online,
-                        None,
-                        Assignment::Any,
-                        exp,
-                        endpoints,
-                        1,
-                        None,
-                        quota,
-                    );
-                    rcv.await
-                }
-            });
-            match res {
-                Err(Error::InvalidQuota { details }) => details,
-                other => panic!("unexpected {other:?}"),
-            }
-        };
-        for witness in [false, true] {
-            assert_eq!(
-                receive(&mut wallet, witness, endpoints.clone(), Some(0)),
-                "must be at least 1"
-            );
-            assert_eq!(
-                receive(&mut wallet, witness, vec![], Some(2)),
-                "a reusable invoice requires transport endpoints"
-            );
-        }
-        assert_eq!(
-            receive(&mut wallet, false, endpoints.clone(), Some(max + 1)),
-            format!("a blind invoice can receive at most {max} transfers")
-        );
-        MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(2));
-        let details = receive(&mut wallet, false, endpoints, Some(3));
-        MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(None);
-        assert_eq!(details, "a blind invoice can receive at most 2 transfers");
-        assert!(wallet.database.iter_batch_transfers().unwrap().is_empty());
-    }
-
-    #[test]
-    fn reusable_receive_stores_invoice() {
-        let mut wallet = make_test_wallet(false);
-        let online = online(&mut wallet);
-        let (server, mocks) = proxy_with_quota(3, 100);
-        let (long_server, long_mocks) = proxy_with_quota(3, 300);
-        let exp = now().unix_timestamp() + 100_000;
-        let data = crate::block_on(wallet.create_receive_data(
-            Some(online.clone()),
-            None,
-            Assignment::Any,
-            exp,
-            vec![
-                format!("rpc://{}", server.host_with_port()),
-                format!("rpc://{}", long_server.host_with_port()),
-            ],
-            RecipientType::Witness,
-            None,
-            3,
-        ))
-        .unwrap();
-        long_mocks[1].assert();
-        // The longest proxy retention grace sets the deadline.
-        let deadline = exp + 300 + i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS);
-        assert_eq!(data.invoice_deadline, Some(deadline));
-        let receive_dir = format!(
-            "{}_{}",
-            wallet.normalize_recipient_id(&data.recipient_id),
-            &hex::encode(&data.recipient_pubkey)[..16]
-        );
-        assert_eq!(data.receive_dir, Some(receive_dir.clone()));
-        wallet.store_receive_transfer(&data, 1).unwrap();
-        mocks[1].assert();
-        assert_eq!(
-            wallet.database.iter_invoices().unwrap(),
-            vec![DbInvoice {
-                idx: 1,
-                quota: 3,
-                asset_id: None,
-                deadline,
-            }]
-        );
-        let db_data = wallet.database.get_db_data(false).unwrap();
-        assert_eq!(db_data.batch_transfers[0].retention_deadline, None);
-        let transfer = &db_data.transfers[0];
-        assert_eq!(transfer.invoice_idx, Some(1));
-        assert_eq!(wallet.get_receive_dir(transfer), receive_dir);
-
-        // A blind invoice needs a UTXO with room for its full quota.
-        add_fake_txos(&wallet);
-        let blind_receive = |wallet: &mut Wallet, quota| {
-            let (server, _mocks) = proxy_with_quota(quota, 100);
-            let res = crate::block_on(wallet.create_receive_data(
-                Some(online.clone()),
-                None,
-                Assignment::Any,
-                exp,
-                vec![format!("rpc://{}", server.host_with_port())],
-                RecipientType::Blind,
-                None,
-                quota,
-            ));
-            res.map(|data| wallet.store_receive_transfer(&data, 1).unwrap())
-        };
-        let max = wallet.max_utxo_allocations();
-        for _ in 0..3 {
-            blind_receive(&mut wallet, max - 1).unwrap();
-        }
-        // No UTXO has room for 2. The wallet has no bitcoins to color a new one.
-        assert!(matches!(
-            blind_receive(&mut wallet, 2),
-            Err(Error::InsufficientBitcoins { .. })
-        ));
-        blind_receive(&mut wallet, 1).unwrap();
-    }
-
-    #[test]
-    fn witness_receives_on_reused_address_keep_own_data() {
-        let mut wallet = make_test_wallet(true);
-        let online = online(&mut wallet);
-        let (server, _mocks) = proxy_with_quota(1, 100);
-        for _ in 0..2 {
-            let data = crate::block_on(wallet.create_receive_data(
-                Some(online.clone()),
-                None,
-                Assignment::Any,
-                now().unix_timestamp() + 100_000,
-                vec![format!("rpc://{}", server.host_with_port())],
-                RecipientType::Witness,
-                None,
-                1,
-            ))
-            .unwrap();
-            wallet.store_receive_transfer(&data, 1).unwrap();
-        }
-        let transfers = wallet.database.get_db_data(false).unwrap().transfers;
-        assert_eq!(transfers[0].recipient_id, transfers[1].recipient_id);
-        assert_ne!(
-            wallet.get_receive_dir(&transfers[0]),
-            wallet.get_receive_dir(&transfers[1])
-        );
-    }
 }
 
 #[cfg(test)]
 mod available_allocations_tests {
-    use super::address_reuse_tests::make_test_wallet;
+    use super::test_wallet::make_test_wallet;
     use super::*;
 
     fn unspent(vout: u32, allocations: usize, pending_blinded: u32) -> LocalUnspent {
@@ -6184,7 +5720,7 @@ mod available_allocations_tests {
 
     #[test]
     fn available_allocations_capped_by_the_bundle_limit() {
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         wallet.wallet_data.max_allocations_per_utxo = u32::MAX;
         let max = MAX_UTXO_ASSET_ALLOCATIONS;
         let mut unspents = vec![
@@ -6228,10 +5764,7 @@ mod inspect_psbt_tests {
     }
 
     fn wallet(keys: &str) -> Wallet {
-        address_reuse_tests::make_test_wallet_with_singlesig_keys(
-            serde_json::from_str(keys).unwrap(),
-            false,
-        )
+        test_wallet::make_test_wallet_with_singlesig_keys(serde_json::from_str(keys).unwrap())
     }
 
     fn matches_rgb_lib(w: &Wallet, psbt: &str, expected: &str) -> PsbtInspection {
@@ -6312,7 +5845,7 @@ mod inspect_psbt_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod export_contract_tests {
-    use super::address_reuse_tests::{add_fake_txos, media_attachment, set_media, state};
+    use super::test_wallet::{add_fake_txos, media_attachment, set_media, state};
     use super::*;
     use crate::keys::generate_keys;
 
@@ -6324,7 +5857,6 @@ mod export_contract_tests {
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa, AssetSchema::Bfa],
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         };
         let wallet = Wallet::new(wd, SinglesigKeys::from_keys(&keys, None)).unwrap();

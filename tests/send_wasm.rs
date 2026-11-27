@@ -34,7 +34,6 @@ fn test_wallet_data(
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
-            reuse_addresses: false,
             allow_reckless_schemas: false,
         },
         SinglesigKeys::from_keys(&keys, None),
@@ -1316,7 +1315,6 @@ async fn proxy_auth() {
             vec![endpoint.clone()],
             1,
             None,
-            None,
         )
         .await;
     assert!(res.is_err());
@@ -1335,7 +1333,6 @@ async fn proxy_auth() {
             vec![endpoint.clone()],
             1,
             None,
-            None,
         )
         .await;
     assert!(matches!(res, Err(Error::InvalidProxyAuthSignature)));
@@ -1353,7 +1350,6 @@ async fn proxy_auth() {
             default_rcv_expiration(),
             vec![endpoint.clone()],
             1,
-            None,
             None,
         )
         .await

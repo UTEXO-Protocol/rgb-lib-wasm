@@ -1,6 +1,6 @@
 [package]
 name = "rgb-lib-wasm"
-version = "1.0.0-beta.6"
+version = "1.0.0-beta.7"
 authors = [
     "Zoe Faltibà <zoefaltiba@gmail.com>",
     "Nicola Busanello <nicola.busanello@gmail.com>",

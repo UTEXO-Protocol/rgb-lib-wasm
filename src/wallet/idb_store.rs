@@ -1,6 +1,6 @@
 //! IndexedDB persistence for WASM wallet snapshots.
 
-use bdk_wallet::{ChangeSet, KeychainKind};
+use bdk_wallet::ChangeSet;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
@@ -28,26 +28,23 @@ pub struct WalletSnapshot {
     pub db: InMemoryDb,
     /// The BDK wallet changeset.
     pub bdk_changeset: Option<ChangeSet>,
-    /// Complete pending transfer state keyed by txid.
+    /// Artifacts of RGB operations, and the consignments of ended ones, keyed by TXID.
     pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
-    /// Received consignment bytes keyed by receive dir of the transfer.
+    /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
-    /// Proxy data of each received consignment keyed by receive dir of the transfer.
+    /// Proxy data of each received consignment keyed by recipient_id.
     pub(crate) received_consignment_meta: HashMap<String, super::ReceivedConsignmentMeta>,
-    /// Signed TXs released by the sender proxy keyed by receive dir of the transfer.
+    /// Signed TXs released by the sender proxy keyed by recipient_id.
     pub received_signed_txs: HashMap<String, Vec<u8>>,
-    /// Received mints keyed by receive dir of the transfer.
+    /// Received mints keyed by recipient_id.
     pub(crate) received_mints: HashMap<String, super::ReceivedMint>,
-    /// Mint locks a received consignment waits for, keyed by receive dir of the transfer.
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
     pub(crate) pending_mint_locks: HashMap<String, super::PendingMintLocks>,
     /// Media bytes keyed by hex digest.
     pub(crate) media: HashMap<String, Vec<u8>>,
     /// Encoded RGB store (base64).
     pub rgb_store: String,
-    /// Pinned derivation index per keychain for address reuse.
-    #[serde(default)]
-    pub reuse_address_index: HashMap<KeychainKind, u32>,
     /// Settings and public keys of the wallet.
     pub(crate) manifest: super::WalletManifest,
     /// Version that the wallet last wrote or restored, per store label.
@@ -334,8 +331,8 @@ mod tests {
             .insert("asset-id".to_owned(), vec![1, 2, 3, 4]);
         transfer_artifact.signed_tx = Some(vec![9]);
         transfer_artifact.fascia = Some(vec![7, 8]);
-        let pml = crate::wallet::offline::address_reuse_tests::pending_mint_locks();
-        let w = crate::wallet::offline::address_reuse_tests::make_test_wallet(false);
+        let pml = crate::wallet::offline::test_wallet::pending_mint_locks();
+        let w = crate::wallet::offline::test_wallet::make_test_wallet();
         let snapshot = WalletSnapshot {
             writer: 1,
             sequence: 1,
@@ -370,7 +367,6 @@ mod tests {
             pending_mint_locks: HashMap::from([("rid".to_owned(), pml)]),
             media: HashMap::from([("digest".to_owned(), vec![10])]),
             rgb_store: s,
-            reuse_address_index: HashMap::new(),
             manifest: super::super::WalletManifest::new(&w.wallet_data, &w.keys),
             backup_versions: HashMap::from([(store_label("vss", &["x", "y", "z"]), 7)]),
         };

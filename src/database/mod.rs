@@ -6,10 +6,10 @@ use super::*;
 pub(crate) use crate::database::memory_db::{
     ActiveValue, DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
     DbBackupInfoActMod, DbBatchTransfer, DbBatchTransferActMod, DbColoring, DbColoringActMod,
-    DbInvoice, DbInvoiceActMod, DbMedia, DbMediaActMod, DbPendingWitnessScript,
-    DbPendingWitnessScriptActMod, DbTransfer, DbTransferActMod, DbTransferTransportEndpoint,
-    DbTransferTransportEndpointActMod, DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
-    DbTxoActMod, DbWalletTransaction, DbWalletTransactionActMod,
+    DbMedia, DbMediaActMod, DbPendingWitnessScript, DbPendingWitnessScriptActMod, DbTransfer,
+    DbTransferActMod, DbTransferTransportEndpoint, DbTransferTransportEndpointActMod,
+    DbTransportEndpoint, DbTransportEndpointActMod, DbTxo, DbTxoActMod, DbWalletTransaction,
+    DbWalletTransactionActMod,
 };
 
 #[derive(Clone, Debug)]
@@ -121,14 +121,6 @@ pub(crate) struct DbData {
     pub(crate) transfers: Vec<DbTransfer>,
     pub(crate) colorings: Vec<DbColoring>,
     pub(crate) txos: Vec<DbTxo>,
-}
-
-impl DbInvoice {
-    /// Whether the invoice can still receive transfers.
-    /// Until the deadline, a transfer created before expiration can still be discovered.
-    pub(crate) fn live(&self, now: i64) -> bool {
-        now < self.deadline
-    }
 }
 
 impl DbTransfer {

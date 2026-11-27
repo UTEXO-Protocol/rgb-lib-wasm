@@ -32,10 +32,7 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) bdk_changeset: Option<bdk_wallet::ChangeSet>,
     /// Encoded RGB store, base64
     pub(crate) rgb_store: String,
-    /// Pinned derivation index per keychain for address reuse.
-    #[serde(default)]
-    pub(crate) reuse_address_index: std::collections::HashMap<bdk_wallet::KeychainKind, u32>,
-    /// Artifacts keyed by TXID. A broadcast send keeps only its consignments.
+    /// Artifacts of RGB operations, and the consignments of ended ones, keyed by TXID.
     #[serde(default)]
     pub(crate) transfer_artifacts:
         std::collections::HashMap<String, super::online::TransferArtifacts>,
@@ -43,9 +40,9 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) received_consignment_meta:
         std::collections::HashMap<String, super::ReceivedConsignmentMeta>,
     pub(crate) received_signed_txs: std::collections::HashMap<String, Vec<u8>>,
-    /// Received mints, keyed by receive dir of the transfer.
+    /// Received mints, keyed by recipient_id.
     pub(crate) received_mints: std::collections::HashMap<String, super::ReceivedMint>,
-    /// Mint locks a received consignment waits for, keyed by receive dir of the transfer.
+    /// Mint locks a received consignment waits for, keyed by recipient_id.
     pub(crate) pending_mint_locks: std::collections::HashMap<String, super::PendingMintLocks>,
     /// Media bytes keyed by hex digest.
     pub(crate) media: std::collections::HashMap<String, Vec<u8>>,
@@ -211,7 +208,6 @@ impl super::Wallet {
             pending_mint_locks: payload.pending_mint_locks,
             media: payload.media,
             rgb_store: payload.rgb_store,
-            reuse_address_index: payload.reuse_address_index,
             manifest: payload.manifest,
             backup_versions: self.backup_versions.borrow().clone(),
         };
@@ -409,7 +405,6 @@ impl super::Wallet {
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
             rgb_store,
-            reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
             received_consignment_meta: self.received_consignment_meta.clone(),
@@ -517,9 +512,9 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn backup_info_is_false_without_row() {
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
-        let wallet = make_test_wallet(false);
+        let wallet = make_test_wallet();
         assert!(wallet.database.get_backup_info().unwrap().is_none());
         assert!(!wallet.backup_info().unwrap());
     }
@@ -528,9 +523,9 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn backup_info_compares_integer_timestamps() {
         use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
 
-        let wallet = make_test_wallet(false);
+        let wallet = make_test_wallet();
         let info = wallet.update_backup_info(true).unwrap().unwrap();
         assert_eq!(info.last_operation_timestamp, "0");
         assert!(!wallet.backup_info().unwrap());
@@ -637,7 +632,7 @@ mod tests {
         asset_id: &str,
         transition: crate::database::enums::TypeOfTransition,
         bytes: Vec<u8>,
-    ) -> i32 {
+    ) {
         use crate::database::enums::{AssetSchema, TransferStatus};
         use crate::database::memory_db::{
             ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
@@ -678,7 +673,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let idx = wallet
+        wallet
             .database
             .set_transfer(DbTransferActMod {
                 asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
@@ -694,200 +689,121 @@ mod tests {
                 ..Default::default()
             },
         );
-        idx
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    // Rows of one incoming transfer, with `stored` as its received consignment.
-    fn seed_receive(
-        wallet: &mut crate::wallet::Wallet,
-        rid: &str,
-        status: crate::database::enums::TransferStatus,
-        txid: Option<&str>,
-        stored: Option<Vec<u8>>,
-        hash_of: &[u8],
-    ) -> i32 {
-        use crate::database::enums::RecipientTypeFull;
-        use crate::database::memory_db::{
-            ActiveValue, DbAssetTransferActMod, DbBatchTransferActMod, DbTransferActMod,
-        };
-        use crate::encryption::sha256_digest;
-
-        let batch_idx = wallet
-            .database
-            .set_batch_transfer(DbBatchTransferActMod {
-                txid: ActiveValue::Set(txid.map(String::from)),
-                status: ActiveValue::Set(status),
-                expiration: ActiveValue::Set(Some(i64::MAX)),
-                min_confirmations: ActiveValue::Set(1),
-                ..Default::default()
-            })
-            .unwrap();
-        let asset_transfer_idx = wallet
-            .database
-            .set_asset_transfer(DbAssetTransferActMod {
-                user_driven: ActiveValue::Set(true),
-                batch_transfer_idx: ActiveValue::Set(batch_idx),
-                asset_id: ActiveValue::Set(Some(s!("rgb:rcv"))),
-                ..Default::default()
-            })
-            .unwrap();
-        if let Some(bytes) = stored {
-            wallet.received_consignments.insert(rid.to_string(), bytes);
-        }
-        wallet
-            .database
-            .set_transfer(DbTransferActMod {
-                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
-                incoming: ActiveValue::Set(true),
-                recipient_id: ActiveValue::Set(Some(rid.to_string())),
-                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None })),
-                consignment_hash: ActiveValue::Set(Some(hex::encode(sha256_digest(hash_of)))),
-                ..Default::default()
-            })
-            .unwrap()
-    }
-
-    // A transfer returns the consignment of its kind and status.
+    // A burn and a link return the consignment they sent.
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn get_consignment_by_kind() {
-        use crate::database::enums::{TransferStatus::*, TypeOfTransition};
-        use crate::database::memory_db::{ActiveValue, DbAssetTransferActMod};
-        use crate::encryption::sha256_digest;
+    fn get_consignment_of_sent_transfers() {
+        use crate::database::enums::TypeOfTransition;
         use crate::keys::generate_keys;
-        use crate::utils::MemStock;
-        use crate::wallet::ReceivedMint;
-        use crate::wallet::offline::PendingMintLocks;
-        use crate::wallet::offline::address_reuse_tests::{
-            make_test_wallet_with_keys, pending_mint_locks,
-        };
+        use crate::wallet::offline::test_wallet::make_test_wallet_with_keys;
+        use crate::wallet::{AssetFilter, TransferScope};
 
-        let keys = generate_keys(
+        let mut wallet = make_test_wallet_with_keys(generate_keys(
             crate::BitcoinNetwork::Regtest,
             crate::WitnessVersion::Taproot,
-        );
-        let mut wallet = make_test_wallet_with_keys(keys.clone(), false);
-        let burn = seed_ended_without_recipient(
+        ));
+        seed_ended_without_recipient(
             &mut wallet,
             &"4".repeat(64),
             "rgb:burn",
             TypeOfTransition::Burn,
             vec![1, 2, 3],
         );
-        let link = seed_ended_without_recipient(
+        seed_ended_without_recipient(
             &mut wallet,
             &"6".repeat(64),
             "rgb:link",
             TypeOfTransition::Link,
             vec![7],
         );
-        assert_eq!(wallet.get_consignment(burn), Ok(Some(vec![1, 2, 3])));
-        assert_eq!(wallet.get_consignment(link), Ok(Some(vec![7])));
+
+        let get = |asset_id: &str| {
+            let transfers = wallet
+                .list_transfers(AssetFilter::Id(asset_id.to_string()), TransferScope::All)
+                .unwrap();
+            wallet.get_consignment(transfers[0].idx)
+        };
+        assert_eq!(get("rgb:burn"), Ok(Some(vec![1, 2, 3])));
+        assert_eq!(get("rgb:link"), Ok(Some(vec![7])));
         assert_eq!(
             wallet.get_consignment(999),
-            Err(Error::TransferNotFound { idx: 999 })
+            Err(Error::BatchTransferNotFound { idx: 999 })
         );
+    }
 
-        let h = |b: &[u8]| hex::encode(sha256_digest(b));
-        let none = seed_receive(&mut wallet, "none", WaitingCounterparty, None, None, &[]);
-        assert_eq!(wallet.get_consignment(none), Ok(None));
-        let unvalidated = seed_receive(
-            &mut wallet,
-            "unvalidated",
-            WaitingCounterparty,
-            None,
-            Some(vec![9]),
-            &[9],
-        );
-        assert_eq!(wallet.get_consignment(unvalidated), Ok(None));
-        // a transfer that listTransfers hides fails as an unknown one
-        let hidden = wallet
-            .database
-            .get_db_data(false)
-            .unwrap()
-            .transfers
-            .into_iter()
-            .find(|t| t.idx == unvalidated)
-            .unwrap()
-            .asset_transfer_idx;
-        wallet
-            .database
-            .update_asset_transfer(&mut DbAssetTransferActMod {
-                idx: ActiveValue::Set(hidden),
-                user_driven: ActiveValue::Set(false),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(
-            wallet.get_consignment(unvalidated),
-            Err(Error::TransferNotFound { idx: unvalidated })
-        );
-        let mint = seed_receive(
-            &mut wallet,
-            "mint",
-            WaitingCounterparty,
-            None,
-            Some(vec![8]),
-            &[8],
-        );
-        let lock = |digest| PendingMintLocks {
-            consignment_digest: digest,
-            ..pending_mint_locks()
-        };
-        wallet.pending_mint_locks.insert(s!("mint"), lock(h(&[8])));
-        // a lock wait can be for the history only, before the mint check
-        assert_eq!(wallet.get_consignment(mint), Ok(None));
-        wallet.received_mints.insert(
-            s!("mint"),
-            ReceivedMint {
-                opid: s!("opid"),
-                lock_id: s!("lock"),
-                amount: 1,
-                before_block: 2,
-                evm_chain_id: 3,
-                bridge_contract: s!("bridge"),
-            },
-        );
-        wallet.pending_mint_locks.insert(s!("mint"), lock(h(&[7])));
-        assert_eq!(wallet.get_consignment(mint), Ok(None));
-        wallet.pending_mint_locks.remove("mint");
-        assert_eq!(wallet.get_consignment(mint), Ok(None));
-        wallet.pending_mint_locks.insert(s!("mint"), lock(h(&[8])));
-        assert_eq!(wallet.get_consignment(mint), Ok(Some(vec![8])));
+    // A snapshot and a backup of a 1.0.0-beta.5 wallet with reused addresses load and work.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn beta5_snapshot_and_backup_load() {
+        use crate::database::enums::TransferStatus;
+        use crate::wallet::offline::test_wallet::make_test_wallet_with_singlesig_keys;
+        use crate::wallet::{AssetFilter, TransferScope};
 
-        let settled = seed_receive(
-            &mut wallet,
-            "settled",
-            Settled,
-            Some(&"5".repeat(64)),
-            Some(vec![5]),
-            &[5],
-        );
-        assert_eq!(wallet.get_consignment(settled), Ok(Some(vec![5])));
-        let mismatch = seed_receive(
-            &mut wallet,
-            "mismatch",
-            WaitingConfirmations,
-            Some(&"8".repeat(64)),
-            Some(vec![2]),
-            &[3],
-        );
-        assert_eq!(wallet.get_consignment(mismatch), Ok(None));
+        let keys: crate::wallet::SinglesigKeys =
+            serde_json::from_str(include_str!("../../tests/fixtures/beta5/keys.json")).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/beta5/meta.json")).unwrap();
+        let m = |k: &str| meta[k].as_str().unwrap().to_string();
 
-        *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
-        let mut restored = make_test_wallet_with_keys(keys.clone(), false);
-        restored
-            .restore_payload(&wallet.serialize_backup_payload().unwrap())
-            .unwrap();
-        let mut from_snapshot = make_test_wallet_with_keys(keys, false);
+        let mut from_snapshot = make_test_wallet_with_singlesig_keys(keys.clone());
         from_snapshot
-            .restore_from_snapshot(wallet.snapshot().unwrap())
+            .restore_from_snapshot(
+                serde_json::from_str(include_str!("../../tests/fixtures/beta5/snapshot.json"))
+                    .unwrap(),
+            )
             .unwrap();
-        for w in [&restored, &from_snapshot] {
-            assert_eq!(w.get_consignment(burn), Ok(Some(vec![1, 2, 3])));
-            assert_eq!(w.get_consignment(mint), Ok(Some(vec![8])));
-            assert_eq!(w.get_consignment(settled), Ok(Some(vec![5])));
+        let mut from_backup = make_test_wallet_with_singlesig_keys(keys);
+        from_backup
+            .restore_backup(
+                include_bytes!("../../tests/fixtures/beta5/backup.bin"),
+                "password",
+            )
+            .unwrap();
+
+        for wallet in [&mut from_snapshot, &mut from_backup] {
+            let transfers = wallet
+                .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+                .unwrap();
+            let of = |rid: &str| {
+                transfers
+                    .iter()
+                    .find(|t| t.recipient_id.as_deref() == Some(rid))
+                    .unwrap()
+            };
+            let settled = of(&m("settled_rid"));
+            assert_eq!(settled.status, TransferStatus::Settled);
+            assert_eq!(wallet.get_consignment(settled.idx), Ok(None));
+            let pending = of(&m("pending_rid"));
+            assert_eq!(pending.status, TransferStatus::WaitingCounterparty);
+            assert_eq!(wallet.get_consignment(pending.idx), Ok(None));
+
+            // the pending receive keeps what it needs to receive
+            let db_data = wallet.database.get_db_data(false).unwrap();
+            let batch = db_data
+                .batch_transfers
+                .iter()
+                .find(|b| b.idx == pending.batch_transfer_idx)
+                .unwrap();
+            assert!(batch.operation_secret_key.is_some());
+            let script = crate::no_wallet::script_buf_from_recipient_id(m("pending_rid"))
+                .unwrap()
+                .unwrap();
+            assert!(wallet.bdk_wallet.is_mine(script));
+
+            assert_eq!(
+                wallet.get_asset_balance(m("asset_id")).unwrap().settled,
+                100
+            );
+            assert!(wallet.bdk_wallet.balance().total().to_sat() > 0);
+
+            // addresses are new and skip the ones the wallet pinned
+            assert_ne!(wallet.get_address().unwrap(), m("vanilla_address"));
+            assert_ne!(
+                wallet.get_new_address().unwrap().to_string(),
+                m("colored_address")
+            );
         }
     }
 
@@ -896,7 +812,7 @@ mod tests {
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::Online;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::offline::test_wallet::make_test_wallet_with_keys;
         use crate::wallet::online::{OnlineData, TransferArtifacts};
 
         let txid = "1".repeat(64);
@@ -907,7 +823,7 @@ mod tests {
             crate::WitnessVersion::Taproot,
         );
 
-        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
+        let mut sender = make_test_wallet_with_keys(keys.clone());
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
         let (proxy, _mock) = ack_proxy();
         let batch_idx = seed_acknowledged_transfer(&mut sender, &txid, asset_id, &proxy.url());
@@ -926,7 +842,7 @@ mod tests {
         let backup_bytes = encode_backup(&ciphertext, &pub_data).unwrap();
         drop(sender);
 
-        let mut rebuilt = make_test_wallet_with_keys(keys, false);
+        let mut rebuilt = make_test_wallet_with_keys(keys);
         rebuilt.restore_backup(&backup_bytes, password).unwrap();
 
         rebuilt.online_data = Some(OnlineData::for_test(indexer_url));
@@ -965,13 +881,13 @@ mod tests {
     fn refresh_fails_transfer_without_signed_tx_impl(asset_id: Option<&str>) {
         use crate::database::enums::TransferStatus;
         use crate::wallet::Online;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
         use crate::wallet::online::OnlineData;
 
         let txid = "1".repeat(64);
         let indexer_url = "http://127.0.0.1:1";
         // A wallet restored from a backup without artifacts, ACK already received.
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let (proxy, _mock) = ack_proxy();
         let batch_idx = seed_acknowledged_transfer(&mut wallet, &txid, asset_id, &proxy.url());
         let seeded_expiration = wallet
@@ -1040,14 +956,14 @@ mod tests {
     fn refresh_skips_and_fail_transfers_fails_expired_initiated_sends() {
         use crate::database::enums::TransferStatus;
         use crate::database::memory_db::{ActiveValue, DbBatchTransferActMod};
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet;
+        use crate::wallet::offline::test_wallet::make_test_wallet;
         use crate::wallet::online::{
             OnlineData, RefreshFilter, RefreshTransferStatus, TransferArtifacts,
         };
         use crate::wallet::{Online, Outpoint};
 
         let indexer_url = "http://127.0.0.1:1";
-        let mut wallet = make_test_wallet(false);
+        let mut wallet = make_test_wallet();
         let (proxy, _mock) = ack_proxy();
         let mut seeded = vec![];
         for (txid, expiration) in [("1".repeat(64), 1), ("2".repeat(64), i64::MAX)] {
@@ -1132,7 +1048,7 @@ mod tests {
         use crate::keys::generate_keys;
         use crate::utils::MemStock;
         use crate::wallet::offline::ReceivedConsignmentMeta;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::offline::test_wallet::make_test_wallet_with_keys;
         use crate::wallet::online::TransferArtifacts;
 
         let txid = "2".repeat(64);
@@ -1141,7 +1057,7 @@ mod tests {
             crate::WitnessVersion::Taproot,
         );
 
-        let mut sender = make_test_wallet_with_keys(keys.clone(), false);
+        let mut sender = make_test_wallet_with_keys(keys.clone());
         *sender.rgb_stock.borrow_mut() = Some(MemStock::default());
         sender.transfer_artifacts.insert(
             txid.clone(),
@@ -1168,16 +1084,16 @@ mod tests {
         sender
             .received_signed_txs
             .insert(s!("recipient"), vec![4, 5, 6]);
-        let pml = crate::wallet::offline::address_reuse_tests::pending_mint_locks();
+        let pml = crate::wallet::offline::test_wallet::pending_mint_locks();
         sender
             .pending_mint_locks
             .insert(s!("recipient"), pml.clone());
         sender.media.insert(s!("digest"), vec![7, 8]);
         let payload_json = sender.serialize_backup_payload().unwrap();
 
-        let mut restored = make_test_wallet_with_keys(keys.clone(), false);
+        let mut restored = make_test_wallet_with_keys(keys.clone());
         restored.restore_payload(&payload_json).unwrap();
-        let mut from_snapshot = make_test_wallet_with_keys(keys, false);
+        let mut from_snapshot = make_test_wallet_with_keys(keys);
         from_snapshot
             .restore_from_snapshot(sender.snapshot().unwrap())
             .unwrap();
@@ -1211,10 +1127,10 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn wallet_with_transfer(keys: crate::keys::Keys) -> crate::wallet::Wallet {
         use crate::utils::MemStock;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_keys;
+        use crate::wallet::offline::test_wallet::make_test_wallet_with_keys;
         use crate::wallet::online::TransferArtifacts;
 
-        let mut wallet = make_test_wallet_with_keys(keys, false);
+        let mut wallet = make_test_wallet_with_keys(keys);
         *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
         seed_acknowledged_transfer(
             &mut wallet,
@@ -1238,9 +1154,9 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn backup_payload_of(keys: crate::wallet::SinglesigKeys) -> WalletBackupPayload {
         use crate::utils::MemStock;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_with_singlesig_keys;
+        use crate::wallet::offline::test_wallet::make_test_wallet_with_singlesig_keys;
 
-        let source = make_test_wallet_with_singlesig_keys(keys, false);
+        let source = make_test_wallet_with_singlesig_keys(keys);
         *source.rgb_stock.borrow_mut() = Some(MemStock::default());
         serde_json::from_slice(&source.serialize_backup_payload().unwrap()).unwrap()
     }
@@ -1414,11 +1330,10 @@ mod tests {
         store: &MemKvStore,
     ) -> crate::wallet::Wallet {
         use crate::utils::MemStock;
-        use crate::wallet::offline::address_reuse_tests::make_test_wallet_on_network;
+        use crate::wallet::offline::test_wallet::make_test_wallet_on_network;
 
         let mut wallet = make_test_wallet_on_network(
             crate::wallet::SinglesigKeys::from_keys(keys, None),
-            false,
             network,
         );
         *wallet.rgb_stock.borrow_mut() = Some(MemStock::default());
