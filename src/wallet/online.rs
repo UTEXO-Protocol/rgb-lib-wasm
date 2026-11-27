@@ -621,8 +621,78 @@ impl From<RejectListLocation> for RejectListSource {
     }
 }
 
+/// The reject and allow opouts of a reject list.
+type RejectList = (HashSet<Opout>, HashSet<Opout>);
+
 /// The reject and allow opouts of each reject list fetched by an operation.
-type RejectLists = HashMap<RejectListSource, (HashSet<Opout>, HashSet<Opout>)>;
+type RejectLists = HashMap<RejectListSource, RejectList>;
+
+/// Parse a URL list: one opout per line, `!` marks an allow, the last line for an opout wins.
+/// Trim lines, skip empty ones, and count invalid ones.
+fn parse_reject_list(list: &str) -> (RejectList, usize) {
+    let mut opout_map = HashMap::new();
+    let mut invalid = 0;
+    for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
+        match Opout::from_str(opout_str) {
+            Ok(opout) => {
+                opout_map.insert(opout, is_allow);
+            }
+            Err(_) => invalid += 1,
+        }
+    }
+    let (mut reject, mut allow) = (HashSet::new(), HashSet::new());
+    for (opout, allowed) in opout_map {
+        if allowed {
+            allow.insert(opout);
+        } else {
+            reject.insert(opout);
+        }
+    }
+    ((reject, allow), invalid)
+}
+
+/// The latest finalized entry for an opout decides it.
+/// A pending reject also rejects it.
+/// A pending allow does not count until final, as a reorg can drop or reorder it.
+fn reject_list_from_evm(list: &EvmRejectList) -> Result<RejectList, Error> {
+    if list.finalized > list.entries.len() {
+        return Err(Error::InvalidRejectList {
+            details: format!(
+                "{} finalized entries reported out of {}",
+                list.finalized,
+                list.entries.len()
+            ),
+        });
+    }
+    let entries = list
+        .entries
+        .iter()
+        .map(|e| {
+            Opout::from_str(&e.opout)
+                .map(|opout| (opout, e.reject))
+                .map_err(|_| Error::InvalidRejectList {
+                    details: format!("invalid opout {}", e.opout),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (finalized, pending) = entries.split_at(list.finalized);
+    let finalized = finalized.iter().copied().collect::<HashMap<_, _>>();
+    let mut reject = pending
+        .iter()
+        .filter(|(_, reject)| *reject)
+        .map(|(opout, _)| *opout)
+        .collect::<HashSet<_>>();
+    let mut allow = HashSet::new();
+    for (opout, rejected) in finalized {
+        if rejected {
+            reject.insert(opout);
+        } else if !reject.contains(&opout) {
+            allow.insert(opout);
+        }
+    }
+    Ok((reject, allow))
+}
 
 /// Return where the reject list of the asset is published, if any.
 /// The genesis is already validated, so an invalid global is an internal error.
@@ -4877,52 +4947,28 @@ impl Wallet {
         Ok(true)
     }
 
-    async fn _get_reject_list_async(
-        &self,
-        source: &RejectListSource,
-    ) -> Result<(HashSet<Opout>, HashSet<Opout>), Error> {
-        let reject_list_url = match source {
-            RejectListSource::Url(url) => url,
+    async fn _get_reject_list_async(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        let (reject_list, invalid) = match source {
+            RejectListSource::Url(url) => parse_reject_list(
+                &crate::abort::race(RejectListClient::new(url)?.get_reject_list()).await?,
+            ),
             RejectListSource::Evm(EvmContract { chain_id, address }) => {
                 let evm_client = self._evm_client(*chain_id).ok_or(Error::NoEvmRpcUrl {
                     chain_id: *chain_id,
                 })?;
-                return Ok(evm_client.reject_list_entries(address).await?.decisions());
+                (
+                    reject_list_from_evm(&evm_client.reject_list_entries(address).await?)?,
+                    0,
+                )
             }
         };
-        let list =
-            crate::abort::race(RejectListClient::new(reject_list_url)?.get_reject_list()).await?;
-        // trim each line and skip empty ones, count the invalid ones and warn once
-        let mut opout_map = HashMap::new();
-        let mut invalid = 0;
-        for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
-            match Opout::from_str(opout_str) {
-                Ok(opout) => {
-                    opout_map.insert(opout, is_allow);
-                }
-                Err(_) => invalid += 1,
-            }
-        }
         if invalid > 0 {
             warn!(
                 self.logger,
                 "Ignoring {invalid} invalid opout(s) in reject list"
             );
         }
-        let (allow_opouts, reject_opouts) = opout_map.into_iter().fold(
-            (HashSet::new(), HashSet::new()),
-            |(mut allow, mut reject), (o, allowed)| {
-                if allowed {
-                    allow.insert(o);
-                } else {
-                    reject.insert(o);
-                }
-                (allow, reject)
-            },
-        );
-
-        Ok((reject_opouts, allow_opouts))
+        Ok(reject_list)
     }
 
     /// The canonical ACK/NACK content message digest used both when signing (recipient) and
@@ -17201,20 +17247,86 @@ mod bfa_tests {
         use crate::api::evm::tests::{block_on, test_opout};
         use crate::wallet::offline::test_wallet::make_test_wallet;
 
-        // lines are trimmed, empty lines are skipped and invalid lines are ignored
         let mut server = mockito::Server::new();
         let body = format!(
-            "  {}\r\n\n\t!{} \nnot an opout\n# comment\n",
+            "  {0}\r\n\n  \n\t!{1} \nnot an opout\n# comment\n{2}\n!{2}\n!{3}\n{3}\n",
             test_opout(1),
-            test_opout(2)
+            test_opout(2),
+            test_opout(3),
+            test_opout(4)
         );
+        assert_eq!(parse_reject_list(&body).1, 2);
         let _mock = server.mock("GET", "/").with_body(body).create();
         let mut wallet = make_test_wallet();
         wallet.online_data = Some(OnlineData::for_test(&server.url()));
         let source = RejectListSource::Url(server.url());
         let (reject, allow) = block_on(wallet._get_reject_list_async(&source)).unwrap();
-        assert_eq!(reject, HashSet::from([test_opout(1)]));
-        assert_eq!(allow, HashSet::from([test_opout(2)]));
+        assert_eq!(reject, HashSet::from([test_opout(1), test_opout(4)]));
+        assert_eq!(allow, HashSet::from([test_opout(2), test_opout(3)]));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn reject_list_from_evm() {
+        use crate::api::evm::EvmRejectListEntry;
+        use crate::api::evm::tests::{test_entry, test_opout};
+
+        let reject_list = |entries: &[(u8, bool)], finalized: usize| {
+            let entries = entries.iter().map(|(b, r)| test_entry(*b, *r)).collect();
+            super::reject_list_from_evm(&EvmRejectList { entries, finalized })
+        };
+        let decisions =
+            |entries: &[(u8, bool)], finalized: usize| reject_list(entries, finalized).unwrap();
+        let set = |bytes: &[u8]| bytes.iter().map(|b| test_opout(*b)).collect::<HashSet<_>>();
+
+        // the latest finalized entry wins
+        let (reject, allow) = decisions(&[(1, true), (2, false), (3, false), (3, true)], 4);
+        assert_eq!(reject, set(&[1, 3]));
+        assert_eq!(allow, set(&[2]));
+
+        // a non-finalized reject counts at once
+        let (reject, allow) = decisions(&[(2, false), (1, true), (2, true)], 1);
+        assert_eq!(reject, set(&[1, 2]));
+        assert!(allow.is_empty());
+
+        // a non-finalized allow does not count
+        let (reject, allow) = decisions(&[(1, true), (2, false), (1, false)], 1);
+        assert_eq!(reject, set(&[1]));
+        assert!(allow.is_empty());
+
+        // a non-finalized reject counts even if a later non-finalized allow replaces it
+        let entries = [(1, false), (1, true), (1, false), (2, true), (2, false)];
+        let (reject, allow) = decisions(&entries, 1);
+        assert_eq!(reject, set(&[1, 2]));
+        assert!(allow.is_empty());
+
+        // when all entries are finalized, the latest entry wins
+        let (reject, allow) = decisions(&entries, 5);
+        assert!(reject.is_empty());
+        assert_eq!(allow, set(&[1, 2]));
+
+        assert!(matches!(
+            reject_list(&[(1, true)], 2),
+            Err(Error::InvalidRejectList { .. })
+        ));
+
+        let err = super::reject_list_from_evm(&EvmRejectList {
+            entries: vec![EvmRejectListEntry {
+                opout: s!("not an opout"),
+                reject: true,
+            }],
+            finalized: 1,
+        })
+        .unwrap_err();
+        // the forms JS receives: the thrown message and the serialized refresh failure
+        assert_eq!(
+            err.to_string(),
+            "Invalid reject list: invalid opout not an opout"
+        );
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            serde_json::json!({"InvalidRejectList": {"details": "invalid opout not an opout"}})
+        );
     }
 
     #[test]

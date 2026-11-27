@@ -258,7 +258,7 @@ use crate::utils::{check_psbt_parsable, strip_rgb_data};
 #[cfg(feature = "esplora")]
 use crate::{
     api::{
-        evm::{EvmClient, MintClaimResolver, MintLockStatus},
+        evm::{EvmClient, EvmRejectList, MintClaimResolver, MintLockStatus},
         proxy_v1::{
             AckTransferData, CONSIGNMENT_GONE_CODES, GetAckResponse, GetConsignmentResponse,
             INVOICE_UNKNOWN_CODES, InvoiceStatus, JsonRpcError, JsonRpcResponse, PostAckResponse,
