@@ -264,11 +264,23 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 3600
         run: 'wasm-pack test --headless --firefox --release --lib -- test_mint::'
 
+      # It replays the chain of the release fixtures, so it needs the stack before any other test
+      - name: Run released wallet tests
+        if: matrix.group == 'receive-check'
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_released:: --include-ignored'
+
       - name: Run receive check tests
         if: matrix.group == 'receive-check'
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_send::'
+      - name: Run invoice reuse tests
+        if: matrix.group == 'receive-check'
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_invoice_reuse::'
       - name: Run import tests
         if: matrix.group == 'lib'
         env:
