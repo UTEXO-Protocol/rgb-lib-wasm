@@ -4,6 +4,7 @@ use wasm_bindgen_test::*;
 use super::test_bfa::utils::*;
 use super::test_bfa::*;
 use super::test_send::{ResetMocks, serve_media, test_media, validations, witness_ord};
+use crate::database::memory_db::{ActiveValue, DbTransferActMod};
 use crate::no_wallet::{
     BundleFilter, Invoice, RgbBridgeLocationInfo, RgbEvmContractInfo, TransitionGlobal,
     TransitionMetadata, inspect_consignment,
@@ -154,6 +155,89 @@ async fn mint(
         receive.recipient_id,
         OpId::from_str(&res.details.opid).unwrap(),
     )
+}
+
+/// Two mints to a reusable blind invoice with quota 2 both settle.
+#[wasm_bindgen_test]
+async fn bfa_mint_reused_invoice() {
+    let (mut a, a_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 5).await;
+    let (mut b, b_online) = funded_wallet(wallet_data(vec![AssetSchema::Bfa]), 3).await;
+    let bridge = new_evm_address();
+    deploy_bridge(&bridge).await;
+    // a mint right per mint, plus the last one that cannot be spent
+    let asset_id = a
+        .issue_asset_bfa(
+            s("BFA"),
+            s("Bridged"),
+            0,
+            3,
+            CHAIN_ID,
+            s(&bridge),
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap()
+        .asset_id;
+
+    let receive = b
+        .blind_receive(
+            Some(b_online.clone()),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+            None,
+            Some(2),
+        )
+        .await
+        .unwrap();
+    register_receive(&receive, Encryption::Required);
+    let res_1 = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    let res_2 = mint_begin(
+        &mut a,
+        &a_online,
+        &asset_id,
+        mint_recipient(&receive, MINT_AMOUNT),
+    )
+    .await
+    .unwrap();
+    assert_ne!(res_1.details.opid, res_2.details.opid);
+
+    // the recipient checks each mint on its own
+    refresh(&mut b, &b_online).await;
+    let mut opids: Vec<String> = b
+        .get_received_mint(receive.recipient_id.clone())
+        .unwrap()
+        .into_iter()
+        .map(|m| m.opid)
+        .collect();
+    opids.sort();
+    let mut expected = vec![res_1.details.opid.clone(), res_2.details.opid.clone()];
+    expected.sort();
+    assert_eq!(opids, expected);
+
+    // both mints complete once their locks are final
+    lock_mint(&bridge, &res_1, MINT_AMOUNT).await;
+    lock_mint(&bridge, &res_2, MINT_AMOUNT).await;
+    refresh(&mut b, &b_online).await;
+    for res in [&res_1, &res_2] {
+        mint_end(&mut a, &a_online, res).await.unwrap();
+    }
+    settle_both(&mut a, &a_online, &mut b, &b_online).await;
+    assert_eq!(
+        b.get_asset_balance(asset_id).unwrap().settled,
+        MINT_AMOUNT * 2
+    );
 }
 
 #[wasm_bindgen_test]
@@ -308,7 +392,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     b.backup("pw").unwrap();
     assert!(!b.backup_info().unwrap());
@@ -318,7 +402,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     let received = b
         .get_received_mint(receive.recipient_id.clone())
         .unwrap()
-        .unwrap();
+        .remove(0);
     // the check keeps the transfer waiting and marks a backup as required
     assert_eq!(
         transfer_status(&mut b, &receive.recipient_id),
@@ -466,7 +550,7 @@ async fn bfa_mint_settles_and_is_spendable() {
     // the details stay after the settlement and in a restored wallet
     assert_eq!(
         b.get_received_mint(receive.recipient_id.clone()).unwrap(),
-        Some(received.clone())
+        vec![received.clone()]
     );
     let backup = b.backup("password").unwrap();
     let mut restored = Wallet::new(wd, keys).unwrap();
@@ -475,7 +559,7 @@ async fn bfa_mint_settles_and_is_spendable() {
         restored
             .get_received_mint(receive.recipient_id.clone())
             .unwrap(),
-        Some(received)
+        vec![received]
     );
 
     // the minted units are spendable
@@ -913,7 +997,7 @@ async fn bfa_mint_receiver_checks() {
         transfer_status(&mut b, &rcv.recipient_id),
         TransferStatus::Failed
     );
-    assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_none());
+    assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_empty());
     assert_eq!(rpc_count("ack.post"), 0);
 
     // a mint keeping part of the amount minted is refused before the lock, with no NACK
@@ -936,7 +1020,7 @@ async fn bfa_mint_receiver_checks() {
         transfer_status(&mut b, &rcv.recipient_id),
         TransferStatus::Failed
     );
-    assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_none());
+    assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_empty());
     assert_eq!(rpc_count("ack.post"), 0);
     clear_rpc_hooks();
 
@@ -989,7 +1073,7 @@ async fn bfa_mint_receiver_checks() {
     assert!(
         b.get_received_mint(rcv.recipient_id.clone())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     let b_online = b
         .go_online(OnlineOptions {
@@ -1002,7 +1086,7 @@ async fn bfa_mint_receiver_checks() {
     assert_eq!(
         b.get_received_mint(rcv.recipient_id.clone())
             .unwrap()
-            .unwrap()
+            .remove(0)
             .amount,
         MINT_AMOUNT
     );
@@ -1063,7 +1147,7 @@ async fn bfa_mint_past_u64_on_utxo_refused() {
     assert!(
         b.get_received_mint(rcv.recipient_id.clone())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert_eq!(
         b.get_asset_balance(asset_id.clone()).unwrap().settled,
@@ -1098,7 +1182,8 @@ async fn begin_checked_mint(
         receiver
             .get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_some()
+            .len()
+            == 1
     );
     (res, receive)
 }
@@ -1455,7 +1540,7 @@ async fn bfa_mint_before_block_too_far() {
     assert_eq!(
         b.get_received_mint(receive.recipient_id)
             .unwrap()
-            .unwrap()
+            .remove(0)
             .before_block,
         before_block
     );
@@ -1485,7 +1570,8 @@ async fn bfa_mint_before_block_too_far() {
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_some()
+            .len()
+            == 1
     );
     finalize_evm().await;
     mint_end(&mut a, &a_online, &res).await.unwrap();
@@ -1628,7 +1714,8 @@ async fn bfa_mint_reject_list_not_repeated() {
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_some()
+            .len()
+            == 1
     );
     finalize_evm().await;
     mint_end(&mut a, &a_online, &res).await.unwrap();
@@ -1675,7 +1762,7 @@ async fn bfa_mint_never_failed_by_clock() {
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert!(
         !b.fail_transfers(b_online.clone(), None, false, false)
@@ -1685,7 +1772,8 @@ async fn bfa_mint_never_failed_by_clock() {
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_some()
+            .len()
+            == 1
     );
     assert_eq!(
         transfer_status(&mut b, &receive.recipient_id),
@@ -1741,7 +1829,7 @@ async fn bfa_mint_never_failed_by_clock() {
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     let result = b
         .fail_transfers(
@@ -1758,7 +1846,8 @@ async fn bfa_mint_never_failed_by_clock() {
     assert!(
         b.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_some()
+            .len()
+            == 1
     );
     let copy = Wallet::restore(b.get_wallet_data(), b.get_keys())
         .await
@@ -1766,7 +1855,8 @@ async fn bfa_mint_never_failed_by_clock() {
     assert!(
         copy.get_received_mint(receive.recipient_id.clone())
             .unwrap()
-            .is_some()
+            .len()
+            == 1
     );
     assert_eq!(
         transfer_status(&mut b, &receive.recipient_id),
@@ -1867,18 +1957,14 @@ async fn bfa_mint_is_atomic() {
     assert!(
         b.get_received_mint(rcv.recipient_id.clone())
             .unwrap()
-            .is_none()
+            .is_empty()
     );
     assert_eq!(b.media, HashMap::from([old.clone()]));
     b.refresh(b_online.clone(), None, vec![], false)
         .await
         .unwrap();
     clear_rpc_hooks();
-    assert!(
-        b.get_received_mint(rcv.recipient_id.clone())
-            .unwrap()
-            .is_some()
-    );
+    assert!(b.get_received_mint(rcv.recipient_id.clone()).unwrap().len() == 1);
     let stored = (hex::encode(sha256_digest(b"media")), b"media".to_vec());
     assert_eq!(b.media, HashMap::from([old, stored]));
     lock_mint(&bridge, &res, MINT_AMOUNT).await;
@@ -1893,6 +1979,17 @@ async fn bfa_mint_retry_looks_up_lock() {
     let (mut a, a_online, mut b, b_online, bridge, asset_id) =
         minter_and_receiver(2, 1, None).await;
     let rcv = mint_rcv(&mut b, &b_online).await;
+    let key = "mint_dir".to_string();
+    let mut transfer: DbTransferActMod = b
+        .database
+        .iter_transfers()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.recipient_id.as_ref() == Some(&rcv.recipient_id))
+        .unwrap()
+        .into();
+    transfer.receive_dir = ActiveValue::Set(Some(key.clone()));
+    b.database.update_transfer(&mut transfer).unwrap();
     let res = mint_begin(
         &mut a,
         &a_online,
@@ -1914,10 +2011,9 @@ async fn bfa_mint_retry_looks_up_lock() {
     let v0 = validations();
     refresh(&mut b, &b_online).await;
     assert_eq!(received(&b), sent);
-    assert!(
-        b.get_received_mint(rcv.recipient_id.clone())
-            .unwrap()
-            .is_some()
+    assert_eq!(
+        b.get_received_mint(rcv.recipient_id.clone()).unwrap().len(),
+        1
     );
     assert_eq!(
         transfer_status(&mut b, &rcv.recipient_id),
@@ -1929,15 +2025,13 @@ async fn bfa_mint_retry_looks_up_lock() {
             .await
             .unwrap()
             .pending_mint_locks
-            .contains_key(&rcv.recipient_id)
+            .contains_key(&key)
     );
 
     // a saved entry for other consignment bytes is not used: the consignment is validated again
-    let digest = b.pending_mint_locks[&rcv.recipient_id]
-        .consignment_digest
-        .clone();
+    let digest = b.pending_mint_locks[&key].consignment_digest.clone();
     b.pending_mint_locks
-        .get_mut(&rcv.recipient_id)
+        .get_mut(&key)
         .unwrap()
         .consignment_digest = "00".repeat(32);
     // bytes the wallet did not check give no consignment
@@ -1948,10 +2042,7 @@ async fn bfa_mint_retry_looks_up_lock() {
         transfer_status(&mut b, &rcv.recipient_id),
         TransferStatus::WaitingCounterparty
     );
-    assert_eq!(
-        b.pending_mint_locks[&rcv.recipient_id].consignment_digest,
-        digest
-    );
+    assert_eq!(b.pending_mint_locks[&key].consignment_digest, digest);
 
     // until its lock is finalized, a refresh only looks the lock up
     refresh(&mut b, &b_online).await;
@@ -1991,10 +2082,7 @@ async fn bfa_mint_retry_looks_up_lock() {
     );
 
     // settlement uses the validated copy: it validates nothing and needs no EVM RPC URL
-    assert!(
-        b.received_valid_consignments
-            .contains_key(&rcv.recipient_id)
-    );
+    assert!(b.received_valid_consignments.contains_key(&key));
     let no_evm = b.go_online(go_online_options(false)).await.unwrap();
     let statuses = settle_both(&mut a, &a_online, &mut b, &no_evm).await;
     assert_eq!(statuses.last(), Some(&TransferStatus::Settled));
@@ -2088,7 +2176,11 @@ async fn bfa_mint_media_mismatch_not_imported() {
             TransferStatus::WaitingCounterparty
         );
         assert!(b.database.check_asset_exists(asset_id.clone()).is_err());
-        assert!(!b.received_mints.contains_key(&rcv.recipient_id));
+        assert!(
+            b.get_received_mint(rcv.recipient_id.clone())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     serve_media("media");
@@ -2232,7 +2324,7 @@ async fn bfa_mint_invoice_restrictions() {
         transfer_status(&mut b, &rcv.recipient_id),
         TransferStatus::Failed
     );
-    assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_none());
+    assert!(b.get_received_mint(rcv.recipient_id).unwrap().is_empty());
 
     // a mint that keeps the rules passes the receive checks
     let rcv = blind_rcv(
@@ -2259,7 +2351,7 @@ async fn bfa_mint_invoice_restrictions() {
     assert_eq!(
         b.get_received_mint(rcv.recipient_id)
             .unwrap()
-            .unwrap()
+            .remove(0)
             .amount,
         MINT_AMOUNT
     );

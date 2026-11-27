@@ -130,6 +130,27 @@ pub async fn mine_blocks(n: u32) -> u64 {
     panic!("esplora mempool did not drain");
 }
 
+/// Submit raw blocks to the node and return its height.
+#[allow(dead_code)]
+pub async fn submit_blocks(blocks: &[&str]) -> u64 {
+    let client = reqwest::Client::new();
+    let mut height = 0;
+    // a request stays under the body limit of the helper
+    for chunk in blocks.chunks(50) {
+        let resp: HeightResponse = client
+            .post(format!("{}/submit-blocks", REGTEST_HELPER_URL))
+            .json(&serde_json::json!({ "blocks": chunk }))
+            .send()
+            .await
+            .expect("submit request failed")
+            .json()
+            .await
+            .expect("submit response parse failed");
+        height = resp.height;
+    }
+    height
+}
+
 pub async fn fund_address(addr: &str, amount: &str) -> String {
     let client = reqwest::Client::new();
     let resp: FundResponse = client
@@ -252,6 +273,7 @@ pub async fn witness_rcv_enc(
             endpoints,
             1,
             encryption,
+            None,
         )
         .await?;
     register_receive(&data, encryption.unwrap_or(Encryption::Required));
@@ -292,6 +314,7 @@ pub async fn blind_rcv_enc(
             endpoints,
             1,
             encryption,
+            None,
         )
         .await?;
     register_receive(&data, encryption.unwrap_or(Encryption::Required));
