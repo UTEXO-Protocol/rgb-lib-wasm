@@ -39,6 +39,8 @@ fn test_wallet_data(
         max_allocations_per_utxo: 5,
         supported_schemas: schemas,
         allow_reckless_schemas: false,
+        address_reuse_vanilla: false,
+        address_reuse_colored_auto: false,
     };
     (wd, SinglesigKeys::from_keys(keys, None))
 }
@@ -981,6 +983,7 @@ async fn test_failed_save_of_an_async_call_is_an_error() {
             default_rcv_expiration(),
             vec![transport_endpoint()],
             1,
+            None,
             None,
             None,
         )

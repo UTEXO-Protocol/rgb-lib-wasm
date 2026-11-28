@@ -29,6 +29,8 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKeys) {
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
             allow_reckless_schemas: false,
+            address_reuse_vanilla: false,
+            address_reuse_colored_auto: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )
@@ -50,6 +52,8 @@ fn test_wallet_new_watch_only() {
         max_allocations_per_utxo: 5,
         supported_schemas: vec![AssetSchema::Nia],
         allow_reckless_schemas: false,
+        address_reuse_vanilla: false,
+        address_reuse_colored_auto: false,
     };
     let keys = SinglesigKeys::from_keys_no_mnemonic(&keys, None);
     assert!(Wallet::new(wd, keys).is_ok());
@@ -65,6 +69,8 @@ fn test_wallet_new_fingerprint_mismatch() {
         max_allocations_per_utxo: 5,
         supported_schemas: vec![AssetSchema::Nia],
         allow_reckless_schemas: false,
+        address_reuse_vanilla: false,
+        address_reuse_colored_auto: false,
     };
     let keys = SinglesigKeys {
         master_fingerprint: "deadbeef".to_string(),
@@ -168,6 +174,7 @@ async fn test_receive_and_transfers() {
             1,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -207,6 +214,7 @@ async fn test_receive_and_transfers() {
             1,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -236,6 +244,7 @@ async fn test_receive_and_transfers() {
             rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
             None,
             None,
         )
@@ -357,6 +366,7 @@ async fn test_errors_and_backup() {
             rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
             None,
             None,
         )
@@ -538,6 +548,7 @@ async fn witness_receive_on(wallet: &mut Wallet) -> String {
             rcv_expiration(),
             vec![transport_endpoint(PROXY_URL)],
             1,
+            None,
             None,
             None,
         )
@@ -735,6 +746,8 @@ fn config_data(name: &str, bitcoin_network: BitcoinNetwork) -> WalletData {
         max_allocations_per_utxo: 5,
         supported_schemas: vec![Nia],
         allow_reckless_schemas: false,
+        address_reuse_vanilla: false,
+        address_reuse_colored_auto: false,
     }
 }
 
@@ -768,6 +781,8 @@ async fn config_load_success() {
         max_allocations_per_utxo: 1,
         supported_schemas: vec![Nia, Ifa],
         allow_reckless_schemas: true,
+        address_reuse_vanilla: true,
+        address_reuse_colored_auto: true,
         ..config_data("load", Signet)
     };
     let sk = SinglesigKeys::from_keys(&keys, Some(2));

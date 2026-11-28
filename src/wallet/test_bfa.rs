@@ -37,6 +37,8 @@ pub(super) fn wallet_data(schemas: Vec<AssetSchema>) -> (WalletData, SinglesigKe
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
             allow_reckless_schemas: false,
+            address_reuse_vanilla: false,
+            address_reuse_colored_auto: false,
         },
         SinglesigKeys::from_keys(&keys, None),
     )

@@ -6,9 +6,10 @@ use super::test_bfa::utils::*;
 use super::test_bfa::{settle_both, wallet_data};
 use super::test_send::{begin_map, issue, nia_wallet};
 use crate::api::proxy_v1::ProxyClient;
+use crate::no_wallet::script_buf_from_recipient_id;
 use crate::utils::now;
 use crate::wallet::{Recipient, Wallet, WitnessData};
-use crate::{AssetSchema, Assignment, TransferStatus};
+use crate::{AssetSchema, Assignment, BdkAddress, BdkNetwork, TransferStatus};
 
 /// Replace the chain of a fresh stack with the one the fixtures were written on.
 async fn replay_fixture_chain() {
@@ -114,6 +115,19 @@ async fn released_pending_receives_complete() {
                 pending_recipient(&r, rids[0], ids[0], None, 50).await,
                 pending_recipient(&r, rids[1], ids[1], witness_data, 30).await,
             ];
+            // Read the released transfers before a new receive shares a recipient ID.
+            let released = rids.map(|rid| transfer_of(&r, rid));
+            // In the backup, a new receive reuses the address of the released witness receive.
+            if name == "backup" {
+                let script = script_buf_from_recipient_id(rids[1].to_string());
+                let script = script.unwrap().unwrap();
+                let address = BdkAddress::from_script(&script, BdkNetwork::Regtest).unwrap();
+                witness_rcv_at(&mut r, &r_on, Some(address.to_string()))
+                    .await
+                    .unwrap();
+                let marked = r.database.get_transfer(released[1].idx).unwrap().unwrap();
+                assert_eq!(marked.receive_dir.as_deref(), Some(rids[1]));
+            }
             let map = HashMap::from([(asset_id.clone(), recipients)]);
             let psbt = begin_map(&mut s, &s_on, map, false).await.unwrap();
             let signed = s.sign_psbt(psbt, None).unwrap();
@@ -121,8 +135,8 @@ async fn released_pending_receives_complete() {
             settle_both(&mut s, &s_on, &mut r, &r_on).await;
 
             assert_eq!(r.get_asset_balance(asset_id.clone()).unwrap().settled, 80);
-            for rid in rids {
-                let received = transfer_of(&r, rid);
+            for (rid, released) in rids.into_iter().zip(released) {
+                let received = transfer_at(&r, released.batch_transfer_idx);
                 assert_eq!(received.status, TransferStatus::Settled);
                 let consignment = r.get_consignment(received.idx).unwrap();
                 assert!(consignment.is_some());

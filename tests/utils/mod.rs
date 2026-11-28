@@ -274,6 +274,7 @@ pub async fn witness_rcv_enc(
             1,
             encryption,
             None,
+            None,
         )
         .await?;
     register_receive(&data, encryption.unwrap_or(Encryption::Required));
@@ -720,4 +721,54 @@ pub fn reject_list_fetches(url: &str) -> u32 {
     .unwrap()
     .as_f64()
     .unwrap() as u32
+}
+
+/// A witness receive that reuses `address` when given. It registers nothing.
+#[allow(dead_code)]
+pub async fn witness_rcv_at(
+    wallet: &mut Wallet,
+    online: &Online,
+    address: Option<String>,
+) -> Result<ReceiveData, Error> {
+    wallet
+        .witness_receive(
+            Some(online.clone()),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![transport_endpoint(PROXY_URL)],
+            1,
+            None,
+            None,
+            address,
+        )
+        .await
+}
+
+/// A witness recipient built from its own receive data.
+#[allow(dead_code)]
+pub fn recipient_for(data: &ReceiveData, amount: u64, sat: u64) -> Recipient {
+    Recipient {
+        recipient_id: data.recipient_id.clone(),
+        witness_data: Some(WitnessData {
+            amount_sat: sat,
+            blinding: None,
+        }),
+        assignment: Assignment::Fungible(amount),
+        transport_endpoints: vec![transport_endpoint(PROXY_URL)],
+        public_key: Some(data.public_key.clone()),
+        encryption: Encryption::Required,
+        expiration_timestamp: Some(data.expiration_timestamp),
+    }
+}
+
+/// The transfer of the batch `batch_transfer_idx`.
+#[allow(dead_code)]
+pub fn transfer_at(wallet: &Wallet, batch_transfer_idx: i32) -> Transfer {
+    wallet
+        .list_transfers(AssetFilter::AnyOrNone, TransferScope::All)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.batch_transfer_idx == batch_transfer_idx)
+        .unwrap()
 }
