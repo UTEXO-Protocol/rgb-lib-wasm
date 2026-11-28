@@ -85,6 +85,13 @@ pub enum Error {
     #[error("An asset cannot be linked to itself")]
     CannotLinkToItself,
 
+    /// The address passed to a witness receive cannot be reused
+    #[error("Cannot reuse address: {details}")]
+    CannotReuseAddress {
+        /// Error details
+        details: String,
+    },
+
     /// The schema cannot be used on mainnet, unless `allow_reckless_schemas` is set (see `WalletData`)
     #[error("Cannot use {asset_schema} schema on mainnet")]
     CannotUseSchemaOnMainnet {
@@ -839,6 +846,13 @@ pub enum Error {
     UnknownTransfer {
         /// Transfer TXID
         txid: String,
+    },
+
+    /// Address reuse is not supported in the requested context
+    #[error("Address reuse is not supported: {details}")]
+    UnsupportedAddressReuse {
+        /// Error details
+        details: String,
     },
 
     /// The backup version is not supported

@@ -1160,7 +1160,7 @@ pub(crate) struct ProxyReceiveData {
 pub(crate) struct WatchedWitnessScript {
     /// whether a receive that it pays is pending
     pub(crate) pending: bool,
-    /// whether more than one transfer can pay it (reusable invoice)
+    /// whether more than one transfer can pay it (reusable invoice or reused address)
     pub(crate) shared: bool,
 }
 
@@ -2020,6 +2020,7 @@ impl Wallet {
         addresses: &Vec<ScriptBuf>,
         size: u32,
         fee_rate: FeeRate,
+        change: Option<ScriptBuf>,
     ) -> Result<Psbt, bdk_wallet::error::CreateTxError> {
         let mut tx_builder = self.bdk_wallet.build_tx();
         tx_builder
@@ -2029,6 +2030,9 @@ impl Wallet {
             .fee_rate(fee_rate);
         for address in addresses {
             tx_builder.add_recipient(address.clone(), BdkAmount::from_sat(size as u64));
+        }
+        if let Some(change) = change {
+            tx_builder.drain_to(change);
         }
         let mut psbt = tx_builder.finish()?;
         self.add_non_witness_utxos(&mut psbt);
@@ -2132,7 +2136,7 @@ impl Wallet {
             }
             // Pending witness reconciliation handles a shared script.
             // Its other TXOs can belong to pending transfers.
-            if transfer.invoice_idx.is_none()
+            if transfer.receive_dir.is_none()
                 && let Some(recipient_id) = transfer.recipient_id
                 && let Some(script) = script_buf_from_recipient_id(recipient_id)?
             {
@@ -2163,7 +2167,7 @@ impl Wallet {
                     .failed_witness_receive_grace_secs,
             );
         let db_data = self.database.get_db_data(false)?;
-        // A reusable invoice script is pending if any of its transfers is pending.
+        // A shared script is pending if any of its transfers is pending.
         let mut receives: HashMap<String, WatchedWitnessScript> = HashMap::new();
         // The script of a live reusable invoice is always pending.
         // A later transfer can pay it before its consignment is accepted.
@@ -2221,7 +2225,7 @@ impl Wallet {
                 {
                     let entry = receives.entry(script.to_hex_string()).or_default();
                     entry.pending |= pending;
-                    entry.shared |= transfer.invoice_idx.is_some();
+                    entry.shared |= transfer.receive_dir.is_some();
                     if pending {
                         pending_asset_transfers.insert(transfer.asset_transfer_idx);
                     }
@@ -2677,7 +2681,9 @@ impl Wallet {
         fee_rate: FeeRate,
         lock_time: Option<u32>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
-        let change_addr = self.get_new_address()?.script_pubkey();
+        let change_addr = self
+            .get_output_address(KeychainKind::External)?
+            .script_pubkey();
         let mut builder = self.bdk_wallet.build_tx();
         builder
             .add_data(&[0; 32])
@@ -2701,7 +2707,7 @@ impl Wallet {
         for (script_buf, amount_sat) in witness_recipients {
             builder.add_recipient(script_buf.clone(), BdkAmount::from_sat(*amount_sat));
         }
-        builder.drain_to(change_addr.clone());
+        builder.drain_to(change_addr);
 
         let mut psbt = builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
@@ -2720,16 +2726,12 @@ impl Wallet {
         })?;
         self.add_non_witness_utxos(&mut psbt);
 
-        let btc_change = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.script_pubkey == change_addr)
-            .map(|(i, o)| BtcChange {
-                vout: i as u32,
-                amount: o.value.to_sat(),
-            });
+        // The change is the last output: ordering is untouched. A recipient can pay the same script.
+        let change_vout = witness_recipients.len() + 1;
+        let btc_change = psbt.unsigned_tx.output.get(change_vout).map(|o| BtcChange {
+            vout: change_vout as u32,
+            amount: o.value.to_sat(),
+        });
 
         Ok((psbt, btc_change))
     }
@@ -2885,6 +2887,34 @@ impl Wallet {
         Ok(to_reject)
     }
 
+    /// Register an output of a TX the wallet builds and return its TXO idx.
+    fn register_own_txo(&self, txid: &str, vout: u32, btc_amount: u64) -> Result<i32, Error> {
+        let outpoint = Outpoint {
+            txid: txid.to_string(),
+            vout,
+        };
+        if let Some(txo) = self.database.get_txo(&outpoint)? {
+            // An output of the wallet's own TX never pays a receive.
+            if txo.pending_witness {
+                self.database.update_txo(DbTxoActMod {
+                    idx: ActiveValue::Set(txo.idx),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                })?;
+            }
+            return Ok(txo.idx);
+        }
+        Ok(self.database.set_txo(DbTxoActMod {
+            txid: ActiveValue::Set(txid.to_string()),
+            vout: ActiveValue::Set(vout),
+            btc_amount: ActiveValue::Set(btc_amount.to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(false),
+            pending_witness: ActiveValue::Set(false),
+            ..Default::default()
+        })?)
+    }
+
     fn _save_transfers(
         &self,
         txid: String,
@@ -2924,30 +2954,9 @@ impl Wallet {
             None => None,
         };
 
-        let btc_change_idx = if let Some(btc_change) = btc_change {
-            Some(
-                match self.database.get_txo(&Outpoint {
-                    txid: txid.clone(),
-                    vout: btc_change.vout,
-                })? {
-                    Some(txo) => txo.idx,
-                    None => {
-                        let db_utxo = DbTxoActMod {
-                            txid: ActiveValue::Set(txid.clone()),
-                            vout: ActiveValue::Set(btc_change.vout),
-                            btc_amount: ActiveValue::Set(btc_change.amount.to_string()),
-                            spent: ActiveValue::Set(false),
-                            exists: ActiveValue::Set(false),
-                            pending_witness: ActiveValue::Set(false),
-                            ..Default::default()
-                        };
-                        self.database.set_txo(db_utxo)?
-                    }
-                },
-            )
-        } else {
-            None
-        };
+        let btc_change_idx = btc_change
+            .map(|c| self.register_own_txo(&txid, c.vout, c.amount))
+            .transpose()?;
         let change_idx = |destination: &ChangeDestination| -> Result<i32, Error> {
             Ok(match destination {
                 ChangeDestination::BtcChange => btc_change_idx.ok_or(InternalError::Unexpected)?,
@@ -3659,6 +3668,7 @@ impl Wallet {
 
     /// A new TXO that pays one of `pending_witness_scripts` is flagged only if the receive is pending.
     /// The paid script is then dropped. A shared script stays and flags every new TXO.
+    /// An output the wallet registered for its own TX is never flagged.
     fn update_db_colored_txos_from_bdk(
         &self,
         include_spent: bool,
@@ -3667,9 +3677,21 @@ impl Wallet {
         let db_txos = self.database.iter_txos()?;
 
         let db_outpoints: HashSet<String> = db_txos
-            .into_iter()
+            .iter()
             .filter(|t| t.exists && (include_spent || !t.spent))
             .map(|u| u.outpoint().to_string())
+            .collect();
+        let receive_txo_idxs: HashSet<i32> = self
+            .database
+            .iter_colorings()?
+            .into_iter()
+            .filter(|c| c.r#type == ColoringType::Receive)
+            .map(|c| c.txo_idx)
+            .collect();
+        let own_outpoints: HashSet<String> = db_txos
+            .iter()
+            .filter(|t| !t.exists && !receive_txo_idxs.contains(&t.idx))
+            .map(|t| t.outpoint().to_string())
             .collect();
         let bdk_utxos: Box<dyn Iterator<Item = LocalOutput>> = if include_spent {
             Box::new(self.bdk_wallet.list_output())
@@ -3689,7 +3711,10 @@ impl Wallet {
         for new_utxo in new_utxos.iter().cloned() {
             let mut new_db_utxo: DbTxoActMod = new_utxo.clone().into();
             let script = new_utxo.txout.script_pubkey.to_hex_string();
-            if let Some(pws) = pending_witness_scripts.get(&script) {
+            // The wallet's own outputs never pay a watched script.
+            if !own_outpoints.contains(&new_utxo.outpoint.to_string())
+                && let Some(pws) = pending_witness_scripts.get(&script)
+            {
                 new_db_utxo.pending_witness = ActiveValue::Set(pws.pending);
                 if !pws.shared {
                     self.database.del_pending_witness_script(script)?;
@@ -3740,6 +3765,7 @@ impl Wallet {
 
     async fn _broadcast_tx(&self, tx: BdkTransaction) -> Result<BdkTransaction, Error> {
         crate::abort::check()?;
+        fault_point("broadcast")?;
         let txid = tx.compute_txid().to_string();
         let indexer = self.indexer();
         match crate::abort::write(indexer.broadcast(&tx)).await {
@@ -3869,6 +3895,19 @@ impl Wallet {
     ) -> Result<BdkTransaction, Error> {
         let signed_psbt = Psbt::from_str(&signed_psbt)?;
         self._check_vanilla_end(&signed_psbt, r#type)?;
+        // Register the created UTXOs before broadcast.
+        if r#type == WalletTransactionType::CreateUtxos {
+            let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
+            for (vout, out) in signed_psbt.unsigned_tx.output.iter().enumerate() {
+                if let Some((KeychainKind::External, _)) = self
+                    .bdk_wallet
+                    .spk_index()
+                    .index_of_spk(out.script_pubkey.clone())
+                {
+                    self.register_own_txo(&txid, vout as u32, out.value.to_sat())?;
+                }
+            }
+        }
         let tx = self._broadcast_psbt(signed_psbt).await?;
         let txid = tx.compute_txid().to_string();
         if let Some(existing) = self.database.get_wallet_transaction_by_txid(&txid)? {
@@ -4070,8 +4109,12 @@ impl Wallet {
         };
         let mut addresses = vec![];
         for _i in 0..num_try_creating {
-            addresses.push(self.get_new_address()?.script_pubkey());
+            addresses.push(
+                self.get_output_address(KeychainKind::External)?
+                    .script_pubkey(),
+            );
         }
+        let change = self.vanilla_change()?;
         if exact && !addresses.is_empty() && inputs.is_empty() {
             // BDK needs an input to compute the amount: assume one of the internal keychain
             let output = addresses
@@ -4103,7 +4146,13 @@ impl Wallet {
             });
         }
         while !addresses.is_empty() {
-            match self._create_split_tx(&inputs, &addresses, utxo_size, fee_rate_checked) {
+            match self._create_split_tx(
+                &inputs,
+                &addresses,
+                utxo_size,
+                fee_rate_checked,
+                change.clone(),
+            ) {
                 Ok(psbt) => {
                     if !dry_run {
                         self._record_vanilla_begin(&psbt, WalletTransactionType::CreateUtxos)?;
@@ -5250,7 +5299,7 @@ impl Wallet {
         }
         // A sync can flag a TXO that pays the script of the refused receive.
         // Pending witness reconciliation handles a shared script.
-        if transfer.invoice_idx.is_none() {
+        if transfer.receive_dir.is_none() {
             let scripts = script_buf_from_recipient_id(recipient_id.to_string())?
                 .into_iter()
                 .collect();
@@ -9880,8 +9929,7 @@ impl Wallet {
         let batch_transfer_idx = if info_contents.donation {
             // Broadcast immediately for donations
             let mut runtime = self.rgb_runtime()?;
-            self._broadcast_psbt(psbt).await?;
-            Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
+            // Save before broadcast: the outputs are then the wallet's own.
             let idx = self._update_or_save_transfers(
                 txid.clone(),
                 &asset_infos,
@@ -9889,6 +9937,8 @@ impl Wallet {
                 TransferStatus::WaitingConfirmations,
                 &consignment_hashes,
             )?;
+            self._broadcast_psbt(psbt).await?;
+            Self::_consume_broadcast_fascia(&mut runtime, fascia)?;
             self.keep_only_consignments(&txid);
             idx
         } else {
@@ -10007,11 +10057,15 @@ impl Wallet {
         let mut unspendable = self._get_unspendable_bdk_outpoints()?;
         unspendable.extend(self.get_reserved_vanilla_outpoints()?);
 
+        let change = self.vanilla_change()?;
         let mut tx_builder = self.bdk_wallet.build_tx();
         tx_builder
             .unspendable(unspendable)
             .add_recipient(script_pubkey, BdkAmount::from_sat(amount))
             .fee_rate(fee_rate_checked);
+        if let Some(change) = change {
+            tx_builder.drain_to(change);
+        }
 
         let mut psbt = tx_builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
@@ -10496,6 +10550,15 @@ impl Wallet {
         })?;
         let transfer_info_map = artifacts.asset_infos.clone();
 
+        // Save before broadcast: the outputs are then the wallet's own.
+        let batch_transfer_idx = self._update_or_save_transfers(
+            txid.clone(),
+            &transfer_info_map,
+            &info_contents,
+            TransferStatus::WaitingConfirmations,
+            &HashMap::new(),
+        )?;
+
         // the artifacts stay until the stock has the fascia, so a failed sync can be retried
         let mut runtime = self.rgb_runtime()?;
         let tx = self._broadcast_psbt(psbt).await?;
@@ -10510,14 +10573,6 @@ impl Wallet {
                 ..Default::default()
             },
         );
-
-        let batch_transfer_idx = self._update_or_save_transfers(
-            txid.clone(),
-            &transfer_info_map,
-            &info_contents,
-            TransferStatus::WaitingConfirmations,
-            &HashMap::new(),
-        )?;
 
         let (asset_id, transfer_info) = transfer_info_map.into_iter().next().unwrap();
         // a test BFA mint has no known circulating supply
@@ -10867,12 +10922,7 @@ impl Wallet {
             consignment_bytes.insert(asset_id.clone(), bytes);
         }
 
-        let tx = self._broadcast_psbt(psbt).await?;
-        runtime.consume_fascia(fascia, None)?;
-        runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
-        // Drop runtime so Stock returns to RefCell before auto-save
-        drop(runtime);
-
+        // Save before broadcast: the outputs are then the wallet's own.
         let batch_transfer_idx = match batch_transfer {
             Some(batch_transfer) => {
                 let mut updated: DbBatchTransferActMod = batch_transfer.into();
@@ -10893,6 +10943,11 @@ impl Wallet {
                 &HashMap::new(),
             )?,
         };
+        let tx = self._broadcast_psbt(psbt).await?;
+        runtime.consume_fascia(fascia, None)?;
+        runtime.upsert_witness(RgbTxid::from_str(&txid).unwrap(), WitnessOrd::Tentative)?;
+        // Drop runtime so Stock returns to RefCell before auto-save
+        drop(runtime);
         self.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
@@ -12240,9 +12295,33 @@ mod separate_signer_tests {
                 &vec![recipient],
                 1000,
                 FeeRate::from_sat_per_vb(1).unwrap(),
+                None,
             )
             .unwrap();
         assert_signed(&signer, &psbt);
+    }
+
+    // A recipient that pays the change script is not taken for the bitcoin change.
+    #[test]
+    fn change_found_by_position() {
+        let (mut wallet, _, outpoint) = funded_wallet_and_signer();
+        wallet.wallet_data.address_reuse_colored_auto = true;
+        let script = wallet
+            .get_first_address(KeychainKind::External)
+            .unwrap()
+            .script_pubkey();
+        let (psbt, btc_change) = wallet
+            ._prepare_psbt(
+                HashSet::from([outpoint]),
+                &vec![(script.clone(), 1000)],
+                FeeRate::from_sat_per_vb(1).unwrap(),
+                None,
+            )
+            .unwrap();
+        let outputs = &psbt.unsigned_tx.output;
+        assert_eq!(outputs[1].script_pubkey, script);
+        assert_eq!(outputs[2].script_pubkey, script);
+        assert_eq!(btc_change.unwrap().vout, 2);
     }
 
     #[test]
@@ -13123,6 +13202,248 @@ mod send_end_tests {
         }
     }
 
+    // A wallet reusing its first colored address, with a pending witness receive on it.
+    fn reusing_wallet_with_receive(receive_dir: bool) -> (Wallet, ScriptBuf) {
+        let (mut wallet, _) = setup();
+        wallet.wallet_data.address_reuse_colored_auto = true;
+        let first = wallet.get_first_address(KeychainKind::External).unwrap();
+        let spk = first.script_pubkey();
+        let status = TransferStatus::WaitingCounterparty;
+        let idx = seed_witness_receive(&wallet, &"44".repeat(32), status, None, &spk);
+        if receive_dir {
+            let rid = recipient_id_from_script_buf(spk.clone(), BitcoinNetwork::Regtest);
+            set_receive_dir(&wallet, idx, &rid);
+        }
+        set_pending_witness_scripts(&wallet, &[&spk]);
+        (wallet, spk)
+    }
+
+    fn use_esplora(wallet: &mut Wallet, url: String) -> Online {
+        wallet.online_data = Some(OnlineData::for_test(&url));
+        Online {
+            id: 1,
+            indexer_url: url,
+        }
+    }
+
+    fn txo_at(wallet: &Wallet, txid: &str, vout: u32) -> DbTxo {
+        let txos = wallet.database.iter_txos().unwrap();
+        txos.into_iter()
+            .find(|t| t.txid == txid && t.vout == vout)
+            .unwrap()
+    }
+
+    #[test]
+    fn create_utxos_outputs_never_pay_a_receive() {
+        let (mut wallet, spk) = reusing_wallet_with_receive(false);
+        let url = fake_esplora(|path| match path {
+            "/tx" => ("200 OK", vec![]),
+            _ => ("404 Not Found", vec![]),
+        });
+        let online = use_esplora(&mut wallet, url);
+        let (psbt, txid) = dummy_psbt_to(spk.clone());
+        seed_txo(&wallet, &Txid::from_byte_array([1; 32]).to_string(), 0);
+        expect_registered_at_broadcast(&wallet, &txid, 0);
+        assert_eq!(block_on(wallet.create_utxos_end(online, psbt)), Ok(1));
+        assert_checked_at_broadcast();
+        let txo = txo_at(&wallet, &txid, 0);
+        assert!(txo.exists && !txo.pending_witness);
+        assert!(db_pending_witness_scripts(&wallet).contains(&spk.to_hex_string()));
+    }
+
+    // A sync between a failed end and its retry can flag an own output. The retry clears it.
+    #[test]
+    fn create_utxos_end_retry_keeps_outputs_own() {
+        let (mut wallet, spk) = reusing_wallet_with_receive(true);
+        let (psbt, txid) = dummy_psbt_to(spk.clone());
+        let online = use_esplora(
+            &mut wallet,
+            fake_esplora(esplora_route(Some(raw_tx(&psbt)))),
+        );
+        let parsed = Psbt::from_str(&psbt).unwrap();
+        let input = parsed.unsigned_tx.input[0].previous_output;
+        let input_spk = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let txout = TxOut {
+            value: BdkAmount::from_sat(2000),
+            script_pubkey: input_spk,
+        };
+        wallet.bdk_wallet.insert_txout(input, txout);
+        seed_txo(&wallet, &input.txid.to_string(), input.vout);
+        let create_utxos = WalletTransactionType::CreateUtxos;
+        wallet._record_vanilla_begin(&parsed, create_utxos).unwrap();
+        let fault = "after_broadcast";
+        let res = block_on(assert_no_partial_change(&mut wallet, fault, 1, async |w| {
+            w.create_utxos_end(online.clone(), psbt.clone()).await
+        }));
+        assert_eq!(res, vec![txid.clone()]);
+
+        let scripts = wallet._reconcile_pending_witness().unwrap();
+        wallet
+            .update_db_colored_txos_from_bdk(false, &scripts)
+            .unwrap();
+        let txo = txo_at(&wallet, &txid, 0);
+        assert!(txo.exists && txo.pending_witness);
+
+        assert_eq!(block_on(wallet.create_utxos_end(online, psbt)), Ok(1));
+        let txo = txo_at(&wallet, &txid, 0);
+        assert!(txo.exists && !txo.pending_witness);
+        assert!(db_pending_witness_scripts(&wallet).contains(&spk.to_hex_string()));
+    }
+
+    // A send to oneself on the first colored address, with an earlier receive pending there and a
+    // later one settled. The payment waits for a receive and the change is available.
+    #[test]
+    fn own_change_beside_a_payment_to_a_reused_address() {
+        let (mut wallet, spk) = reusing_wallet_with_receive(true);
+        let earlier = wallet.database.iter_batch_transfers().unwrap()[0].idx;
+        let status = TransferStatus::Settled;
+        let later = seed_witness_receive(&wallet, &"55".repeat(32), status, None, &spk);
+        set_receive_dir(&wallet, later, "later");
+        let txid = apply_tx_paying(&mut wallet, &[spk.clone(), spk.clone()]);
+        let sync = |wallet: &Wallet| {
+            let scripts = wallet._reconcile_pending_witness().unwrap();
+            wallet
+                .update_db_colored_txos_from_bdk(false, &scripts)
+                .unwrap();
+        };
+        // A sync between a failed end and its retry flags the change. The retry clears it.
+        sync(&wallet);
+        assert!(txo_at(&wallet, &txid, 1).pending_witness);
+        let change = BtcChange {
+            vout: 1,
+            amount: 1000,
+        };
+        wallet
+            ._save_transfers(
+                txid.clone(),
+                &BTreeMap::new(),
+                HashMap::new(),
+                Some(change),
+                TransferStatus::WaitingConfirmations,
+                1,
+                None,
+                None,
+                None,
+                None,
+                &HashMap::new(),
+            )
+            .unwrap();
+        sync(&wallet);
+        assert!(txo_at(&wallet, &txid, 0).pending_witness);
+        assert!(!txo_at(&wallet, &txid, 1).pending_witness);
+        let txos = wallet.database.get_unspent_txos(vec![]).unwrap();
+        let unspents = wallet
+            .database
+            .get_rgb_allocations(txos, None, None, None, None);
+        let available = wallet.get_available_allocations(unspents.unwrap(), &[], None);
+        let vouts: Vec<u32> = available
+            .unwrap()
+            .iter()
+            .filter(|u| u.utxo.txid == txid)
+            .map(|u| u.utxo.vout)
+            .collect();
+        assert_eq!(vouts, vec![1]);
+        assert!(db_pending_witness_scripts(&wallet).contains(&spk.to_hex_string()));
+
+        // The payment is released when no receive on the address is pending.
+        fail_receive(&mut wallet, earlier);
+        sync(&wallet);
+        assert!(!txo_at(&wallet, &txid, 0).pending_witness);
+    }
+
+    #[test]
+    fn create_utxos_end_rolls_back_on_failed_broadcast() {
+        let (mut wallet, spk) = reusing_wallet_with_receive(false);
+        let url = fake_esplora(|path| match path {
+            "/tx" => ("500 Internal Server Error", vec![]),
+            p if p.ends_with("/status") => ("200 OK", b"{\"confirmed\":false}".to_vec()),
+            _ => ("404 Not Found", vec![]),
+        });
+        let online = use_esplora(&mut wallet, url);
+        let (psbt, _) = dummy_psbt_to(spk);
+        seed_txo(&wallet, &Txid::from_byte_array([1; 32]).to_string(), 0);
+        let before = wallet.database.iter_txos().unwrap();
+        let res = block_on(wallet.create_utxos_end(online, psbt));
+        assert!(matches!(res, Err(Error::FailedBroadcast { .. })));
+        assert_eq!(wallet.database.iter_txos().unwrap(), before);
+    }
+
+    // A failed batch takes the outputs it registered and that never came to exist.
+    #[test]
+    fn delete_transfers_drops_unbroadcast_outputs() {
+        let (wallet, _) = setup();
+        let txid = "55".repeat(32);
+        seed_batch(&wallet, &txid, TransferStatus::Failed, false, None);
+        let other = seed_batch(
+            &wallet,
+            "66",
+            TransferStatus::WaitingCounterparty,
+            true,
+            None,
+        );
+        let own = wallet.register_own_txo(&txid, 0, 1000).unwrap();
+        let received = wallet.register_own_txo(&txid, 1, 1000).unwrap();
+        let asset_transfer_idx = batch_transfer_row(&wallet, other).asset_transfer_idx;
+        wallet
+            .database
+            .set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(received),
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                r#type: ActiveValue::Set(ColoringType::Receive),
+                assignment: ActiveValue::Set(Assignment::Fungible(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(wallet.delete_transfers(None, false), Ok(true));
+        let left: Vec<i32> = wallet
+            .database
+            .iter_txos()
+            .unwrap()
+            .iter()
+            .map(|t| t.idx)
+            .collect();
+        assert!(!left.contains(&own) && left.contains(&received));
+    }
+
+    // A 1.0.0-beta.6 wallet with `reuse_addresses` gave each witness receive a dir.
+    #[test]
+    fn beta6_reused_address_receives_stay_shared() {
+        let (mut wallet, _) = setup();
+        let spk = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let status = TransferStatus::WaitingCounterparty;
+        let idx = seed_witness_receive(&wallet, &"44".repeat(32), status, None, &spk);
+        let rid = recipient_id_from_script_buf(spk.clone(), BitcoinNetwork::Regtest);
+        let dir = format!("{}_{idx}", wallet.normalize_recipient_id(&rid));
+        set_receive_dir(&wallet, idx, &dir);
+        set_pending_witness_scripts(&wallet, &[&spk]);
+        wallet.received_consignments.insert(dir.clone(), vec![6]);
+        let endpoint = LocalTransportEndpoint {
+            endpoint: ENDPOINT.to_string(),
+            transport_type: TransportType::JsonRpc,
+            used: false,
+            usable: true,
+        };
+        let transfer_idx = batch_transfer_row(&wallet, idx).idx;
+        wallet
+            .save_transfer_transport_endpoint(transfer_idx, &endpoint)
+            .unwrap();
+
+        let scripts = wallet._reconcile_pending_witness().unwrap();
+        assert!(scripts[&spk.to_hex_string()].shared);
+        let transfer = batch_transfer_row(&wallet, idx);
+        let key = wallet.received_key(&wallet.received_consignments, &transfer);
+        assert_eq!(key, dir);
+        assert_eq!(wallet.received_consignments[&key], vec![6]);
+        let to_share = wallet.earlier_witness_receives_to_share(&rid).unwrap();
+        assert!(to_share.is_empty());
+    }
+
     #[test]
     fn vanilla_ends_do_not_sync() {
         for r#type in VANILLA_TYPES {
@@ -13182,6 +13503,7 @@ mod send_end_tests {
     fn vanilla_begin_dry_run_reserves_nothing() {
         use bdk_wallet::bitcoin::{Transaction, TxIn, TxOut};
         let (mut wallet, online) = setup();
+        wallet.wallet_data.address_reuse_vanilla = true;
         let funding_tx = Transaction {
             version: bdk_wallet::bitcoin::transaction::Version::TWO,
             lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
@@ -13200,6 +13522,12 @@ mod send_end_tests {
         wallet.bdk_wallet.apply_unconfirmed_txs([(funding_tx, 1)]);
         let addr = wallet.get_address().unwrap();
         let before = wallet.database.get_backup_info().unwrap();
+        let revealed = |w: &Wallet| {
+            w.bdk_wallet
+                .spk_index()
+                .last_revealed_index(KeychainKind::Internal)
+        };
+        let revealed_before = revealed(&wallet);
         crate::utils::CLOCK_OFFSET.with(|o| o.set(10));
 
         let send =
@@ -13208,13 +13536,30 @@ mod send_end_tests {
             online.clone(),
             false,
             false,
-            Some(1),
+            Some(2),
             None,
             1,
             true,
             true,
         ));
-        for psbt in [send.unwrap(), create.unwrap()] {
+        let (send, create) = (send.unwrap(), create.unwrap());
+        // The change goes to the first vanilla address. The colored outputs stay distinct.
+        let first = wallet
+            .bdk_wallet
+            .peek_address(KeychainKind::Internal, 0)
+            .script_pubkey();
+        let scripts = |psbt: &str| -> Vec<ScriptBuf> {
+            let tx = Psbt::from_str(psbt).unwrap().unsigned_tx;
+            tx.output.into_iter().map(|o| o.script_pubkey).collect()
+        };
+        assert_eq!(scripts(&send), vec![first.clone(); 2]);
+        let (change, colored): (Vec<_>, Vec<_>) =
+            scripts(&create).into_iter().partition(|s| *s == first);
+        assert_eq!(change.len(), 1);
+        assert_eq!(colored.len(), 2);
+        assert_ne!(colored[0], colored[1]);
+        assert_eq!(revealed(&wallet), revealed_before);
+        for psbt in [send, create] {
             let txid = Psbt::from_str(&psbt).unwrap().unsigned_tx.compute_txid();
             let row = wallet
                 .database
@@ -13547,6 +13892,74 @@ mod send_end_tests {
             assert_eq!(status(&wallet, idx), st);
             assert!(wallet.transfer_artifacts.contains_key(&txid));
         }
+    }
+
+    // The output of `txid` is in the DB when the broadcast starts.
+    fn expect_registered_at_broadcast(wallet: &Wallet, txid: &str, vout: u32) {
+        let outpoint = Outpoint {
+            txid: txid.to_string(),
+            vout,
+        };
+        let database = wallet.database.clone();
+        let check = move || assert!(database.get_txo(&outpoint).unwrap().is_some());
+        crate::utils::CHECK_AT.with_borrow_mut(|c| *c = Some(("broadcast", Box::new(check))));
+    }
+
+    fn assert_checked_at_broadcast() {
+        assert!(crate::utils::CHECK_AT.with_borrow(Option::is_none));
+    }
+
+    // After a dry-run burn begin, the end registers the change before it broadcasts it.
+    #[test]
+    fn dry_run_burn_end_registers_change_before_broadcast() {
+        let url = fake_esplora(|path| match path {
+            "/tx" => ("200 OK", vec![]),
+            p if p.ends_with("/status") => ("200 OK", b"{\"confirmed\":false}".to_vec()),
+            _ => ("404 Not Found", vec![]),
+        });
+        let (mut wallet, online) = setup_at(&url);
+        wallet.wallet_data.address_reuse_colored_auto = true;
+        wallet.wallet_data.supported_schemas = vec![AssetSchema::Ifa];
+        let scripts = [new_script(&mut wallet), new_script(&mut wallet)];
+        let funding = apply_tx_paying(&mut wallet, &scripts);
+        seed_txo(&wallet, &funding, 0);
+        seed_txo(&wallet, &funding, 1);
+        fund_vanilla(&mut wallet, 100_000);
+        AssetSchema::Ifa
+            .import_schema_definition(&mut wallet.rgb_runtime().unwrap())
+            .unwrap();
+        let asset = wallet
+            .issue_asset_ifa(
+                s!("IFA"),
+                s!("Name"),
+                0,
+                vec![100],
+                vec![],
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let begin =
+            block_on(wallet.burn_begin(online.clone(), asset.asset_id, 10, None, 1, 1, true))
+                .unwrap();
+        assert!(begin.batch_transfer_idx.is_none());
+        let signed = wallet.sign_psbt(begin.psbt, None).unwrap();
+        let tx = Psbt::from_str(&signed).unwrap().unsigned_tx;
+        let first = wallet
+            .get_first_address(KeychainKind::External)
+            .unwrap()
+            .script_pubkey();
+        let vout = tx
+            .output
+            .iter()
+            .position(|o| o.script_pubkey == first)
+            .unwrap() as u32;
+        let txid = tx.compute_txid().to_string();
+        expect_registered_at_broadcast(&wallet, &txid, vout);
+        block_on(wallet.burn_end(online, signed)).unwrap();
+        assert_checked_at_broadcast();
     }
 
     #[test]
@@ -16525,10 +16938,11 @@ mod send_end_tests {
     }
 
     // A refused witness consignment releases the TXO that paid it.
-    // A script shared by a reusable invoice is not released.
+    // A shared script is not released.
     #[test]
     fn refusing_a_consignment_clears_pending_witness_txo() {
-        for reusable in [false, true] {
+        // (reusable invoice, shared address)
+        for (reusable, shared) in [(false, false), (true, true), (false, true)] {
             let (mut wallet, online) = setup();
             let mut server = mockito::Server::new();
             let _ack = rpc_mock(
@@ -16548,10 +16962,13 @@ mod send_end_tests {
                 ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: None }));
             transfer.recipient_id = ActiveValue::Set(Some(rid.clone()));
             wallet.database.update_transfer(&mut transfer).unwrap();
+            let key = wallet.normalize_recipient_id(&rid);
             if reusable {
                 link_invoice(&wallet, idx, 2, now().unix_timestamp() + 3600);
             }
-            let key = wallet.normalize_recipient_id(&rid);
+            if shared {
+                set_receive_dir(&wallet, idx, &key);
+            }
             let consignment = wallet.received_consignments.remove("recipient").unwrap();
             wallet
                 .received_consignments
@@ -16591,7 +17008,7 @@ mod send_end_tests {
 
             assert_eq!(res[&idx].updated_status, Some(TransferStatus::Failed));
             assert_eq!(kept(&wallet), [false; 4]);
-            assert_eq!(pending_witness(&wallet, paid_txo), reusable);
+            assert_eq!(pending_witness(&wallet, paid_txo), shared);
             assert!(pending_witness(&wallet, unrelated_txo));
         }
     }
@@ -16617,12 +17034,22 @@ mod send_end_tests {
         let script = new_script(&mut wallet);
         let reusable = seed_witness_receive(&wallet, "", status_before, None, &script);
         link_invoice(&wallet, reusable, 2, now().unix_timestamp() + 3600);
+        set_receive_dir(&wallet, reusable, "dir");
         let txid = apply_tx_paying(&mut wallet, &[script]);
         let shared_txo = seed_pending_witness_txo(&wallet, &txid, 0);
 
+        // A reused address stays flagged while another receive on it is pending.
+        let script = new_script(&mut wallet);
+        let reused = seed_witness_receive(&wallet, "", status_before, None, &script);
+        let pending = seed_witness_receive(&wallet, "", status_before, None, &script);
+        set_receive_dir(&wallet, reused, "dir_a");
+        set_receive_dir(&wallet, pending, "dir_b");
+        let txid = apply_tx_paying(&mut wallet, &[script]);
+        let reused_txo = seed_pending_witness_txo(&wallet, &txid, 0);
+
         let unrelated_txo = seed_pending_witness_txo(&wallet, &"22".repeat(32), 0);
 
-        for idx in [by_outpoint, by_script, reusable] {
+        for idx in [by_outpoint, by_script, reusable, reused] {
             let batch_transfer = wallet
                 .database
                 .iter_batch_transfers()
@@ -16636,6 +17063,7 @@ mod send_end_tests {
         assert!(!pending_witness(&wallet, outpoint_txo));
         assert!(!pending_witness(&wallet, script_txo));
         assert!(pending_witness(&wallet, shared_txo));
+        assert!(pending_witness(&wallet, reused_txo));
         assert!(pending_witness(&wallet, unrelated_txo));
     }
 
