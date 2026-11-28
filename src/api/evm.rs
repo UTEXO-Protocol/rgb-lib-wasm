@@ -85,49 +85,22 @@ fn abi_word_u64(data: &str, index: usize) -> Result<Option<u64>, Error> {
     Ok(Some(u64::from_be_bytes(word[24..32].try_into().unwrap())))
 }
 
-/// An entry of a reject list kept by an EVM contract (`IRgbRejectList.Entry`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RejectListEntry {
-    pub opout: Opout,
+/// An entry of a reject list kept by an `IRgbRejectList` EVM contract (`IRgbRejectList.Entry`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EvmRejectListEntry {
+    /// RGB operation output the entry is about, as `<operation ID>/<assignment type>/<index>`
+    pub opout: String,
     /// Whether the opout is rejected (`true`) or allowed (`false`)
     pub reject: bool,
 }
 
-/// The entries of a reject list kept by an EVM contract, in append order.
+/// The entries of a reject list kept by an `IRgbRejectList` EVM contract, as read from it.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RejectListLog {
+pub(crate) struct EvmRejectList {
     /// All the entries, as of the latest block
-    pub entries: Vec<RejectListEntry>,
+    pub entries: Vec<EvmRejectListEntry>,
     /// How many of the leading entries are in finalized blocks
     pub finalized: usize,
-}
-
-impl RejectListLog {
-    /// The opouts currently rejected and allowed, as `(reject, allow)`.
-    ///
-    /// The latest finalized entry for an opout wins. A reject counts as soon as it is seen. An
-    /// allow counts only when it is finalized and no later entry rejects the opout.
-    pub(crate) fn decisions(&self) -> (HashSet<Opout>, HashSet<Opout>) {
-        let (finalized, pending) = self.entries.split_at(self.finalized);
-        let finalized = finalized
-            .iter()
-            .map(|e| (e.opout, e.reject))
-            .collect::<HashMap<_, _>>();
-        let mut reject = pending
-            .iter()
-            .filter(|e| e.reject)
-            .map(|e| e.opout)
-            .collect::<HashSet<_>>();
-        let mut allow = HashSet::new();
-        for (opout, rejected) in finalized {
-            if rejected {
-                reject.insert(opout);
-            } else if !reject.contains(&opout) {
-                allow.insert(opout);
-            }
-        }
-        (reject, allow)
-    }
 }
 
 fn abi_error(details: &str) -> Error {
@@ -144,7 +117,7 @@ fn abi_word_u16(data: &str, index: usize) -> Result<u16, Error> {
 
 /// Decode the result of `entries(uint256,uint256)`, an ABI-encoded
 /// `(bytes32, uint16, uint16, bool)[]`: the array offset, its length, then four words per entry.
-fn decode_reject_list_entries(data: &str) -> Result<Vec<RejectListEntry>, Error> {
+fn decode_reject_list_entries(data: &str) -> Result<Vec<EvmRejectListEntry>, Error> {
     let offset = abi_word_u64(data, 0)?
         .filter(|o| o % 32 == 0)
         .ok_or_else(|| abi_error("bad array offset"))?;
@@ -163,7 +136,10 @@ fn decode_reject_list_entries(data: &str) -> Result<Vec<RejectListEntry>, Error>
             Some(1) => true,
             _ => return Err(abi_error("bad bool")),
         };
-        entries.push(RejectListEntry { opout, reject });
+        entries.push(EvmRejectListEntry {
+            opout: opout.to_string(),
+            reject,
+        });
     }
     Ok(entries)
 }
@@ -547,7 +523,7 @@ impl EvmClient {
     pub(crate) async fn reject_list_entries(
         &self,
         contract: &EvmAddress,
-    ) -> Result<RejectListLog, Error> {
+    ) -> Result<EvmRejectList, Error> {
         let block = self.block_number().await?;
         let finalized_block = min(self.finalized_block_number().await?, block);
         // a contract deployed in a non-finalized block has no finalized entries
@@ -585,7 +561,7 @@ impl EvmClient {
             entries.extend(page);
             start = end;
         }
-        Ok(RejectListLog {
+        Ok(EvmRejectList {
             entries,
             finalized: finalized_len as usize,
         })
@@ -697,9 +673,9 @@ pub(crate) mod tests {
         }
     }
 
-    fn test_entry(b: u8, reject: bool) -> RejectListEntry {
-        RejectListEntry {
-            opout: test_opout(b),
+    pub(crate) fn test_entry(b: u8, reject: bool) -> EvmRejectListEntry {
+        EvmRejectListEntry {
+            opout: test_opout(b).to_string(),
             reject,
         }
     }
@@ -805,33 +781,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reject_list_decisions() {
-        let log = |entries: &[(u8, bool)], finalized: usize| RejectListLog {
-            entries: entries
-                .iter()
-                .map(|(b, reject)| test_entry(*b, *reject))
-                .collect(),
-            finalized,
-        };
-        let set = |bytes: &[u8]| bytes.iter().map(|b| test_opout(*b)).collect::<HashSet<_>>();
-
-        // the latest finalized entry wins
-        let (reject, allow) = log(&[(1, true), (2, false), (3, false), (3, true)], 4).decisions();
-        assert_eq!(reject, set(&[1, 3]));
-        assert_eq!(allow, set(&[2]));
-
-        // a non-finalized reject counts at once
-        let (reject, allow) = log(&[(2, false), (1, true), (2, true)], 1).decisions();
-        assert_eq!(reject, set(&[1, 2]));
-        assert!(allow.is_empty());
-
-        // a non-finalized allow does not count
-        let (reject, allow) = log(&[(1, true), (2, false), (1, false)], 1).decisions();
-        assert_eq!(reject, set(&[1]));
-        assert!(allow.is_empty());
-    }
-
-    #[test]
     fn chain_id() {
         let mut server = mockito::Server::new();
         let mock = mock_rpc(
@@ -915,7 +864,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             read(&server).unwrap(),
-            RejectListLog {
+            EvmRejectList {
                 entries: all.iter().map(|(b, r)| test_entry(*b, *r)).collect(),
                 finalized: 1,
             }
