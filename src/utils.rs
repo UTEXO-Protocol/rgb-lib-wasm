@@ -723,8 +723,19 @@ thread_local! {
     > = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The check that runs at the next fault point of its name in this test thread.
+    pub(crate) static CHECK_AT: std::cell::RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Fail when a test injects a fault at `point`.
 pub(crate) fn fault_point(point: &'static str) -> Result<(), Error> {
+    #[cfg(test)]
+    if let Some((_, check)) = CHECK_AT.with_borrow_mut(|c| c.take_if(|(p, _)| *p == point)) {
+        check();
+    }
     #[cfg(test)]
     if let Some((_, controller)) = ABORT_AT.with_borrow_mut(|a| a.take_if(|(p, _)| *p == point)) {
         controller.abort();

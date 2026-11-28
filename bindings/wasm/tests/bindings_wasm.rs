@@ -37,6 +37,8 @@ fn wallet_json(supported_schemas: Vec<AssetSchema>) -> (String, String) {
         max_allocations_per_utxo: 5,
         supported_schemas,
         allow_reckless_schemas: false,
+        address_reuse_vanilla: false,
+        address_reuse_colored_auto: false,
     };
     (
         serde_json::to_string(&wd).unwrap(),
@@ -91,10 +93,21 @@ async fn witness_receive_takes_number_bigint_and_string() {
         JsValue::from_str(&exp.to_string()),
     ] {
         let data = wallet
-            .witness_receive(online.clone(), None, any(), v, endpoints(), 1, None, None)
+            .witness_receive(
+                online.clone(),
+                None,
+                any(),
+                v,
+                endpoints(),
+                1,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let data: ReceiveData = serde_wasm_bindgen::from_value(data).unwrap();
+        assert!(data.address.is_some());
         assert_eq!(data.expiration_timestamp, exp);
         assert_eq!(data.public_key.len(), 64);
         let invoice = WasmInvoice::new(&format!("{}&foo=bar", data.invoice)).unwrap();
@@ -119,6 +132,7 @@ async fn receive_rejects_malformed_expiration() {
             1,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err());
@@ -132,7 +146,17 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
     // the invoice is reserved on the proxy, so the wallet needs to be online
     for online in [JsValue::NULL, JsValue::UNDEFINED] {
         let e = err(wallet
-            .witness_receive(online, None, any(), exp.clone(), endpoints(), 1, None, None)
+            .witness_receive(
+                online,
+                None,
+                any(),
+                exp.clone(),
+                endpoints(),
+                1,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap_err());
         assert_eq!(e, "The Online object is needed to perform this operation");
@@ -148,6 +172,7 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
             1,
             Some("Sometimes".to_string()),
             None,
+            None,
         )
         .await
         .unwrap_err());
@@ -162,6 +187,7 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
             1,
             None,
             Some(0),
+            None,
         )
         .await
         .unwrap_err());
@@ -191,10 +217,53 @@ async fn receive_takes_an_optional_online_and_an_encryption() {
                 1,
                 Some(encryption.to_string()),
                 None,
+                None,
             )
             .await
             .unwrap();
     }
+}
+
+#[wasm_bindgen_test]
+async fn address_reuse_settings_and_parameter() {
+    let (wd, keys) = wallet_json(vec![AssetSchema::Nia]);
+    let mut wd: serde_json::Value = serde_json::from_str(&wd).unwrap();
+    let settings = ["addressReuseVanilla", "addressReuseColoredAuto"];
+    for setting in settings {
+        wd.as_object_mut().unwrap().remove(setting);
+    }
+    let wallet = WasmWallet::new(&wd.to_string(), &keys).unwrap();
+    let data = wallet.get_wallet_data().unwrap();
+    for setting in settings {
+        assert_eq!(prop(&data, setting).as_bool(), Some(false));
+        wd[setting] = serde_json::Value::Bool(true);
+    }
+    let wallet = WasmWallet::new(&wd.to_string(), &keys).unwrap();
+    let data = wallet.get_wallet_data().unwrap();
+    for setting in settings {
+        assert_eq!(prop(&data, setting).as_bool(), Some(true));
+    }
+    let exp = JsValue::from_f64((now_secs() + 100_000) as f64);
+    let no_endpoints = serde_wasm_bindgen::to_value(&Vec::<String>::new()).unwrap();
+    let address = Some(wallet.get_address().unwrap());
+    let e = err(wallet
+        .witness_receive(
+            JsValue::NULL,
+            None,
+            any(),
+            exp,
+            no_endpoints,
+            1,
+            None,
+            None,
+            address,
+        )
+        .await
+        .unwrap_err());
+    assert_eq!(
+        e,
+        "Address reuse is not supported: a witness receive reusing an address requires transport endpoints"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -1249,6 +1318,7 @@ async fn refresh_reports_proxy_failures_to_js() {
                 1,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1715,7 +1785,7 @@ async fn backup_store_backup_and_restore() {
     let online = online(&a).await;
     let exp = JsValue::from(now_secs() + 100_000);
     let receive = a
-        .witness_receive(online, None, any(), exp, endpoints(), 1, None, None)
+        .witness_receive(online, None, any(), exp, endpoints(), 1, None, None, None)
         .await
         .unwrap();
     let recipient_id: String = prop(&receive, "recipientId").as_string().unwrap();

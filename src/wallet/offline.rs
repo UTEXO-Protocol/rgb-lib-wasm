@@ -541,6 +541,9 @@ pub struct ReceiveData {
     pub batch_transfer_idx: i32,
     /// Recipient's Ed25519 public key (hex-encoded), as embedded in the invoice
     pub public_key: String,
+    /// Address that a witness receive pays. Pass it to a later witness receive to reuse it.
+    /// `None` for a blind receive.
+    pub address: Option<String>,
 }
 
 /// Data of a receive operation, ready to be stored.
@@ -562,6 +565,8 @@ pub(crate) struct ReceiveDataInternal {
     quota: u32,
     invoice_deadline: Option<i64>,
     receive_dir: Option<String>,
+    address: Option<String>,
+    earlier_receives_to_share: Vec<DbTransfer>,
 }
 
 /// Supported database types.
@@ -1077,6 +1082,20 @@ pub struct WalletData {
     /// Default: `false`
     #[serde(default)]
     pub allow_reckless_schemas: bool,
+    /// Whether the wallet reuses its first vanilla address. When set, `get_address` always returns
+    /// it and the bitcoin change of the wallet's transactions goes to it. This links all the
+    /// wallet's bitcoin activity on-chain. The value is fixed when the wallet is created. The
+    /// manifest records it, and a snapshot or backup with another value fails with
+    /// [`crate::Error::WalletSettingMismatch`]. Default: `false`
+    #[serde(default)]
+    pub address_reuse_vanilla: bool,
+    /// Whether the wallet reuses its first colored address for the colored outputs it picks.
+    /// These are the UTXOs of `create_utxos` and the change of RGB operations. The new supply of an
+    /// inflation still goes to new addresses. These outputs are registered before broadcast, so
+    /// they are usable at once. A witness receive with no `address` always gets a new address,
+    /// never the first one. Fixed when the wallet is created, as above. Default: `false`
+    #[serde(default)]
+    pub address_reuse_colored_auto: bool,
 }
 
 /// Keys for the singlesig wallet.
@@ -1195,6 +1214,11 @@ pub(crate) struct WalletManifest {
     // Stored state keeps this field. The wallet does not read it.
     pub(crate) reuse_addresses: bool,
     pub(crate) allow_reckless_schemas: bool,
+    // Older manifests lack these fields. They load as off.
+    #[serde(default)]
+    pub(crate) address_reuse_vanilla: bool,
+    #[serde(default)]
+    pub(crate) address_reuse_colored_auto: bool,
     pub(crate) account_xpub_vanilla: String,
     pub(crate) account_xpub_colored: String,
     pub(crate) vanilla_keychain: u8,
@@ -1211,6 +1235,8 @@ impl WalletManifest {
             supported_schemas: wallet_data.supported_schemas.clone(),
             reuse_addresses: false,
             allow_reckless_schemas: wallet_data.allow_reckless_schemas,
+            address_reuse_vanilla: wallet_data.address_reuse_vanilla,
+            address_reuse_colored_auto: wallet_data.address_reuse_colored_auto,
             account_xpub_vanilla: keys.account_xpub_vanilla.clone(),
             account_xpub_colored: keys.account_xpub_colored.clone(),
             vanilla_keychain: keys.vanilla_keychain.unwrap_or(KEYCHAIN_BTC),
@@ -1250,6 +1276,8 @@ impl WalletManifest {
             vanilla_keychain,
             account_xpub_colored,
             account_xpub_vanilla,
+            address_reuse_vanilla,
+            address_reuse_colored_auto,
         );
         Ok(())
     }
@@ -1267,6 +1295,8 @@ impl WalletManifest {
                 max_allocations_per_utxo: self.max_allocations_per_utxo,
                 supported_schemas: self.supported_schemas,
                 allow_reckless_schemas: self.allow_reckless_schemas,
+                address_reuse_vanilla: self.address_reuse_vanilla,
+                address_reuse_colored_auto: self.address_reuse_colored_auto,
             },
             SinglesigKeys {
                 account_xpub_vanilla: self.account_xpub_vanilla,
@@ -1376,7 +1406,8 @@ impl Wallet {
     ///
     /// The returned wallet is ready for use only after the IndexedDB read and snapshot
     /// restoration complete. IndexedDB and snapshot decoding failures are returned to the caller.
-    /// A snapshot saved with another fingerprint, witness version, vanilla keychain or account xPub gives
+    /// A snapshot saved with another fingerprint, witness version, vanilla keychain, account xPub
+    /// or address reuse setting gives
     /// [`Error::WalletSettingMismatch`]. Other settings come from `wallet_data` and are saved
     /// with the next save.
     /// It asks the browser to keep the storage. A refusal does not fail the call.
@@ -3121,6 +3152,21 @@ impl Wallet {
                     }
                 });
         }
+        // Outputs registered before broadcast never came to exist, unless another transfer colors them.
+        if let Some(txid) = &batch_transfer.txid {
+            let asset_transfer_idxs: HashSet<i32> =
+                asset_transfers.iter().map(|at| at.idx).collect();
+            txos.iter()
+                .filter(|t| !t.exists && t.txid == *txid)
+                .filter(|t| {
+                    !colorings.iter().any(|c| {
+                        c.txo_idx == t.idx && !asset_transfer_idxs.contains(&c.asset_transfer_idx)
+                    })
+                })
+                .for_each(|t| {
+                    txos_to_delete.insert(t.idx);
+                });
+        }
         for txo in txos_to_delete {
             self.database.del_txo(txo)?;
         }
@@ -3820,7 +3866,7 @@ impl Wallet {
         transfer: &DbTransfer,
     ) -> String {
         let key = self.get_receive_dir(transfer);
-        if transfer.receive_dir.is_none() && !map.contains_key(&key) {
+        if !Self::has_own_receive_dir(transfer) && !map.contains_key(&key) {
             let normalized = self.normalize_recipient_id(&key);
             if map.contains_key(&normalized) {
                 return normalized;
@@ -3829,11 +3875,19 @@ impl Wallet {
         key
     }
 
+    /// A receive on a reused address marked as shared has its recipient ID as receive dir.
+    /// Its data keeps the key of a receive without a dir.
+    fn has_own_receive_dir(transfer: &DbTransfer) -> bool {
+        transfer.receive_dir.is_some() && transfer.receive_dir != transfer.recipient_id
+    }
+
     pub(crate) fn get_receive_consignment_path(&self, transfer: &DbTransfer) -> PathBuf {
+        let dir = match &transfer.receive_dir {
+            Some(dir) if Self::has_own_receive_dir(transfer) => dir.clone(),
+            _ => self.normalize_recipient_id(transfer.recipient_id.as_ref().unwrap()),
+        };
         self.get_transfers_dir()
-            .join(transfer.receive_dir.clone().unwrap_or_else(|| {
-                self.normalize_recipient_id(transfer.recipient_id.as_ref().unwrap())
-            }))
+            .join(dir)
             .join(CONSIGNMENT_RCV_FILE.as_str())
     }
 
@@ -4168,6 +4222,7 @@ impl Wallet {
         recipient_type: RecipientType,
         encryption: Option<Encryption>,
         quota: u32,
+        address: Option<String>,
     ) -> Result<ReceiveDataInternal, Error> {
         let encryption = encryption.unwrap_or(Encryption::Required);
 
@@ -4181,6 +4236,14 @@ impl Wallet {
         if transport_endpoints.is_empty() && quota > 1 {
             return Err(Error::InvalidQuota {
                 details: s!("a reusable invoice requires transport endpoints"),
+            });
+        }
+        // A reused address is paid by the transfers of each invoice on it.
+        // Each operation needs its own seal blinding.
+        let reused_address = address.is_some();
+        if reused_address && transport_endpoints.is_empty() {
+            return Err(Error::UnsupportedAddressReuse {
+                details: s!("a witness receive reusing an address requires transport endpoints"),
             });
         }
         // The blinded UTXO needs one allocation for each transfer.
@@ -4203,8 +4266,7 @@ impl Wallet {
             let online = online.ok_or(Error::OnlineNeeded)?;
             self.check_online(online)?;
 
-            let (beneficiary, recipient_type_full, blind_seal, script_pubkey) = match recipient_type
-            {
+            let (beneficiary, recipient_type_full, blind_seal, address) = match recipient_type {
                 RecipientType::Blind => {
                     let mut unspents: Vec<LocalUnspent> = self.database.get_rgb_allocations(
                         self.database.get_unspent_txos(vec![])?,
@@ -4247,10 +4309,13 @@ impl Wallet {
                     (beneficiary, recipient_type_full, Some(blind_seal), None)
                 }
                 RecipientType::Witness => {
-                    let script_pubkey = self.get_new_address()?.script_pubkey();
-                    let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
+                    let address = match &address {
+                        Some(a) => self.check_reused_address(a)?,
+                        None => self.get_new_address()?,
+                    };
+                    let beneficiary = beneficiary_from_script_buf(address.script_pubkey());
                     let recipient_type_full = RecipientTypeFull::Witness { vout: None };
-                    (beneficiary, recipient_type_full, None, Some(script_pubkey))
+                    (beneficiary, recipient_type_full, None, Some(address))
                 }
             };
 
@@ -4258,6 +4323,11 @@ impl Wallet {
             let beneficiary = XChainNet::with(network, beneficiary);
             let recipient_id = beneficiary.to_string();
             debug!(self.logger, "Recipient ID: {recipient_id}");
+            let earlier_receives_to_share = if reused_address {
+                self.earlier_witness_receives_to_share(&recipient_id)?
+            } else {
+                vec![]
+            };
             let (schema, contract_id) = if let Some(aid) = asset_id.clone() {
                 let asset = self.database.check_asset_exists(aid.clone())?;
                 let contract_id = ContractId::from_str(&aid).expect("invalid contract ID");
@@ -4423,9 +4493,9 @@ impl Wallet {
                 .filter(|_| quota > 1)
                 .map(|d| d.saturating_add(i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS)));
 
-            // Transfers of a reusable invoice share the recipient ID.
+            // A reusable invoice or a reused address shares the recipient ID between transfers.
             // The unique invoice key gives each receive its own dir.
-            let receive_dir = (quota > 1).then(|| {
+            let receive_dir = (quota > 1 || reused_address).then(|| {
                 format!(
                     "{}_{}",
                     self.normalize_recipient_id(&recipient_id),
@@ -4443,7 +4513,7 @@ impl Wallet {
                 expiration_timestamp,
                 recipient_type_full,
                 blind_seal,
-                script_pubkey,
+                script_pubkey: address.as_ref().map(BdkAddress::script_pubkey),
                 operation_secret_key: recipient_sk.to_bytes().to_vec(),
                 recipient_pubkey: recipient_vk.to_bytes().to_vec(),
                 encryption,
@@ -4451,8 +4521,71 @@ impl Wallet {
                 quota,
                 invoice_deadline,
                 receive_dir,
+                address: address.map(|a| a.to_string()),
+                earlier_receives_to_share,
             })
         }
+    }
+
+    /// Parse an address to reuse. It must be a revealed address of the colored keychain.
+    #[cfg(feature = "esplora")]
+    pub(crate) fn check_reused_address(&self, address: &str) -> Result<BdkAddress, Error> {
+        let address = parse_address_str(address, self.bitcoin_network()).map_err(|e| {
+            Error::CannotReuseAddress {
+                details: match e {
+                    Error::InvalidAddress { details } => format!("invalid address: {details}"),
+                    e => e.to_string(),
+                },
+            }
+        })?;
+        let spk_index = self.bdk_wallet.spk_index();
+        let Some((KeychainKind::External, index)) =
+            spk_index.index_of_spk(address.script_pubkey()).copied()
+        else {
+            return Err(Error::CannotReuseAddress {
+                details: s!("not an address of the wallet's colored keychain"),
+            });
+        };
+        if spk_index
+            .last_revealed_index(KeychainKind::External)
+            .is_none_or(|last| index > last)
+        {
+            return Err(Error::CannotReuseAddress {
+                details: s!("not revealed yet"),
+            });
+        }
+        Ok(address)
+    }
+
+    /// The earlier witness receives on `recipient_id` that do not share it yet.
+    /// An earlier out-of-band receive cannot tell the transfers apart: it refuses the address.
+    #[cfg(feature = "esplora")]
+    pub(crate) fn earlier_witness_receives_to_share(
+        &self,
+        recipient_id: &str,
+    ) -> Result<Vec<DbTransfer>, Error> {
+        let mut to_share = vec![];
+        for t in self.database.iter_transfers()? {
+            if !t.incoming
+                || t.recipient_id.as_deref() != Some(recipient_id)
+                || !matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
+            {
+                continue;
+            }
+            if self
+                .database
+                .get_transfer_transport_endpoints_data(t.idx)?
+                .is_empty()
+            {
+                return Err(Error::CannotReuseAddress {
+                    details: s!("an earlier witness receive on it used the out-of-band exchange"),
+                });
+            }
+            if t.receive_dir.is_none() {
+                to_share.push(t);
+            }
+        }
+        Ok(to_share)
     }
 
     fn store_receive_transfer(
@@ -4477,6 +4610,12 @@ impl Wallet {
             ..Default::default()
         };
         let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
+        // Earlier receives on a reused address now share it. Their data keeps its key.
+        for t in &data.earlier_receives_to_share {
+            let mut u: DbTransferActMod = t.clone().into();
+            u.receive_dir = ActiveValue::Set(Some(data.recipient_id.clone()));
+            self.database.update_transfer(&mut u)?;
+        }
         // A reusable invoice receives more transfers after the first one, until it expires.
         let invoice_idx = data
             .invoice_deadline
@@ -4626,6 +4765,7 @@ impl Wallet {
                 RecipientType::Blind,
                 encryption,
                 quota.unwrap_or(1),
+                None,
             )
             .await?;
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
@@ -4639,6 +4779,7 @@ impl Wallet {
             expiration_timestamp,
             batch_transfer_idx,
             public_key: hex::encode(&data.recipient_pubkey),
+            address: data.address,
         })
     }
 
@@ -4674,6 +4815,13 @@ impl Wallet {
     /// above 1 requires transport endpoints. Refresh creates a transfer for each one after the first.
     /// Each transfer uses its own seal blinding, derived from the keys of both parties. It identifies
     /// the paying output. That output cannot be spent until its transfer is accepted.
+    ///
+    /// An optional `address`, the `address` of an earlier [`ReceiveData`], reuses it. It must be a
+    /// revealed address of the colored keychain, and the earlier receives on it must not be
+    /// out-of-band. It requires transport endpoints. Each transfer uses its own seal blinding.
+    /// The invoices share the recipient ID, so one batch cannot pay two of them
+    /// ([`Error::RecipientIDDuplicated`]). An output on the address that no transfer claims stays
+    /// unusable while a receive on it is pending. Reuse links the payments on-chain.
     #[allow(clippy::too_many_arguments)]
     pub async fn witness_receive(
         &mut self,
@@ -4685,6 +4833,7 @@ impl Wallet {
         min_confirmations: u8,
         encryption: Option<Encryption>,
         quota: Option<u32>,
+        address: Option<String>,
     ) -> Result<ReceiveData, Error> {
         let cp = self.checkpoint("witness_receive");
         let res = self
@@ -4697,6 +4846,7 @@ impl Wallet {
                 min_confirmations,
                 encryption,
                 quota,
+                address,
             )
             .await;
         self.commit(cp, res, |_| false).await
@@ -4713,6 +4863,7 @@ impl Wallet {
         min_confirmations: u8,
         encryption: Option<Encryption>,
         quota: Option<u32>,
+        address: Option<String>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
@@ -4731,6 +4882,7 @@ impl Wallet {
                 RecipientType::Witness,
                 encryption,
                 quota.unwrap_or(1),
+                address,
             )
             .await?;
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
@@ -4744,10 +4896,53 @@ impl Wallet {
             expiration_timestamp,
             batch_transfer_idx,
             public_key: hex::encode(&data.recipient_pubkey),
+            address: data.address,
         })
     }
 
+    pub(crate) fn reuses_address(&self, keychain: KeychainKind) -> bool {
+        match keychain {
+            KeychainKind::Internal => self.wallet_data.address_reuse_vanilla,
+            KeychainKind::External => self.wallet_data.address_reuse_colored_auto,
+        }
+    }
+
+    pub(crate) fn get_first_address(
+        &mut self,
+        keychain: KeychainKind,
+    ) -> Result<BdkAddress, Error> {
+        let _ = self.bdk_wallet.reveal_addresses_to(keychain, 0);
+        self.bdk_wallet.persist(&mut self.bdk_database)?;
+        Ok(self.bdk_wallet.peek_address(keychain, 0).address)
+    }
+
+    pub(crate) fn get_output_address(
+        &mut self,
+        keychain: KeychainKind,
+    ) -> Result<BdkAddress, Error> {
+        if self.reuses_address(keychain) {
+            self.get_first_address(keychain)
+        } else {
+            self._get_new_address(keychain)
+        }
+    }
+
+    // The bitcoin change script of a vanilla TX, when the wallet reuses its first vanilla address.
+    pub(crate) fn vanilla_change(&mut self) -> Result<Option<ScriptBuf>, Error> {
+        if !self.reuses_address(KeychainKind::Internal) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.get_first_address(KeychainKind::Internal)?
+                .script_pubkey(),
+        ))
+    }
+
     pub(crate) fn _get_new_address(&mut self, keychain: KeychainKind) -> Result<BdkAddress, Error> {
+        // Keep the first address for the wallet's own outputs.
+        if self.reuses_address(keychain) {
+            self.get_first_address(keychain)?;
+        }
         let address = self.bdk_wallet.reveal_next_address(keychain).address;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
         Ok(address)
@@ -4757,7 +4952,8 @@ impl Wallet {
         self._get_new_address(KeychainKind::External)
     }
 
-    /// Return a new Bitcoin address from the vanilla wallet.
+    /// Return a new Bitcoin address from the vanilla wallet, or always the first one when
+    /// `address_reuse_vanilla` is set.
     pub fn get_address(&mut self) -> Result<String, Error> {
         let cp = self.checkpoint("get_address");
         let res = self._get_address();
@@ -4766,7 +4962,7 @@ impl Wallet {
 
     fn _get_address(&mut self) -> Result<String, Error> {
         info!(self.logger, "Getting address...");
-        let address = self._get_new_address(KeychainKind::Internal)?;
+        let address = self.get_output_address(KeychainKind::Internal)?;
         self.update_backup_info(false)?;
 
         info!(self.logger, "Get address completed");
@@ -5219,6 +5415,8 @@ pub(crate) mod test_wallet {
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia],
             allow_reckless_schemas: false,
+            address_reuse_vanilla: false,
+            address_reuse_colored_auto: false,
         };
 
         let drain = slog::Discard;
@@ -5352,6 +5550,57 @@ pub(crate) mod test_wallet {
     }
 
     #[test]
+    fn address_reuse_keeps_first_address() {
+        let mut wallet = make_test_wallet();
+        assert_ne!(wallet.get_address().unwrap(), wallet.get_address().unwrap());
+
+        let mut wallet = make_test_wallet();
+        wallet.wallet_data.address_reuse_vanilla = true;
+        wallet.wallet_data.address_reuse_colored_auto = true;
+        let first = wallet.bdk_wallet.peek_address(KeychainKind::Internal, 0);
+        assert_eq!(wallet.get_address().unwrap(), first.address.to_string());
+        assert_eq!(wallet.get_address().unwrap(), first.address.to_string());
+        let index = wallet.bdk_wallet.spk_index();
+        assert_eq!(index.last_revealed_index(KeychainKind::Internal), Some(0));
+        // A new colored address never takes the first one.
+        let new = wallet.get_new_address().unwrap();
+        assert_eq!(
+            wallet.bdk_wallet.derivation_of_spk(new.script_pubkey()),
+            Some((KeychainKind::External, 1))
+        );
+        let first = wallet.bdk_wallet.peek_address(KeychainKind::External, 0);
+        for _ in 0..2 {
+            let address = wallet.get_output_address(KeychainKind::External).unwrap();
+            assert_eq!(address, first.address);
+        }
+    }
+
+    #[test]
+    fn check_reused_address_refusals() {
+        let mut wallet = make_test_wallet();
+        let err = |w: &Wallet, a: &str| match w.check_reused_address(a) {
+            Err(Error::CannotReuseAddress { details }) => details,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(err(&wallet, "invalid").starts_with("invalid address"));
+        let mainnet = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        assert_eq!(
+            err(&wallet, mainnet),
+            "invalid address: belongs to another network"
+        );
+        let colored = s!("not an address of the wallet's colored keychain");
+        let vanilla = wallet.get_address().unwrap();
+        assert_eq!(err(&wallet, &vanilla), colored);
+        let other = make_test_wallet().get_new_address().unwrap().to_string();
+        assert_eq!(err(&wallet, &other), colored);
+        let revealed = wallet.get_new_address().unwrap();
+        let next = wallet.bdk_wallet.peek_address(KeychainKind::External, 1);
+        assert_eq!(err(&wallet, &next.address.to_string()), "not revealed yet");
+        let ok = wallet.check_reused_address(&revealed.to_string()).unwrap();
+        assert_eq!(ok, revealed);
+    }
+
+    #[test]
     fn get_address_is_atomic() {
         let mut wallet = make_test_wallet();
         block_on(assert_no_partial_change(
@@ -5395,6 +5644,8 @@ mod mainnet_schema_tests {
             max_allocations_per_utxo: 5,
             supported_schemas: schemas,
             allow_reckless_schemas: reckless,
+            address_reuse_vanilla: false,
+            address_reuse_colored_auto: false,
         };
         (wd, SinglesigKeys::from_keys(&keys, None))
     }
@@ -5447,6 +5698,8 @@ mod keys_and_settings_tests {
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia],
             allow_reckless_schemas: false,
+            address_reuse_vanilla: false,
+            address_reuse_colored_auto: false,
         }
     }
 
@@ -5644,6 +5897,24 @@ mod keys_and_settings_tests {
         };
         mismatch(check(&wd, &colored), "account_xpub_colored");
 
+        let reuse_vanilla = WalletData {
+            address_reuse_vanilla: true,
+            ..wallet_data()
+        };
+        let reuse_colored = WalletData {
+            address_reuse_colored_auto: true,
+            ..wallet_data()
+        };
+        for (on, setting) in [
+            (reuse_vanilla, "address_reuse_vanilla"),
+            (reuse_colored, "address_reuse_colored_auto"),
+        ] {
+            let manifest = WalletManifest::new(&on, &sk);
+            let (expected, provided) =
+                mismatch(manifest.check_settings_unchanged(&wd, &sk), setting);
+            assert_eq!((expected.as_str(), provided.as_str()), ("true", "false"));
+        }
+
         let vanilla = SinglesigKeys {
             account_xpub_vanilla: other.account_xpub_vanilla,
             ..sk
@@ -5682,6 +5953,8 @@ mod keys_and_settings_tests {
             max_allocations_per_utxo: 1,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
             allow_reckless_schemas: true,
+            address_reuse_vanilla: true,
+            address_reuse_colored_auto: true,
             ..wallet_data()
         };
         let sk = SinglesigKeys::from_keys(&keys, Some(2));
@@ -5761,6 +6034,7 @@ mod receive_expiration_tests {
             1,
             None,
             None,
+            None,
         ));
         assert!(matches!(result, Err(Error::InvalidExpiration)));
         let db_data = wallet.database.get_db_data(false).unwrap();
@@ -5779,6 +6053,7 @@ mod receive_expiration_tests {
                 exp,
                 vec![s!("rpc://127.0.0.1")],
                 1,
+                None,
                 None,
                 None,
             )),
@@ -5815,6 +6090,7 @@ mod receive_expiration_tests {
                 RecipientType::Witness,
                 Some(Encryption::Optional),
                 1,
+                None,
             ))
             .unwrap()
         };
@@ -5874,6 +6150,7 @@ mod receive_expiration_tests {
                         1,
                         None,
                         quota,
+                        None,
                     );
                     rcv.await
                 } else {
@@ -5916,6 +6193,123 @@ mod receive_expiration_tests {
         assert!(wallet.database.iter_batch_transfers().unwrap().is_empty());
     }
 
+    fn receive_at(
+        wallet: &mut Wallet,
+        endpoints: Vec<String>,
+        recipient_type: RecipientType,
+        address: Option<String>,
+    ) -> Result<ReceiveDataInternal, Error> {
+        let online = online(wallet);
+        let exp = now().unix_timestamp() + 100_000;
+        crate::block_on(wallet.create_receive_data(
+            Some(online),
+            None,
+            Assignment::Any,
+            exp,
+            endpoints,
+            recipient_type,
+            None,
+            1,
+            address,
+        ))
+    }
+
+    #[test]
+    fn witness_receive_reuses_address() {
+        let mut wallet = make_test_wallet();
+        let (server, _mocks) = proxy_with_quota(1, 100);
+        let endpoints = vec![format!("rpc://{}", server.host_with_port())];
+        let witness = RecipientType::Witness;
+        let d1 = receive_at(&mut wallet, endpoints.clone(), witness, None).unwrap();
+        assert!(d1.receive_dir.is_none());
+        wallet.store_receive_transfer(&d1, 1).unwrap();
+        let t1 = wallet.database.iter_transfers().unwrap()[0].idx;
+
+        let d2 = receive_at(&mut wallet, endpoints.clone(), witness, d1.address.clone()).unwrap();
+        assert_eq!(d2.recipient_id, d1.recipient_id);
+        assert_eq!(d2.address, d1.address);
+        assert_ne!(d2.recipient_pubkey, d1.recipient_pubkey);
+        let dir = format!(
+            "{}_{}",
+            wallet.normalize_recipient_id(&d1.recipient_id),
+            &hex::encode(&d2.recipient_pubkey)[..16]
+        );
+        assert_eq!(d2.receive_dir, Some(dir));
+        let shared: Vec<i32> = d2.earlier_receives_to_share.iter().map(|t| t.idx).collect();
+        assert_eq!(shared, vec![t1]);
+        wallet.store_receive_transfer(&d2, 1).unwrap();
+        let t1 = wallet.database.get_transfer(t1).unwrap().unwrap();
+        assert_eq!(t1.receive_dir, Some(d1.recipient_id.clone()));
+        assert_eq!(wallet.get_receive_dir(&t1), d1.recipient_id);
+
+        let d3 = receive_at(&mut wallet, endpoints.clone(), witness, d1.address).unwrap();
+        assert!(d3.earlier_receives_to_share.is_empty());
+        add_fake_txos(&wallet);
+        let blind = receive_at(&mut wallet, endpoints, RecipientType::Blind, None).unwrap();
+        assert_eq!(blind.address, None);
+    }
+
+    #[test]
+    fn witness_receive_address_reuse_refusals() {
+        let mut wallet = make_test_wallet();
+        let (server, _mocks) = proxy_with_quota(1, 100);
+        let endpoints = vec![format!("rpc://{}", server.host_with_port())];
+        let witness = RecipientType::Witness;
+        let d1 = receive_at(&mut wallet, endpoints.clone(), witness, None).unwrap();
+        wallet.store_receive_transfer(&d1, 1).unwrap();
+        match receive_at(&mut wallet, vec![], witness, d1.address) {
+            Err(Error::UnsupportedAddressReuse { details }) => assert_eq!(
+                details,
+                "a witness receive reusing an address requires transport endpoints"
+            ),
+            other => panic!("unexpected {:?}", other.err()),
+        }
+        let mut oob = receive_at(&mut wallet, endpoints.clone(), witness, None).unwrap();
+        oob.endpoints = vec![];
+        wallet.store_receive_transfer(&oob, 1).unwrap();
+        match receive_at(&mut wallet, endpoints, witness, oob.address) {
+            Err(Error::CannotReuseAddress { details }) => assert_eq!(
+                details,
+                "an earlier witness receive on it used the out-of-band exchange"
+            ),
+            other => panic!("unexpected {:?}", other.err()),
+        }
+        assert_eq!(wallet.database.iter_batch_transfers().unwrap().len(), 2);
+    }
+
+    // A receive marked as shared keeps the key its release wrote: raw or normalized.
+    #[test]
+    fn marked_receive_keeps_its_data_key() {
+        let mut wallet = make_test_wallet();
+        let (server, _mocks) = proxy_with_quota(1, 100);
+        let endpoints = vec![format!("rpc://{}", server.host_with_port())];
+        let witness = RecipientType::Witness;
+        for normalized in [false, true] {
+            let d1 = receive_at(&mut wallet, endpoints.clone(), witness, None).unwrap();
+            let idx = wallet.store_receive_transfer(&d1, 1).unwrap();
+            let t1 = wallet.database.get_transfer(idx).unwrap().unwrap();
+            let key = if normalized {
+                wallet.normalize_recipient_id(&d1.recipient_id)
+            } else {
+                d1.recipient_id.clone()
+            };
+            wallet
+                .received_consignments
+                .insert(key.clone(), key.clone().into_bytes());
+            assert_eq!(wallet.received_key(&wallet.received_consignments, &t1), key);
+            let path = wallet.get_receive_consignment_path(&t1);
+
+            let d2 = receive_at(&mut wallet, endpoints.clone(), witness, d1.address).unwrap();
+            wallet.store_receive_transfer(&d2, 1).unwrap();
+            let t1 = wallet.database.get_transfer(t1.idx).unwrap().unwrap();
+            assert_eq!(t1.receive_dir, Some(d1.recipient_id));
+            let got = wallet.received_key(&wallet.received_consignments, &t1);
+            assert_eq!(got, key);
+            assert_eq!(wallet.received_consignments[&got], key.as_bytes());
+            assert_eq!(wallet.get_receive_consignment_path(&t1), path);
+        }
+    }
+
     #[test]
     fn reusable_receive_stores_invoice() {
         let mut wallet = make_test_wallet();
@@ -5935,6 +6329,7 @@ mod receive_expiration_tests {
             RecipientType::Witness,
             None,
             3,
+            None,
         ))
         .unwrap();
         long_mocks[1].assert();
@@ -5977,6 +6372,7 @@ mod receive_expiration_tests {
                 RecipientType::Blind,
                 None,
                 quota,
+                None,
             ));
             res.map(|data| {
                 let retention = exp + 100;
@@ -6172,6 +6568,8 @@ mod export_contract_tests {
             max_allocations_per_utxo: 5,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa, AssetSchema::Bfa],
             allow_reckless_schemas: false,
+            address_reuse_vanilla: false,
+            address_reuse_colored_auto: false,
         };
         let wallet = Wallet::new(wd, SinglesigKeys::from_keys(&keys, None)).unwrap();
         add_fake_txos(&wallet);

@@ -38,6 +38,7 @@ async fn reusable_receive(
                 1,
                 encryption,
                 quota,
+                None,
             )
             .await
     } else {

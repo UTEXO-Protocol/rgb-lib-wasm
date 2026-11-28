@@ -786,6 +786,7 @@ impl WasmWallet {
     /// `expiration_timestamp_js` is a UTC timestamp in seconds, as a number, BigInt or decimal string.
     /// `encryption` is "Required" (default), "Unsupported" or "Optional".
     /// `quota` is the number of transfers the invoice can receive (default 1).
+    /// `address` reuses the address of an earlier witness receive (`ReceiveData.address`).
     #[wasm_bindgen(js_name = "witnessReceive")]
     #[allow(clippy::too_many_arguments)]
     pub async fn witness_receive(
@@ -798,6 +799,7 @@ impl WasmWallet {
         min_confirmations: u8,
         encryption: Option<String>,
         quota: Option<u32>,
+        address: Option<String>,
     ) -> Result<JsValue, JsValue> {
         let online = js_to_online_opt(online_js)?;
         let expiration_timestamp = js_to_u64(expiration_timestamp_js)?;
@@ -818,13 +820,15 @@ impl WasmWallet {
                 min_confirmations,
                 encryption,
                 quota,
+                address,
             )
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&data)
     }
 
-    /// Return a new Bitcoin address from the vanilla wallet.
+    /// Return a new Bitcoin address from the vanilla wallet, or always the first one when
+    /// `addressReuseVanilla` is on.
     #[wasm_bindgen(js_name = "getAddress")]
     pub fn get_address(&self) -> Result<String, JsValue> {
         self.inner

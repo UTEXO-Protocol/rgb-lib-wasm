@@ -297,6 +297,12 @@ jobs:
           WASM_BINDGEN_TEST_TIMEOUT: 1800
         run: 'wasm-pack test --headless --firefox --release --lib -- test_vanilla::'
 
+      - name: Run address reuse tests
+        if: matrix.group == 'lib'
+        env:
+          WASM_BINDGEN_TEST_TIMEOUT: 1800
+        run: 'wasm-pack test --headless --firefox --release --lib -- test_address_reuse::'
+
       - name: Stop regtest services
         if: always()
         working-directory: tests

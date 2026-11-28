@@ -818,13 +818,41 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let mut from_backup = make_test_wallet_with_singlesig_keys(keys);
+        let mut from_backup = make_test_wallet_with_singlesig_keys(keys.clone());
         from_backup
             .restore_backup(
                 include_bytes!("../../tests/fixtures/beta5/backup.bin"),
                 "password",
             )
             .unwrap();
+
+        // The manifest has no address reuse settings: they load as off.
+        for setting in ["address_reuse_vanilla", "address_reuse_colored_auto"] {
+            let reusing = || {
+                let mut wallet = make_test_wallet_with_singlesig_keys(keys.clone());
+                let wd = &mut wallet.wallet_data;
+                wd.address_reuse_vanilla = setting == "address_reuse_vanilla";
+                wd.address_reuse_colored_auto = setting == "address_reuse_colored_auto";
+                wallet
+            };
+            let snapshot =
+                serde_json::from_str(include_str!("../../tests/fixtures/beta5/snapshot.json"))
+                    .unwrap();
+            let backup = include_bytes!("../../tests/fixtures/beta5/backup.bin");
+            for err in [
+                reusing().restore_from_snapshot(snapshot).unwrap_err(),
+                reusing().restore_backup(backup, "password").unwrap_err(),
+            ] {
+                assert!(
+                    matches!(
+                        &err,
+                        Error::WalletSettingMismatch { setting: s, expected, provided }
+                            if s == setting && expected == "false" && provided == "true"
+                    ),
+                    "{err:?}"
+                );
+            }
+        }
 
         for wallet in [&mut from_snapshot, &mut from_backup] {
             let transfers = wallet
