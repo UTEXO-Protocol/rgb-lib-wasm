@@ -88,6 +88,8 @@ const walletData = {
   maxAllocationsPerUtxo: 5,
   supportedSchemas: ['Nia', 'Ifa'],
   allowRecklessSchemas: false,
+  addressReuseVanilla: false,
+  addressReuseColoredAuto: false,
 };
 const walletKeys = {
   accountXpubVanilla: keys.accountXpubVanilla,
@@ -109,6 +111,15 @@ On `Mainnet`, a wallet that supports `Ifa` or `Bfa` fails with `Cannot use <sche
 Set `allowRecklessSchemas: true` to allow it. The wallet then logs a warning.
 The field is optional and defaults to `false`. Other networks allow every schema.
 
+#### Address reuse
+
+- `addressReuseVanilla: true`: `getAddress` always returns the first vanilla address, and the bitcoin change of the wallet's transactions goes to it.
+- `addressReuseColoredAuto: true`: the UTXOs of `createUtxos` and the change of RGB operations go to the first colored address. The wallet registers them before broadcast, so they are usable at once.
+- Both fields are optional and default to `false`. Reuse links the wallet's payments on-chain.
+- They are fixed when the wallet is created. A snapshot or backup with another value fails with the Rust error `WalletSettingMismatch`.
+  In JavaScript, `create` and `vssRestoreBackup` reject with a message that starts with `Wallet setting '<setting>' cannot be changed`.
+  `restoreBackup` is synchronous and throws that message.
+
 ### Persistence ordering
 
 `WasmWallet.create()` and Rust `Wallet::restore()` finish IndexedDB restoration
@@ -127,8 +138,9 @@ its calls return a persistence error.
 
 Every save and backup stores the wallet settings and public keys, without the
 mnemonic. `create`, `restore`, `restoreBackup` and `vssRestoreBackup` refuse a
-changed vanilla keychain or account xpub with `WalletSettingMismatch`, and
-`restoreBackup` also refuses a changed fingerprint with it.
+changed vanilla keychain, account xpub, `addressReuseVanilla` or
+`addressReuseColoredAuto` with `WalletSettingMismatch`, and `restoreBackup` also
+refuses a changed fingerprint with it.
 `restoreBackup` and `vssRestoreBackup` refuse a backup of another network with
 `BackupNetworkMismatch`, which names both networks.
 Other settings changed in `create` are stored with the next save.
@@ -222,11 +234,20 @@ const txid = await wallet.sendBtcEnd(online, signed);
 // Encryption is 'Required' (default), 'Unsupported' or 'Optional'.
 // The quota is the number of transfers (default 1). Above 1, it needs transport endpoints.
 const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
-// blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey }
+// blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey, address }
 
 // Witness receive (address-based)
 const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
+
+// Witness receive that reuses the address of an earlier one (the last argument)
+const again = await wallet.witnessReceive(online, null, { Fungible: 50 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null, witness.address);
 ```
+
+`address` is the address a witness receive pays. It is `undefined` for a blind receive.
+A witness receive can reuse a revealed colored address:
+- Each receive has its own invoice. One batch cannot pay two invoices on the same address.
+- It needs transport endpoints. Without them it fails with `Address reuse is not supported: <details>`.
+- An address that is not a revealed colored address, or that an earlier out-of-band receive used, fails with `Cannot reuse address: <details>`.
 
 An invoice with a quota above 1 is reusable: it can receive that number of transfers.
 - A blind invoice can receive at most `maxAllocationsPerUtxo` transfers.
@@ -466,7 +487,7 @@ To protect a wallet:
 | `getWalletData()` | no | Return WalletData as JS object |
 | `getKeys()` | no | Return SinglesigKeys; `mnemonic` is null |
 | `getDescriptors()` | no | Return `{colored, vanilla}`; a signing wallet's descriptors hold its account private keys |
-| `getAddress()` | no | Get a new Bitcoin address |
+| `getAddress()` | no | Get a new Bitcoin address, or the first one when `addressReuseVanilla` is on |
 | `getBtcBalance(online?, skipSync)` | yes | Get BTC balance, after a sync unless `skipSync` |
 | `getAssetBalance(assetId)` | no | Get balance for an RGB asset |
 | `getAssetMetadata(assetId)` | no | Get metadata for an RGB asset (name, ticker, precision, supply, etc.) |
@@ -488,7 +509,7 @@ To protect a wallet:
 | `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
 | `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
 | `blindReceive(..., quota?)` | yes | Create a blind receive invoice and reserve it on the proxies. `quota` is the number of transfers it can receive (default 1) |
-| `witnessReceive(..., quota?)` | yes | Create a witness receive invoice and reserve it on the proxies. `quota` is the number of transfers it can receive (default 1) |
+| `witnessReceive(..., quota?, address?)` | yes | Create a witness receive invoice and reserve it on the proxies. `quota` is the number of transfers it can receive (default 1). `address` reuses the address of an earlier witness receive |
 | `send(online, recipientMap, donation, feeRate, minConf, expiration, senderEndpoint?)` | yes | Send RGB assets, signing with the wallet keys |
 | `sendBegin(..., signal?)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
 | `sendEnd(online, psbt)` | yes | Broadcast RGB send PSBT |
