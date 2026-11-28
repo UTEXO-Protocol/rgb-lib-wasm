@@ -38,6 +38,16 @@ impl AppState {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        self.rpc_call_opt(method, params)
+            .await?
+            .ok_or_else(|| "null result".to_string())
+    }
+
+    async fn rpc_call_opt(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, String> {
         let req = RpcRequest {
             jsonrpc: "1.0",
             id: "helper",
@@ -61,7 +71,7 @@ impl AppState {
         if let Some(err) = body.error {
             return Err(format!("RPC error: {err}"));
         }
-        body.result.ok_or_else(|| "null result".to_string())
+        Ok(body.result)
     }
 
     async fn rpc_call_wallet(
@@ -201,6 +211,41 @@ async fn mine_handler(
 }
 
 #[derive(Deserialize)]
+struct SubmitBlocksRequest {
+    blocks: Vec<String>,
+}
+
+async fn submit_blocks_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SubmitBlocksRequest>,
+) -> Result<Json<MineResponse>, (StatusCode, String)> {
+    for (i, block) in req.blocks.iter().enumerate() {
+        let result = state
+            .rpc_call_opt("submitblock", serde_json::json!([block]))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // "inconclusive" is a block of a branch that does not have the most work yet
+        if let Some(result) = result {
+            if !matches!(
+                result.as_str(),
+                Some("duplicate" | "inconclusive" | "duplicate-inconclusive")
+            ) {
+                let error = format!("block {i}: {result}");
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
+            }
+        }
+    }
+
+    let height_val = state
+        .rpc_call("getblockcount", serde_json::json!([]))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let height = height_val.as_u64().unwrap_or(0);
+
+    Ok(Json(MineResponse { height }))
+}
+
+#[derive(Deserialize)]
 struct FundRequest {
     address: String,
     #[serde(default = "default_amount")]
@@ -283,6 +328,7 @@ async fn main() {
         .route("/height", get(height_handler))
         .route("/mine", post(mine_handler))
         .route("/fund", post(fund_handler))
+        .route("/submit-blocks", post(submit_blocks_handler))
         // a valid reject list larger than one read chunk
         .route(
             "/reject-list/valid",

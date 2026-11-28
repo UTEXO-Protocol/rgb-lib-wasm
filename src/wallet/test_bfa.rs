@@ -574,11 +574,13 @@ pub(super) async fn deploy_bridge(address: &str) {
 pub(super) async fn record_lock(bridge: &str, lock_id: &LockId, amount: u64, block: u64) {
     let key = format!("{}{amount:064x}", hex::encode(lock_id.to_byte_array()));
     let data = format!("0x00000000{key}{:064x}", block + 1);
-    evm_rpc(
-        "eth_sendTransaction",
+    // eth_sendTransaction returns before anvil mines the TX: wait for its receipt
+    let receipt = evm_rpc(
+        "eth_sendTransactionSync",
         json!([{"from": ANVIL_ACCOUNT, "to": bridge, "data": data}]),
     )
     .await;
+    assert_eq!(receipt["status"], json!("0x1"));
     let read = evm_rpc(
         "eth_call",
         json!([{"to": bridge, "data": format!("0x2ce06e2d{key}")}, "latest"]),

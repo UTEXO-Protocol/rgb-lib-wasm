@@ -982,6 +982,7 @@ async fn test_failed_save_of_an_async_call_is_an_error() {
             vec![transport_endpoint()],
             1,
             None,
+            None,
         )
         .await;
     assert!(

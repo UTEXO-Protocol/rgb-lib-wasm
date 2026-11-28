@@ -559,6 +559,9 @@ pub(crate) struct ReceiveDataInternal {
     recipient_pubkey: Vec<u8>,
     encryption: Encryption,
     retention_deadline: Option<i64>,
+    quota: u32,
+    invoice_deadline: Option<i64>,
+    receive_dir: Option<String>,
 }
 
 /// Supported database types.
@@ -1334,23 +1337,23 @@ pub struct Wallet {
     #[cfg(feature = "esplora")]
     pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
     /// In-memory storage for received consignment bytes (replaces filesystem on wasm32).
-    /// Key: recipient_id
+    /// Key: receive dir of the transfer
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
-    /// Validated copy of each received consignment, kept for settlement. Key: recipient_id
+    /// Validated copy of each received consignment, kept for settlement. Key: receive dir of the transfer
     #[cfg(feature = "esplora")]
     pub(crate) received_valid_consignments: HashMap<String, ValidTransfer>,
-    /// Proxy data of each received consignment. Key: recipient_id
+    /// Proxy data of each received consignment. Key: receive dir of the transfer
     #[cfg(feature = "esplora")]
     pub(crate) received_consignment_meta: HashMap<String, ReceivedConsignmentMeta>,
-    /// Signed TX released by the sender proxy. Key: recipient_id
+    /// Signed TX released by the sender proxy. Key: receive dir of the transfer
     #[cfg(feature = "esplora")]
     pub(crate) received_signed_txs: HashMap<String, Vec<u8>>,
-    /// Received mints, as checked, keyed by recipient_id
+    /// Received mints, as checked. Key: receive dir of the transfer
     pub(crate) received_mints: HashMap<String, ReceivedMint>,
     /// Media bytes keyed by hex digest (replaces the media directory on wasm32).
     pub(crate) media: HashMap<String, Vec<u8>>,
-    /// Mint locks a received consignment waits for, keyed by recipient_id
+    /// Mint locks a received consignment waits for. Key: receive dir of the transfer
     pub(crate) pending_mint_locks: HashMap<String, PendingMintLocks>,
     /// TXs this wallet broadcast in the running operation. A failed operation keeps them in BDK.
     #[cfg(feature = "esplora")]
@@ -1709,6 +1712,15 @@ impl Wallet {
             .sum())
     }
 
+    /// The maximum number of allocations a UTXO can hold and still be spent.
+    /// It counts all assets, so it is an upper bound for each asset.
+    pub(crate) fn max_utxo_allocations(&self) -> u32 {
+        Ord::min(
+            self.max_allocations_per_utxo(),
+            u32::try_from(max_utxo_asset_allocations()).unwrap_or(u32::MAX),
+        )
+    }
+
     pub(crate) fn get_available_allocations<T>(
         &self,
         unspents: T,
@@ -1723,12 +1735,7 @@ impl Wallet {
             .iter_mut()
             .for_each(|u| u.rgb_allocations.retain(|a| !a.status.failed()));
         let max_allocs = max_allocations.unwrap_or_else(|| {
-            // a UTXO cannot get more allocations than it can hold and still be spent
-            let max_per_utxo = Ord::min(
-                self.max_allocations_per_utxo(),
-                u32::try_from(max_utxo_asset_allocations()).unwrap_or(u32::MAX),
-            );
-            max_per_utxo
+            self.max_utxo_allocations()
                 .checked_sub(1)
                 .expect("max allocations per UTXO must be greater than 0")
         });
@@ -3131,7 +3138,9 @@ impl Wallet {
     /// If no `batch_transfer_idx` is provided, all failed transfers will be deleted, and if
     /// `no_asset_only` is true transfers with an associated asset ID will be skipped.
     ///
-    /// Eligible transfers are the ones in status [`TransferStatus::Failed`].
+    /// Eligible transfers are in status [`TransferStatus::Failed`]. Transfers of a live reusable
+    /// invoice are not eligible, because the invoice needs them to receive more transfers.
+    /// Delete-all skips them. A `batch_transfer_idx` of one returns an error.
     pub fn delete_transfers(
         &self,
         batch_transfer_idx: Option<i32>,
@@ -3158,6 +3167,28 @@ impl Wallet {
         let db_data = self.database.get_db_data(false)?;
         let mut transfers_changed = false;
 
+        // A live reusable invoice reaches its proxies and its UTXO or script through its transfers.
+        // Refresh also deletes its failed transfers from the proxies. Keep them while it is live.
+        let now = now().unix_timestamp();
+        let live_invoices: HashSet<i32> = self
+            .database
+            .iter_invoices()?
+            .into_iter()
+            .filter(|i| i.live(now))
+            .map(|i| i.idx)
+            .collect();
+        let live_invoice_asset_transfers: HashSet<i32> = db_data
+            .transfers
+            .iter()
+            .filter(|t| t.invoice_idx.is_some_and(|i| live_invoices.contains(&i)))
+            .map(|t| t.asset_transfer_idx)
+            .collect();
+        let of_live_invoice = |asset_transfers: &[DbAssetTransfer]| {
+            asset_transfers
+                .iter()
+                .any(|at| live_invoice_asset_transfers.contains(&at.idx))
+        };
+
         if let Some(batch_transfer_idx) = batch_transfer_idx {
             let batch_transfer = &self
                 .database
@@ -3168,6 +3199,10 @@ impl Wallet {
             }
 
             let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
+
+            if of_live_invoice(&asset_transfers) {
+                return Err(Error::CannotDeleteBatchTransfer);
+            }
 
             if no_asset_only {
                 let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
@@ -3194,6 +3229,9 @@ impl Wallet {
             for batch_transfer in batch_transfers.iter_mut() {
                 let asset_transfers =
                     batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
+                if of_live_invoice(&asset_transfers) {
+                    continue;
+                }
                 if no_asset_only {
                     let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
                     if connected_assets {
@@ -3218,36 +3256,42 @@ impl Wallet {
         Ok(transfers_changed)
     }
 
-    /// Get the details of the mint received on the provided `recipient_id`, once the wallet has
-    /// checked it: what the lock on the external chain has to match for the mint to complete. The
-    /// lock has to be made for [`ReceivedMint::lock_id`], of [`ReceivedMint::amount`], and be
-    /// included before [`ReceivedMint::before_block`]. A checked mint is not refused later by the
-    /// reject list.
-    ///
-    /// Returns `None` if no mint checked by the wallet pays `recipient_id`, or if it failed.
-    pub fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, Error> {
+    /// Get the checked mints received on `recipient_id`, one per transfer. A failed transfer has none.
+    /// Make each lock for [`ReceivedMint::lock_id`] and [`ReceivedMint::amount`], and include it
+    /// before [`ReceivedMint::before_block`]. The reject list does not refuse a checked mint later.
+    pub fn get_received_mint(&self, recipient_id: String) -> Result<Vec<ReceivedMint>, Error> {
         info!(self.logger, "Getting received mint...");
         // a failed receive has nothing left to lock for
         let db_data = self.database.get_db_data(false)?;
-        let failed = db_data.transfers.iter().any(|t| {
-            t.recipient_id.as_deref() == Some(&recipient_id)
-                && db_data
-                    .asset_transfers
-                    .iter()
-                    .find(|at| at.idx == t.asset_transfer_idx)
-                    .and_then(|at| {
-                        db_data
-                            .batch_transfers
-                            .iter()
-                            .find(|bt| bt.idx == at.batch_transfer_idx)
-                    })
-                    .is_some_and(|bt| t.incoming && bt.status == TransferStatus::Failed)
-        });
-        info!(self.logger, "Get received mint completed");
-        if failed {
-            return Ok(None);
+        let mut received_mints = vec![];
+        for transfer in db_data
+            .transfers
+            .iter()
+            .filter(|t| t.incoming && t.recipient_id.as_deref() == Some(&recipient_id))
+        {
+            let failed = db_data
+                .asset_transfers
+                .iter()
+                .find(|at| at.idx == transfer.asset_transfer_idx)
+                .and_then(|at| {
+                    db_data
+                        .batch_transfers
+                        .iter()
+                        .find(|bt| bt.idx == at.batch_transfer_idx)
+                })
+                .is_some_and(|bt| bt.status == TransferStatus::Failed);
+            if failed {
+                continue;
+            }
+            if let Some(mint) = self
+                .received_mints
+                .get(&self.received_key(&self.received_mints, transfer))
+            {
+                received_mints.push(mint.clone());
+            }
         }
-        Ok(self.received_mints.get(&recipient_id).cloned())
+        info!(self.logger, "Get received mint completed");
+        Ok(received_mints)
     }
 
     /// Return the consignment of the transfer with this `idx` from
@@ -3292,18 +3336,23 @@ impl Wallet {
                     .cloned()
             }
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness => {
-                let recipient_id = transfer.recipient_id.as_deref().unwrap_or_default();
-                let bytes = self.received_consignments.get(recipient_id);
+                let bytes = self
+                    .received_consignments
+                    .get(&self.received_key(&self.received_consignments, transfer));
                 match batch_transfer.status {
                     // a failed receive can keep bytes the wallet did not validate
                     TransferStatus::Failed => None,
                     // only a checked mint that waits for its lock has validated bytes
                     TransferStatus::Initiated | TransferStatus::WaitingCounterparty => bytes
                         .filter(|b| {
-                            self.received_mints.contains_key(recipient_id)
-                                && self.pending_mint_locks.get(recipient_id).is_some_and(|l| {
-                                    l.consignment_digest == hex::encode(sha256_digest(b))
-                                })
+                            self.received_mints
+                                .contains_key(&self.received_key(&self.received_mints, transfer))
+                                && self
+                                    .pending_mint_locks
+                                    .get(&self.received_key(&self.pending_mint_locks, transfer))
+                                    .is_some_and(|l| {
+                                        l.consignment_digest == hex::encode(sha256_digest(b))
+                                    })
                         })
                         .cloned(),
                     _ => bytes.cloned(),
@@ -3753,9 +3802,38 @@ impl Wallet {
         recipient_id.replace(":", "_")
     }
 
-    pub(crate) fn get_receive_consignment_path(&self, recipient_id: &str) -> PathBuf {
+    /// Key of the data of an incoming transfer: its receive dir, else its raw recipient ID.
+    pub(crate) fn get_receive_dir(&self, transfer: &DbTransfer) -> String {
+        transfer.receive_dir.clone().unwrap_or_else(|| {
+            transfer
+                .recipient_id
+                .clone()
+                .expect("transfer should have a recipient ID")
+        })
+    }
+
+    /// Key to read the data of an incoming transfer from `map`.
+    /// A wallet of an older release keeps this data under the normalized recipient ID.
+    pub(crate) fn received_key<V>(
+        &self,
+        map: &HashMap<String, V>,
+        transfer: &DbTransfer,
+    ) -> String {
+        let key = self.get_receive_dir(transfer);
+        if transfer.receive_dir.is_none() && !map.contains_key(&key) {
+            let normalized = self.normalize_recipient_id(&key);
+            if map.contains_key(&normalized) {
+                return normalized;
+            }
+        }
+        key
+    }
+
+    pub(crate) fn get_receive_consignment_path(&self, transfer: &DbTransfer) -> PathBuf {
         self.get_transfers_dir()
-            .join(self.normalize_recipient_id(recipient_id))
+            .join(transfer.receive_dir.clone().unwrap_or_else(|| {
+                self.normalize_recipient_id(transfer.recipient_id.as_ref().unwrap())
+            }))
             .join(CONSIGNMENT_RCV_FILE.as_str())
     }
 
@@ -3873,7 +3951,7 @@ impl Wallet {
                 TransferStatus::WaitingCounterparty,
             ) => None,
             (TransferKind::ReceiveBlind | TransferKind::ReceiveWitness, _) => {
-                Some(self.get_receive_consignment_path(&transfer.recipient_id.clone().unwrap()))
+                Some(self.get_receive_consignment_path(transfer))
             }
             (TransferKind::Issuance, _) => {
                 Some(self._get_issue_consignment_path(&asset_transfer.asset_id.clone().unwrap()))
@@ -4089,8 +4167,31 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         recipient_type: RecipientType,
         encryption: Option<Encryption>,
+        quota: u32,
     ) -> Result<ReceiveDataInternal, Error> {
         let encryption = encryption.unwrap_or(Encryption::Required);
+
+        // A reusable invoice needs proxies to keep its transfers apart.
+        // The seal blinding from both parties' keys identifies the outputs of each transfer.
+        if quota == 0 {
+            return Err(Error::InvalidQuota {
+                details: s!("must be at least 1"),
+            });
+        }
+        if transport_endpoints.is_empty() && quota > 1 {
+            return Err(Error::InvalidQuota {
+                details: s!("a reusable invoice requires transport endpoints"),
+            });
+        }
+        // The blinded UTXO needs one allocation for each transfer.
+        if recipient_type == RecipientType::Blind && quota > self.max_utxo_allocations() {
+            return Err(Error::InvalidQuota {
+                details: format!(
+                    "a blind invoice can receive at most {} transfers",
+                    self.max_utxo_allocations()
+                ),
+            });
+        }
 
         #[cfg(not(feature = "esplora"))]
         {
@@ -4131,7 +4232,9 @@ impl Wallet {
                                 })
                         });
                     }
-                    let utxo = self.get_utxo(&[], Some(&unspents), true, None)?;
+                    // The blinded UTXO needs one allocation for each transfer.
+                    let max_allocations = self.max_utxo_allocations() - quota;
+                    let utxo = self.get_utxo(&[], Some(&unspents), true, Some(max_allocations))?;
                     let unblinded_utxo = utxo.outpoint();
                     debug!(
                         self.logger,
@@ -4249,6 +4352,8 @@ impl Wallet {
             // for a blind receive, the invoice expiration plus the longest retention grace among
             // the proxies, until which a transfer to the invoice can still be downloaded
             let mut retention_deadline: Option<i64> = None;
+            // Expiration plus the longest retention grace of the invoice proxies, for all recipient types.
+            let mut proxies_retention_deadline: Option<i64> = None;
 
             // reserve the invoice on the proxies
             let recipient_pk = hex::encode(recipient_vk.to_bytes());
@@ -4271,6 +4376,7 @@ impl Wallet {
                             &invoice_id,
                             &reservation_expiration,
                             &recipient_pk,
+                            quota,
                         ),
                     )
                 });
@@ -4279,20 +4385,19 @@ impl Wallet {
                         &invoice_id,
                         &reservation_expiration,
                         &recipient_pk,
+                        quota,
                         signature,
                     )
                     .await
                 {
                     Ok(res) if res.error.is_none() => {
                         reserved = true;
-                        if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
-                            let deadline = expiration_timestamp
-                                + i64::from(crate::utils::proxy_retention_grace(&info));
-                            retention_deadline = Some(std::cmp::max(
-                                retention_deadline.unwrap_or(deadline),
-                                deadline,
-                            ));
-                        }
+                        let deadline = expiration_timestamp
+                            .saturating_add(i64::from(crate::utils::proxy_retention_grace(&info)));
+                        proxies_retention_deadline = Some(std::cmp::max(
+                            proxies_retention_deadline.unwrap_or(deadline),
+                            deadline,
+                        ));
                     }
                     Ok(res) => match map_proxy_error(res.error.unwrap()) {
                         // a draining proxy, the invoice can be reserved on the other ones
@@ -4310,6 +4415,23 @@ impl Wallet {
                     Error::NoValidTransportEndpoint
                 });
             }
+            if matches!(recipient_type_full, RecipientTypeFull::Blind { .. }) {
+                retention_deadline = proxies_retention_deadline;
+            }
+            // The retention deadline must also pass on the proxy clocks.
+            let invoice_deadline = proxies_retention_deadline
+                .filter(|_| quota > 1)
+                .map(|d| d.saturating_add(i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS)));
+
+            // Transfers of a reusable invoice share the recipient ID.
+            // The unique invoice key gives each receive its own dir.
+            let receive_dir = (quota > 1).then(|| {
+                format!(
+                    "{}_{}",
+                    self.normalize_recipient_id(&recipient_id),
+                    hex::encode(&recipient_vk.to_bytes()[..8])
+                )
+            });
 
             Ok(ReceiveDataInternal {
                 asset_id,
@@ -4326,6 +4448,9 @@ impl Wallet {
                 recipient_pubkey: recipient_vk.to_bytes().to_vec(),
                 encryption,
                 retention_deadline,
+                quota,
+                invoice_deadline,
+                receive_dir,
             })
         }
     }
@@ -4352,7 +4477,21 @@ impl Wallet {
             ..Default::default()
         };
         let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
+        // A reusable invoice receives more transfers after the first one, until it expires.
+        let invoice_idx = data
+            .invoice_deadline
+            .map(|deadline| {
+                self.database.set_invoice(DbInvoiceActMod {
+                    quota: ActiveValue::Set(data.quota),
+                    asset_id: ActiveValue::Set(data.asset_id.clone()),
+                    deadline: ActiveValue::Set(deadline),
+                    ..Default::default()
+                })
+            })
+            .transpose()?;
         let transfer = DbTransferActMod {
+            invoice_idx: ActiveValue::Set(invoice_idx),
+            receive_dir: ActiveValue::Set(data.receive_dir.clone()),
             asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
             requested_assignment: ActiveValue::Set(Some(data.detected_assignment.clone())),
             incoming: ActiveValue::Set(true),
@@ -4425,6 +4564,11 @@ impl Wallet {
     ///
     /// The `encryption` preference is embedded in the invoice and is [`Encryption::Required`] when
     /// not specified.
+    ///
+    /// An optional `quota` (default 1) sets the number of transfers the invoice can receive. A quota
+    /// above 1 requires transport endpoints. Refresh creates a transfer for each one after the first.
+    /// The blinded UTXO keeps free slots. It cannot be spent before the invoice expiration plus the
+    /// longest retention grace of its proxies.
     #[allow(clippy::too_many_arguments)]
     pub async fn blind_receive(
         &mut self,
@@ -4435,6 +4579,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         let cp = self.checkpoint("blind_receive");
         let res = self
@@ -4446,6 +4591,7 @@ impl Wallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
+                quota,
             )
             .await;
         self.commit(cp, res, |_| false).await
@@ -4461,6 +4607,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
@@ -4478,6 +4625,7 @@ impl Wallet {
                 transport_endpoints,
                 RecipientType::Blind,
                 encryption,
+                quota.unwrap_or(1),
             )
             .await?;
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
@@ -4521,6 +4669,11 @@ impl Wallet {
     ///
     /// The `encryption` preference is embedded in the invoice and is [`Encryption::Required`] when
     /// not specified.
+    ///
+    /// An optional `quota` (default 1) sets the number of transfers the invoice can receive. A quota
+    /// above 1 requires transport endpoints. Refresh creates a transfer for each one after the first.
+    /// Each transfer uses its own seal blinding, derived from the keys of both parties. It identifies
+    /// the paying output. That output cannot be spent until its transfer is accepted.
     #[allow(clippy::too_many_arguments)]
     pub async fn witness_receive(
         &mut self,
@@ -4531,6 +4684,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         let cp = self.checkpoint("witness_receive");
         let res = self
@@ -4542,6 +4696,7 @@ impl Wallet {
                 transport_endpoints,
                 min_confirmations,
                 encryption,
+                quota,
             )
             .await;
         self.commit(cp, res, |_| false).await
@@ -4557,6 +4712,7 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
         encryption: Option<Encryption>,
+        quota: Option<u32>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
@@ -4574,6 +4730,7 @@ impl Wallet {
                 transport_endpoints,
                 RecipientType::Witness,
                 encryption,
+                quota.unwrap_or(1),
             )
             .await?;
         let batch_transfer_idx = self.store_receive_transfer(&data, min_confirmations)?;
@@ -5555,7 +5712,7 @@ mod keys_and_settings_tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod receive_expiration_tests {
-    use super::test_wallet::make_test_wallet;
+    use super::test_wallet::{add_fake_txos, make_test_wallet};
     use super::*;
 
     const INDEXER_URL: &str = "http://127.0.0.1:1";
@@ -5568,20 +5725,23 @@ mod receive_expiration_tests {
         }
     }
 
-    // A proxy answering `server.info` and `invoice.prepare`.
-    fn proxy() -> (mockito::ServerGuard, Vec<mockito::Mock>) {
+    // A proxy that answers `server.info` with `grace` and `invoice.prepare` for `quota`.
+    fn proxy_with_quota(quota: u32, grace: u32) -> (mockito::ServerGuard, Vec<mockito::Mock>) {
         let mut server = mockito::Server::new();
         let info = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(s!("server.info")))
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"jsonrpc":"2.0","id":null,"result":{"protocol_version":"1.0","version":"0.4.0","uptime":1,"retention_grace_secs":"100"}}"#,
-            )
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","id":null,"result":{{"protocol_version":"1.0","version":"0.4.0","uptime":1,"retention_grace_secs":"{grace}"}}}}"#
+            ))
             .create();
         let prepare = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(s!("invoice.prepare")))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(s!("invoice.prepare")),
+                mockito::Matcher::Regex(format!(r#""quota":"{quota}""#)),
+            ]))
             .with_header("content-type", "application/json")
             .with_body(r#"{"jsonrpc":"2.0","id":null,"result":true}"#)
             .create();
@@ -5599,6 +5759,7 @@ mod receive_expiration_tests {
             now().unix_timestamp() as u64 - 1,
             vec![s!("rpc://127.0.0.1")],
             1,
+            None,
             None,
         ));
         assert!(matches!(result, Err(Error::InvalidExpiration)));
@@ -5619,6 +5780,7 @@ mod receive_expiration_tests {
                 vec![s!("rpc://127.0.0.1")],
                 1,
                 None,
+                None,
             )),
             crate::block_on(wallet.blind_receive(
                 None,
@@ -5627,6 +5789,7 @@ mod receive_expiration_tests {
                 exp,
                 vec![s!("rpc://127.0.0.1")],
                 1,
+                None,
                 None,
             )),
         ] {
@@ -5640,7 +5803,7 @@ mod receive_expiration_tests {
     fn receive_keeps_given_expiration_and_stores_v1_data() {
         let mut wallet = make_test_wallet();
         let online = online(&mut wallet);
-        let (server, _mocks) = proxy();
+        let (server, _mocks) = proxy_with_quota(1, 100);
         let exp = now().unix_timestamp() + 100_000;
         let mut receive = || {
             crate::block_on(wallet.create_receive_data(
@@ -5651,6 +5814,7 @@ mod receive_expiration_tests {
                 vec![format!("rpc://{}", server.host_with_port())],
                 RecipientType::Witness,
                 Some(Encryption::Optional),
+                1,
             ))
             .unwrap()
         };
@@ -5667,6 +5831,9 @@ mod receive_expiration_tests {
         // the retention deadline is only for a blind receive
         assert_eq!(batch.retention_deadline, None);
         let transfer = &db_data.transfers[0];
+        assert_eq!(transfer.invoice_idx, None);
+        assert_eq!(transfer.receive_dir, None);
+        assert!(wallet.database.iter_invoices().unwrap().is_empty());
         assert_eq!(
             hex::encode(transfer.recipient_pubkey.as_ref().unwrap()),
             public_key
@@ -5685,6 +5852,153 @@ mod receive_expiration_tests {
                 ("baz".to_string(), "qux".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn reuse_fail() {
+        let mut wallet = make_test_wallet();
+        let online = online(&mut wallet);
+        let exp = now().unix_timestamp() as u64 + 100_000;
+        let endpoints = vec![s!("rpc://127.0.0.1")];
+        let max = wallet.max_utxo_allocations();
+        let receive = |wallet: &mut Wallet, witness: bool, endpoints: Vec<String>, quota| {
+            let online = Some(online.clone());
+            let res = crate::block_on(async {
+                if witness {
+                    let rcv = wallet.witness_receive(
+                        online,
+                        None,
+                        Assignment::Any,
+                        exp,
+                        endpoints,
+                        1,
+                        None,
+                        quota,
+                    );
+                    rcv.await
+                } else {
+                    let rcv = wallet.blind_receive(
+                        online,
+                        None,
+                        Assignment::Any,
+                        exp,
+                        endpoints,
+                        1,
+                        None,
+                        quota,
+                    );
+                    rcv.await
+                }
+            });
+            match res {
+                Err(Error::InvalidQuota { details }) => details,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        for witness in [false, true] {
+            assert_eq!(
+                receive(&mut wallet, witness, endpoints.clone(), Some(0)),
+                "must be at least 1"
+            );
+            assert_eq!(
+                receive(&mut wallet, witness, vec![], Some(2)),
+                "a reusable invoice requires transport endpoints"
+            );
+        }
+        assert_eq!(
+            receive(&mut wallet, false, endpoints.clone(), Some(max + 1)),
+            format!("a blind invoice can receive at most {max} transfers")
+        );
+        MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(Some(2));
+        let details = receive(&mut wallet, false, endpoints, Some(3));
+        MOCK_MAX_UTXO_ASSET_ALLOCATIONS.set(None);
+        assert_eq!(details, "a blind invoice can receive at most 2 transfers");
+        assert!(wallet.database.iter_batch_transfers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reusable_receive_stores_invoice() {
+        let mut wallet = make_test_wallet();
+        let online = online(&mut wallet);
+        let (server, mocks) = proxy_with_quota(3, 100);
+        let (long_server, long_mocks) = proxy_with_quota(3, 300);
+        let exp = now().unix_timestamp() + 100_000;
+        let data = crate::block_on(wallet.create_receive_data(
+            Some(online.clone()),
+            None,
+            Assignment::Any,
+            exp,
+            vec![
+                format!("rpc://{}", server.host_with_port()),
+                format!("rpc://{}", long_server.host_with_port()),
+            ],
+            RecipientType::Witness,
+            None,
+            3,
+        ))
+        .unwrap();
+        long_mocks[1].assert();
+        // The longest proxy retention grace sets the deadline.
+        let deadline = exp + 300 + i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS);
+        assert_eq!(data.invoice_deadline, Some(deadline));
+        let receive_dir = format!(
+            "{}_{}",
+            wallet.normalize_recipient_id(&data.recipient_id),
+            &hex::encode(&data.recipient_pubkey)[..16]
+        );
+        assert_eq!(data.receive_dir, Some(receive_dir.clone()));
+        wallet.store_receive_transfer(&data, 1).unwrap();
+        mocks[1].assert();
+        assert_eq!(
+            wallet.database.iter_invoices().unwrap(),
+            vec![DbInvoice {
+                idx: 1,
+                quota: 3,
+                asset_id: None,
+                deadline,
+            }]
+        );
+        let db_data = wallet.database.get_db_data(false).unwrap();
+        assert_eq!(db_data.batch_transfers[0].retention_deadline, None);
+        let transfer = &db_data.transfers[0];
+        assert_eq!(transfer.invoice_idx, Some(1));
+        assert_eq!(wallet.get_receive_dir(transfer), receive_dir);
+
+        // A blind invoice needs a UTXO with room for its full quota.
+        add_fake_txos(&wallet);
+        let blind_receive = |wallet: &mut Wallet, quota| {
+            let (server, _mocks) = proxy_with_quota(quota, 100);
+            let res = crate::block_on(wallet.create_receive_data(
+                Some(online.clone()),
+                None,
+                Assignment::Any,
+                exp,
+                vec![format!("rpc://{}", server.host_with_port())],
+                RecipientType::Blind,
+                None,
+                quota,
+            ));
+            res.map(|data| {
+                let retention = exp + 100;
+                let deadline =
+                    (quota > 1).then(|| retention + i64::from(PROXY_CLOCK_SKEW_MARGIN_SECS));
+                assert_eq!(data.invoice_deadline, deadline);
+                wallet.store_receive_transfer(&data, 1).unwrap();
+                let db_data = wallet.database.get_db_data(false).unwrap();
+                let batch = db_data.batch_transfers.last().unwrap();
+                assert_eq!(batch.retention_deadline, Some(retention));
+            })
+        };
+        let max = wallet.max_utxo_allocations();
+        for _ in 0..3 {
+            blind_receive(&mut wallet, max - 1).unwrap();
+        }
+        // No UTXO has room for 2. The wallet has no bitcoins to color a new one.
+        assert!(matches!(
+            blind_receive(&mut wallet, 2),
+            Err(Error::InsufficientBitcoins { .. })
+        ));
+        blind_receive(&mut wallet, 1).unwrap();
     }
 }
 

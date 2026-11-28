@@ -217,14 +217,22 @@ const txid = await wallet.sendBtcEnd(online, signed);
 
 ```javascript
 // Blind receive (UTXO-based)
-// The wallet reserves the invoice on its proxies, so it takes the Online object. The last argument
-// is the encryption preference ('Required' by default, 'Unsupported' or 'Optional').
-const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+// The wallet reserves the invoice on its proxies, so it takes the Online object.
+// The last two arguments are the encryption preference and the quota.
+// Encryption is 'Required' (default), 'Unsupported' or 'Optional'.
+// The quota is the number of transfers (default 1). Above 1, it needs transport endpoints.
+const blind = await wallet.blindReceive(online, null, 'Any', Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
 // blind: { invoice, recipientId, expirationTimestamp, batchTransferIdx, publicKey }
 
 // Witness receive (address-based)
-const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null);
+const witness = await wallet.witnessReceive(online, null, { Fungible: 100 }, Math.floor(Date.now() / 1000) + 86400, ['rpc://localhost:3000/json-rpc'], 1, null, null);
 ```
+
+An invoice with a quota above 1 is reusable: it can receive that number of transfers.
+- A blind invoice can receive at most `maxAllocationsPerUtxo` transfers.
+- `refresh` finds each payment on the proxies and creates one transfer for it.
+- The wallet keeps the invoice, and the outputs it pays, until the proxies drop its transfers.
+- A quota of 0, a quota above 1 with no transport endpoints, or a blind quota above the limit fails with `Invalid quota: <details>`.
 
 ### Parsing invoices
 
@@ -479,8 +487,8 @@ To protect a wallet:
 | `issueAssetNia(ticker, name, precision, amounts)` | no | Issue a Non-Inflatable Asset |
 | `issueAssetIfa(ticker, name, precision, amounts, inflationAmounts, rejectListUrl?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue an Inflatable Fungible Asset, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
 | `issueAssetBfa(ticker, name, precision, mintRights, chainId, contractAddress, rejectListAddress?, linkRight, linkedFromContract?, skipContractChecks)` | no | Issue a Bridged Fungible Asset with mint rights and no units, with its link right if `linkRight`; `skipContractChecks` skips the checks on `linkedFromContract` |
-| `blindReceive(...)` | yes | Create a blind receive invoice and reserve it on the proxies |
-| `witnessReceive(...)` | yes | Create a witness receive invoice and reserve it on the proxies |
+| `blindReceive(..., quota?)` | yes | Create a blind receive invoice and reserve it on the proxies. `quota` is the number of transfers it can receive (default 1) |
+| `witnessReceive(..., quota?)` | yes | Create a witness receive invoice and reserve it on the proxies. `quota` is the number of transfers it can receive (default 1) |
 | `send(online, recipientMap, donation, feeRate, minConf, expiration, senderEndpoint?)` | yes | Send RGB assets, signing with the wallet keys |
 | `sendBegin(..., signal?)` | yes | Prepare RGB send PSBT, save it as Initiated unless dryRun |
 | `sendEnd(online, psbt)` | yes | Broadcast RGB send PSBT |
@@ -502,7 +510,7 @@ To protect a wallet:
 | `linkEnd(online, psbt)` | yes | Broadcast link PSBT |
 | `mintBegin(online, assetId, recipient, beforeBlock, feeRate, minConf, senderEndpoint, signal?)` | yes | Prepare BFA mint PSBT and post the consignment to the recipient. The lock has to be included before `beforeBlock` |
 | `mintEnd(online, psbt)` | yes | Broadcast mint PSBT once the lock on the EVM chain is finalized |
-| `getReceivedMint(recipientId)` | no | Return what the lock of a received mint has to match (`lockId`, `amount`, `beforeBlock`), or null |
+| `getReceivedMint(recipientId)` | no | Return what the lock of each checked mint received on a recipient ID has to match (`lockId`, `amount`, `beforeBlock`), one per transfer; an empty array if none |
 | `listUnspentsVanilla(online, minConf, skipSync)` | yes | List non-colored UTXOs |
 | `getConsignment(transferIdx)` | no | Return the consignment of a transfer (`Uint8Array`) or `null` |
 | `refresh(online, assetId?, filter, skipSync, signal?)` | yes | Refresh pending transfers and settle ended vanilla operations |
